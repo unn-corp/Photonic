@@ -4,8 +4,9 @@
 //! to closed boundary loops. The result is one compound editable path per
 //! color, ordered from broad/background colors to smaller foreground colors.
 
-use crate::{ops, PathData};
-use kurbo::{BezPath, PathEl};
+use crate::PathData;
+use geo::{Coord, LineString, Simplify};
+use kurbo::{BezPath, PathEl, Point};
 use std::collections::HashMap;
 
 /// User-facing trace controls after the GUI has sampled the requested area.
@@ -104,19 +105,17 @@ pub fn trace_bitmap(
         }
         let mut bez = BezPath::new();
         for ring in loops {
-            let mut points = remove_collinear(&ring);
+            let points = remove_collinear(&ring);
             if points.len() < 3 {
                 continue;
             }
-            let first = points.remove(0);
-            bez.move_to((
-                bounds[0] + first.0 as f64 * cell_w,
-                bounds[1] + first.1 as f64 * cell_h,
-            ));
-            for (x, y) in points {
-                bez.line_to((bounds[0] + x as f64 * cell_w, bounds[1] + y as f64 * cell_h));
-            }
-            bez.close_path();
+            let points: Vec<Point> = points
+                .into_iter()
+                .map(|(x, y)| {
+                    Point::new(bounds[0] + x as f64 * cell_w, bounds[1] + y as f64 * cell_h)
+                })
+                .collect();
+            append_smoothed_ring(&mut bez, &points, options.smoothing);
         }
         if !bez
             .elements()
@@ -126,25 +125,107 @@ pub fn trace_bitmap(
             continue;
         }
 
-        let mut path = PathData::from_bez_path(&bez);
-        if options.smoothing > 0.0 {
-            path = ops::simplify::simplify_path(&path, options.smoothing * 0.45);
-            path = ops::fit_curves::fit_curves(
-                &path,
-                &ops::fit_curves::FitOptions {
-                    accuracy: options.smoothing.max(0.05),
-                    corner_angle_deg: 35.0,
-                    refit_existing: false,
-                },
-            );
-        }
         traced.push(TracedShape {
             rgba: palette[cluster],
-            path,
+            path: PathData::from_bez_path(&bez),
             sampled_cells: counts[cluster],
         });
     }
     traced
+}
+
+/// Append a closed polygon with bounded quadratic rounding at each corner.
+///
+/// Area Trace previously sent dense, closed pixel contours through kurbo's
+/// optimal cubic fitter. Certain high-tolerance contours make that fitter's
+/// root solver abort the process, which cannot be recovered with
+/// `catch_unwind`. Keeping smoothing local to each corner is deterministic and
+/// guarantees that even a very large requested radius cannot cross either
+/// adjacent segment.
+fn append_smoothed_ring(path: &mut BezPath, points: &[Point], smoothing: f64) {
+    if points.len() < 3 {
+        return;
+    }
+
+    let smoothing = if smoothing.is_finite() {
+        smoothing.max(0.0)
+    } else {
+        0.0
+    };
+    if smoothing <= f64::EPSILON {
+        path.move_to(points[0]);
+        for &point in &points[1..] {
+            path.line_to(point);
+        }
+        path.close_path();
+        return;
+    }
+
+    // Preserve the useful point-count reduction of the old smoothing stage,
+    // but run RDP directly on a closed polyline. If a large tolerance would
+    // collapse the ring, retain the original geometry.
+    let points = simplify_closed_ring(points, smoothing * 0.45);
+    let mut corners = Vec::with_capacity(points.len());
+    for index in 0..points.len() {
+        let previous = points[(index + points.len() - 1) % points.len()];
+        let corner = points[index];
+        let next = points[(index + 1) % points.len()];
+        let incoming = corner.distance(previous);
+        let outgoing = corner.distance(next);
+        if incoming <= f64::EPSILON || outgoing <= f64::EPSILON {
+            corners.push((corner, corner, corner));
+            continue;
+        }
+
+        // Never consume more than 45% of either neighboring edge. Adjacent
+        // rounded corners therefore cannot overlap, even at the slider maximum.
+        let inset = smoothing.min(incoming * 0.45).min(outgoing * 0.45);
+        let entry = point_toward(corner, previous, inset / incoming);
+        let exit = point_toward(corner, next, inset / outgoing);
+        corners.push((entry, corner, exit));
+    }
+
+    path.move_to(corners[0].0);
+    path.quad_to(corners[0].1, corners[0].2);
+    for &(entry, corner, exit) in &corners[1..] {
+        path.line_to(entry);
+        path.quad_to(corner, exit);
+    }
+    path.close_path();
+}
+
+fn point_toward(origin: Point, target: Point, fraction: f64) -> Point {
+    Point::new(
+        origin.x + (target.x - origin.x) * fraction,
+        origin.y + (target.y - origin.y) * fraction,
+    )
+}
+
+fn simplify_closed_ring(points: &[Point], tolerance: f64) -> Vec<Point> {
+    if points.len() <= 3 || !tolerance.is_finite() || tolerance <= f64::EPSILON {
+        return points.to_vec();
+    }
+    let mut coordinates: Vec<Coord<f64>> = points
+        .iter()
+        .map(|point| Coord {
+            x: point.x,
+            y: point.y,
+        })
+        .collect();
+    coordinates.push(coordinates[0]);
+    let simplified = LineString::new(coordinates).simplify(&tolerance);
+    let mut simplified: Vec<Point> = simplified
+        .coords()
+        .map(|coordinate| Point::new(coordinate.x, coordinate.y))
+        .collect();
+    if simplified.len() > 1 && simplified[0].distance(*simplified.last().unwrap()) <= f64::EPSILON {
+        simplified.pop();
+    }
+    if simplified.len() >= 3 {
+        simplified
+    } else {
+        points.to_vec()
+    }
 }
 
 fn build_palette(pixels: &[[u8; 4]], options: TraceOptions) -> Option<Vec<[u8; 4]>> {
@@ -506,5 +587,72 @@ mod tests {
         let areas: Vec<i64> = loops.iter().map(|ring| polygon_area_twice(ring)).collect();
         assert!(areas.iter().any(|area| *area > 0));
         assert!(areas.iter().any(|area| *area < 0));
+    }
+
+    #[test]
+    fn high_smoothing_on_a_dense_closed_contour_is_finite_and_curved() {
+        let width = 64;
+        let height = 64;
+        let mut pixels = vec![[0, 0, 0, 0]; width * height];
+        for y in 0..height {
+            // A connected sawtooth silhouette exercises the dense closed-ring
+            // case that previously reached kurbo's aborting cubic root solver.
+            let edge = if (y / 2) % 2 == 0 { 48 } else { 32 };
+            for x in 0..edge {
+                pixels[y * width + x] = [30, 120, 220, 255];
+            }
+        }
+
+        let out = trace_bitmap(
+            &pixels,
+            width as u32,
+            height as u32,
+            [0.0, 0.0, 64.0, 64.0],
+            TraceOptions {
+                smoothing: 8.0,
+                ..defaults()
+            },
+        );
+        assert_eq!(out.len(), 1);
+        let bez = out[0].path.to_bez_path();
+        assert!(bez
+            .elements()
+            .iter()
+            .any(|element| matches!(element, PathEl::QuadTo(_, _))));
+        assert!(bez.elements().iter().all(path_element_is_finite));
+    }
+
+    #[test]
+    fn non_finite_smoothing_falls_back_to_crisp_geometry() {
+        let pixels = vec![[10, 20, 30, 255]; 4];
+        let out = trace_bitmap(
+            &pixels,
+            2,
+            2,
+            [0.0, 0.0, 2.0, 2.0],
+            TraceOptions {
+                smoothing: f64::INFINITY,
+                ..defaults()
+            },
+        );
+        assert_eq!(out.len(), 1);
+        let bez = out[0].path.to_bez_path();
+        assert!(!bez
+            .elements()
+            .iter()
+            .any(|element| matches!(element, PathEl::QuadTo(_, _))));
+        assert!(bez.elements().iter().all(path_element_is_finite));
+    }
+
+    fn path_element_is_finite(element: &PathEl) -> bool {
+        let point_is_finite = |point: Point| point.x.is_finite() && point.y.is_finite();
+        match *element {
+            PathEl::MoveTo(point) | PathEl::LineTo(point) => point_is_finite(point),
+            PathEl::QuadTo(control, point) => point_is_finite(control) && point_is_finite(point),
+            PathEl::CurveTo(control1, control2, point) => {
+                point_is_finite(control1) && point_is_finite(control2) && point_is_finite(point)
+            }
+            PathEl::ClosePath => true,
+        }
     }
 }
