@@ -1347,6 +1347,10 @@ pub struct PhotonicApp {
     /// Canvas-space origin and source raster for the active trace drag.
     area_trace_start: Option<Point>,
     area_trace_source: Option<NodeId>,
+    /// Retained region, sampled pixels, and transient vector nodes for the live
+    /// adjustment workflow. Preview nodes live in the document only until the
+    /// user applies or cancels; they are never added to history directly.
+    area_trace_session: Option<area_trace::AreaTraceSession>,
 
     // ── Raster masking (color range / remove background) ──────────────────────
     /// Fuzziness (0..1) for the color-range / magic-wand mask-out.
@@ -1872,6 +1876,7 @@ impl Default for PhotonicApp {
             area_trace_ignore_white: true,
             area_trace_start: None,
             area_trace_source: None,
+            area_trace_session: None,
             raster_mask_tolerance: 0.25,
             raster_mask_contiguous: false,
             raster_color_range: None,
@@ -2506,6 +2511,11 @@ impl PhotonicApp {
             .as_ref()
             .filter(|s| Some(s.node_id) == self.selected_id)
             .map(|s| s.target);
+        let area_trace_preview_active = self.area_trace_session.is_some();
+        let area_trace_preview_ready = self
+            .area_trace_session
+            .as_ref()
+            .is_some_and(|session| session.preview_root.is_some());
         let mut ctx = panels::PropPanelCtx {
             doc,
             active_tool: self.active_tool,
@@ -2545,6 +2555,8 @@ impl PhotonicApp {
             area_trace_smoothing: &mut self.area_trace_smoothing,
             area_trace_min_area: &mut self.area_trace_min_area,
             area_trace_ignore_white: &mut self.area_trace_ignore_white,
+            area_trace_preview_active,
+            area_trace_preview_ready,
             prop_spread: &mut self.prop_spread,
             prop_falloff_k: &mut self.prop_falloff_k,
             raster_mask_tolerance: &mut self.raster_mask_tolerance,
@@ -2870,6 +2882,7 @@ impl PhotonicApp {
             if prev == Tool::AreaTrace {
                 self.area_trace_start = None;
                 self.area_trace_source = None;
+                self.cancel_area_trace_preview(doc, false);
             }
             if cur == Tool::AreaTrace {
                 // Surface the small slider panel immediately; the trace tool is

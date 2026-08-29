@@ -105,6 +105,12 @@ impl PhotonicApp {
         if target >= self.tabs.len() || target == self.active_tab {
             return;
         }
+        // Area Trace previews are transient document mutations used only for
+        // rendering. Remove them before parking this document so a preview can
+        // never leak into another tab or become stranded in an inactive tab.
+        self.cancel_area_trace_preview(doc, false);
+        self.area_trace_start = None;
+        self.area_trace_source = None;
         let a = self.active_tab;
         // Park the active document into its slot (its engine fields were scratch).
         std::mem::swap(doc, &mut self.tabs[a].document);
@@ -146,6 +152,7 @@ impl PhotonicApp {
             return;
         }
         if self.tabs.len() == 1 {
+            self.cancel_area_trace_preview(doc, false);
             // Last document closed → clear everything and show the welcome screen.
             if let Some(rp) = self.tabs[0].recovery_path.take() {
                 let _ = std::fs::remove_file(rp);

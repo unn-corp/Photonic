@@ -293,6 +293,10 @@ pub enum PanelAction {
     ApplyRasterColorRange,
     /// Discard the active color-range session, restoring the layer.
     CancelRasterColorRange,
+    /// Commit the active Area Trace preview as one undoable vector subtree.
+    ApplyAreaTrace,
+    /// Discard the active Area Trace preview without changing history.
+    CancelAreaTrace,
     /// Remove a raster layer's non-destructive layer mask (undoable).
     ClearRasterMask { node_id: NodeId },
     /// Crop a raster layer's pixels (and mask) to the artboard bounds,
@@ -1173,6 +1177,10 @@ pub(crate) struct PropPanelCtx<'a> {
     pub(crate) area_trace_smoothing: &'a mut f32,
     pub(crate) area_trace_min_area: &'a mut u32,
     pub(crate) area_trace_ignore_white: &'a mut bool,
+    /// Whether Area Trace has a retained region and whether that region
+    /// currently produces a non-empty vector preview.
+    pub(crate) area_trace_preview_active: bool,
+    pub(crate) area_trace_preview_ready: bool,
     /// Proportional Move (Direct Select sub-variant): falloff radius ("spread")
     /// and curve exponent, editable in Tool Options and adjusted live by scroll.
     pub(crate) prop_spread: &'a mut f64,
