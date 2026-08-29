@@ -1168,6 +1168,11 @@ pub(crate) struct PropPanelCtx<'a> {
     pub(crate) magic_wand_attribute: &'a mut SelectSameAttr,
     pub(crate) magic_wand_tolerance: &'a mut f64,
     pub(crate) eraser_radius: &'a mut f64,
+    pub(crate) area_trace_colors: &'a mut u32,
+    pub(crate) area_trace_detail: &'a mut f32,
+    pub(crate) area_trace_smoothing: &'a mut f32,
+    pub(crate) area_trace_min_area: &'a mut u32,
+    pub(crate) area_trace_ignore_white: &'a mut bool,
     /// Proportional Move (Direct Select sub-variant): falloff radius ("spread")
     /// and curve exponent, editable in Tool Options and adjusted live by scroll.
     pub(crate) prop_spread: &'a mut f64,

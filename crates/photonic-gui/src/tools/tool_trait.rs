@@ -97,6 +97,7 @@ tool_registry! {
     Width => WidthTool,
     RasterBrush => RasterBrushTool,
     RasterEraser => RasterEraserTool,
+    AreaTrace => AreaTraceTool,
 }
 
 #[cfg(test)]

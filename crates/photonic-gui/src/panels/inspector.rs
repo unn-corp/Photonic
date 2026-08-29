@@ -2642,6 +2642,38 @@ pub(crate) fn draw_tool_shape_options(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let matches = |label: &str| -> bool { q.is_empty() || label.to_lowercase().contains(q) };
     let forced_open = ctx.forced_open;
     let mut action: Option<PanelAction> = None;
+    if ctx.active_tool == Tool::AreaTrace && matches("Area Trace") {
+        egui::CollapsingHeader::new("Area Trace")
+            .default_open(true)
+            .open(forced_open)
+            .show(ui, |ui| {
+                ui.label("Colors");
+                ui.add(egui::Slider::new(ctx.area_trace_colors, 1..=24));
+                ui.label("Detail");
+                ui.add(
+                    egui::Slider::new(ctx.area_trace_detail, 0.1..=1.0).custom_formatter(
+                        |value, _| format!("{}%", (value * 100.0).round() as u32),
+                    ),
+                );
+                ui.label("Smoothing");
+                ui.add(egui::Slider::new(ctx.area_trace_smoothing, 0.0..=8.0).suffix(" px"));
+                ui.label("Minimum area");
+                ui.add(egui::Slider::new(ctx.area_trace_min_area, 1..=128).suffix(" px"));
+                ui.checkbox(ctx.area_trace_ignore_white, "Ignore white background");
+                ui.add_space(5.0);
+                ui.label(
+                    RichText::new("Drag over an image to create editable vectors")
+                        .weak()
+                        .small(),
+                );
+                ui.label(
+                    RichText::new("The source image is kept · Ctrl+Z removes the trace")
+                        .weak()
+                        .small(),
+                );
+            });
+        return;
+    }
     // ── Tool / shape options ──────────────────────────────────────────────────
     if matches("New Shape Fill") {
         egui::CollapsingHeader::new("New Shape Fill")
