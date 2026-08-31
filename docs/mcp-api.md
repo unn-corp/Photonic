@@ -1059,10 +1059,10 @@ All parts are grouped as 'Lens Flare'. Useful for light effects, sparkle decorat
 | `halo_color` | string | no | Halo color as hex (default: #fffbe6) |
 | `halo_radius` | number | no | Halo circle radius (default: 50) |
 | `layer_id` | string | no | Target layer UUID (default: active layer) |
-| `ray_count` | integer | no | Number of radiating rays (default: 12) |
+| `ray_count` | integer | no | Number of radiating rays (default: 12). Total flare nodes, including halo and group, may not exceed 10000. |
 | `ray_length` | number | no | Length of rays beyond the halo (default: 80) |
 | `ray_opacity` | number | no | Ray opacity 0–1 (default: 0.3) |
-| `ring_count` | integer | no | Number of concentric rings (default: 3) |
+| `ring_count` | integer | no | Number of concentric rings (default: 3). Total flare nodes, including halo and group, may not exceed 10000. |
 
 ## `create_freehand_path`
 
@@ -1376,7 +1376,7 @@ Create an Archimedean spiral path. Specify center, outer/inner radius, and numbe
 | `inner_radius` | number | no | Minimum (inner) radius. Use 0 for a true center spiral (default: 0) |
 | `layer_id` | string | no |  |
 | `name` | string | no |  |
-| `segments_per_turn` | integer | no | Bézier segments per revolution for smoothness (default: 16) |
+| `segments_per_turn` | integer | no | Bézier segments per revolution for smoothness (default: 16). The rounded total across all turns may not exceed 10000 segments. |
 | `stroke` | object | no |  |
 | `turns` | number | no | Number of full revolutions (default: 3) |
 
@@ -4174,7 +4174,7 @@ Useful for confetti, stars, foliage, particle effects, and random textures.
 | `width` | number | yes | Area width |
 | `x` | number | yes | Area left X |
 | `y` | number | yes | Area top Y |
-| `count` | integer | no | Number of copies (default: 20) |
+| `count` | integer | no | Number of copies (default: 20; maximum: 10000) |
 | `rotation_range` | number | no | Random rotation range in degrees (default: 0) |
 | `scale_range` | number | no | Scale variation range (default: 0) |
 | `seed` | integer | no | Random seed (default: 42) |
@@ -4936,9 +4936,9 @@ Divide a path node's bounding box into a rows×cols grid of separate rectangle n
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
-| `cols` | integer | yes | Number of columns in the grid (≥ 1). |
+| `cols` | integer | yes | Number of columns in the grid (≥ 1). Total rows × cols may not exceed 10000 cells. |
 | `node_id` | string | yes | UUID of the source path node whose bounding box defines the grid area. |
-| `rows` | integer | yes | Number of rows in the grid (≥ 1). |
+| `rows` | integer | yes | Number of rows in the grid (≥ 1). Total rows × cols may not exceed 10000 cells. |
 | `gutter_x` | number | no | Horizontal gutter width in document units between columns. Default: 0. |
 | `gutter_y` | number | no | Vertical gutter height in document units between rows. Default: 0. |
 | `keep_original` | boolean | no | When true, keep the source node after splitting. Default: false (source is deleted). |
