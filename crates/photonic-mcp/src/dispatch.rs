@@ -3674,6 +3674,114 @@ mod tests {
         assert!(!entry.is_error);
     }
 
+    async fn add_array_source(state: &AppState) -> uuid::Uuid {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+        let source = SceneNode::new(
+            "Array source",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0))),
+        );
+        let source_id = source.id;
+        doc.add_node(source, Some(layer_id));
+        source_id
+    }
+
+    #[tokio::test]
+    async fn create_array_rejects_grid_product_overflow_and_over_cap() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let cases = [
+            (
+                "overflow",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": usize::MAX,
+                    "cols": 2
+                }),
+            ),
+            (
+                "over cap",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": MAX_ARRAY_GRID_CELLS + 1,
+                    "cols": 1
+                }),
+            ),
+        ];
+
+        for (label, args) in cases {
+            let result = dispatch_tool(&state, "create_array", args)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: dispatch failed: {error}"));
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{label}: expected ToolResult error"
+            );
+            assert_eq!(
+                state.document.lock().await.nodes.len(),
+                1,
+                "{label}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{label}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_array_grid_and_radial_keep_copy_counts_and_single_undo_steps() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let grid = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "grid" }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(grid.is_error, Some(true));
+        assert_eq!(
+            structured_data(&grid)["node_ids"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+
+        let radial = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "radial", "count": 4 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(radial.is_error, Some(true));
+        assert_eq!(
+            structured_data(&radial)["node_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
     async fn swatch_state(with_matching_node: bool) -> AppState {
         let state = test_state();
         let mut doc = state.document.lock().await;

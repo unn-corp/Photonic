@@ -1,3 +1,4 @@
+use crate::protocol::MAX_ARRAY_GRID_CELLS;
 use serde_json::{json, Value};
 
 /// Returns the MCP tool list manifest (the `tools/list` response payload).
@@ -1935,8 +1936,8 @@ pub fn tool_list() -> Value {
                     "properties": {
                         "node_id":   { "type": "string", "description": "ID of the source node to repeat" },
                         "mode":      { "type": "string", "enum": ["grid", "radial"], "description": "Layout mode" },
-                        "rows":      { "type": "integer", "description": "(grid) Number of rows — source is row 0. Default 2." },
-                        "cols":      { "type": "integer", "description": "(grid) Number of columns — source is col 0. Default 2." },
+                        "rows":      { "type": "integer", "maximum": MAX_ARRAY_GRID_CELLS, "description": format!("(grid) Number of rows — source is row 0. Default 2. Total grid size must not exceed {MAX_ARRAY_GRID_CELLS} cells.") },
+                        "cols":      { "type": "integer", "maximum": MAX_ARRAY_GRID_CELLS, "description": format!("(grid) Number of columns — source is col 0. Default 2. Total grid size must not exceed {MAX_ARRAY_GRID_CELLS} cells.") },
                         "col_stride":{ "type": "number",  "description": "(grid) Horizontal distance between column centres in px. Default 100." },
                         "row_stride":{ "type": "number",  "description": "(grid) Vertical distance between row centres in px. Default 100." },
                         "count":     { "type": "integer", "description": "(radial) Total instances including source (min 2, default 6). Creates count-1 new copies." },
@@ -7703,6 +7704,26 @@ mod tests {
         assert_eq!(
             tool["inputSchema"]["properties"]["sides"]["minimum"].as_u64(),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn create_array_schema_exposes_shared_grid_cell_cap() {
+        let manifest = tool_list();
+        let tool = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("create_array"))
+            .expect("create_array tool");
+
+        assert_eq!(
+            tool["inputSchema"]["properties"]["rows"]["maximum"],
+            json!(MAX_ARRAY_GRID_CELLS)
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["cols"]["maximum"],
+            json!(MAX_ARRAY_GRID_CELLS)
         );
     }
 }

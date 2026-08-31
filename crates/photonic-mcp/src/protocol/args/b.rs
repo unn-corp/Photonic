@@ -685,6 +685,9 @@ pub struct DuplicateNodesArgs {
     pub layer_id: Option<Uuid>,
 }
 
+/// Maximum total number of cells that `create_array` may materialize in grid mode.
+pub const MAX_ARRAY_GRID_CELLS: usize = 10_000;
+
 /// Arguments for `create_array` tool — repeat a node in a grid or radial pattern.
 #[derive(Debug, Deserialize)]
 pub struct CreateArrayArgs {
@@ -695,9 +698,11 @@ pub struct CreateArrayArgs {
 
     // ── Grid params (ignored for radial) ─────────────────────────────────
     /// Number of rows in the grid (default 2). The source is row 0, col 0.
+    /// The total grid size may not exceed [`MAX_ARRAY_GRID_CELLS`].
     #[serde(default)]
     pub rows: Option<usize>,
     /// Number of columns in the grid (default 2).
+    /// The total grid size may not exceed [`MAX_ARRAY_GRID_CELLS`].
     #[serde(default)]
     pub cols: Option<usize>,
     /// Horizontal distance (px) between column centres (default 100).

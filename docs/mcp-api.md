@@ -918,13 +918,13 @@ Radial mode: source is instance 0; `count - 1` copies are placed at evenly-space
 | `center_x` | number | no | (radial) X of rotation centre. Default 0. |
 | `center_y` | number | no | (radial) Y of rotation centre. Default 0. |
 | `col_stride` | number | no | (grid) Horizontal distance between column centres in px. Default 100. |
-| `cols` | integer | no | (grid) Number of columns — source is col 0. Default 2. |
+| `cols` | integer | no | (grid) Number of columns — source is col 0. Default 2. Total grid size must not exceed 10000 cells. |
 | `count` | integer | no | (radial) Total instances including source (min 2, default 6). Creates count-1 new copies. |
 | `group_result` | boolean | no | Wrap source + all copies into a new group node. Default false. |
 | `layer_id` | string | no | Target layer UUID. Defaults to source node's layer. |
 | `name_prefix` | string | no | Name prefix for copies, e.g. 'Petal' → 'Petal 1', 'Petal 2'. Defaults to the source node's name. |
 | `row_stride` | number | no | (grid) Vertical distance between row centres in px. Default 100. |
-| `rows` | integer | no | (grid) Number of rows — source is row 0. Default 2. |
+| `rows` | integer | no | (grid) Number of rows — source is row 0. Default 2. Total grid size must not exceed 10000 cells. |
 | `start_angle_degrees` | number | no | (radial) Clockwise angle in degrees for the first copy relative to the source. Default 0 (evenly distributed). |
 
 ## `create_arrow_shape`

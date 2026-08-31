@@ -584,13 +584,26 @@ pub async fn create_array(state: &AppState, args: CreateArrayArgs) -> ToolResult
         ArrayMode::Grid => {
             let rows = args.rows.unwrap_or(2).max(1);
             let cols = args.cols.unwrap_or(2).max(1);
-            if rows * cols < 2 {
+            let cell_count = match rows.checked_mul(cols) {
+                Some(cell_count) => cell_count,
+                None => {
+                    return ToolResult::error(
+                        "Grid dimensions overflow before array allocation (rows × cols)",
+                    )
+                }
+            };
+            if cell_count > MAX_ARRAY_GRID_CELLS {
+                return ToolResult::error(format!(
+                    "Grid must have at most {MAX_ARRAY_GRID_CELLS} cells (rows × cols)"
+                ));
+            }
+            if cell_count < 2 {
                 return ToolResult::error("Grid must have at least 2 cells (rows × cols ≥ 2)");
             }
             let dx = args.col_stride.unwrap_or(100.0);
             let dy = args.row_stride.unwrap_or(100.0);
 
-            let mut out = Vec::with_capacity(rows * cols - 1);
+            let mut out = Vec::with_capacity(cell_count - 1);
             let mut n = 1usize;
             for r in 0..rows {
                 for c in 0..cols {
