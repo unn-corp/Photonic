@@ -1,3 +1,4 @@
+use crate::protocol::{MAX_ARRAY_GRID_CELLS, MAX_GENERATED_WORK};
 use serde_json::{json, Value};
 
 /// Returns the MCP tool list manifest (the `tools/list` response payload).
@@ -125,9 +126,9 @@ pub fn tool_list() -> Value {
                     "cx": { "type": "number", "description": "Center X coordinate" },
                     "cy": { "type": "number", "description": "Center Y coordinate" },
                     "halo_radius": { "type": "number", "description": "Halo circle radius (default: 50)" },
-                    "ray_count": { "type": "integer", "description": "Number of radiating rays (default: 12)" },
+                    "ray_count": { "type": "integer", "minimum": 2, "maximum": MAX_GENERATED_WORK, "description": format!("Number of radiating rays (default: 12). Total flare nodes, including halo and group, may not exceed {MAX_GENERATED_WORK}.") },
                     "ray_length": { "type": "number", "description": "Length of rays beyond the halo (default: 80)" },
-                    "ring_count": { "type": "integer", "description": "Number of concentric rings (default: 3)" },
+                    "ring_count": { "type": "integer", "minimum": 0, "maximum": MAX_GENERATED_WORK, "description": format!("Number of concentric rings (default: 3). Total flare nodes, including halo and group, may not exceed {MAX_GENERATED_WORK}.") },
                     "halo_color": { "type": "string", "description": "Halo color as hex (default: #fffbe6)" },
                     "ray_opacity": { "type": "number", "description": "Ray opacity 0–1 (default: 0.3)" },
                     "layer_id": { "type": "string", "description": "Target layer UUID (default: active layer)" }
@@ -161,7 +162,7 @@ pub fn tool_list() -> Value {
                     "outer_radius": { "type": "number", "description": "Maximum (outer) radius in document units" },
                     "inner_radius": { "type": "number", "description": "Minimum (inner) radius. Use 0 for a true center spiral (default: 0)" },
                     "turns": { "type": "number", "description": "Number of full revolutions (default: 3)" },
-                    "segments_per_turn": { "type": "integer", "description": "Bézier segments per revolution for smoothness (default: 16)" },
+                    "segments_per_turn": { "type": "integer", "maximum": MAX_GENERATED_WORK, "description": format!("Bézier segments per revolution for smoothness (default: 16). The rounded total across all turns may not exceed {MAX_GENERATED_WORK} segments.") },
                     "fill": { "type": "object" },
                     "stroke": { "type": "object" },
                     "layer_id": { "type": "string" },
@@ -876,7 +877,7 @@ pub fn tool_list() -> Value {
                 "type": "object",
                 "properties": {
                     "node_id": { "type": "string", "description": "Source node to copy" },
-                    "count": { "type": "integer", "description": "Number of copies (default: 20)" },
+                    "count": { "type": "integer", "minimum": 1, "maximum": MAX_GENERATED_WORK, "description": format!("Number of copies (default: 20; maximum: {MAX_GENERATED_WORK})") },
                     "x": { "type": "number", "description": "Area left X" },
                     "y": { "type": "number", "description": "Area top Y" },
                     "width": { "type": "number", "description": "Area width" },
@@ -1889,8 +1890,8 @@ pub fn tool_list() -> Value {
                 "properties": {
                     "node_id":   { "type": "string", "description": "ID of the source node to repeat" },
                     "mode":      { "type": "string", "enum": ["grid", "radial"], "description": "Layout mode" },
-                    "rows":      { "type": "integer", "description": "(grid) Number of rows — source is row 0. Default 2." },
-                    "cols":      { "type": "integer", "description": "(grid) Number of columns — source is col 0. Default 2." },
+                    "rows":      { "type": "integer", "maximum": MAX_ARRAY_GRID_CELLS, "description": format!("(grid) Number of rows — source is row 0. Default 2. Total grid size must not exceed {MAX_ARRAY_GRID_CELLS} cells.") },
+                    "cols":      { "type": "integer", "maximum": MAX_ARRAY_GRID_CELLS, "description": format!("(grid) Number of columns — source is col 0. Default 2. Total grid size must not exceed {MAX_ARRAY_GRID_CELLS} cells.") },
                     "col_stride":{ "type": "number",  "description": "(grid) Horizontal distance between column centres in px. Default 100." },
                     "row_stride":{ "type": "number",  "description": "(grid) Vertical distance between row centres in px. Default 100." },
                     "count":     { "type": "integer", "description": "(radial) Total instances including source (min 2, default 6). Creates count-1 new copies." },
@@ -3053,12 +3054,14 @@ pub fn tool_list() -> Value {
                     "rows": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of rows in the grid (≥ 1)."
+                        "maximum": MAX_GENERATED_WORK,
+                        "description": format!("Number of rows in the grid (≥ 1). Total rows × cols may not exceed {MAX_GENERATED_WORK} cells.")
                     },
                     "cols": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of columns in the grid (≥ 1)."
+                        "maximum": MAX_GENERATED_WORK,
+                        "description": format!("Number of columns in the grid (≥ 1). Total rows × cols may not exceed {MAX_GENERATED_WORK} cells.")
                     },
                     "gutter_x": {
                         "type": "number",
@@ -4967,7 +4970,8 @@ pub fn tool_list() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_list;
+    use super::{tool_list, MAX_ARRAY_GRID_CELLS, MAX_GENERATED_WORK};
+    use serde_json::{json, Value};
     use std::collections::HashSet;
 
     #[test]
@@ -4985,6 +4989,54 @@ mod tests {
             assert!(
                 names.insert(name),
                 "duplicate MCP tool name {name:?} at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_array_schema_exposes_shared_grid_cell_cap() {
+        let manifest = tool_list();
+        let tool = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some("create_array"))
+            .expect("create_array tool");
+
+        assert_eq!(
+            tool["inputSchema"]["properties"]["rows"]["maximum"],
+            json!(MAX_ARRAY_GRID_CELLS)
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["cols"]["maximum"],
+            json!(MAX_ARRAY_GRID_CELLS)
+        );
+    }
+
+    #[test]
+    fn procedural_generation_schemas_expose_work_caps() {
+        let tools = tool_list();
+        let tool = |name: &str| {
+            tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                .unwrap_or_else(|| panic!("missing {name} tool"))
+        };
+
+        for (name, field) in [
+            ("scatter_copies", "count"),
+            ("create_flare", "ray_count"),
+            ("create_flare", "ring_count"),
+            ("create_spiral", "segments_per_turn"),
+            ("split_into_grid", "rows"),
+            ("split_into_grid", "cols"),
+        ] {
+            assert_eq!(
+                tool(name)["inputSchema"]["properties"][field]["maximum"],
+                json!(MAX_GENERATED_WORK),
+                "missing maximum for {name}.{field}"
             );
         }
     }

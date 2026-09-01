@@ -2387,6 +2387,296 @@ mod tests {
         assert!(!entry.is_error);
     }
 
+    async fn add_array_source(state: &AppState) -> uuid::Uuid {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+        let source = SceneNode::new(
+            "Array source",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0))),
+        );
+        let source_id = source.id;
+        doc.add_node(source, Some(layer_id));
+        source_id
+    }
+
+    #[tokio::test]
+    async fn create_array_rejects_grid_product_overflow_and_over_cap() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let cases = [
+            (
+                "overflow",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": usize::MAX,
+                    "cols": 2
+                }),
+            ),
+            (
+                "over cap",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": MAX_ARRAY_GRID_CELLS + 1,
+                    "cols": 1
+                }),
+            ),
+        ];
+
+        for (label, args) in cases {
+            let result = dispatch_tool(&state, "create_array", args)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: dispatch failed: {error}"));
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{label}: expected ToolResult error"
+            );
+            assert_eq!(
+                state.document.lock().await.nodes.len(),
+                1,
+                "{label}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{label}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_array_grid_and_radial_keep_copy_counts_and_single_undo_steps() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let grid = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "grid" }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(grid.is_error, Some(true));
+        assert_eq!(
+            structured_data(&grid)["node_ids"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+
+        let radial = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "radial", "count": 4 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(radial.is_error, Some(true));
+        assert_eq!(
+            structured_data(&radial)["node_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn procedural_generation_rejects_over_budget_without_document_mutation() {
+        let cases = [
+            "scatter_count",
+            "split_count",
+            "split_product",
+            "spiral_count",
+            "spiral_product",
+            "flare_ray_count",
+            "flare_ring_count",
+            "flare_product",
+        ];
+
+        for case in cases {
+            let state = test_state();
+            let (tool, args) = match case {
+                "scatter_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "scatter_copies",
+                        json!({
+                            "node_id": source_id,
+                            "count": MAX_GENERATED_WORK + 1,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "width": 10.0,
+                            "height": 10.0
+                        }),
+                    )
+                }
+                "split_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "split_into_grid",
+                        json!({
+                            "node_id": source_id,
+                            "rows": MAX_GENERATED_WORK + 1,
+                            "cols": 1
+                        }),
+                    )
+                }
+                "split_product" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "split_into_grid",
+                        json!({ "node_id": source_id, "rows": 101, "cols": 100 }),
+                    )
+                }
+                "spiral_count" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 1.0,
+                        "segments_per_turn": MAX_GENERATED_WORK + 1
+                    }),
+                ),
+                "spiral_product" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 3.0,
+                        "segments_per_turn": 4_000
+                    }),
+                ),
+                "flare_ray_count" => (
+                    "create_flare",
+                    json!({ "cx": 0.0, "cy": 0.0, "ray_count": MAX_GENERATED_WORK + 1 }),
+                ),
+                "flare_ring_count" => (
+                    "create_flare",
+                    json!({ "cx": 0.0, "cy": 0.0, "ring_count": MAX_GENERATED_WORK + 1 }),
+                ),
+                "flare_product" => (
+                    "create_flare",
+                    json!({
+                        "cx": 0.0,
+                        "cy": 0.0,
+                        "ray_count": 5_000,
+                        "ring_count": 5_000
+                    }),
+                ),
+                _ => unreachable!("unknown test case"),
+            };
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let result = dispatch_tool(&state, tool, args)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: dispatch failed: {error}"));
+
+            assert_eq!(result.is_error, Some(true), "{case}: expected rejection");
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before,
+                "{case}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{case}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn split_into_grid_rejects_overflow_before_document_lookup() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+        let result = dispatch_tool(
+            &state,
+            "split_into_grid",
+            json!({
+                "node_id": source_id,
+                "rows": usize::MAX,
+                "cols": 2
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn procedural_generation_accepts_representative_valid_counts() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let scatter = dispatch_tool(
+            &state,
+            "scatter_copies",
+            json!({
+                "node_id": source_id,
+                "count": 2,
+                "x": 0.0,
+                "y": 0.0,
+                "width": 10.0,
+                "height": 10.0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(scatter.is_error, Some(true));
+
+        let spiral = dispatch_tool(
+            &state,
+            "create_spiral",
+            json!({
+                "x": 20.0,
+                "y": 20.0,
+                "outer_radius": 10.0,
+                "turns": 1.0,
+                "segments_per_turn": 4
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(spiral.is_error, Some(true));
+
+        let flare = dispatch_tool(
+            &state,
+            "create_flare",
+            json!({ "cx": 30.0, "cy": 30.0, "ray_count": 2, "ring_count": 0 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(flare.is_error, Some(true));
+
+        let split = dispatch_tool(
+            &state,
+            "split_into_grid",
+            json!({ "node_id": source_id, "rows": 2, "cols": 2, "keep_original": true }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(split.is_error, Some(true));
+    }
+
     async fn swatch_state(with_matching_node: bool) -> AppState {
         let state = test_state();
         let mut doc = state.document.lock().await;

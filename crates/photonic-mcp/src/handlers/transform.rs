@@ -584,13 +584,26 @@ pub async fn create_array(state: &AppState, args: CreateArrayArgs) -> ToolResult
         ArrayMode::Grid => {
             let rows = args.rows.unwrap_or(2).max(1);
             let cols = args.cols.unwrap_or(2).max(1);
-            if rows * cols < 2 {
+            let cell_count = match rows.checked_mul(cols) {
+                Some(cell_count) => cell_count,
+                None => {
+                    return ToolResult::error(
+                        "Grid dimensions overflow before array allocation (rows × cols)",
+                    )
+                }
+            };
+            if cell_count > MAX_ARRAY_GRID_CELLS {
+                return ToolResult::error(format!(
+                    "Grid must have at most {MAX_ARRAY_GRID_CELLS} cells (rows × cols)"
+                ));
+            }
+            if cell_count < 2 {
                 return ToolResult::error("Grid must have at least 2 cells (rows × cols ≥ 2)");
             }
             let dx = args.col_stride.unwrap_or(100.0);
             let dy = args.row_stride.unwrap_or(100.0);
 
-            let mut out = Vec::with_capacity(rows * cols - 1);
+            let mut out = Vec::with_capacity(cell_count - 1);
             let mut n = 1usize;
             for r in 0..rows {
                 for c in 0..cols {
@@ -1265,6 +1278,11 @@ pub async fn scatter_copies(state: &AppState, args: ScatterCopiesArgs) -> ToolRe
     tracing::debug!("tool: scatter_copies");
 
     let count = args.count.unwrap_or(20).max(1);
+    if count > MAX_GENERATED_WORK {
+        return ToolResult::error(format!(
+            "scatter_copies may generate at most {MAX_GENERATED_WORK} copies"
+        ));
+    }
     let rot_range = args.rotation_range.unwrap_or(0.0).abs();
     let scale_range = args.scale_range.unwrap_or(0.0).abs();
     let seed = args.seed.unwrap_or(42).max(1);
@@ -1533,6 +1551,15 @@ pub async fn split_into_grid(state: &AppState, args: SplitIntoGridArgs) -> ToolR
     if args.cols == 0 {
         return ToolResult::error("cols must be ≥ 1");
     }
+    let cell_count = match args.rows.checked_mul(args.cols) {
+        Some(cell_count) => cell_count,
+        None => return ToolResult::error("rows × cols overflow before grid allocation"),
+    };
+    if cell_count > MAX_GENERATED_WORK {
+        return ToolResult::error(format!(
+            "split_into_grid may generate at most {MAX_GENERATED_WORK} cells (rows × cols)"
+        ));
+    }
 
     let mut doc = state.document.lock().await;
 
@@ -1596,8 +1623,8 @@ pub async fn split_into_grid(state: &AppState, args: SplitIntoGridArgs) -> ToolR
     let keep = args.keep_original.unwrap_or(false);
     let source_name = source.name.clone();
 
-    let mut commands: Vec<Command> = Vec::new();
-    let mut created_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut commands: Vec<Command> = Vec::with_capacity(cell_count + if keep { 0 } else { 1 });
+    let mut created_ids: Vec<uuid::Uuid> = Vec::with_capacity(cell_count);
 
     for r in 0..args.rows {
         for c in 0..args.cols {

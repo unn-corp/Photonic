@@ -24,7 +24,7 @@ pub struct CreateSpiralArgs {
     pub inner_radius: f64,
     /// Number of full rotations (e.g. 3.0 = three turns).
     pub turns: f64,
-    /// Cubic Bézier segments per full turn (default 16; higher = smoother).
+    /// Cubic Bézier segments per full turn (default 16; maximum [`MAX_GENERATED_WORK`]).
     #[serde(default = "default_spiral_segs")]
     pub segments_per_turn: usize,
     #[serde(default)]
@@ -685,6 +685,9 @@ pub struct DuplicateNodesArgs {
     pub layer_id: Option<Uuid>,
 }
 
+/// Maximum total number of cells that `create_array` may materialize in grid mode.
+pub const MAX_ARRAY_GRID_CELLS: usize = MAX_GENERATED_WORK;
+
 /// Arguments for `create_array` tool — repeat a node in a grid or radial pattern.
 #[derive(Debug, Deserialize)]
 pub struct CreateArrayArgs {
@@ -695,9 +698,11 @@ pub struct CreateArrayArgs {
 
     // ── Grid params (ignored for radial) ─────────────────────────────────
     /// Number of rows in the grid (default 2). The source is row 0, col 0.
+    /// The total grid size may not exceed [`MAX_ARRAY_GRID_CELLS`].
     #[serde(default)]
     pub rows: Option<usize>,
     /// Number of columns in the grid (default 2).
+    /// The total grid size may not exceed [`MAX_ARRAY_GRID_CELLS`].
     #[serde(default)]
     pub cols: Option<usize>,
     /// Horizontal distance (px) between column centres (default 100).

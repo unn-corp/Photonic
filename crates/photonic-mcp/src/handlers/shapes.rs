@@ -198,6 +198,19 @@ pub async fn create_flare(state: &AppState, args: CreateFlareArgs) -> ToolResult
     let ring_count = args.ring_count.unwrap_or(3);
     let ray_opacity = args.ray_opacity.unwrap_or(0.3);
 
+    let generated_nodes = match 2usize
+        .checked_add(ray_count)
+        .and_then(|count| count.checked_add(ring_count))
+    {
+        Some(count) => count,
+        None => return ToolResult::error("Lens flare generated-node count overflow"),
+    };
+    if generated_nodes > MAX_GENERATED_WORK {
+        return ToolResult::error(format!(
+            "create_flare may generate at most {MAX_GENERATED_WORK} nodes, including the halo and group"
+        ));
+    }
+
     let halo_color = args.halo_color.as_deref().unwrap_or("#fffbe6");
     let halo_c = Color::from_hex(halo_color).unwrap_or(Color::new(1.0, 0.98, 0.9, 0.6));
 
@@ -209,7 +222,7 @@ pub async fn create_flare(state: &AppState, args: CreateFlareArgs) -> ToolResult
     let actual_layer = layer_id
         .or(doc.active_layer_id)
         .unwrap_or(uuid::Uuid::nil());
-    let mut child_ids = Vec::new();
+    let mut child_ids = Vec::with_capacity(generated_nodes - 1);
 
     // 1. Create halo circle (semi-transparent filled ellipse).
     {
@@ -333,8 +346,19 @@ pub async fn create_spiral(state: &AppState, args: CreateSpiralArgs) -> ToolResu
     if args.outer_radius <= 0.0 {
         return ToolResult::error("outer_radius must be greater than 0");
     }
-    if args.turns <= 0.0 {
-        return ToolResult::error("turns must be greater than 0");
+    if !args.turns.is_finite() || args.turns <= 0.0 {
+        return ToolResult::error("turns must be a finite number greater than 0");
+    }
+
+    // PathData::spiral applies these same minimums before deriving its loop
+    // count. Check the resulting rounded segment count before path creation.
+    let effective_turns = args.turns.max(0.01);
+    let effective_segments_per_turn = args.segments_per_turn.max(4);
+    let generated_segments = (effective_turns * effective_segments_per_turn as f64).round();
+    if !generated_segments.is_finite() || generated_segments > MAX_GENERATED_WORK as f64 {
+        return ToolResult::error(format!(
+            "create_spiral may generate at most {MAX_GENERATED_WORK} Bézier segments"
+        ));
     }
 
     let path_data = PathData::spiral(
