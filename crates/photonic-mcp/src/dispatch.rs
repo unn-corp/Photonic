@@ -683,15 +683,23 @@ pub(crate) async fn dispatch_tool_inner(
         "find_replace_style" => {
             let a: FindReplaceStyleArgs =
                 serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::find_replace_style(state, a).await,
-            ))
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::find_replace_style(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "find_replace_text" => {
             let a: FindReplaceTextArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::find_replace_text(state, a).await,
-            ))
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::find_replace_text(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "layout_nodes" => {
             let a: LayoutNodesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -721,9 +729,13 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "auto_name_nodes" => {
             let a: AutoNameNodesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::auto_name_nodes(state, a).await,
-            ))
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::auto_name_nodes(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "add_anchor_points" => {
             let a: AddAnchorPointsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -1110,9 +1122,13 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "clean_up" => {
             let a: CleanUpArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::clean_up(state, a).await,
-            ))
+            let dry_run = a.dry_run.unwrap_or(false);
+            let result = handlers::nodes::clean_up(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "join_paths" => {
             let a: JoinPathsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -1403,9 +1419,13 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "simplify_path" => {
             let a: SimplifyPathArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::simplify_path(state, a).await,
-            ))
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::simplify_path(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "smooth_path" => {
             let a: SmoothPathArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -3431,6 +3451,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     fn test_state() -> AppState {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -3523,6 +3544,178 @@ mod tests {
             assert_eq!(state.document.lock().await.nodes.len(), 1);
             assert_eq!(state.history.lock().await.undo_depth(), 1);
         }
+    }
+
+    async fn seed_dry_run_document(state: &AppState) -> (Uuid, Uuid, Uuid, Uuid) {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+
+        let mut style_path = PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0));
+        style_path.fill = Fill::solid(Color::from_hex("#112233").unwrap());
+        let style_node = SceneNode::new("rectangle", layer_id, SceneNodeKind::Path(style_path));
+        let style_id = style_node.id;
+        doc.add_node(style_node, Some(layer_id));
+
+        let text_node = SceneNode::new(
+            "headline",
+            layer_id,
+            SceneNodeKind::Text(TextNode::new("before")),
+        );
+        let text_id = text_node.id;
+        doc.add_node(text_node, Some(layer_id));
+
+        let simplify_node = SceneNode::new(
+            "path",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(
+                PathData::from_svg("M 0 0 L 10 0 L 20 5 L 30 0 L 40 0").unwrap(),
+            )),
+        );
+        let simplify_id = simplify_node.id;
+        doc.add_node(simplify_node, Some(layer_id));
+
+        let cleanup_node = SceneNode::new(
+            "cleanup target",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::new())),
+        );
+        let cleanup_id = cleanup_node.id;
+        doc.add_node(cleanup_node, Some(layer_id));
+
+        (style_id, text_id, simplify_id, cleanup_id)
+    }
+
+    async fn document_snapshot(state: &AppState) -> Value {
+        serde_json::to_value(&*state.document.lock().await).unwrap()
+    }
+
+    async fn history_snapshot(state: &AppState) -> Value {
+        serde_json::to_value(state.history.lock().await.snapshot_state()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dry_run_routes_are_read_only_through_dispatcher() {
+        let state = test_state();
+        let (style_id, text_id, simplify_id, _cleanup_id) = seed_dry_run_document(&state).await;
+        let cases = [
+            (
+                "find_replace_style",
+                json!({
+                    "fill_color": "#112233",
+                    "new_fill_color": "#445566",
+                    "node_ids": [style_id],
+                    "dry_run": true
+                }),
+            ),
+            (
+                "find_replace_text",
+                json!({
+                    "find": "before",
+                    "replace": "after",
+                    "node_ids": [text_id],
+                    "dry_run": true
+                }),
+            ),
+            ("auto_name_nodes", json!({ "dry_run": true })),
+            (
+                "simplify_path",
+                json!({
+                    "node_id": simplify_id,
+                    "tolerance": 1.0,
+                    "dry_run": true
+                }),
+            ),
+            ("clean_up", json!({ "dry_run": true })),
+        ];
+
+        for (name, args) in cases {
+            let before_document = document_snapshot(&state).await;
+            let before_history = history_snapshot(&state).await;
+
+            let route = dispatch_tool_inner(&state, name, args.clone())
+                .await
+                .unwrap();
+            assert!(!route.mutates, "{name} dry run must be read-only");
+            assert_ne!(route.result.is_error, Some(true), "{name} dry run failed");
+
+            let result = dispatch_tool(&state, name, args).await.unwrap();
+            assert_ne!(result.is_error, Some(true), "{name} dry run failed");
+            assert_eq!(
+                document_snapshot(&state).await,
+                before_document,
+                "{name} dry run changed the document"
+            );
+            assert_eq!(
+                history_snapshot(&state).await,
+                before_history,
+                "{name} dry run changed persistent history"
+            );
+
+            let checkpoint_count = {
+                let doc = state.document.lock().await;
+                let mut history = state.history.lock().await;
+                history.tick_mcp_checkpoint(&doc);
+                history.list_checkpoints().len()
+            };
+            assert_eq!(checkpoint_count, 0, "{name} dry run created a checkpoint");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_capable_routes_remain_mutating_when_applied() {
+        let state = test_state();
+        let (style_id, text_id, simplify_id, cleanup_id) = seed_dry_run_document(&state).await;
+        let cases = [
+            (
+                "find_replace_style",
+                json!({
+                    "fill_color": "#112233",
+                    "new_fill_color": "#445566",
+                    "node_ids": [style_id],
+                    "dry_run": false
+                }),
+            ),
+            (
+                "find_replace_text",
+                json!({
+                    "find": "before",
+                    "replace": "after",
+                    "node_ids": [text_id],
+                    "dry_run": false
+                }),
+            ),
+            ("auto_name_nodes", json!({ "dry_run": false })),
+            (
+                "simplify_path",
+                json!({
+                    "node_id": simplify_id,
+                    "tolerance": 1.0,
+                    "dry_run": false
+                }),
+            ),
+            ("clean_up", json!({ "dry_run": false })),
+        ];
+
+        for (name, args) in cases {
+            let before_document = document_snapshot(&state).await;
+            let before_history = history_snapshot(&state).await;
+
+            let route = dispatch_tool_inner(&state, name, args).await.unwrap();
+            assert!(route.mutates, "{name} must be mutating when applied");
+            assert_ne!(route.result.is_error, Some(true), "{name} mutation failed");
+            assert_ne!(
+                document_snapshot(&state).await,
+                before_document,
+                "{name} did not change the document"
+            );
+            assert_ne!(
+                history_snapshot(&state).await,
+                before_history,
+                "{name} did not record history"
+            );
+        }
+
+        assert!(!state.document.lock().await.nodes.contains_key(&cleanup_id));
     }
 
     async fn undo(state: &AppState) {
