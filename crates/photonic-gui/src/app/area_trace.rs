@@ -570,28 +570,36 @@ fn paint_trace_region(
     }
 }
 
+fn traceable_raster<'a>(
+    doc: &Document,
+    node: &'a SceneNode,
+) -> Option<&'a photonic_core::node::RasterNode> {
+    let SceneNodeKind::Raster(raster) = &node.kind else {
+        return None;
+    };
+    if !node.visible || raster.is_adjustment_layer() {
+        return None;
+    }
+    let layer_visible = doc
+        .layers
+        .get(&node.layer_id)
+        .is_some_and(|layer| layer.visible);
+    if !layer_visible {
+        return None;
+    }
+    let [a, b, c, d, _, _] = node.transform.matrix;
+    if (a * d - b * c).abs() < 1e-12 {
+        return None;
+    }
+    Some(raster)
+}
+
 fn trace_raster_at(doc: &Document, point: Point) -> Option<NodeId> {
     doc.nodes_in_draw_order()
         .into_iter()
         .rev()
         .find_map(|node| {
-            let SceneNodeKind::Raster(raster) = &node.kind else {
-                return None;
-            };
-            if !node.visible || raster.is_adjustment_layer() {
-                return None;
-            }
-            let layer_visible = doc
-                .layers
-                .get(&node.layer_id)
-                .is_some_and(|layer| layer.visible);
-            if !layer_visible {
-                return None;
-            }
-            let [a, b, c, d, _, _] = node.transform.matrix;
-            if (a * d - b * c).abs() < 1e-12 {
-                return None;
-            }
+            let raster = traceable_raster(doc, node)?;
             let local = node.transform.to_kurbo().inverse() * point;
             (local.x >= 0.0
                 && local.y >= 0.0
@@ -626,12 +634,7 @@ fn trace_raster_for_area(doc: &Document, start: Point, end: Point) -> Option<Nod
         .into_iter()
         .rev()
         .find_map(|node| {
-            let SceneNodeKind::Raster(raster) = &node.kind else {
-                return None;
-            };
-            if raster.is_adjustment_layer() {
-                return None;
-            }
+            let raster = traceable_raster(doc, node)?;
             let w = raster.image.width as f64;
             let h = raster.image.height as f64;
             let corners = [(0.0, 0.0), (w, 0.0), (w, h), (0.0, h)];
@@ -692,16 +695,113 @@ mod tests {
             layer,
             SceneNodeKind::Raster(photonic_core::node::RasterNode::new(RasterImage::filled(
                 10,
-                10,
+                1,
                 [30, 40, 50, 255],
             ))),
         )
-        .with_transform(photonic_core::Transform::translate(10.0, 10.0));
+        .with_transform(photonic_core::Transform::translate(10.0, 0.0));
         let id = node.id;
         doc.add_node(node, Some(layer));
         assert_eq!(
-            trace_raster_for_area(&doc, Point::new(5.0, 5.0), Point::new(25.0, 25.0)),
+            trace_raster_for_area(&doc, Point::new(0.0, 0.0), Point::new(20.0, 2.0)),
             Some(id)
+        );
+    }
+
+    #[test]
+    fn area_hit_test_skips_hidden_nodes_and_layers() {
+        let mut doc = Document::new("t", 30.0, 30.0);
+        let layer = doc.layer_order[0];
+        let mut node = SceneNode::new(
+            "hidden node",
+            layer,
+            SceneNodeKind::Raster(photonic_core::node::RasterNode::new(RasterImage::filled(
+                10,
+                1,
+                [30, 40, 50, 255],
+            ))),
+        )
+        .with_transform(photonic_core::Transform::translate(10.0, 0.0));
+        node.visible = false;
+        doc.add_node(node, Some(layer));
+        assert_eq!(
+            trace_raster_for_area(&doc, Point::new(0.0, 0.0), Point::new(20.0, 2.0)),
+            None
+        );
+
+        let mut doc = Document::new("t", 30.0, 30.0);
+        let layer = doc.layer_order[0];
+        doc.layers.get_mut(&layer).expect("default layer").visible = false;
+        let node = SceneNode::new(
+            "hidden layer",
+            layer,
+            SceneNodeKind::Raster(photonic_core::node::RasterNode::new(RasterImage::filled(
+                10,
+                1,
+                [30, 40, 50, 255],
+            ))),
+        )
+        .with_transform(photonic_core::Transform::translate(10.0, 0.0));
+        doc.add_node(node, Some(layer));
+        assert_eq!(
+            trace_raster_for_area(&doc, Point::new(0.0, 0.0), Point::new(20.0, 2.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn area_hit_test_skips_singular_transform() {
+        let mut doc = Document::new("t", 30.0, 30.0);
+        let layer = doc.layer_order[0];
+        let node = SceneNode::new(
+            "singular",
+            layer,
+            SceneNodeKind::Raster(photonic_core::node::RasterNode::new(RasterImage::filled(
+                10,
+                1,
+                [30, 40, 50, 255],
+            ))),
+        )
+        .with_transform(photonic_core::Transform::new(0.0, 0.0, 0.0, 1.0, 10.0, 0.0));
+        doc.add_node(node, Some(layer));
+        assert_eq!(
+            trace_raster_for_area(&doc, Point::new(0.0, 0.0), Point::new(20.0, 2.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn area_hit_test_skips_hidden_top_raster_for_visible_overlap() {
+        let mut doc = Document::new("t", 30.0, 30.0);
+        let layer = doc.layer_order[0];
+        let bottom = SceneNode::new(
+            "visible bottom",
+            layer,
+            SceneNodeKind::Raster(photonic_core::node::RasterNode::new(RasterImage::filled(
+                10,
+                1,
+                [30, 40, 50, 255],
+            ))),
+        )
+        .with_transform(photonic_core::Transform::translate(10.0, 0.0));
+        let bottom_id = bottom.id;
+        let mut top = SceneNode::new(
+            "hidden top",
+            layer,
+            SceneNodeKind::Raster(photonic_core::node::RasterNode::new(RasterImage::filled(
+                10,
+                1,
+                [60, 70, 80, 255],
+            ))),
+        )
+        .with_transform(photonic_core::Transform::translate(10.0, 0.0));
+        top.visible = false;
+        doc.add_node(bottom, Some(layer));
+        doc.add_node(top, Some(layer));
+
+        assert_eq!(
+            trace_raster_for_area(&doc, Point::new(0.0, 0.0), Point::new(20.0, 2.0)),
+            Some(bottom_id)
         );
     }
 
