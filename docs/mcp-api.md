@@ -1378,7 +1378,7 @@ Create an Archimedean spiral path. Specify center, outer/inner radius, and numbe
 | `name` | string | no |  |
 | `segments_per_turn` | integer | no | Bézier segments per revolution for smoothness (default: 16). The rounded total across all turns may not exceed 10000 segments. |
 | `stroke` | object | no |  |
-| `turns` | number | no | Number of full revolutions (default: 3) |
+| `turns` | number | no | Number of full revolutions (default: 3). The rounded total across all turns may not exceed 10000 segments. |
 
 ## `create_stacked_bar_chart`
 

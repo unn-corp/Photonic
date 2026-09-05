@@ -207,7 +207,7 @@ pub fn tool_list() -> Value {
                         "y": { "type": "number", "description": "Y coordinate of spiral center" },
                         "outer_radius": { "type": "number", "description": "Maximum (outer) radius in document units" },
                         "inner_radius": { "type": "number", "description": "Minimum (inner) radius. Use 0 for a true center spiral (default: 0)" },
-                        "turns": { "type": "number", "description": "Number of full revolutions (default: 3)" },
+                        "turns": { "type": "number", "maximum": MAX_GENERATED_WORK / 4, "description": format!("Number of full revolutions (default: 3). The rounded total across all turns may not exceed {MAX_GENERATED_WORK} segments.") },
                         "segments_per_turn": { "type": "integer", "maximum": MAX_GENERATED_WORK, "description": format!("Bézier segments per revolution for smoothness (default: 16). The rounded total across all turns may not exceed {MAX_GENERATED_WORK} segments.") },
                         "fill": { "type": "object" },
                         "stroke": { "type": "object" },
@@ -7760,6 +7760,11 @@ mod tests {
                 "missing maximum for {name}.{field}"
             );
         }
+
+        assert_eq!(
+            tool("create_spiral")["inputSchema"]["properties"]["turns"]["maximum"],
+            json!(MAX_GENERATED_WORK / 4),
+        );
     }
 }
 
