@@ -1,4 +1,5 @@
 use crate::handlers::shared::{cloning::*, random::*};
+use crate::procedural_work::{check_array_work, check_scatter_work, check_split_work};
 use crate::protocol::*;
 use crate::server::AppState;
 use kurbo;
@@ -561,6 +562,10 @@ pub async fn duplicate_nodes(state: &AppState, args: DuplicateNodesArgs) -> Tool
 /// group node as part of the same undo step.
 pub async fn create_array(state: &AppState, args: CreateArrayArgs) -> ToolResult {
     use photonic_core::transform::Transform;
+
+    if let Err(error) = check_array_work(&args) {
+        return ToolResult::error(error);
+    }
 
     // ── Read phase: validate source ───────────────────────────────────────
     let (src_id, src_layer, src_name, src_z) = {
@@ -1277,12 +1282,10 @@ pub async fn fit_to_canvas(state: &AppState, args: FitToCanvasArgs) -> ToolResul
 pub async fn scatter_copies(state: &AppState, args: ScatterCopiesArgs) -> ToolResult {
     tracing::debug!("tool: scatter_copies");
 
-    let count = args.count.unwrap_or(20).max(1);
-    if count > MAX_GENERATED_WORK {
-        return ToolResult::error(format!(
-            "scatter_copies may generate at most {MAX_GENERATED_WORK} copies"
-        ));
+    if let Err(error) = check_scatter_work(args.count) {
+        return ToolResult::error(error);
     }
+    let count = args.count.unwrap_or(20).max(1);
     let rot_range = args.rotation_range.unwrap_or(0.0).abs();
     let scale_range = args.scale_range.unwrap_or(0.0).abs();
     let seed = args.seed.unwrap_or(42).max(1);
@@ -1545,21 +1548,13 @@ pub async fn transform_copies(state: &AppState, args: TransformCopiesArgs) -> To
 }
 /// Divide a path node's bounding box into a rows×cols grid of rectangle nodes.
 pub async fn split_into_grid(state: &AppState, args: SplitIntoGridArgs) -> ToolResult {
-    if args.rows == 0 {
-        return ToolResult::error("rows must be ≥ 1");
+    if let Err(error) = check_split_work(args.rows, args.cols) {
+        return ToolResult::error(error);
     }
-    if args.cols == 0 {
-        return ToolResult::error("cols must be ≥ 1");
-    }
-    let cell_count = match args.rows.checked_mul(args.cols) {
-        Some(cell_count) => cell_count,
-        None => return ToolResult::error("rows × cols overflow before grid allocation"),
-    };
-    if cell_count > MAX_GENERATED_WORK {
-        return ToolResult::error(format!(
-            "split_into_grid may generate at most {MAX_GENERATED_WORK} cells (rows × cols)"
-        ));
-    }
+    let cell_count = args
+        .rows
+        .checked_mul(args.cols)
+        .expect("validated split grid dimensions");
 
     let mut doc = state.document.lock().await;
 

@@ -919,7 +919,7 @@ Radial mode: source is instance 0; `count - 1` copies are placed at evenly-space
 | `center_y` | number | no | (radial) Y of rotation centre. Default 0. |
 | `col_stride` | number | no | (grid) Horizontal distance between column centres in px. Default 100. |
 | `cols` | integer | no | (grid) Number of columns — source is col 0. Default 2. Total grid size must not exceed 10000 cells. |
-| `count` | integer | no | (radial) Total instances including source (min 2, default 6). Creates count-1 new copies. |
+| `count` | integer | no | (radial) Total instances including source (min 2, default 6; maximum 10000). Creates count-1 new copies. |
 | `group_result` | boolean | no | Wrap source + all copies into a new group node. Default false. |
 | `layer_id` | string | no | Target layer UUID. Defaults to source node's layer. |
 | `name_prefix` | string | no | Name prefix for copies, e.g. 'Petal' → 'Petal 1', 'Petal 2'. Defaults to the source node's name. |
@@ -1103,11 +1103,11 @@ Create a rectangular grid of lines. Specify position, size, and the number of ro
 | `width` | number | yes | Total grid width in document units |
 | `x` | number | yes | X coordinate of the top-left corner |
 | `y` | number | yes | Y coordinate of the top-left corner |
-| `cols` | integer | no | Number of columns (default: 4) |
+| `cols` | integer | no | Number of columns (default: 4). The total generated grid lines may not exceed 10000. |
 | `fill` | object | no |  |
 | `layer_id` | string | no |  |
 | `name` | string | no |  |
-| `rows` | integer | no | Number of rows (default: 4) |
+| `rows` | integer | no | Number of rows (default: 4). The total generated grid lines may not exceed 10000. |
 | `stroke` | object | no |  |
 
 ## `create_heart`
@@ -1237,8 +1237,8 @@ Create a polar (radial) grid centered at a point. Draws concentric circles and r
 | `inner_radius` | number | no | Inner radius (0 = full disk, default: 0) |
 | `layer_id` | string | no |  |
 | `name` | string | no |  |
-| `rings` | integer | no | Number of concentric rings (default: 4) |
-| `sectors` | integer | no | Number of radial sectors/spokes (default: 8) |
+| `rings` | integer | no | Number of concentric rings (default: 4). The total generated grid parts may not exceed 10000. |
+| `sectors` | integer | no | Number of radial sectors/spokes (default: 8). The total generated grid parts may not exceed 10000. |
 | `stroke` | object | no |  |
 
 ## `create_qr_code`

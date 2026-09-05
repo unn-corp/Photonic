@@ -49,10 +49,10 @@ pub struct CreatePolarGridArgs {
     /// Inner (minimum) radius. Use 0 for a full-disk polar grid (default: 0).
     #[serde(default)]
     pub inner_radius: Option<f64>,
-    /// Number of concentric rings (default: 4).
+    /// Number of concentric rings (default: 4; the generated grid parts are capped).
     #[serde(default)]
     pub rings: Option<u32>,
-    /// Number of radial sector dividers (default: 8).
+    /// Number of radial sector dividers (default: 8; the generated grid parts are capped).
     #[serde(default)]
     pub sectors: Option<u32>,
     #[serde(default)]
@@ -76,10 +76,10 @@ pub struct CreateGridArgs {
     pub width: f64,
     /// Total height of the grid.
     pub height: f64,
-    /// Number of columns (cell divisions horizontally). Default 4.
+    /// Number of columns (cell divisions horizontally). Default 4. The generated grid lines are capped.
     #[serde(default)]
     pub cols: Option<u32>,
-    /// Number of rows (cell divisions vertically). Default 4.
+    /// Number of rows (cell divisions vertically). Default 4. The generated grid lines are capped.
     #[serde(default)]
     pub rows: Option<u32>,
     #[serde(default)]
@@ -713,7 +713,7 @@ pub struct CreateArrayArgs {
     pub row_stride: Option<f64>,
 
     // ── Radial params (ignored for grid) ─────────────────────────────────
-    /// Total number of instances including the source (default 6, min 2).
+    /// Total number of instances including the source (default 6, min 2, maximum [`MAX_GENERATED_WORK`]).
     /// The source counts as instance 0 — so `count = 6` creates 5 new copies.
     #[serde(default)]
     pub count: Option<usize>,
