@@ -140,4 +140,50 @@ mod tests {
             "vertical glyph origins should share x: {vertical_origins:?}"
         );
     }
+
+    #[test]
+    fn multiline_layout_uses_line_height_multiplier() {
+        let mut font_system = FontSystem::new();
+        let font_size = 24.0;
+        let mut layout = |line_height_mul| {
+            layout_text_buffer(
+                &mut font_system,
+                "first\nsecond",
+                "sans-serif",
+                font_size,
+                TextLayoutOptions {
+                    line_height_mul,
+                    ..TextLayoutOptions::default()
+                },
+            )
+        };
+
+        let single_spaced = layout(1.0);
+        let double_spaced = layout(2.0);
+        let single_runs: Vec<_> = single_spaced
+            .layout_runs()
+            .map(|run| (run.line_y, run.line_height, run.glyphs.len()))
+            .collect();
+        let double_runs: Vec<_> = double_spaced
+            .layout_runs()
+            .map(|run| (run.line_y, run.line_height, run.glyphs.len()))
+            .collect();
+
+        if single_runs.len() < 2
+            || double_runs.len() < 2
+            || single_runs.iter().all(|(_, _, glyphs)| *glyphs == 0)
+            || double_runs.iter().all(|(_, _, glyphs)| *glyphs == 0)
+        {
+            eprintln!("no system font available — skipping multiline layout check");
+            return;
+        }
+
+        let single_spacing = single_runs[1].0 - single_runs[0].0;
+        let double_spacing = double_runs[1].0 - double_runs[0].0;
+        assert!((single_runs[0].1 - font_size).abs() < 0.01);
+        assert!((double_runs[0].1 - font_size * 2.0).abs() < 0.01);
+        assert!((single_spacing - font_size).abs() < 0.01);
+        assert!((double_spacing - font_size * 2.0).abs() < 0.01);
+        assert!(double_spacing > single_spacing * 1.9);
+    }
 }
