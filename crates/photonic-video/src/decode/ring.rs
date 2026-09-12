@@ -19,6 +19,8 @@ use super::DecodedFrame;
 pub const DEFAULT_FWD: usize = 24;
 /// Default backward window at preview quality (02 §3).
 pub const DEFAULT_BACK: usize = 6;
+/// Per-source share of the default 512 MiB decoded-ring budget (eight sources).
+pub const DEFAULT_RING_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A pts-keyed decoded-frame ring for one decode source. Not itself
 /// thread-safe; share via [`SharedRing`].
@@ -27,6 +29,8 @@ pub struct FrameRing {
     back_cap: usize,
     playhead: Tick,
     frames: BTreeMap<Tick, Arc<DecodedFrame>>,
+    budget_bytes: u64,
+    resident_bytes: u64,
 }
 
 impl FrameRing {
@@ -36,7 +40,48 @@ impl FrameRing {
             back_cap,
             playhead: Tick::ZERO,
             frames: BTreeMap::new(),
+            budget_bytes: DEFAULT_RING_BYTES,
+            resident_bytes: 0,
         }
+    }
+
+    pub fn with_byte_budget(mut self, bytes: u64) -> Self {
+        self.budget_bytes = bytes;
+        self.prune();
+        self
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    /// A single frame larger than the share is retained for exactness and
+    /// reported as pressure. Prefetch never retains additional oversize frames.
+    pub fn can_prefetch(&self) -> bool {
+        let Some(frame) = self.frames.values().next_back() else {
+            return true;
+        };
+        if self.playhead > frame.pts {
+            // The consumer moved beyond the frontier. The next decoded frame
+            // replaces the old covering frame, even with a one-frame budget.
+            return true;
+        }
+        let ahead = self.frames.range(self.playhead..);
+        let covering_bytes = if self.frames.contains_key(&self.playhead) {
+            0 // the exact covering frame is already included in `ahead`
+        } else {
+            self.frames
+                .range(..self.playhead)
+                .next_back()
+                .map_or(0, |(_, frame)| frame.planes.allocated_bytes())
+        };
+        ahead.clone().count() < self.fwd_cap
+            && ahead
+                .map(|(_, frame)| frame.planes.allocated_bytes())
+                .sum::<u64>()
+                .saturating_add(covering_bytes)
+                .saturating_add(frame.planes.allocated_bytes())
+                <= self.budget_bytes.max(frame.planes.allocated_bytes())
     }
 
     /// Preview-quality ring with the 16-fwd / 4-back defaults.
@@ -99,6 +144,7 @@ impl FrameRing {
     /// Drop everything (used on a discontinuous seek to a new GOP).
     pub fn clear(&mut self) {
         self.frames.clear();
+        self.resident_bytes = 0;
     }
 
     /// Keep at most `back_cap` frames before the playhead and `fwd_cap` at or
@@ -147,6 +193,32 @@ impl FrameRing {
                 }
             });
         }
+        self.resident_bytes = self
+            .frames
+            .values()
+            .map(|f| f.planes.allocated_bytes())
+            .sum();
+        let covering = self
+            .frames
+            .range(..=playhead)
+            .next_back()
+            .map(|(pts, _)| *pts);
+        while self.resident_bytes > self.budget_bytes && self.frames.len() > 1 {
+            let victim = self
+                .frames
+                .keys()
+                .filter(|pts| Some(**pts) != covering)
+                // Prefer evicting optional history over forward frames, so a
+                // full ring can make progress after the playhead advances.
+                .max_by_key(|pts| (**pts < playhead, pts.0.abs_diff(playhead.0)))
+                .copied();
+            let Some(victim) = victim else { break };
+            if let Some(frame) = self.frames.remove(&victim) {
+                self.resident_bytes = self
+                    .resident_bytes
+                    .saturating_sub(frame.planes.allocated_bytes());
+            }
+        }
     }
 }
 
@@ -168,6 +240,30 @@ impl SharedRing {
 
     pub fn preview() -> Self {
         Self::new(FrameRing::preview())
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.inner
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .resident_bytes()
+    }
+
+    pub fn can_prefetch(&self) -> bool {
+        self.inner
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .can_prefetch()
+    }
+
+    pub fn try_frame_covering(&self, t: Tick) -> Option<Arc<DecodedFrame>> {
+        match self.inner.0.try_lock() {
+            Ok(ring) => ring.frame_covering(t),
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().frame_covering(t),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     /// Reader worker: push a decoded frame and wake any waiting consumer.
@@ -354,5 +450,48 @@ mod tests {
         ring.set_playhead(Tick(600));
         ring.clear();
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn t005_ring_byte_budget_preserves_cover_and_advances_under_pressure() {
+        let mut ring = FrameRing::new(24, 6).with_byte_budget(12);
+        ring.push(frame(Tick(0)));
+        ring.push(frame(Tick(100)));
+        assert_eq!(ring.resident_bytes(), 12);
+        assert!(!ring.can_prefetch());
+        ring.set_playhead(Tick(50));
+        assert!(!ring.can_prefetch());
+        ring.set_playhead(Tick(100));
+        assert!(ring.can_prefetch());
+        ring.push(frame(Tick(200)));
+        assert_eq!(ring.resident_bytes(), 12);
+        assert!(ring.contains(Tick(100)));
+        assert!(ring.contains(Tick(200)));
+        ring.clear();
+        assert_eq!(ring.resident_bytes(), 0);
+    }
+
+    #[test]
+    fn t005_oversize_ring_retains_one_exact_frame_without_prefetch_growth() {
+        let mut ring = FrameRing::new(24, 6).with_byte_budget(1);
+        ring.push(frame(Tick(0)));
+        assert_eq!(ring.resident_bytes(), 6);
+        assert!(!ring.can_prefetch());
+        ring.set_playhead(Tick(100));
+        assert!(ring.can_prefetch());
+        ring.push(frame(Tick(100)));
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.get(Tick(100)).unwrap().pts, Tick(100));
+    }
+
+    #[test]
+    fn t005_realtime_ring_lookup_does_not_wait_for_writer() {
+        let ring = SharedRing::new(FrameRing::new(24, 6));
+        ring.push(frame(Tick(0)));
+        let (lock, _) = &*ring.inner;
+        let guard = lock.lock().unwrap();
+        assert!(ring.try_frame_covering(Tick(0)).is_none());
+        drop(guard);
+        assert!(ring.try_frame_covering(Tick(0)).is_some());
     }
 }

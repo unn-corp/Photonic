@@ -31,6 +31,10 @@ pub trait TextureAllocator {
     type Texture;
     /// Allocate a fresh texture of exactly `bucket` (width, height) dimensions.
     fn allocate(&mut self, bucket: (u32, u32)) -> Self::Texture;
+    /// Shared handles may outlive a cache entry. Only recycle exclusive storage.
+    fn can_recycle(&self, _texture: &Self::Texture) -> bool {
+        false
+    }
 }
 
 struct Entry<T> {
@@ -75,6 +79,11 @@ impl<A: TextureAllocator> TexturePool<A> {
     /// Total bytes the pool currently holds (resident entries + free-list).
     pub fn used_bytes(&self) -> u64 {
         self.used_bytes
+    }
+
+    pub fn set_budget_bytes(&mut self, budget_bytes: u64) {
+        self.budget_bytes = budget_bytes;
+        self.reclaim_to_fit(0);
     }
 
     /// Number of resident (cached) entries.
@@ -200,7 +209,11 @@ impl<A: TextureAllocator> TexturePool<A> {
         for h in victims {
             let e = self.entries.remove(&h).unwrap();
             self.pinned.remove(&h);
-            self.free.entry(e.bucket).or_default().push(e.texture);
+            if self.allocator.can_recycle(&e.texture) {
+                self.free.entry(e.bucket).or_default().push(e.texture);
+            } else {
+                self.used_bytes -= bucket_bytes(e.bucket);
+            }
         }
     }
 }
@@ -218,6 +231,10 @@ impl WgpuTextureAllocator {
 
 impl TextureAllocator for WgpuTextureAllocator {
     type Texture = wgpu::Texture;
+
+    fn can_recycle(&self, _texture: &Self::Texture) -> bool {
+        true
+    }
 
     fn allocate(&mut self, bucket: (u32, u32)) -> wgpu::Texture {
         self.device.create_texture(&wgpu::TextureDescriptor {
@@ -259,6 +276,9 @@ mod tests {
     }
     impl TextureAllocator for MockAllocator {
         type Texture = u64;
+        fn can_recycle(&self, _texture: &Self::Texture) -> bool {
+            true
+        }
         fn allocate(&mut self, _bucket: (u32, u32)) -> u64 {
             self.allocations += 1;
             let id = self.next_id;
@@ -395,5 +415,39 @@ mod tests {
         let id_b = pool.get_or_alloc(h(2), desc(1920, 1080)).global_id();
         assert_ne!(id_a, id_b, "distinct hashes get distinct textures");
         assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn t005_retained_arc_and_weak_handles_prevent_texture_recycling() {
+        #[derive(Default)]
+        struct SharedAllocator(u64);
+        impl TextureAllocator for SharedAllocator {
+            type Texture = Arc<std::sync::atomic::AtomicU64>;
+            fn allocate(&mut self, _: (u32, u32)) -> Self::Texture {
+                self.0 += 1;
+                Arc::new(std::sync::atomic::AtomicU64::new(self.0))
+            }
+            fn can_recycle(&self, texture: &Self::Texture) -> bool {
+                Arc::strong_count(texture) == 1 && Arc::weak_count(texture) == 0
+            }
+        }
+        let mut pool = TexturePool::new(SharedAllocator::default(), 1024 * 1024);
+        let retained = pool.get_or_alloc(h(1), desc(64, 64)).clone();
+        let weak = Arc::downgrade(pool.get_or_alloc(h(2), desc(64, 64)));
+        pool.evict_matching(|_| true);
+        assert_eq!(
+            pool.used_bytes(),
+            0,
+            "externally held textures are not pooled storage"
+        );
+        let next = pool.get_or_alloc(h(3), desc(64, 64)).clone();
+        next.store(900, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(retained.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            weak.upgrade().is_none(),
+            "weak-only allocation was discarded, not recycled"
+        );
+        pool.set_budget_bytes(0);
+        assert_eq!(pool.used_bytes(), 0);
     }
 }

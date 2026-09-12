@@ -26,7 +26,7 @@
 //! two stay deliberately thin):
 //! - [`source_monitor`]  — 17 G-10 (dual-monitor + true source in/out marks)
 //! - [`multicam`]        — 17 G-20 (multicam angle grid + live cutting)
-//! - [`transcript`]      — 17 G-18 (text-based/transcript editing)
+//! - [`transcript`]      — 20 §9 G-18 (derived transcript and synchronized edits)
 //! - [`seq_tabs`]        — 17 G-17 (sequence tab strip). Not a `DrawerGroup`
 //!   panel — no rail icon owns it; the timeline-panel story embeds it in the
 //!   timeline panel header (`app/timeline/mod.rs`, out of this territory).
@@ -151,6 +151,9 @@ pub(crate) struct VideoPanelUi<'a> {
     /// `playhead` above. The armed source and its in/out trim marks already
     /// live on `PhotonicApp::pending_source` (spec 16 §1) — this is the one
     /// new piece a source-monitor UI needs. `None` = nothing scrubbed yet.
+    pub(crate) source_marks: &'a mut crate::app::source_marks::SourceMarksSession,
+    pub(crate) source_audition: Option<photonic_video::source_audition::SourceAuditionStatus>,
+    pub(crate) source_audition_error: Option<String>,
     pub(crate) source_monitor_scrub: &'a mut Option<Tick>,
     /// [multicam, 17 G-20] Angle currently cut to in the open multicam clip
     /// (Premiere's live 1-9 number-key cutting). `None` = no angle chosen.

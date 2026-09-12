@@ -1170,7 +1170,10 @@ pub fn move_clips(
     for (track_id, clip_id) in moving {
         let t = track(s, *track_id)?;
         let c = clip(t, *clip_id)?;
-        let new_start = c.start + delta;
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        let new_start = Tick(c.start.0.checked_add(delta.0).ok_or(EditError::Overlap)?);
         if new_start.0 < 0 {
             return Err(EditError::Overlap);
         }
@@ -1258,7 +1261,15 @@ pub fn move_clips(
     for (track_id, _, _, duration, new_start, _, new_track, _) in &planned {
         let dest_id = new_track.unwrap_or(*track_id);
         let t = track(s, dest_id)?;
-        let end = *new_start + *duration;
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        let end = Tick(
+            new_start
+                .0
+                .checked_add(duration.0)
+                .ok_or(EditError::Overlap)?,
+        );
         let hits_stationary = t
             .clips
             .iter()
@@ -1306,6 +1317,132 @@ pub fn move_clips(
             },
         )
         .collect())
+}
+
+/// Resolve selected clips and their linked partners once, refusing locked
+/// participants. GUI and MCP share this policy so a blocked partner cannot
+/// silently detach from its picture or sound.
+pub fn linked_moving_set(
+    p: &TimelineProject,
+    id: SequenceId,
+    selected: &[(TrackId, ClipId)],
+) -> Result<Vec<(TrackId, ClipId)>, EditError> {
+    let sequence = seq(p, id)?;
+    let mut moving = Vec::new();
+    for &(track_id, clip_id) in selected {
+        let source = clip(track(sequence, track_id)?, clip_id)?;
+        if !moving.contains(&(track_id, clip_id)) {
+            moving.push((track_id, clip_id));
+        }
+        if let Some(group) = source.link_group {
+            for lane in sequence.tracks() {
+                for partner in lane.clips.iter().filter(|c| c.link_group == Some(group)) {
+                    if !moving.contains(&(lane.id, partner.id)) {
+                        moving.push((lane.id, partner.id));
+                    }
+                }
+            }
+        }
+    }
+    if moving
+        .iter()
+        .any(|(id, _)| sequence.track(*id).is_some_and(|track| track.locked))
+    {
+        return Err(EditError::TrackLocked);
+    }
+    Ok(moving)
+}
+
+/// Move one linked unit. Only the explicitly addressed clip changes lanes;
+/// all linked partners receive the same time delta on their current lanes.
+/// Cross-lane edits are staged to guarantee valid intermediate command order.
+pub fn move_linked_clip(
+    p: &TimelineProject,
+    id: SequenceId,
+    track_id: TrackId,
+    clip_id: ClipId,
+    new_start: Tick,
+    new_track: Option<TrackId>,
+) -> Result<Vec<TimelineCmd>, EditError> {
+    let sequence = seq(p, id)?;
+    let source = clip(track(sequence, track_id)?, clip_id)?;
+    let delta = Tick(
+        new_start
+            .0
+            .checked_sub(source.start.0)
+            .ok_or(EditError::Overlap)?,
+    );
+    let moving = linked_moving_set(p, id, &[(track_id, clip_id)])?;
+    let Some(destination) = new_track.filter(|id| *id != track_id) else {
+        return move_clips(p, id, &moving, delta, 0);
+    };
+    let destination_track = track(sequence, destination)?;
+    if destination_track.locked {
+        return Err(EditError::TrackLocked);
+    }
+    if destination_track.kind != track(sequence, track_id)?.kind {
+        return Err(EditError::NoTrack(destination));
+    }
+    // Validate final destinations against both moving and stationary clips.
+    let mut staged = p.clone();
+    let mut pending = Vec::new();
+    for &(lane, item) in &moving {
+        let original = clip(track(sequence, lane)?, item)?;
+        let start = Tick(
+            original
+                .start
+                .0
+                .checked_add(delta.0)
+                .ok_or(EditError::Overlap)?,
+        );
+        if start.0 < 0 {
+            return Err(EditError::Overlap);
+        }
+        pending.push((
+            lane,
+            item,
+            start,
+            if item == clip_id {
+                Some(destination)
+            } else {
+                None
+            },
+        ));
+    }
+    // A valid order always vacates a destination before its next occupant
+    // lands. If no move can advance, reject the entire unit.
+    let mut commands = Vec::with_capacity(pending.len());
+    while !pending.is_empty() {
+        let candidate =
+            pending
+                .iter()
+                .enumerate()
+                .find_map(|(index, &(lane, item, start, dest))| {
+                    move_clip_to_track(&staged, id, lane, item, start, dest)
+                        .ok()
+                        .map(|command| (index, command))
+                });
+        let Some((index, command)) = candidate else {
+            return Err(EditError::Overlap);
+        };
+        let (lane, item, start, dest) = pending.remove(index);
+        let sequence = staged.sequences.get_mut(&id).expect("validated sequence");
+        let source = sequence.track_mut(lane).expect("validated track");
+        let position = source
+            .clips
+            .iter()
+            .position(|c| c.id == item)
+            .expect("validated clip");
+        let mut moved = source.clips.remove(position);
+        moved.start = start;
+        let target = sequence
+            .track_mut(dest.unwrap_or(lane))
+            .expect("validated destination");
+        target.clips.push(moved);
+        target.clips.sort_by_key(|clip| clip.start);
+        commands.push(command);
+    }
+    Ok(commands)
 }
 
 /// Move a clip within its track. Signature preserved for existing callers;
@@ -1726,27 +1863,130 @@ pub fn roll_edit(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let l = clip(t, left)?;
     let r = clip(t, right)?;
+    let left_end = l
+        .start
+        .0
+        .checked_add(l.duration.0)
+        .ok_or(EditError::InvalidSplit)?;
+    if left == right || left_end != r.start.0 {
+        return Err(EditError::InvalidSplit);
+    }
     let l_old = ClipTiming::of(l);
     let r_old = ClipTiming::of(r);
     let l_new = ClipTiming {
-        duration: l.duration + delta,
+        duration: Tick(
+            l.duration
+                .0
+                .checked_add(delta.0)
+                .ok_or(EditError::InvalidSplit)?,
+        ),
         ..l_old
     };
     let r_new = ClipTiming {
-        start: r.start + delta,
-        duration: r.duration - delta,
-        source_in: r.source_in + delta,
+        start: Tick(
+            r.start
+                .0
+                .checked_add(delta.0)
+                .ok_or(EditError::InvalidSplit)?,
+        ),
+        duration: Tick(
+            r.duration
+                .0
+                .checked_sub(delta.0)
+                .ok_or(EditError::InvalidSplit)?,
+        ),
+        source_in: Tick(
+            r.source_in
+                .0
+                .checked_add(checked_source_delta(&r.speed, delta)?.0)
+                .ok_or(EditError::InvalidSplit)?,
+        ),
     };
     if l_new.duration.0 <= 0 || r_new.duration.0 <= 0 {
         return Err(EditError::NonPositiveDuration);
     }
+    validate_source_timing(p, l, l_new)?;
+    validate_source_timing(p, r, r_new)?;
     Ok(TimelineCmd::RollEdit {
         seq: id,
         track: track_id,
         changes: vec![(left, l_old, l_new), (right, r_old, r_new)],
     })
+}
+
+/// Checked source mapping for precision edits; the legacy low-level mapper
+/// returns an i64 and cannot report an out-of-range rational product.
+pub(super) fn checked_source_delta(speed: &SpeedMap, delta: Tick) -> Result<Tick, EditError> {
+    match speed {
+        SpeedMap::Constant(ratio) => {
+            if ratio.den == 0 {
+                return Err(EditError::InvalidSpeedMap);
+            }
+            let mapped = delta.0 as i128 * ratio.num as i128 / ratio.den as i128;
+            i64::try_from(mapped)
+                .map(Tick)
+                .map_err(|_| EditError::InvalidSplit)
+        }
+        SpeedMap::Keyframed { .. } => {
+            let mapped = speed.source_delta_f64(delta);
+            if !mapped.is_finite() || mapped < i64::MIN as f64 || mapped >= i64::MAX as f64 {
+                return Err(EditError::InvalidSplit);
+            }
+            Ok(speed.source_delta(delta))
+        }
+    }
+}
+
+/// Validate available source bounds without requiring online media. Missing
+/// probe information leaves only non-negative/finite mapping enforceable.
+pub(super) fn validate_source_timing(
+    project: &TimelineProject,
+    clip: &Clip,
+    timing: ClipTiming,
+) -> Result<(), EditError> {
+    if timing.start < Tick::ZERO || timing.source_in < Tick::ZERO || timing.duration <= Tick::ZERO {
+        return Err(EditError::InvalidSplit);
+    }
+    timing
+        .start
+        .0
+        .checked_add(timing.duration.0)
+        .ok_or(EditError::InvalidSplit)?;
+    clip.speed
+        .validate_for_duration(clip.duration)
+        .map_err(|_| EditError::InvalidSpeedMap)?;
+    let (low, high) = clip.speed.source_delta_range(timing.duration);
+    let lo = timing.source_in.0 as f64 + low;
+    let hi = timing.source_in.0 as f64 + high;
+    if !lo.is_finite() || !hi.is_finite() || lo < 0.0 || hi >= i64::MAX as f64 {
+        return Err(EditError::InvalidSplit);
+    }
+    let bounds = match clip.source {
+        ClipSource::Asset { asset } | ClipSource::Vector { asset } => {
+            project.media.assets.get(&asset).and_then(|asset| {
+                asset.subclip_range.or_else(|| {
+                    asset
+                        .probe
+                        .as_ref()
+                        .map(|probe| (Tick::ZERO, probe.duration))
+                })
+            })
+        }
+        ClipSource::NestedSequence { sequence } => project
+            .sequences
+            .get(&sequence)
+            .map(|sequence| (Tick::ZERO, sequence.content_end())),
+        _ => None,
+    };
+    if bounds.is_some_and(|(start, end)| lo < start.0 as f64 || hi > end.0 as f64) {
+        return Err(EditError::InvalidSplit);
+    }
+    Ok(())
 }
 
 /// Slide a clip over its neighbors, keeping total span.
@@ -3660,6 +3900,41 @@ pub fn set_marker_category_of(
 }
 
 /// Set (or clear, with `None`) a sequence's preview/export work range.
+/// Replace preview intent with sorted, merged, outward-frame-snapped zones.
+pub fn set_preview_zones(
+    p: &TimelineProject,
+    id: SequenceId,
+    zones: &[super::sequence::PreviewZone],
+) -> Result<TimelineCmd, EditError> {
+    let sequence = seq(p, id)?;
+    if zones.len() > 128 {
+        return Err(EditError::IndexOutOfRange);
+    }
+    let rate = sequence.frame_rate;
+    let mut zones = zones.to_vec();
+    for zone in &mut zones {
+        if zone.start.0 < 0 || zone.end <= zone.start {
+            return Err(EditError::NonPositiveDuration);
+        }
+        zone.start = rate.frame_start(rate.frame_at(zone.start));
+        zone.end = rate.frame_start(rate.frame_at(Tick(zone.end.0 - 1)) + 1);
+    }
+    zones.sort_by_key(|zone| zone.start);
+    let mut merged: Vec<super::sequence::PreviewZone> = Vec::new();
+    for zone in zones {
+        if let Some(last) = merged.last_mut().filter(|last| last.end >= zone.start) {
+            last.end = last.end.max(zone.end);
+        } else {
+            merged.push(zone);
+        }
+    }
+    Ok(TimelineCmd::SetPreviewZones {
+        seq: id,
+        old: sequence.preview_zones.clone(),
+        new: merged,
+    })
+}
+
 pub fn set_work_range(
     p: &TimelineProject,
     id: SequenceId,

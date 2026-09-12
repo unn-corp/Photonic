@@ -89,12 +89,20 @@ const NATIVE_CAP: usize = 512;
 /// Generic over the cached value so the keying can be unit-tested with no GPU
 /// (the engine instantiates it as `StillCache<GpuFrame>`).
 pub struct StillCache<T> {
-    entries: HashMap<StillKey, T>,
+    entries: HashMap<StillKey, StillEntry<T>>,
     /// Native decoded size per asset, learned on the first decode. Lets a later
     /// request for a *larger* canvas canonicalize onto the entry that already
     /// holds the full-resolution image instead of allocating a second copy.
     native: HashMap<AssetId, (u32, u32)>,
     cap: usize,
+    byte_budget: u64,
+    clock: u64,
+}
+
+struct StillEntry<T> {
+    value: T,
+    bytes: u64,
+    last_used: u64,
 }
 
 impl<T> StillCache<T> {
@@ -103,7 +111,18 @@ impl<T> StillCache<T> {
             entries: HashMap::new(),
             native: HashMap::new(),
             cap: cap.max(1),
+            byte_budget: u64::MAX,
+            clock: 0,
         }
+    }
+
+    pub fn with_byte_budget(mut self, bytes: u64) -> Self {
+        self.byte_budget = bytes;
+        self
+    }
+
+    pub fn resident_bytes(&self) -> u64 {
+        self.entries.values().map(|entry| entry.bytes).sum()
     }
 
     /// The canonical key for `requested`. Once the asset's native size is known
@@ -122,15 +141,19 @@ impl<T> StillCache<T> {
         }
     }
 
-    pub fn get(&self, asset: AssetId, requested: (u32, u32)) -> Option<&T> {
-        self.entries.get(&self.key_for(asset, requested))
+    pub fn get(&mut self, asset: AssetId, requested: (u32, u32)) -> Option<&T> {
+        self.clock = self.clock.wrapping_add(1);
+        let key = self.key_for(asset, requested);
+        let entry = self.entries.get_mut(&key)?;
+        entry.last_used = self.clock;
+        Some(&entry.value)
     }
 
     /// File a freshly decoded still. `native` is the asset's decoded size, which
     /// is what makes the key canonical from here on.
     ///
-    /// Wholesale clear on overflow, like `uploads`: entries are cheap to redecode
-    /// from disk, and a wholesale clear keeps the bound trivially provable.
+    /// Evict the coldest entries to satisfy both count and physical GPU bytes.
+    /// An individual oversize frame is returned by its caller but not retained.
     pub fn insert(&mut self, asset: AssetId, native: (u32, u32), requested: (u32, u32), value: T) {
         if self.native.len() >= NATIVE_CAP && !self.native.contains_key(&asset) {
             self.native.clear();
@@ -138,10 +161,38 @@ impl<T> StillCache<T> {
         self.native
             .insert(asset, (native.0.max(1), native.1.max(1)));
         let key = self.key_for(asset, requested);
-        if self.entries.len() >= self.cap && !self.entries.contains_key(&key) {
-            self.entries.clear();
+        let (bw, bh) = crate::graph::ir::TextureDesc {
+            width: key.1,
+            height: key.2,
         }
-        self.entries.insert(key, value);
+        .bucket();
+        let bytes = u64::from(bw) * u64::from(bh) * 8;
+        self.entries.remove(&key);
+        if bytes > self.byte_budget {
+            return;
+        }
+        while self.entries.len() >= self.cap
+            || self.resident_bytes().saturating_add(bytes) > self.byte_budget
+        {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.entries.remove(&victim);
+        }
+        self.clock = self.clock.wrapping_add(1);
+        self.entries.insert(
+            key,
+            StillEntry {
+                value,
+                bytes,
+                last_used: self.clock,
+            },
+        );
     }
 
     /// Drop everything (project swap / whole-cache invalidation).
@@ -470,5 +521,20 @@ mod tests {
         let img = quadrants(4);
         let out = resampled(&img, 64, 64);
         assert_eq!(out.len(), 16, "clamped to the 4×4 source");
+    }
+
+    #[test]
+    fn t005_still_budget_uses_padded_bytes_and_preserves_hot_images() {
+        let mut cache = StillCache::new(16).with_byte_budget(2 * 64 * 64 * 8);
+        cache.insert(asset(1), (50, 50), (50, 50), 1);
+        cache.insert(asset(2), (50, 50), (50, 50), 2);
+        assert_eq!(cache.get(asset(1), (50, 50)), Some(&1));
+        cache.insert(asset(3), (50, 50), (50, 50), 3);
+        assert_eq!(cache.resident_bytes(), 2 * 64 * 64 * 8);
+        assert!(cache.get(asset(2), (50, 50)).is_none());
+        assert_eq!(cache.get(asset(1), (50, 50)), Some(&1));
+        cache.insert(asset(4), (128, 128), (128, 128), 4);
+        assert!(cache.get(asset(4), (128, 128)).is_none());
+        assert_eq!(cache.len(), 2);
     }
 }

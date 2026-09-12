@@ -22,7 +22,7 @@ use photonic_core::timeline::{FrameRate, Tick};
 
 use super::reader::{FrameReader, PtsModel};
 use super::ring::SharedRing;
-use super::sidecar::{Sidecar, SidecarConfig};
+use super::sidecar::{DecodeCancellation, Sidecar, SidecarConfig};
 use super::{DecodeError, DecodedFrame, PixFmt};
 use crate::media::ffmpeg_locate::FfmpegTools;
 use crate::media::keyframe_index::{KeyframeIndex, PtsIndex};
@@ -63,6 +63,8 @@ pub struct DecodeSource {
     /// True while CUDA is still usable for this source. A failed CUDA decode
     /// permanently falls back to software for the lifetime of the source.
     cuda_enabled: bool,
+    software_decoder: Option<&'static str>,
+    cancellation: DecodeCancellation,
 }
 
 impl DecodeSource {
@@ -75,7 +77,22 @@ impl DecodeSource {
             sidecar: None,
             reader: None,
             cuda_enabled,
+            software_decoder: None,
+            cancellation: DecodeCancellation::default(),
         }
+    }
+
+    /// Preview VP9 alpha requires libvpx-vp9: FFmpeg's native VP9 decoder
+    /// discards the alpha side channel. This opt-in keeps normal sources on
+    /// their existing decoder selection and disables incompatible HW decode.
+    pub(crate) fn with_software_decoder(mut self, decoder: &'static str) -> Self {
+        self.software_decoder = Some(decoder);
+        self.cuda_enabled = false;
+        self
+    }
+
+    pub(crate) fn cancellation(&self) -> DecodeCancellation {
+        self.cancellation.clone()
     }
 
     /// The ring this source fills (shared with the consumer).
@@ -114,6 +131,9 @@ impl DecodeSource {
     /// Start (or restart) the ffmpeg process seeked to `kf_tick` and rebuild the
     /// reader with a pts model whose origin is that keyframe.
     fn start_process(&mut self, kf_tick: Tick, use_cuda: bool) -> Result<(), DecodeError> {
+        if self.cancellation.cancelled() {
+            return Err(DecodeError::Cancelled);
+        }
         // Drop the old process/reader first (kill-on-drop) before respawning.
         self.reader = None;
         self.sidecar = None;
@@ -123,7 +143,11 @@ impl DecodeSource {
             seek: kf_tick,
             pix_fmt: self.params.pix_fmt,
         };
-        let (sidecar, stdout) = Sidecar::spawn(&self.tools, &cfg, use_cuda)?;
+        let (sidecar, stdout) =
+            Sidecar::spawn_with_decoder(&self.tools, &cfg, use_cuda, self.software_decoder)?;
+        if !self.cancellation.register(sidecar.child_handle()) {
+            return Err(DecodeError::Cancelled);
+        }
         let model = self.pts_model(self.start_frame(kf_tick));
         let reader = FrameReader::new(
             stdout,
@@ -154,6 +178,9 @@ impl DecodeSource {
             modes[0] = true;
         }
         for mode in modes.into_iter().take(mode_count) {
+            if self.cancellation.cancelled() {
+                return Err(DecodeError::Cancelled);
+            }
             match self.seek_mode(kf, target, mode) {
                 Ok(frame) => {
                     self.ring.set_playhead(frame.pts);
@@ -187,6 +214,9 @@ impl DecodeSource {
     ) -> Result<Arc<DecodedFrame>, DecodeError> {
         let mut last_err: Option<DecodeError> = None;
         for attempt in 0..=MAX_RESTARTS {
+            if self.cancellation.cancelled() {
+                return Err(DecodeError::Cancelled);
+            }
             if attempt > 0 {
                 // Exponential-ish backoff: 20ms, 40ms, 80ms.
                 std::thread::sleep(Duration::from_millis(20u64 << (attempt - 1)));
@@ -217,6 +247,9 @@ impl DecodeSource {
         let reader = self.reader.as_mut().expect("reader set by start_process");
 
         loop {
+            if self.cancellation.cancelled() {
+                return Err(DecodeError::Cancelled);
+            }
             // The reader's PTS model can answer this before consuming the raw
             // bytes. Pre-target GOP frames are never retained, so read them
             // through its reusable discard buffer rather than allocating one
@@ -266,6 +299,9 @@ impl DecodeSource {
             modes[0] = true;
         }
         for mode in modes.into_iter().take(mode_count) {
+            if self.cancellation.cancelled() {
+                return Err(DecodeError::Cancelled);
+            }
             match self.seek_keyframe_mode(kf, mode) {
                 Ok(frame) => {
                     self.ring.set_playhead(frame.pts);
@@ -293,6 +329,9 @@ impl DecodeSource {
     ) -> Result<Arc<DecodedFrame>, DecodeError> {
         let mut last_err: Option<DecodeError> = None;
         for attempt in 0..=MAX_RESTARTS {
+            if self.cancellation.cancelled() {
+                return Err(DecodeError::Cancelled);
+            }
             if attempt > 0 {
                 std::thread::sleep(Duration::from_millis(20u64 << (attempt - 1)));
             }
@@ -351,6 +390,12 @@ impl DecodeSource {
         let reader = self.reader.as_mut().expect("reader checked by pump");
         let mut count = 0;
         for _ in 0..n {
+            if self.cancellation.cancelled() {
+                return Err(DecodeError::Cancelled);
+            }
+            if !self.ring.can_prefetch() {
+                break;
+            }
             match reader.next_frame()? {
                 Some(frame) => {
                     self.ring.push(frame);

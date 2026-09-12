@@ -15,17 +15,28 @@ pub fn tool_list() -> Value {
         .filter_map(|m| m.id.legacy_kind())
         .map(|k| serde_json::to_value(k).expect("EffectKind serializes to a string tag"))
         .collect();
-    json!([
+    let mut tools = json!([
             {
                 "name": "search_actions",
-                "description": "Search the MCP tool catalog by keywords (name/description). Returns ranked action summaries with slim schemas. Prefer this over tools/list when discovering uncommon operations. Use execute_action to run a hit.",
+                "description": "Search the MCP tool catalog by keywords (name/description). Returns ranked actions with complete input/output schemas and available behavior annotations. Use get_action_schema for exact-name lookup and execute_action to run a hit.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "description": "Keywords, e.g. \"split clip\" or \"export\"." },
-                        "limit": { "type": "integer", "description": "Max hits (default 15, max 50)." }
+                        "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 15, "description": "Max hits (default 15, max 50)." }
                     },
                     "required": ["query"]
+                }
+            },
+            {
+                "name": "get_action_schema",
+                "description": "Get one complete tool definition by exact name, including inputSchema, outputSchema when available, and behavior annotations. No tool is executed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Exact, case-sensitive tool name." }
+                    },
+                    "required": ["name"]
                 }
             },
             {
@@ -6318,8 +6329,8 @@ pub fn tool_list() -> Value {
                         "at_tc": { "type": "string", "description": "HH:MM:SS:FF or HH:MM:SS;FF." },
                         "at_seconds": { "type": "number", "description": "Convenience; sub-tick rounding possible." },
                         "format_index": { "type": "integer", "description": "Which SequenceFormat (aspect variant). Default: the active format. Applied per-call only — the document's active format is untouched." },
-                        "quality": { "type": "string", "enum": ["preview","full"], "description": "preview = proxy-eligible sources; full = originals. See cost warnings." },
-                        "scale": { "type": "number", "description": "0 < scale <= 1 — deterministic box-downscale of the output." },
+                        "quality": { "type": "string", "enum": ["preview","full"], "description": "preview = proxy-eligible sources and Draft processing (960px long edge); full = originals processed at full sequence resolution." },
+                        "scale": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Output scale. PNG thumbnails shrink on the GPU before readback; raw pixels use deterministic CPU box downscale." },
                         "output_format": { "type": "string", "enum": ["png","raw_rgba16f"], "description": "Default png." }
                     },
                     "required": ["sequence_id","quality"]
@@ -6400,12 +6411,13 @@ pub fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "expected_revision": { "type": "integer", "minimum": 0, "description": "Optional revision precondition from get_timeline_snapshot." },
                         "sequence_id": { "type": "string" },
                         "out_path": { "type": "string", "description": "Destination file path. Extension should match the preset container." },
                         "preset": { "type": "string", "description": "Preset name (see list_export_presets). Default \"Web H.264\"." },
                         "format_index": { "type": "integer", "description": "Which SequenceFormat to export. Default: the active format." },
-                        "range": { "type": "object", "description": "{start_ticks|start_tc|start_seconds, end_ticks|end_tc|end_seconds} — ticks > tc > seconds precedence per bound." },
-                        "overrides": { "type": "object", "description": "{width?, height?, frame_rate?:{num,den}} — width/height together; nearest-source-frame retiming for an explicit frame rate (05 §6.2)." }
+                        "range": { "type": "object", "properties": {"start_ticks":{"type":"integer","minimum":0},"end_ticks":{"type":"integer","minimum":1},"start_tc":{"type":"string"},"end_tc":{"type":"string"},"start_seconds":{"type":"number","minimum":0},"end_seconds":{"type":"number","exclusiveMinimum":0}},"allOf":[{"anyOf":[{"required":["start_ticks"]},{"required":["start_tc"]},{"required":["start_seconds"]}]},{"anyOf":[{"required":["end_ticks"]},{"required":["end_tc"]},{"required":["end_seconds"]}]}], "description": "Half-open range; ticks > tc > seconds precedence per bound." },
+                        "overrides": { "type": "object", "properties":{"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"frame_rate":{"type":"object","properties":{"num":{"type":"integer","minimum":1},"den":{"type":"integer","minimum":1}},"required":["num","den"]}},"dependentRequired":{"width":["height"],"height":["width"]},"description": "Width/height together; nearest-source-frame retiming for an explicit frame rate." }
                     },
                     "required": ["sequence_id","out_path"]
                 }
@@ -6903,5 +6915,928 @@ pub fn tool_list() -> Value {
                     "required": ["template","track_id"]
                 }
             }
-        ])
+        ]);
+    if let Some(definitions) = tools.as_array_mut() {
+        for definition in definitions.iter_mut() {
+            let name = definition["name"].as_str().unwrap_or_default();
+            let output = known_output_schema(name);
+            let behavior = known_behavior(name);
+            if let Some(schema) = output {
+                definition["outputSchema"] = result_schema(schema);
+            }
+            if let Some(behavior) = behavior {
+                definition["annotations"] = behavior.annotations();
+            }
+        }
+        definitions.extend(crate::handlers::video_transcript::tool_schemas());
+        definitions.extend(crate::handlers::video_inspect::tool_schemas());
+        definitions.push(crate::handlers::video_export::tool_schema(&definitions));
+        definitions.extend(crate::handlers::video_workflows::tool_schemas());
+        // Plans embed the complete schemas of their allowed operations,
+        // including transcript tools; build them last without catalog lookup.
+        definitions.push(crate::handlers::video_edits::tool_schema(definitions));
+    }
+    tools
+}
+
+/// Explicit behavior classifications for tools whose implementations have been
+/// checked. MCP read-only includes the whole environment, not just document
+/// history: playback, job cancellation, export, and cache writes are mutations.
+#[derive(Clone, Copy, Debug)]
+pub enum ToolBehavior {
+    /// Reads the document or an in-memory catalog without editing state.
+    ReadOnly,
+    /// Adds document content without replacing or removing existing content.
+    Additive,
+    /// May change existing document or session state.
+    Mutation,
+    /// Reads external files or providers without modifying them.
+    ExternalRead,
+    /// May write files, change external state, or start background work.
+    ExternalMutation,
+}
+
+impl ToolBehavior {
+    fn annotations(self) -> Value {
+        match self {
+            Self::ReadOnly => json!({ "readOnlyHint": true, "openWorldHint": false }),
+            Self::ExternalRead => json!({ "readOnlyHint": true, "openWorldHint": true }),
+            Self::Additive => json!({
+                "readOnlyHint": false, "destructiveHint": false,
+                "idempotentHint": false, "openWorldHint": false
+            }),
+            Self::Mutation => json!({
+                "readOnlyHint": false, "destructiveHint": true, "openWorldHint": false
+            }),
+            Self::ExternalMutation => json!({
+                "readOnlyHint": false, "destructiveHint": true, "openWorldHint": true
+            }),
+        }
+    }
+}
+
+/// Build a tool definition with a verified success schema and behavior. The
+/// output automatically includes the common execution-error shape. Keep the
+/// success schema faithful to all successful branches, including empty results.
+pub fn tool_definition(
+    name: &str,
+    description: &str,
+    input_schema: Value,
+    success_output_schema: Value,
+    behavior: ToolBehavior,
+) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": input_schema,
+        "outputSchema": result_schema(success_output_schema),
+        "annotations": behavior.annotations(),
+    })
+}
+
+fn result_schema(success: Value) -> Value {
+    json!({
+        "anyOf": [success, {
+            "type": "object",
+            "properties": {
+                "error_code": { "type": "string", "description": "Machine-readable domain code, or ToolExecutionError when no specific code is available." },
+                "message": { "type": "string" }
+            },
+            "required": ["error_code", "message"],
+            "additionalProperties": true
+        }]
+    })
+}
+
+fn object_schema(properties: Value, required: &[&str]) -> Value {
+    json!({ "type": "object", "properties": properties, "required": required })
+}
+
+fn id_result(field: &str) -> Value {
+    object_schema(
+        json!({ field: { "type": "string", "format": "uuid" } }),
+        &[field],
+    )
+}
+
+fn list_result(field: &str, item: Value) -> Value {
+    object_schema(
+        json!({ field: { "type": "array", "items": item } }),
+        &[field],
+    )
+}
+
+fn message_schema() -> Value {
+    object_schema(json!({ "message": { "type": "string" } }), &["message"])
+}
+
+fn action_definition_schema() -> Value {
+    object_schema(
+        json!({
+            "name": { "type": "string" },
+            "description": { "type": "string" },
+            "inputSchema": { "type": "object" },
+            "outputSchema": { "type": "object" },
+            "annotations": { "type": "object" },
+            "score": { "type": "integer", "minimum": 1 }
+        }),
+        &["name", "description", "inputSchema"],
+    )
+}
+
+fn artboard_schema() -> Value {
+    object_schema(
+        json!({
+            "id": { "type": "string", "format": "uuid" },
+            "name": { "type": "string" },
+            "x": { "type": "number" }, "y": { "type": "number" },
+            "width": { "type": "number" }, "height": { "type": "number" },
+            "active": { "type": "boolean" }
+        }),
+        &["id", "name", "x", "y", "width", "height", "active"],
+    )
+}
+
+fn engine_status_schema() -> Value {
+    object_schema(
+        json!({
+            "playhead_ticks": { "type": "integer" },
+            "playing": { "type": "boolean" },
+            "dropped_frames": { "type": "integer", "minimum": 0 },
+            "cache": object_schema(json!({
+                "hits": { "type": "integer", "minimum": 0 },
+                "misses": { "type": "integer", "minimum": 0 },
+                "resident_entries": { "type": "integer", "minimum": 0 },
+                "resident_bytes": { "type": "integer", "minimum": 0 }
+            }), &["hits", "misses", "resident_entries", "resident_bytes"]),
+            "audio_xruns": { "type": "integer", "minimum": 0 },
+            "doc_revision": { "type": "integer", "minimum": 0 },
+            "active_sequence": { "type": ["string", "null"], "format": "uuid" },
+            "last_error": { "type": ["object", "null"] },
+            "snapshot_synced": { "type": "boolean" }
+        }),
+        &[
+            "playhead_ticks",
+            "playing",
+            "dropped_frames",
+            "cache",
+            "audio_xruns",
+            "doc_revision",
+            "active_sequence",
+            "last_error",
+        ],
+    )
+}
+
+fn job_status_schema() -> Value {
+    object_schema(
+        json!({
+            "job_id": { "type": "string", "format": "uuid" },
+            "kind": { "type": "string" },
+            "status": { "oneOf": [
+                object_schema(json!({ "state": { "const": "queued" } }), &["state"]),
+                object_schema(json!({
+                    "state": { "const": "running" }, "progress": { "type": "number" },
+                    "message": { "type": "string" }
+                }), &["state", "progress", "message"]),
+                object_schema(json!({ "state": { "const": "done" }, "result": {} }), &["state", "result"]),
+                object_schema(json!({
+                    "state": { "const": "failed" }, "error_code": { "type": "string" },
+                    "message": { "type": "string" }
+                }), &["state", "error_code", "message"]),
+                object_schema(json!({ "state": { "const": "cancelled" } }), &["state"])
+            ]}
+        }),
+        &["job_id", "kind", "status"],
+    )
+}
+
+// Deliberate allowlists, not name-prefix guesses. Unreviewed legacy tools keep
+// their schemas/annotations absent instead of advertising invented contracts.
+fn known_output_schema(name: &str) -> Option<Value> {
+    Some(match name {
+        "render_frame_at" => object_schema(
+            json!({
+                "width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"tick":{"type":"integer","minimum":0},
+                "render_ms":{"type":"integer","minimum":0},"output_format":{"type":"string","enum":["png","raw_rgba16f"]},
+                "data_base64":{"type":"string"},"encoding":{"type":"string"},"sequence_id":{"type":"string","format":"uuid"},
+                "revision":{"type":"integer","minimum":0},"snapshot_generation":{"type":"integer","minimum":0},"format_index":{"type":"integer","minimum":0},
+                "quality":{"type":"string","enum":["preview","full"]},"processing_quality":{"type":"string","enum":["draft","full"]},
+                "source_width":{"type":"integer","minimum":1},"source_height":{"type":"integer","minimum":1},"gpu_downscaled":{"type":"boolean"}
+            }),
+            &[
+                "width",
+                "height",
+                "tick",
+                "render_ms",
+                "output_format",
+                "sequence_id",
+                "revision",
+                "snapshot_generation",
+                "format_index",
+                "quality",
+                "processing_quality",
+                "source_width",
+                "source_height",
+                "gpu_downscaled",
+            ],
+        ),
+        "get_scopes" => object_schema(
+            json!({
+                "tick":{"type":"integer"},"histogram":{"type":"object"},"waveform":{"type":"object"},"vectorscope":{"type":"object"},
+                "tap":{"type":"string","enum":["clip","program"]},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"tap_fallback_reason":{"type":"string"}
+            }),
+            &[
+                "tick",
+                "histogram",
+                "waveform",
+                "vectorscope",
+                "tap",
+                "width",
+                "height",
+            ],
+        ),
+
+        "search_actions" => object_schema(
+            json!({
+                "actions": { "type": "array", "items": action_definition_schema(), "maxItems": 50 },
+                "count": { "type": "integer", "minimum": 0, "maximum": 50 },
+                "query": { "type": "string" }
+            }),
+            &["actions", "count", "query"],
+        ),
+        "get_action_schema" => action_definition_schema(),
+        "create_shape" | "add_graph_node" => id_result("node_id"),
+        "create_sequence" => id_result("sequence_id"),
+        "add_track" | "add_caption_track" => id_result("track_id"),
+        "insert_clip"
+        | "insert_edit"
+        | "overwrite_edit"
+        | "replace_clip_source"
+        | "insert_adjustment_clip"
+        | "insert_text_clip" => id_result("clip_id"),
+        "split_clip" => id_result("new_clip_id"),
+        "split_caption_cue" => id_result("new_cue_id"),
+        "create_bin" => id_result("bin_id"),
+        "add_marker" | "add_clip_marker" => id_result("marker_id"),
+        "add_marker_category" => id_result("category_id"),
+        "probe_media" | "generate_voiceover" => id_result("job_id"),
+        "set_caption_cue" => {
+            let mut schema = id_result("cue_id");
+            schema["properties"]["note"] = json!({ "type": ["string", "null"] });
+            schema
+        }
+        "set_paint" => object_schema(
+            json!({
+                "applied_count": { "type": "integer", "minimum": 0 },
+                "target": { "enum": ["fill", "stroke"] },
+                "skipped": { "type": "array", "items": { "type": "string" } }
+            }),
+            &["applied_count", "target", "skipped"],
+        ),
+        "save_document" => object_schema(
+            json!({
+                "path": { "type": "string" }, "bytes": { "type": "integer", "minimum": 0 }
+            }),
+            &["path", "bytes"],
+        ),
+        "list_artboards" => object_schema(
+            json!({
+                "artboards": { "type": "array", "items": artboard_schema() },
+                "active_artboard": { "type": ["string", "null"], "format": "uuid" }
+            }),
+            &["artboards", "active_artboard"],
+        ),
+        "get_document_info" => object_schema(
+            json!({
+                "name": { "type": "string" },
+                "canvas": object_schema(json!({
+                    "width": { "type": "number" }, "height": { "type": "number" }
+                }), &["width", "height"]),
+                "layer_count": { "type": "integer", "minimum": 0 },
+                "layers": { "type": "array", "items": { "type": "object" } },
+                "artboard_count": { "type": "integer", "minimum": 0 },
+                "artboards": { "type": "array", "items": artboard_schema() },
+                "active_artboard": { "type": ["string", "null"], "format": "uuid" },
+                "dpi": { "type": "number" }, "bleed_mm": { "type": "number" },
+                "slug_mm": { "type": "number" }, "color_mode": { "enum": ["rgb", "cmyk"] },
+                "nodes": object_schema(json!({
+                    "total": { "type": "integer", "minimum": 0 }, "path": { "type": "integer", "minimum": 0 },
+                    "text": { "type": "integer", "minimum": 0 }, "group": { "type": "integer", "minimum": 0 }
+                }), &["total", "path", "text", "group"]),
+                "font_names": { "type": "array", "items": { "type": "string" }, "maxItems": 20 },
+                "fill_colors": { "type": "array", "items": { "type": "string" }, "maxItems": 20 }
+            }),
+            &[
+                "name",
+                "canvas",
+                "layer_count",
+                "layers",
+                "artboard_count",
+                "artboards",
+                "active_artboard",
+                "dpi",
+                "bleed_mm",
+                "slug_mm",
+                "color_mode",
+                "nodes",
+                "font_names",
+                "fill_colors",
+            ],
+        ),
+        "get_document_state" => object_schema(
+            json!({
+                "id": { "type": "string", "format": "uuid" }, "name": { "type": "string" },
+                "width": { "type": "number" }, "height": { "type": "number" },
+                "node_count": { "type": "integer", "minimum": 0 }, "layer_count": { "type": "integer", "minimum": 0 },
+                "active_layer_id": { "type": ["string", "null"], "format": "uuid" },
+                "selection": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+                "layers": { "type": "array", "items": { "type": "object" } }
+            }),
+            &[
+                "id",
+                "name",
+                "width",
+                "height",
+                "node_count",
+                "layer_count",
+                "active_layer_id",
+                "selection",
+                "layers",
+            ],
+        ),
+        "list_sequences" => list_result(
+            "sequences",
+            object_schema(
+                json!({
+                    "sequence_id": { "type": "string", "format": "uuid" }, "name": { "type": "string" },
+                    "frame_rate": object_schema(json!({
+                        "num": { "type": "integer", "minimum": 0 }, "den": { "type": "integer", "minimum": 0 }
+                    }), &["num", "den"]),
+                    "formats": { "type": "array", "items": object_schema(json!({
+                        "name": { "type": "string" }, "width": { "type": "integer", "minimum": 0 },
+                        "height": { "type": "integer", "minimum": 0 }
+                    }), &["name", "width", "height"]) },
+                    "active_format": { "type": "integer", "minimum": 0 },
+                    "video_track_count": { "type": "integer", "minimum": 0 },
+                    "audio_track_count": { "type": "integer", "minimum": 0 }, "is_active": { "type": "boolean" }
+                }),
+                &[
+                    "sequence_id",
+                    "name",
+                    "frame_rate",
+                    "formats",
+                    "active_format",
+                    "video_track_count",
+                    "audio_track_count",
+                    "is_active",
+                ],
+            ),
+        ),
+        "list_clips" => list_result(
+            "clips",
+            object_schema(
+                json!({
+                    "clip_id": { "type": "string", "format": "uuid" }, "name": { "type": "string" },
+                    "sequence_id": { "type": "string", "format": "uuid" }, "track_id": { "type": "string", "format": "uuid" },
+                    "start_ticks": { "type": "integer" }, "duration_ticks": { "type": "integer" }, "enabled": { "type": "boolean" }
+                }),
+                &[
+                    "clip_id",
+                    "name",
+                    "sequence_id",
+                    "track_id",
+                    "start_ticks",
+                    "duration_ticks",
+                    "enabled",
+                ],
+            ),
+        ),
+        "get_clip" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" },
+                "track_id": { "type": "string", "format": "uuid" }, "clip": { "type": "object" }
+            }),
+            &["sequence_id", "track_id", "clip"],
+        ),
+        "import_media" => list_result(
+            "assets",
+            object_schema(
+                json!({
+                    "asset_id": { "type": "string", "format": "uuid" }, "path": { "type": "string" },
+                    "kind": { "type": "string" }, "probed": { "type": "boolean" },
+                    "bin_id": { "type": ["string", "null"], "format": "uuid" }
+                }),
+                &["asset_id", "path", "kind", "probed", "bin_id"],
+            ),
+        ),
+        "list_media" => list_result(
+            "assets",
+            object_schema(
+                json!({
+                    "asset_id": { "type": "string", "format": "uuid" }, "kind": { "type": "string" },
+                    "source": { "type": "object" }, "probed": { "type": "boolean" },
+                    "proxy_status": { "type": ["string", "null"] }, "content_hash": { "type": ["string", "null"] },
+                    "bin_id": { "type": ["string", "null"], "format": "uuid" }
+                }),
+                &[
+                    "asset_id",
+                    "kind",
+                    "source",
+                    "probed",
+                    "proxy_status",
+                    "content_hash",
+                    "bin_id",
+                ],
+            ),
+        ),
+        "list_bins" => list_result("bins", json!({ "type": "object" })),
+        "list_markers" => list_result("markers", json!({ "type": "object" })),
+        "list_clip_markers" => object_schema(
+            json!({
+                "markers": { "type": "array", "items": { "type": "object" } },
+                "sequence_id": { "type": "string", "format": "uuid" }, "clip_start_ticks": { "type": "integer" }
+            }),
+            &["markers", "sequence_id", "clip_start_ticks"],
+        ),
+        "list_marker_categories" | "seed_marker_categories" => {
+            list_result("categories", json!({ "type": "object" }))
+        }
+        "remove_marker_category" => object_schema(
+            json!({
+                "markers_retargeted": { "type": "integer", "minimum": 0 }
+            }),
+            &["markers_retargeted"],
+        ),
+        "list_effect_kinds" => list_result("effect_kinds", json!({ "type": "object" })),
+        "list_export_presets" => list_result("presets", json!({ "type": "object" })),
+        "list_title_templates" => list_result("templates", json!({ "type": "object" })),
+        "get_keyframes" => list_result("tracks", json!({ "type": "object" })),
+        "copy_keyframes" => {
+            object_schema(json!({ "clipboard": { "type": "object" } }), &["clipboard"])
+        }
+        "create_subclip" => object_schema(
+            json!({
+                "asset_id": { "type": "string", "format": "uuid" },
+                "parent_asset_id": { "type": "string", "format": "uuid" },
+                "in_ticks": { "type": "integer" }, "out_ticks": { "type": "integer" }
+            }),
+            &["asset_id", "parent_asset_id", "in_ticks", "out_ticks"],
+        ),
+        "set_loop_range" => json!({ "anyOf": [message_schema(), object_schema(json!({
+            "start_ticks": { "type": "integer" }, "end_ticks": { "type": "integer" }
+        }), &["start_ticks", "end_ticks"])] }),
+        "set_proxy_mode" => object_schema(
+            json!({
+                "mode": { "enum": ["Auto", "ForceProxy", "ForceOriginal"] }, "note": { "type": "string" }
+            }),
+            &["mode", "note"],
+        ),
+        "create_clip_composition" | "set_project_graph" => {
+            json!({ "anyOf": [message_schema(), id_result("graph_id")] })
+        }
+        "effect_stack" => json!({ "anyOf": [message_schema(), object_schema(json!({
+            "scope": { "type": "string" }, "effects": { "type": "array", "items": { "type": "object" } },
+            "grade": { "type": ["object", "null"] }
+        }), &["scope", "effects", "grade"])] }),
+        "paste_attributes" => object_schema(
+            json!({
+                "source_clip_id": { "type": "string", "format": "uuid" },
+                "attributes": { "type": "array", "items": { "enum": ["effects", "grade", "transform", "audio"] } },
+                "updated": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+                "skipped": { "type": "array", "items": { "type": "string", "format": "uuid" } }
+            }),
+            &["source_clip_id", "attributes", "updated", "skipped"],
+        ),
+        "effect_preset_list" => object_schema(
+            json!({
+                "presets": { "type": "array", "items": { "type": "object" } },
+                "library_path": { "type": ["string", "null"] }, "quarantined": { "type": ["string", "null"] }
+            }),
+            &["presets", "library_path", "quarantined"],
+        ),
+        "effect_preset_save" => object_schema(
+            json!({
+                "preset": { "type": "object" }, "replaced": { "type": "boolean" }
+            }),
+            &["preset", "replaced"],
+        ),
+        "effect_preset_apply" => object_schema(
+            json!({
+                "name": { "type": "string" }, "targets": { "type": "integer", "minimum": 0 },
+                "commands": { "type": "integer", "minimum": 0 },
+                "unresolvable_effect_ids": { "type": "array", "items": { "type": "string" } }
+            }),
+            &["name", "targets", "commands", "unresolvable_effect_ids"],
+        ),
+        "effect_favourite_list" => list_result("favourites", json!({ "type": "object" })),
+        "relink_media" => object_schema(
+            json!({
+                "asset_id": { "type": "string", "format": "uuid" }, "new_path": { "type": "string" },
+                "hash": { "enum": ["match", "mismatch", "unknown"] }
+            }),
+            &["asset_id", "new_path", "hash"],
+        ),
+        "find_offline_media" => object_schema(
+            json!({
+                "offline": { "type": "array", "items": { "type": "object" } },
+                "pool_size": { "type": "integer", "minimum": 0 }
+            }),
+            &["offline"],
+        ),
+        "relink_media_batch" => object_schema(
+            json!({
+                "dry_run": { "type": "boolean" }, "scanned_files": { "type": "integer", "minimum": 0 },
+                "scan_truncated": { "type": "boolean" }, "hashed_scan": { "type": "boolean" },
+                "relinked": { "type": "array", "items": { "type": "object" } },
+                "skipped_hash_mismatch": { "type": "array", "items": { "type": "object" } },
+                "unmatched": { "type": "array", "items": { "type": "object" } }
+            }),
+            &[
+                "dry_run",
+                "scanned_files",
+                "scan_truncated",
+                "hashed_scan",
+                "relinked",
+                "skipped_hash_mismatch",
+                "unmatched",
+            ],
+        ),
+        "remove_proxy" => object_schema(
+            json!({
+                "assets": { "type": "array", "items": { "type": "object" } },
+                "files_deleted": { "type": "integer", "minimum": 0 }
+            }),
+            &["assets", "files_deleted"],
+        ),
+        "attach_proxy" => object_schema(
+            json!({
+                "asset_id": { "type": "string", "format": "uuid" }, "path": { "type": "string" },
+                "origin": { "const": "attached" }, "warnings": { "type": "array", "items": { "type": "string" } }
+            }),
+            &["asset_id", "path", "origin", "warnings"],
+        ),
+        "detach_proxy" => object_schema(
+            json!({
+                "asset_id": { "type": "string", "format": "uuid" }, "path": { "type": ["string", "null"] },
+                "origin": { "enum": ["generated", "attached", "none"] },
+                "detached": { "type": "boolean" }, "file_deleted": { "const": false }
+            }),
+            &["asset_id", "path", "origin", "detached", "file_deleted"],
+        ),
+        "import_captions" => object_schema(
+            json!({
+                "cues_imported": { "type": "integer", "minimum": 0 },
+                "notes": { "type": "array", "items": { "type": "string" } }
+            }),
+            &["cues_imported", "notes"],
+        ),
+        "export_captions" => object_schema(
+            json!({
+                "path": { "type": "string" }, "notes": { "type": "array", "items": { "type": "string" } }
+            }),
+            &["path", "notes"],
+        ),
+        "grade_preset" => {
+            json!({ "anyOf": [message_schema(), list_result("presets", json!({ "type": "string" }))] })
+        }
+        "get_audio_meters" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" },
+                "peak": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                "rms": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                "graph_latency_samples": { "type": "integer", "minimum": 0 }, "source": { "const": "mixer_output" }
+            }),
+            &[
+                "sequence_id",
+                "peak",
+                "rms",
+                "graph_latency_samples",
+                "source",
+            ],
+        ),
+        "get_waveform" => json!({ "anyOf": [
+            object_schema(json!({ "channels": { "type": "integer", "minimum": 0 },
+                "buckets": { "type": "array", "maxItems": 0 }
+            }), &["channels", "buckets"]),
+            object_schema(json!({
+                "channels": { "type": "integer", "minimum": 0 }, "source_sample_rate": { "type": "integer", "minimum": 0 },
+                "total_frames": { "type": "integer", "minimum": 0 }, "bucket_format": { "const": "[min, max, rms]" },
+                "resolution": { "type": "integer", "minimum": 0 },
+                "waveform": { "type": "array", "items": { "type": "array", "items": {
+                    "type": "array", "items": { "type": "number" }, "minItems": 3, "maxItems": 3
+                } } }
+            }), &["channels", "source_sample_rate", "total_frames", "bucket_format", "resolution", "waveform"])
+        ] }),
+        "match_frame" => object_schema(
+            json!({
+                "source_tick": { "type": "integer" }, "asset_id": { "type": ["string", "null"], "format": "uuid" },
+                "clip_name": { "type": "string" }
+            }),
+            &["source_tick", "asset_id", "clip_name"],
+        ),
+        "add_edit_all_tracks" => object_schema(
+            json!({
+                "split_count": { "type": "integer", "minimum": 0 },
+                "new_clip_ids": { "type": "array", "items": { "type": "string", "format": "uuid" } }
+            }),
+            &["split_count", "new_clip_ids"],
+        ),
+        "close_gap" => object_schema(
+            json!({ "tracks_changed": { "type": "integer", "minimum": 0 } }),
+            &["tracks_changed"],
+        ),
+        "insert_space" | "remove_space" | "remove_all_spaces_after" => object_schema(
+            json!({
+                "commands": { "type": "integer", "minimum": 0 }, "amount_ticks": { "type": "integer" }
+            }),
+            &["commands"],
+        ),
+        "remove_clips_after" => object_schema(
+            json!({ "removed": { "type": "integer", "minimum": 0 } }),
+            &["removed"],
+        ),
+        "play" | "pause" | "seek" | "step" | "get_engine_status" => engine_status_schema(),
+        "get_job_status" => job_status_schema(),
+        "auto_caption" => object_schema(
+            json!({
+                "job_id": { "type": "string", "format": "uuid" }, "track_id": { "type": "string", "format": "uuid" }
+            }),
+            &["job_id", "track_id"],
+        ),
+        "generate_proxies" => object_schema(
+            json!({
+                "job_id": { "type": "string", "format": "uuid" }, "skipped": { "type": "array", "items": { "type": "object" } }
+            }),
+            &["skipped"],
+        ),
+        "transcode_media" => object_schema(
+            json!({
+                "job_id": { "type": "string", "format": "uuid" }, "output_path": { "type": "string" }
+            }),
+            &["job_id", "output_path"],
+        ),
+        "export_sequence" => object_schema(
+            json!({
+                "job_id": { "type": "string", "format": "uuid" }, "total_frames": { "type": "integer", "minimum": 0 },
+                "width": { "type": "integer", "minimum": 0 }, "height": { "type": "integer", "minimum": 0 },
+                "preset": { "type": "string" }, "audio": { "type": "string" }
+            }),
+            &[
+                "job_id",
+                "total_frames",
+                "width",
+                "height",
+                "preset",
+                "audio",
+            ],
+        ),
+        "get_caption_track" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" }, "track": { "type": "object" }
+            }),
+            &["sequence_id", "track"],
+        ),
+        "get_graph" => object_schema(
+            json!({
+                "graph": { "type": "object" }, "diagnostics": { "type": "array", "items": { "type": "string" } },
+                "compiles": { "type": "boolean" }
+            }),
+            &["graph", "diagnostics", "compiles"],
+        ),
+        "undo"
+        | "redo"
+        | "screenshot"
+        | "delete_sequence"
+        | "set_active_sequence"
+        | "set_sequence_format"
+        | "set_active_format"
+        | "set_work_range"
+        | "remove_track"
+        | "set_track_prop"
+        | "reorder_track"
+        | "remove_clip"
+        | "move_clip"
+        | "move_clips"
+        | "trim_clip"
+        | "roll_edit"
+        | "slip_clip"
+        | "slide_clip"
+        | "ripple_edit"
+        | "lift_edit"
+        | "extract_edit"
+        | "set_clip_prop"
+        | "link_clips"
+        | "unlink_clips"
+        | "set_clip_speed"
+        | "freeze_frame"
+        | "set_transition"
+        | "add_effect"
+        | "remove_effect"
+        | "reorder_effects"
+        | "set_effect_param"
+        | "set_effect_zone"
+        | "set_keyframe"
+        | "remove_keyframe"
+        | "batch_set_keyframes"
+        | "paste_keyframes"
+        | "remove_asset"
+        | "set_asset_tags"
+        | "remove_bin"
+        | "set_asset_bin"
+        | "cancel_job"
+        | "save_export_preset"
+        | "delete_export_preset"
+        | "remove_caption_track"
+        | "merge_caption_cues"
+        | "set_caption_word"
+        | "set_caption_style"
+        | "set_grade"
+        | "apply_lut"
+        | "copy_grade"
+        | "remove_graph_node"
+        | "add_graph_edge"
+        | "remove_graph_edge"
+        | "set_graph_node_param"
+        | "set_clip_audio"
+        | "set_track_audio"
+        | "audio_fx"
+        | "set_master_bus"
+        | "insert_title_template"
+        | "remove_marker"
+        | "set_marker"
+        | "remove_clip_marker"
+        | "update_marker_category"
+        | "import_motion_metadata"
+        | "set_stabilization"
+        | "analyze_stabilization"
+        | "get_stabilization_status"
+        | "effect_preset_delete"
+        | "effect_preset_rename"
+        | "effect_favourite_set" => message_schema(),
+        _ => return None,
+    })
+}
+
+fn known_behavior(name: &str) -> Option<ToolBehavior> {
+    use ToolBehavior::{Additive, ExternalMutation, ExternalRead, Mutation, ReadOnly};
+    Some(match name {
+        "search_actions"
+        | "get_action_schema"
+        | "get_document_info"
+        | "get_document_state"
+        | "list_artboards"
+        | "screenshot"
+        | "list_sequences"
+        | "list_clips"
+        | "get_clip"
+        | "list_markers"
+        | "list_clip_markers"
+        | "list_marker_categories"
+        | "list_media"
+        | "list_bins"
+        | "list_effect_kinds"
+        | "get_keyframes"
+        | "copy_keyframes"
+        | "match_frame"
+        | "get_job_status"
+        | "get_caption_track"
+        | "get_graph"
+        | "get_audio_meters"
+        | "list_title_templates"
+        | "get_stabilization_status" => ReadOnly,
+        "list_export_presets" | "find_offline_media" => ExternalRead,
+        "create_shape"
+        | "create_sequence"
+        | "add_track"
+        | "insert_clip"
+        | "insert_adjustment_clip"
+        | "insert_text_clip"
+        | "create_bin"
+        | "add_caption_track"
+        | "add_graph_node" => Additive,
+        "undo"
+        | "redo"
+        | "set_paint"
+        | "delete_sequence"
+        | "set_active_sequence"
+        | "set_sequence_format"
+        | "set_active_format"
+        | "set_work_range"
+        | "add_marker"
+        | "set_marker"
+        | "remove_marker"
+        | "add_clip_marker"
+        | "remove_clip_marker"
+        | "seed_marker_categories"
+        | "add_marker_category"
+        | "update_marker_category"
+        | "remove_marker_category"
+        | "remove_track"
+        | "set_track_prop"
+        | "reorder_track"
+        | "remove_clip"
+        | "move_clip"
+        | "move_clips"
+        | "trim_clip"
+        | "split_clip"
+        | "roll_edit"
+        | "slip_clip"
+        | "slide_clip"
+        | "ripple_edit"
+        | "insert_edit"
+        | "overwrite_edit"
+        | "lift_edit"
+        | "extract_edit"
+        | "replace_clip_source"
+        | "add_edit_all_tracks"
+        | "close_gap"
+        | "insert_space"
+        | "remove_space"
+        | "remove_all_spaces_after"
+        | "remove_clips_after"
+        | "set_clip_prop"
+        | "link_clips"
+        | "unlink_clips"
+        | "set_clip_speed"
+        | "freeze_frame"
+        | "set_transition"
+        | "add_effect"
+        | "remove_effect"
+        | "reorder_effects"
+        | "set_effect_param"
+        | "set_effect_zone"
+        | "effect_stack"
+        | "paste_attributes"
+        | "set_keyframe"
+        | "remove_keyframe"
+        | "batch_set_keyframes"
+        | "paste_keyframes"
+        | "remove_asset"
+        | "set_asset_tags"
+        | "create_subclip"
+        | "remove_bin"
+        | "set_asset_bin"
+        | "cancel_job"
+        | "remove_caption_track"
+        | "set_caption_cue"
+        | "split_caption_cue"
+        | "merge_caption_cues"
+        | "set_caption_word"
+        | "set_caption_style"
+        | "set_grade"
+        | "copy_grade"
+        | "create_clip_composition"
+        | "remove_graph_node"
+        | "add_graph_edge"
+        | "remove_graph_edge"
+        | "set_graph_node_param"
+        | "set_project_graph"
+        | "set_clip_audio"
+        | "set_track_audio"
+        | "audio_fx"
+        | "set_master_bus"
+        | "set_stabilization"
+        | "insert_title_template" => Mutation,
+        "execute_action"
+        | "save_document"
+        | "import_media"
+        | "relink_media"
+        | "relink_media_batch"
+        | "play"
+        | "pause"
+        | "seek"
+        | "step"
+        | "get_engine_status"
+        | "render_frame_at"
+        | "set_loop_range"
+        | "set_proxy_mode"
+        | "probe_media"
+        | "generate_proxies"
+        | "remove_proxy"
+        | "attach_proxy"
+        | "detach_proxy"
+        | "transcode_media"
+        | "export_sequence"
+        | "save_export_preset"
+        | "delete_export_preset"
+        | "auto_caption"
+        | "import_captions"
+        | "export_captions"
+        | "generate_voiceover"
+        | "apply_lut"
+        | "grade_preset"
+        | "get_scopes"
+        | "get_waveform"
+        | "import_motion_metadata"
+        | "analyze_stabilization"
+        | "effect_preset_list"
+        | "effect_favourite_list"
+        | "effect_preset_save"
+        | "effect_preset_apply"
+        | "effect_preset_delete"
+        | "effect_preset_rename"
+        | "effect_favourite_set" => ExternalMutation,
+        _ => return None,
+    })
 }

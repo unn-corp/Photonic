@@ -1141,8 +1141,12 @@ fn draw_job_options(ui: &mut egui::Ui, state: &mut DialogState) {
         .on_hover_text("Overlays sequence timecode on the encode path (K-F polish).");
         ui.checkbox(&mut state.add_to_bin, "Add result to media bin when done")
             .on_hover_text("Host imports the finished file into the media pool (K-F polish).");
-        ui.checkbox(&mut state.two_pass, "Two-pass encode (when supported)")
-            .on_hover_text("Hint for software encoders that support multipass (K-F polish).");
+        state.two_pass = false;
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut state.two_pass, "Two-pass encode (unavailable)"),
+        )
+        .on_disabled_hover_text("The streaming export engine does not support two-pass encoding.");
         ui.checkbox(
             &mut state.inhibit_sleep,
             "Inhibit system sleep during render",

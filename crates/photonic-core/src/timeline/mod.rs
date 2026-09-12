@@ -26,11 +26,13 @@ pub mod ids;
 pub mod load;
 pub mod media;
 pub mod ops;
+pub mod precision_trim;
 pub mod prop_registry;
 pub mod scale;
 pub mod sequence;
 pub mod stabilization;
 pub mod time;
+pub mod transcript;
 pub mod unknown;
 
 // ── Curated re-exports (the surface most callers use) ───────────────────────
@@ -100,8 +102,8 @@ pub use scale::{
 };
 pub use sequence::{
     GroupKind, GroupNode, Marker, MarkerAnchor, MarkerCategory, MarkerGlyph, MarkerRef,
-    MarkerRetarget, ProjectVideoSettings, Sequence, SequenceFormat, TimelineProject, Track,
-    TrackKind, ValidationError,
+    MarkerRetarget, PreviewZone, ProjectVideoSettings, Sequence, SequenceFormat, TimelineProject,
+    Track, TrackKind, ValidationError,
 };
 pub use time::{FrameRate, Tick, Timecode, TICKS_PER_SECOND};
 pub use unknown::UnknownTag;

@@ -26,6 +26,8 @@ pub enum AudioEngineError {
     UnsupportedSampleFormat(SampleFormat),
     #[error("engine already has an active output stream")]
     AlreadyStarted,
+    #[error("no prepared output stream")]
+    NotPrepared,
     #[error(transparent)]
     Cpal(#[from] cpal::Error),
 }
@@ -109,6 +111,17 @@ impl AudioEngine {
     /// duplicating/truncating our stereo mix (v1 output bus is stereo only,
     /// 09 §4). Returns the negotiated sample rate.
     pub fn start(&mut self, consumer: RingConsumer) -> Result<u32, AudioEngineError> {
+        let sample_rate = self.prepare(consumer)?;
+        if let Err(error) = self.play_prepared() {
+            self.stop();
+            return Err(error);
+        }
+        Ok(sample_rate)
+    }
+
+    /// Build a paused stream so a source audition can prefill PCM before its
+    /// master clock starts. Existing program playback uses `start` above.
+    pub fn prepare(&mut self, consumer: RingConsumer) -> Result<u32, AudioEngineError> {
         if self.stream.is_some() {
             return Err(AudioEngineError::AlreadyStarted);
         }
@@ -136,9 +149,16 @@ impl AudioEngine {
             }
             other => return Err(AudioEngineError::UnsupportedSampleFormat(other)),
         };
-        stream.play()?;
         self.stream = Some(stream);
         Ok(sample_rate)
+    }
+
+    pub fn play_prepared(&self) -> Result<(), AudioEngineError> {
+        self.stream
+            .as_ref()
+            .ok_or(AudioEngineError::NotPrepared)?
+            .play()?;
+        Ok(())
     }
 
     /// Stop and drop the active stream, if any. Idempotent.

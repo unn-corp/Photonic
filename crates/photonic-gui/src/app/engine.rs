@@ -83,9 +83,11 @@ pub struct EngineBridge {
     pub(crate) session: EngineSession,
 
     // ── Snapshot mirror (lock-flavor bridge) ────────────────────────────────
-    mirror_doc: Arc<StdMutex<Document>>,
-    mirror_history: Arc<StdMutex<CommandHistory>>,
     last_synced_revision: Option<u64>,
+    last_synced_document: Option<uuid::Uuid>,
+    live_snapshot: Option<photonic_video::RenderSnapshot>,
+    trim_candidate: Option<(Vec<photonic_core::timeline::TimelineCmd>, u64)>,
+    waiting_snapshot: Option<u64>,
 
     // ── Presentation ────────────────────────────────────────────────────────
     presenter: Option<VideoPresenter>,
@@ -110,12 +112,17 @@ pub struct EngineBridge {
     pub(crate) compare_split: f32,
 
     // ── Reconciler state (last values actually sent to the engine) ──────────
+    trim_stills: Option<TrimStills>,
+    retired_trim_textures: Vec<egui::TextureId>,
     sent_playing: Option<bool>,
     sent_loop: Option<Option<(Tick, Tick)>>,
     sent_sequence: Option<SequenceId>,
+    sent_preview_cache_dir: Option<std::path::PathBuf>,
     sent_proxy: Option<ProxyMode>,
     sent_preview_quality: Option<PreviewQuality>,
     sent_preview_target: Option<PreviewTarget>,
+    sent_compare_effects: Option<bool>,
+    pending_source_seek: Option<(photonic_core::timeline::AssetId, Tick)>,
     /// Playhead value the GUI and engine last agreed on — a differing
     /// `self.playhead` means the *user* moved it (ruler scrub, Home/End,
     /// marker jump) and a `Seek` must be sent.
@@ -126,6 +133,18 @@ pub struct EngineBridge {
     pub(crate) preview_quality: PreviewQuality,
     /// Desired single-monitor target; play-wins enforced by engine (24 §3).
     pub(crate) preview_target: PreviewTarget,
+}
+
+struct TrimStills {
+    requests: [(photonic_core::timeline::AssetId, Tick); 2],
+    revision: u64,
+    slots: [Option<TrimStill>; 2],
+}
+struct TrimStill {
+    _texture: wgpu::Texture,
+    id: egui::TextureId,
+    physical: (u32, u32),
+    logical: (u32, u32),
 }
 
 struct PresentTarget {
@@ -154,9 +173,11 @@ impl EngineBridge {
         EngineBridge {
             engine,
             session,
-            mirror_doc,
-            mirror_history,
             last_synced_revision: None,
+            last_synced_document: None,
+            live_snapshot: None,
+            trim_candidate: None,
+            waiting_snapshot: None,
             presenter: None,
             target: None,
             compare_target: None,
@@ -168,12 +189,17 @@ impl EngineBridge {
             present_channel: PresentChannel::Color,
             compare_effects: false,
             compare_split: 0.5,
+            trim_stills: None,
+            retired_trim_textures: Vec::new(),
             sent_playing: None,
             sent_loop: None,
             sent_sequence: None,
+            sent_preview_cache_dir: None,
             sent_proxy: None,
             sent_preview_quality: None,
             sent_preview_target: None,
+            sent_compare_effects: None,
+            pending_source_seek: None,
             agreed_playhead: None,
             proxy_mode: ProxyMode::Auto,
             preview_quality: PreviewQuality::Draft,
@@ -225,21 +251,18 @@ impl EngineBridge {
     /// next frame — `last_synced_revision` is only advanced on success.
     pub fn sync_document(&mut self, doc: &Document, history: &CommandHistory) {
         let rev = history.revision();
-        if self.last_synced_revision == Some(rev) {
+        if self.last_synced_revision == Some(rev) && self.last_synced_document == Some(doc.id) {
             return;
         }
-        let (Ok(mut d), Ok(mut h)) = (self.mirror_doc.try_lock(), self.mirror_history.try_lock())
-        else {
-            return;
-        };
-        d.timeline = doc.timeline.clone();
-        // Cheap public revision bump: the mirror's stacks are always empty, so
-        // `reset` only clears empty collections and increments `revision`,
-        // which is exactly the signal `EngineThread::poll_snapshot` watches.
-        h.reset();
-        drop(h);
-        drop(d);
+        let snapshot = photonic_video::RenderSnapshot::from_document(doc, rev);
+        let generation = self.session.publish_snapshot(snapshot.clone());
+        self.live_snapshot = Some(snapshot);
+        if self.trim_candidate.take().is_some() {
+            self.waiting_snapshot = Some(generation);
+            self.set_playing(false);
+        }
         self.last_synced_revision = Some(rev);
+        self.last_synced_document = Some(doc.id);
     }
 
     // ── Reconciliation ───────────────────────────────────────────────────────
@@ -256,52 +279,105 @@ impl EngineBridge {
 
     /// Send `cmd` kinds only when the desired value changed since last send.
     pub(crate) fn set_playing(&mut self, playing: bool) {
+        if playing {
+            if let Some(generation) = self.waiting_snapshot {
+                if self.status().snapshot_generation != generation {
+                    return;
+                }
+                self.waiting_snapshot = None;
+            }
+        }
         if self.sent_playing != Some(playing) {
-            self.session.send(if playing {
+            if self.session.send(if playing {
                 EngineCmd::Play
             } else {
                 EngineCmd::Pause
-            });
-            self.sent_playing = Some(playing);
+            }) {
+                self.sent_playing = Some(playing);
+            }
         }
     }
 
     pub(crate) fn set_loop(&mut self, range: Option<(Tick, Tick)>) {
         if self.sent_loop != Some(range) {
-            self.session.send(EngineCmd::SetLoop(range));
-            self.sent_loop = Some(range);
+            if self.session.send(EngineCmd::SetLoop(range)) {
+                self.sent_loop = Some(range);
+            }
         }
     }
 
     pub(crate) fn set_active_sequence(&mut self, seq: Option<SequenceId>) {
         if let Some(seq) = seq {
             if self.sent_sequence != Some(seq) {
-                self.session.send(EngineCmd::SetActiveSequence(seq));
-                self.sent_sequence = Some(seq);
+                if self.session.send(EngineCmd::SetActiveSequence(seq)) {
+                    self.sent_sequence = Some(seq);
+                }
             }
         }
     }
 
+    pub(crate) fn set_preview_cache_dir(&mut self, path: std::path::PathBuf) -> bool {
+        if self.sent_preview_cache_dir.as_ref() == Some(&path) {
+            return true;
+        }
+        if self
+            .session
+            .send(EngineCmd::SetPreviewCacheDir { path: path.clone() })
+        {
+            self.sent_preview_cache_dir = Some(path);
+            true
+        } else {
+            false
+        }
+    }
+    pub(crate) fn prepare_full_preview(&mut self) -> bool {
+        self.preview_quality = PreviewQuality::Full;
+        self.proxy_mode = ProxyMode::ForceOriginal;
+        self.apply_preview_quality();
+        self.apply_proxy_mode();
+        self.sent_preview_quality == Some(self.preview_quality)
+            && self.sent_proxy == Some(self.proxy_mode)
+    }
+
     pub(crate) fn apply_proxy_mode(&mut self) {
         if self.sent_proxy != Some(self.proxy_mode) {
-            self.session.send(EngineCmd::SetProxyMode(self.proxy_mode));
-            self.sent_proxy = Some(self.proxy_mode);
+            if self.session.send(EngineCmd::SetProxyMode(self.proxy_mode)) {
+                self.sent_proxy = Some(self.proxy_mode);
+            }
         }
     }
 
     pub(crate) fn apply_preview_quality(&mut self) {
         if self.sent_preview_quality != Some(self.preview_quality) {
-            self.session
-                .send(EngineCmd::SetPreviewQuality(self.preview_quality));
-            self.sent_preview_quality = Some(self.preview_quality);
+            if self
+                .session
+                .send(EngineCmd::SetPreviewQuality(self.preview_quality))
+            {
+                self.sent_preview_quality = Some(self.preview_quality);
+            }
         }
     }
 
     pub(crate) fn apply_preview_target(&mut self) {
+        if let Some((asset, time)) = self.pending_source_seek {
+            if self.session.send(EngineCmd::SeekSource { asset, time }) {
+                self.pending_source_seek = None;
+            }
+        }
+        if self.sent_compare_effects != Some(self.compare_effects)
+            && self
+                .session
+                .send(EngineCmd::SetCompareEffects(self.compare_effects))
+        {
+            self.sent_compare_effects = Some(self.compare_effects);
+        }
         if self.sent_preview_target.as_ref() != Some(&self.preview_target) {
-            self.session
-                .send(EngineCmd::SetPreviewTarget(self.preview_target.clone()));
-            self.sent_preview_target = Some(self.preview_target.clone());
+            if self
+                .session
+                .send(EngineCmd::SetPreviewTarget(self.preview_target.clone()))
+            {
+                self.sent_preview_target = Some(self.preview_target.clone());
+            }
         }
     }
 
@@ -321,8 +397,56 @@ impl EngineBridge {
             asset,
             source_time: time,
         };
-        self.session.send(EngineCmd::SeekSource { asset, time });
+        self.pending_source_seek = Some((asset, time));
         self.apply_preview_target();
+    }
+
+    pub(crate) fn audition_source(
+        &mut self,
+        sequence: SequenceId,
+        playhead: Tick,
+        asset: photonic_core::timeline::AssetId,
+        start: Tick,
+        end: Tick,
+    ) -> bool {
+        self.set_active_sequence(Some(sequence));
+        self.set_playing(false);
+        if self.sent_sequence != Some(sequence) || self.sent_playing != Some(false) {
+            return false;
+        }
+        if self.agreed_playhead != Some(playhead) {
+            self.seek(playhead);
+        }
+        if self.agreed_playhead != Some(playhead) {
+            return false;
+        }
+        if !self
+            .session
+            .send(EngineCmd::AuditionSource { asset, start, end })
+        {
+            return false;
+        }
+        self.pending_source_seek = None;
+        self.preview_target = PreviewTarget::Asset {
+            asset,
+            source_time: start,
+        };
+        self.sent_preview_target = Some(self.preview_target.clone());
+        true
+    }
+
+    /// Follow an engine-owned audition clock without sending a new target
+    /// command (which would cancel that audition).
+    pub(crate) fn follow_source_audition(
+        &mut self,
+        asset: photonic_core::timeline::AssetId,
+        time: Tick,
+    ) {
+        self.preview_target = PreviewTarget::Asset {
+            asset,
+            source_time: time,
+        };
+        self.sent_preview_target = Some(self.preview_target.clone());
     }
 
     /// True when the single monitor is showing a source peek.
@@ -332,34 +456,108 @@ impl EngineBridge {
 
     /// Return the monitor to sequence program view.
     pub(crate) fn peek_sequence(&mut self, sequence: SequenceId) {
+        self.pending_source_seek = None;
         self.preview_target = PreviewTarget::Sequence { sequence };
         self.apply_preview_target();
     }
 
     /// Seek and record agreement so the scrub detector stays quiet.
     pub(crate) fn seek(&mut self, to: Tick) {
-        self.session.send(EngineCmd::Seek(to));
-        self.agreed_playhead = Some(to);
+        if self.session.send(EngineCmd::Seek(to)) {
+            self.agreed_playhead = Some(to);
+        }
     }
 
     /// Live scrub target while the playhead is being dragged: decodes a cheap
     /// keyframe preview. Records agreement like `seek`; the drag-release settle
     /// sends a real `seek` to land the exact frame.
     pub(crate) fn scrub_seek(&mut self, to: Tick) {
-        self.session.send(EngineCmd::ScrubSeek(to));
-        self.agreed_playhead = Some(to);
+        if self.session.send(EngineCmd::ScrubSeek(to)) {
+            self.agreed_playhead = Some(to);
+        }
     }
 
     /// Exact-frame step; the engine pauses itself (02 §4). The caller updates
     /// its optimistic local playhead and then records agreement via
     /// [`Self::note_agreed`].
-    pub(crate) fn step(&mut self, frames: i32) {
-        self.session.send(EngineCmd::Step(frames));
-        self.sent_playing = Some(false);
+    pub(crate) fn step(&mut self, frames: i32) -> bool {
+        if self.session.send(EngineCmd::Step(frames)) {
+            self.sent_playing = Some(false);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn note_agreed(&mut self, playhead: Tick) {
         self.agreed_playhead = Some(playhead);
+    }
+
+    /// Publish an isolated candidate. Wait for its generation before starting
+    /// audio, since snapshot publication and the command mailbox are separate.
+    pub(crate) fn preview_trim_candidate(
+        &mut self,
+        doc: &Document,
+        history: &CommandHistory,
+        commands: &[photonic_core::timeline::TimelineCmd],
+    ) -> bool {
+        self.sync_document(doc, history);
+        if self
+            .trim_candidate
+            .as_ref()
+            .is_some_and(|(old, _)| old == commands)
+        {
+            return false;
+        }
+        self.set_playing(false);
+        let candidate = super::editing_workflows::candidate_document(doc, commands);
+        let generation =
+            self.session
+                .publish_snapshot(photonic_video::RenderSnapshot::from_document(
+                    &candidate,
+                    history.revision(),
+                ));
+        self.trim_candidate = Some((commands.to_vec(), generation));
+        self.waiting_snapshot = Some(generation);
+        true
+    }
+    pub(crate) fn restore_trim_candidate(&mut self) {
+        if self.trim_candidate.take().is_some() {
+            self.set_playing(false);
+            if let Some(snapshot) = &self.live_snapshot {
+                self.waiting_snapshot = Some(self.session.publish_snapshot(snapshot.clone()));
+            }
+        }
+    }
+
+    pub(crate) fn set_trim_stills(
+        &mut self,
+        requests: Option<([(photonic_core::timeline::AssetId, Tick); 2], u64)>,
+    ) {
+        if self.trim_stills.as_ref().map(|s| (s.requests, s.revision)) == requests {
+            return;
+        }
+        if let Some(old) = self.trim_stills.take() {
+            self.retired_trim_textures
+                .extend(old.slots.into_iter().flatten().map(|slot| slot.id));
+        }
+        if let Some((requests, revision)) = requests {
+            self.trim_stills = Some(TrimStills {
+                requests,
+                revision,
+                slots: [None, None],
+            });
+            self.peek_asset(requests[0].0, requests[0].1);
+        }
+    }
+    pub(crate) fn trim_still_images(
+        &self,
+    ) -> [Option<(egui::TextureId, (u32, u32), (u32, u32))>; 2] {
+        std::array::from_fn(|index| {
+            self.trim_stills.as_ref()?.slots[index]
+                .as_ref()
+                .map(|slot| (slot.id, slot.logical, slot.physical))
+        })
     }
 
     // ── Presentation (03 §5) ─────────────────────────────────────────────────
@@ -374,6 +572,9 @@ impl EngineBridge {
         queue: &wgpu::Queue,
         egui_renderer: &mut egui_wgpu::Renderer,
     ) {
+        for id in self.retired_trim_textures.drain(..) {
+            egui_renderer.free_texture(&id);
+        }
         let Some(frame) = self.session.latest_frame() else {
             return;
         };
@@ -394,7 +595,22 @@ impl EngineBridge {
                 ^ (frame.logical_size.0 as usize).wrapping_mul(0x27d4_eb2d)
                 ^ (frame.logical_size.1 as usize).wrapping_mul(0x1656_67b1),
         );
-        if self.presented == Some(key) {
+        let capture = self.trim_stills.as_ref().and_then(|stills| {
+            if frame.doc_revision != stills.revision {
+                return None;
+            }
+            stills
+                .requests
+                .iter()
+                .enumerate()
+                .find_map(|(index, (asset, time))| {
+                    (stills.slots[index].is_none()
+                        && frame.preview_asset == Some(*asset)
+                        && frame.time == *time)
+                        .then_some(index)
+                })
+        });
+        if self.presented == Some(key) && capture.is_none() {
             return;
         }
         let size = (frame.texture.width(), frame.texture.height());
@@ -438,6 +654,55 @@ impl EngineBridge {
                 presenter.present_engine_frame_channel(device, &mut encoder, cv, &ct.view, channel);
             }
         }
+        if let Some(index) = capture {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("precision_trim_still"),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            encoder.copy_texture_to_texture(
+                wgpu::ImageCopyTexture {
+                    texture: &self.target.as_ref().expect("present target").texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyTexture {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&Default::default());
+            let id = egui_renderer.register_native_texture(device, &view, wgpu::FilterMode::Linear);
+            if let Some(stills) = self.trim_stills.as_mut() {
+                stills.slots[index] = Some(TrimStill {
+                    _texture: texture,
+                    id,
+                    physical: size,
+                    logical: frame.logical_size,
+                });
+                if let Some(next) = stills.slots.iter().position(Option::is_none) {
+                    let (asset, time) = stills.requests[next];
+                    self.peek_asset(asset, time);
+                }
+            }
+        }
         queue.submit([encoder.finish()]);
 
         self.presented = Some(key);
@@ -467,10 +732,7 @@ impl EngineBridge {
     /// K-B5: toggle effect-compare split; sends view-state to the engine.
     pub fn toggle_compare_effects(&mut self) {
         self.compare_effects = !self.compare_effects;
-        self.session
-            .send(photonic_video::EngineCmd::SetCompareEffects(
-                self.compare_effects,
-            ));
+        self.apply_preview_target();
         self.presented = None;
     }
 
@@ -515,7 +777,9 @@ impl EngineBridge {
             // egui then decodes the native texture before its gamma-space
             // window pass, avoiding a double sRGB transform.
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&Default::default());
@@ -572,6 +836,88 @@ pub(crate) fn is_buffering(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn precision_candidate_snapshot_restores_live_revision_and_playhead() {
+        use photonic_core::timeline::{
+            precision_trim, Clip, ClipSource, FrameRate, Sequence, TimelineProject, Track,
+            TrackKind,
+        };
+        let Some(engine) = VideoEngine::headless() else {
+            eprintln!("GPU unavailable; precision snapshot integration skipped");
+            return;
+        };
+        let mut bridge = EngineBridge::new(engine);
+        let mut doc = Document::new("precision", 1., 1.);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("test", FrameRate::FPS_30, 32, 32);
+        let mut track = Track::new(TrackKind::Video, "color");
+        let left = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::default(),
+            },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let mut right = Clip::new(
+            left.source.clone(),
+            Tick::from_seconds(2),
+            Tick::from_seconds(2),
+        );
+        right.source_in = Tick::from_seconds(1);
+        let target = precision_trim::TrimTarget {
+            sequence: sequence.id,
+            track: track.id,
+            outgoing: left.id,
+            incoming: right.id,
+        };
+        track.clips = vec![left, right];
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        project.active_sequence = Some(target.sequence);
+        doc.timeline = Some(project);
+        let original = doc.timeline.clone();
+        let mut history = CommandHistory::new(8);
+        let playhead = Tick::from_seconds(1);
+        bridge.sync_document(&doc, &history);
+        bridge.set_active_sequence(Some(target.sequence));
+        bridge.seek(playhead);
+        let commands = precision_trim::plan_trim(
+            doc.timeline.as_ref().unwrap(),
+            target,
+            precision_trim::TrimMode::Roll,
+            FrameRate::FPS_30.ticks_per_frame(),
+        )
+        .unwrap();
+        bridge.preview_trim_candidate(&doc, &history, &commands);
+        let candidate_generation = bridge.trim_candidate.as_ref().unwrap().1;
+        let wait = |bridge: &EngineBridge, generation: u64| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while bridge.status().snapshot_generation != generation
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(bridge.status().snapshot_generation, generation);
+        };
+        wait(&bridge, candidate_generation);
+        assert_eq!(doc.timeline, original);
+        bridge.restore_trim_candidate();
+        let restored_generation = bridge.waiting_snapshot.unwrap();
+        bridge.seek(playhead);
+        wait(&bridge, restored_generation);
+        assert_eq!(bridge.status().doc_revision, history.revision());
+        assert_eq!(bridge.status().playhead, playhead);
+        bridge.preview_trim_candidate(&doc, &history, &commands);
+        history.reset();
+        bridge.sync_document(&doc, &history);
+        assert!(bridge.trim_candidate.is_none());
+        bridge.restore_trim_candidate();
+        let live_generation = bridge.waiting_snapshot.unwrap();
+        wait(&bridge, live_generation);
+        assert_eq!(bridge.status().doc_revision, history.revision());
+        assert_eq!(doc.timeline, original);
+    }
 
     #[test]
     fn padded_uv_crops_bucket_padding() {

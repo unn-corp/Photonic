@@ -682,6 +682,71 @@ pub static REGISTRY: &[CommandDef] = &[
         default: None,
     },
     CommandDef {
+        id: "video.audition_source",
+        label: "Audition Source Audio",
+        default: Some(KeyBinding::alt(egui::Key::Space)),
+    },
+    CommandDef {
+        id: "video.stop_source_audition",
+        label: "Stop Source Audition",
+        default: None,
+    },
+    CommandDef {
+        id: "video.precision_trim",
+        label: "Precision Trim Mode",
+        default: Some(KeyBinding::shift(egui::Key::T)),
+    },
+    CommandDef {
+        id: "video.enter_nested_sequence",
+        label: "Enter Nested Sequence",
+        default: Some(KeyBinding::alt(egui::Key::ArrowRight)),
+    },
+    CommandDef {
+        id: "video.leave_nested_sequence",
+        label: "Back to Parent Sequence",
+        default: Some(KeyBinding::alt(egui::Key::ArrowLeft)),
+    },
+    CommandDef {
+        id: "video.add_preview_zone",
+        label: "Add Preview Zone from In/Out",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_preview_zone",
+        label: "Remove Preview Zone in In/Out",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_all_preview_zones",
+        label: "Remove All Preview Zones",
+        default: None,
+    },
+    CommandDef {
+        id: "video.render_preview",
+        label: "Render Timeline Preview",
+        default: None,
+    },
+    CommandDef {
+        id: "video.stop_preview_render",
+        label: "Stop Preview Render",
+        default: None,
+    },
+    CommandDef {
+        id: "video.open_transcript",
+        label: "Open Transcript",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_transcript_selection",
+        label: "Ripple Delete Selected Transcript Words",
+        default: None,
+    },
+    CommandDef {
+        id: "video.find_fillers",
+        label: "Preview Transcript Filler Words",
+        default: None,
+    },
+    CommandDef {
         id: "video.edit_duration",
         label: "Edit Duration…",
         // No default — Ctrl+D is `edit.duplicate`; palette / context menu /

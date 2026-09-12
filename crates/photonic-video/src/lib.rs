@@ -34,8 +34,11 @@ pub mod export;
 pub mod media;
 /// Playback controller, clock, prefetch (02 §4).
 pub mod playback;
+/// Content-addressed, bounded disk previews for timeline playback (33).
+pub mod preview;
 /// `VideoEngine` facade + per-document `EngineSession` (02 §1).
 pub mod session;
+pub mod source_audition;
 
 /// Pooled `Rgba16Float` working-texture allocator (03 §3.4). The P1 renderer /
 /// P3 evaluator request textures from here keyed by [`graph::ir::ContentHash`].
@@ -61,5 +64,5 @@ pub use media::thumbnails::{RgbaThumb, ThumbHandle, ThumbnailCache, WaveformCach
 pub use session::{
     coalesce_commands, colorimetry_for_probe, AssetReadiness, EngineCmd, EngineFrame,
     EngineSession, EngineStatus, ExportJob, MasterMeterSnapshot, PreviewQuality, PreviewTarget,
-    PreviewTelemetrySnapshot, ProxyMode, RenderJobOptions, VideoEngine,
+    PreviewTelemetrySnapshot, ProxyMode, RenderJobOptions, RenderSnapshot, VideoEngine,
 };

@@ -369,44 +369,6 @@ fn link_partners(
         .collect()
 }
 
-/// Expand a move-by-`delta` edit on `clip` to every linked partner (14 §M-2,
-/// gap #8's UI half — "linked A/V clips move as a unit"). Each partner
-/// shifts by the IDENTICAL tick delta on ITS OWN track: this never
-/// reassigns a partner to a different track, only the dragged clip's own
-/// track can change (see `move_clip_cross_track`). A partner that can't take
-/// the shift (would go negative, or collides with a neighbour on its own
-/// track) is silently dropped from the batch rather than blocking the
-/// primary move — the same per-member guard `ripple_trim` uses above.
-///
-/// This is the reusable "expand a single-clip edit to the whole link group"
-/// helper: the caller builds its own primary-clip command, `extend`s the
-/// `Vec` with this, then commits through `commit_group`.
-pub(crate) fn expand_link_group_move(
-    p: &TimelineProject,
-    seq: SequenceId,
-    track: TrackId,
-    clip: photonic_core::timeline::ClipId,
-    delta: Tick,
-) -> Vec<TimelineCmd> {
-    if delta.0 == 0 {
-        return Vec::new();
-    }
-    let Some(s) = p.sequences.get(&seq) else {
-        return Vec::new();
-    };
-    link_partners(p, seq, track, clip)
-        .into_iter()
-        .filter_map(|(ptrack, pclip)| {
-            let start = s.track(ptrack)?.clips.iter().find(|c| c.id == pclip)?.start;
-            let new_start = start + delta;
-            if new_start.0 < 0 {
-                return None;
-            }
-            ops::move_clip(p, seq, ptrack, pclip, new_start).ok()
-        })
-        .collect()
-}
-
 /// Expand a delete (`remove_clip`'s "lift" semantics — leaves a gap, no
 /// ripple) to every linked partner of `clip` within `seq`, so deleting one
 /// half of a linked pair takes the other half with it. See the module note
@@ -449,21 +411,9 @@ pub fn move_clip(
     let Some(p) = doc.timeline.as_ref() else {
         return;
     };
-    let Ok(cmd) = ops::move_clip(p, seq, track, clip, new_start) else {
+    let Ok(cmds) = ops::move_linked_clip(p, seq, track, clip, new_start, None) else {
         return;
     };
-    let old_start = match &cmd {
-        TimelineCmd::MoveClip { old_start, .. } => *old_start,
-        _ => unreachable!("ops::move_clip always returns MoveClip"),
-    };
-    let mut cmds = vec![cmd];
-    cmds.extend(expand_link_group_move(
-        p,
-        seq,
-        track,
-        clip,
-        new_start - old_start,
-    ));
     commit_group(history, doc, cmds);
 }
 
@@ -479,7 +429,7 @@ pub fn move_clip(
 /// `track_delta` is a same-kind lane-index offset applied **per kind**: kinds
 /// that cannot take the step (typical: a single audio track when an A/V link
 /// partner rides along with a video vertical drag) stay on their own track and
-/// receive time only — matching [`expand_link_group_move`] / single-clip
+/// receive time only — matching [`ops::move_linked_clip`] / single-clip
 /// cross-track. Group move remains behind K-A5.
 /// CAP-019 GUI-arm surface (29 §3) — driven headlessly by the acceptance-story harness.
 pub fn move_clips(
@@ -493,17 +443,9 @@ pub fn move_clips(
     let Some(p) = doc.timeline.as_ref() else {
         return;
     };
-    let mut moving: Vec<(TrackId, photonic_core::timeline::ClipId)> = Vec::new();
-    for (track, clip) in clips {
-        if !moving.contains(&(*track, *clip)) {
-            moving.push((*track, *clip));
-        }
-        for partner in link_partners(p, seq, *track, *clip) {
-            if !moving.contains(&partner) {
-                moving.push(partner);
-            }
-        }
-    }
+    let Ok(moving) = ops::linked_moving_set(p, seq, clips) else {
+        return;
+    };
     let Ok(cmds) = ops::move_clips(p, seq, &moving, delta, track_delta) else {
         return;
     };
@@ -528,22 +470,10 @@ pub fn move_clip_cross_track(
     let Some(p) = doc.timeline.as_ref() else {
         return;
     };
-    let Ok(cmd) = ops::move_clip_to_track(p, seq, from_track, clip, new_start, Some(to_track))
+    let Ok(cmds) = ops::move_linked_clip(p, seq, from_track, clip, new_start, Some(to_track))
     else {
         return;
     };
-    let old_start = match &cmd {
-        TimelineCmd::MoveClip { old_start, .. } => *old_start,
-        _ => unreachable!("ops::move_clip_to_track always returns MoveClip"),
-    };
-    let mut cmds = vec![cmd];
-    cmds.extend(expand_link_group_move(
-        p,
-        seq,
-        from_track,
-        clip,
-        new_start - old_start,
-    ));
     commit_group(history, doc, cmds);
 }
 

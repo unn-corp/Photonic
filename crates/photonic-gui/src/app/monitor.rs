@@ -100,6 +100,16 @@ impl PhotonicApp {
     }
 
     fn monitor_playback_resolution(&self, ctx: &egui::Context) -> PlaybackResolution {
+        if let Some(engine) = &self.engine {
+            if engine.preview_quality == PreviewQuality::Full {
+                return PlaybackResolution::Full;
+            }
+            return if engine.proxy_mode == ProxyMode::ForceProxy {
+                PlaybackResolution::Proxy
+            } else {
+                PlaybackResolution::Draft
+            };
+        }
         ctx.data(|d| d.get_temp(egui::Id::new(MONITOR_RESOLUTION_STATE_ID)))
             .unwrap_or(PlaybackResolution::Draft)
     }
@@ -113,6 +123,64 @@ impl PhotonicApp {
             bridge.preview_quality = res.to_preview_quality();
         }
     }
+}
+
+fn monitor_readiness_text(doc: &Document, status: &photonic_video::EngineStatus) -> String {
+    let assets: Vec<_> = match status.preview_target {
+        PreviewTarget::Asset { asset, .. } => vec![asset],
+        PreviewTarget::Sequence { sequence } => doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.sequences.get(&sequence))
+            .map(|s| {
+                s.tracks()
+                    .flat_map(|t| &t.clips)
+                    .filter(|c| c.start <= status.playhead && status.playhead < c.end())
+                    .filter_map(|c| match c.source {
+                        photonic_core::timeline::ClipSource::Asset { asset } => Some(asset),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    let mut ready = 0;
+    let mut pending = 0;
+    let mut failed = 0;
+    for id in assets {
+        if let Some(proxy) = doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.media.assets.get(&id))
+            .and_then(|m| m.proxy.as_ref())
+        {
+            match proxy.status {
+                photonic_core::timeline::ProxyStatus::Ready => ready += 1,
+                photonic_core::timeline::ProxyStatus::Pending => pending += 1,
+                photonic_core::timeline::ProxyStatus::Failed => failed += 1,
+            }
+        }
+    }
+    let mut label = format!(
+        "{:?} · sources {}/{} · proxies {} ready",
+        status.preview_quality, status.readiness.ready, status.readiness.requested, ready
+    );
+    if pending > 0 {
+        label.push_str(&format!(", {pending} building"));
+    }
+    if failed > 0 || status.readiness.failed_sources > 0 {
+        label.push_str(&format!(
+            " · {} source/proxy failures",
+            failed + status.readiness.failed_sources
+        ));
+    }
+    if status.readiness.pending_source_builds > 0 || status.readiness.pending_rasters > 0 {
+        label.push_str(" · preparing media");
+    }
+    if status.readiness.capacity_limited || status.memory.pressure {
+        label.push_str(" · preview capacity reached");
+    }
+    label
 }
 
 // ── Master output meter (NLE-parity Gap G-4) ────────────────────────────────
@@ -608,6 +676,7 @@ fn format_timecode_with_start(fr: FrameRate, t: Tick, start: Tick) -> String {
 
 impl PhotonicApp {
     pub(crate) fn video_play_pause(&mut self) {
+        self.finish_precision_trim();
         // Intent only — `drive_engine_playback` sends Play/Pause on the diff.
         self.monitor_playing = !self.monitor_playing;
         if self.monitor_playing {
@@ -621,6 +690,7 @@ impl PhotonicApp {
     /// engine attached this becomes a coalesced-`Seek` shuttle while the
     /// engine stays paused — see `drive_engine_playback`.
     pub(crate) fn video_play_reverse(&mut self) {
+        self.finish_precision_trim();
         if self.monitor_playing && self.monitor_play_reverse {
             self.monitor_play_speed = (self.monitor_play_speed * 2.0).min(8.0);
         } else {
@@ -633,11 +703,25 @@ impl PhotonicApp {
     /// K: pause.
     pub(crate) fn video_pause(&mut self) {
         self.monitor_playing = false;
+        if let Some(bridge) = self.engine.as_ref() {
+            if bridge
+                .status()
+                .source_audition
+                .as_ref()
+                .is_some_and(|s| s.playing)
+                && !bridge
+                    .session()
+                    .send(photonic_video::EngineCmd::StopSourceAudition)
+            {
+                self.file_status = Some("Engine is busy; stop source audition again.".into());
+            }
+        }
     }
 
     /// L: play forward; repeated presses ramp speed (1× uses the engine's
     /// audio-mastered `Play`; >1× falls back to the `Seek` shuttle).
     pub(crate) fn video_play_forward(&mut self) {
+        self.finish_precision_trim();
         if self.monitor_playing && !self.monitor_play_reverse {
             self.monitor_play_speed = (self.monitor_play_speed * 2.0).min(8.0);
         } else {
@@ -649,10 +733,18 @@ impl PhotonicApp {
 
     pub(crate) fn video_step_back(&mut self, doc: &Document) {
         self.monitor_playing = false;
-        let tpf = active_frame_rate(doc).ticks_per_frame().0.max(1);
+        let tpf = self.transport_frame_rate(doc).ticks_per_frame().0.max(1);
         if self.io_targets_source_marks() {
             let next = Tick((self.source_marks.source_time.0 - tpf).max(0));
             self.source_marks.source_time = next;
+            if let Some(media) = self
+                .source_marks
+                .armed_asset
+                .and_then(|asset| doc.timeline.as_ref()?.media.assets.get(&asset))
+            {
+                self.source_marks.clamp_to_asset(media);
+            }
+            let next = self.source_marks.source_time;
             if let (Some(asset), Some(bridge)) =
                 (self.source_marks.armed_asset, self.engine.as_mut())
             {
@@ -664,14 +756,15 @@ impl PhotonicApp {
         if let Some(bridge) = self.engine.as_mut() {
             // Exact-frame step on the engine (02 §4: Step always pauses); the
             // local move above is the optimistic echo of the same arithmetic.
-            bridge.step(-1);
-            bridge.note_agreed(self.playhead);
+            if bridge.step(-1) {
+                bridge.note_agreed(self.playhead);
+            }
         }
     }
 
     pub(crate) fn video_step_forward(&mut self, doc: &Document) {
         self.monitor_playing = false;
-        let tpf = active_frame_rate(doc).ticks_per_frame().0.max(1);
+        let tpf = self.transport_frame_rate(doc).ticks_per_frame().0.max(1);
         if self.io_targets_source_marks() {
             let mut next = self.source_marks.source_time.0 + tpf;
             if let Some(end) = self.armed_asset_duration(doc) {
@@ -681,6 +774,14 @@ impl PhotonicApp {
             }
             let next = Tick(next);
             self.source_marks.source_time = next;
+            if let Some(media) = self
+                .source_marks
+                .armed_asset
+                .and_then(|asset| doc.timeline.as_ref()?.media.assets.get(&asset))
+            {
+                self.source_marks.clamp_to_asset(media);
+            }
+            let next = self.source_marks.source_time;
             if let (Some(asset), Some(bridge)) =
                 (self.source_marks.armed_asset, self.engine.as_mut())
             {
@@ -695,9 +796,32 @@ impl PhotonicApp {
         }
         self.playhead = Tick(next);
         if let Some(bridge) = self.engine.as_mut() {
-            bridge.step(1);
-            bridge.note_agreed(self.playhead);
+            if bridge.step(1) {
+                bridge.note_agreed(self.playhead);
+            }
         }
+    }
+
+    fn transport_frame_rate(&self, doc: &Document) -> FrameRate {
+        if self.io_targets_source_marks() {
+            if let Some(rate) = self.source_marks.armed_asset.and_then(|id| {
+                doc.timeline
+                    .as_ref()?
+                    .media
+                    .assets
+                    .get(&id)?
+                    .probe
+                    .as_ref()?
+                    .video
+                    .as_ref()
+                    .map(|video| video.frame_rate)
+            }) {
+                if rate.num > 0 && rate.den > 0 {
+                    return rate;
+                }
+            }
+        }
+        active_frame_rate(doc)
     }
 
     fn armed_asset_duration(&self, doc: &Document) -> Option<Tick> {
@@ -853,8 +977,24 @@ impl PhotonicApp {
     /// to the wall-clock placeholder. Called once per frame from
     /// [`Self::draw_video_monitor`].
     fn drive_playback(&mut self, ctx: &egui::Context, doc: &Document) {
+        if let Some((document, command)) = crate::panels::video::source_monitor::take_command(ctx) {
+            if document == doc.id {
+                self.source_panel_command(doc, command);
+            }
+        }
+        if let Some(time) = self.source_monitor_scrub.take() {
+            if let (Some(asset), Some(bridge)) =
+                (self.source_marks.armed_asset, self.engine.as_mut())
+            {
+                bridge.seek_source(asset, time);
+            }
+        }
         if self.engine.is_none() {
             self.advance_monitor_playback(ctx, doc);
+            return;
+        }
+
+        if self.precision_trim.is_some() {
             return;
         }
 
@@ -878,19 +1018,52 @@ impl PhotonicApp {
 
         let bridge = self.engine.as_mut().expect("checked above");
         bridge.set_active_sequence(active_seq);
+        bridge.set_preview_cache_dir(
+            self.current_file
+                .as_deref()
+                .map(photonic_video::media::cache_dir_for_project)
+                .unwrap_or_else(|| {
+                    std::env::temp_dir()
+                        .join("photonic-preview-cache")
+                        .join(doc.id.to_string())
+                }),
+        );
         bridge.apply_proxy_mode();
         bridge.apply_preview_quality();
+        bridge.apply_preview_target();
         bridge.set_loop(loop_range);
 
         // Media-pool click → source peek on the single monitor (24 §3) + arm G-10.
-        if let Some(asset) = want_peek {
+        if let Some(asset) = want_peek.filter(|_| !self.monitor_playing) {
             let at = if self.source_marks.armed_asset == Some(asset) {
                 self.source_marks.source_time
             } else {
                 Tick::ZERO
             };
             self.source_marks.arm(asset, at);
-            bridge.peek_asset(asset, at);
+            if let Some(media) = doc
+                .timeline
+                .as_ref()
+                .and_then(|p| p.media.assets.get(&asset))
+            {
+                self.source_marks.clamp_to_asset(media);
+            }
+            bridge.peek_asset(asset, self.source_marks.source_time);
+        }
+
+        let source_status = bridge.status();
+        if let Some(source) = &source_status.source_audition {
+            if source.playing && !self.monitor_playing {
+                self.source_marks.arm(source.asset, source.playhead);
+                bridge.follow_source_audition(source.asset, source.playhead);
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+            }
+        }
+
+        if self.monitor_playing {
+            if let Some(sequence) = active_seq {
+                bridge.peek_sequence(sequence);
+            }
         }
 
         // User scrub (ruler drag, scrubber, Home/End, marker jump): the playhead
@@ -961,7 +1134,10 @@ impl PhotonicApp {
                 // actually presented the frame for the current playhead, then go
                 // idle. Self-terminating: the engine always publishes a frame
                 // (real or transparent) stamped at the requested tick.
-                let want = active_frame_rate(doc).snap(self.playhead);
+                let want = match bridge.preview_target {
+                    PreviewTarget::Asset { source_time, .. } => source_time,
+                    _ => active_frame_rate(doc).snap(self.playhead),
+                };
                 let shown = bridge.presented_frame.map(|(t, _)| t);
                 if shown != Some(want) {
                     ctx.request_repaint();
@@ -1307,6 +1483,23 @@ impl PhotonicApp {
                     self.import_media_files(doc, history, None);
                 }
             }
+            let readiness = monitor_readiness_text(doc, &status);
+            painter.text(
+                video_rect.left_top() + egui::vec2(6., 6.),
+                egui::Align2::LEFT_TOP,
+                readiness,
+                egui::FontId::proportional(11.),
+                egui::Color32::from_gray(200),
+            );
+            if let Some(error) = &status.source_audition_error {
+                painter.text(
+                    video_rect.left_top() + egui::vec2(6., 22.),
+                    egui::Align2::LEFT_TOP,
+                    error,
+                    egui::FontId::proportional(12.),
+                    ui.visuals().error_fg_color,
+                );
+            }
             if let Some(err) = &status.last_error {
                 // 36: Diagnostic → badge mapping (code + severity colour).
                 let badge = crate::panels::video::diagnostics::diag_badge(err);
@@ -1323,6 +1516,7 @@ impl PhotonicApp {
         self.draw_master_meter(ui, ctx, meter_rect);
         self.draw_monitor_scrubber(ui, scrub_rect, doc);
         self.draw_transport_bar(ui, transport_rect, doc, history);
+        self.draw_precision_trim(ui.ctx(), doc, history);
         self.draw_format_bar(ui, format_rect, doc, history);
         self.draw_video_shortcut_sheet(ctx);
         self.draw_video_coach_marks(ctx, doc);
@@ -1527,6 +1721,27 @@ impl PhotonicApp {
                     self.monitor_loop_enabled = !self.monitor_loop_enabled;
                 }
 
+                ui.menu_button("Preview",|ui|{
+                    if let Some(engine)=self.engine.as_ref() {
+                        let status=engine.session().preview_status();
+                        let mut profile=status.profile;
+                        use photonic_video::preview::PreviewCodec;
+                        ui.label("Preview format · Full resolution");
+                        for (codec,label) in [(PreviewCodec::IntraH264,"H.264 · opaque"),(PreviewCodec::IntraProResLike,"ProRes · alpha"),(PreviewCodec::Lossless,"VP9 lossless mode · alpha")] {
+                            ui.selectable_value(&mut profile.codec,codec,label);
+                        }
+                        ui.add(egui::DragValue::new(&mut profile.quality).range(0..=51).prefix("Quality "));
+                        if profile.codec==PreviewCodec::Lossless {ui.small("Uses an 8-bit YUV conversion with alpha.");}
+                        if profile!=status.profile && !engine.session().send(photonic_video::EngineCmd::SetPreviewProfile(profile)) {
+                            self.file_status=Some("Preview format request rejected: engine busy.".into());
+                        }
+                        if let Some(error)=&status.error {ui.colored_label(ui.visuals().error_fg_color,error);}
+                        ui.separator();
+                    }
+                    for (label,id) in [("Add zone from In/Out","video.add_preview_zone"),("Remove zone in In/Out","video.remove_preview_zone"),("Remove all zones","video.remove_all_preview_zones"),("Render preview","video.render_preview"),("Stop preview render","video.stop_preview_render")] {
+                        if ui.button(label).clicked(){self.video_preview_action(doc,history,id);ui.close_menu();}
+                    }
+                });
                 ui.separator();
                 // Single-monitor mode badge (24 §3.3): SOURCE vs SEQUENCE.
                 let badge = self
@@ -1547,6 +1762,13 @@ impl PhotonicApp {
                     "Single monitor — SEQUENCE is the timeline; SOURCE is a media-pool peek",
                 );
 
+                if self.io_targets_source_marks() {
+                    let auditioning = self.engine.as_ref().is_some_and(|engine|engine.status().source_audition.as_ref().is_some_and(|a|a.playing));
+                    if ui.button(if auditioning {"Stop source"} else {"Audition source"}).clicked() {
+                        if auditioning {self.source_panel_command(doc,crate::panels::video::source_monitor::SourceCommand::Stop);}
+                        else {self.video_audition_source(doc);}
+                    }
+                }
                 ui.separator();
                 // Prominent current / total timecode readout (pro-NLE feel).
                 // When SOURCE peaking: source clock (G-10); else sequence playhead.
@@ -1780,6 +2002,9 @@ impl PhotonicApp {
         doc: &mut Document,
         history: &mut CommandHistory,
     ) {
+        if self.precision_trim.is_some() {
+            return;
+        }
         if !viewport_kb(ctx) {
             return;
         }
@@ -2111,6 +2336,9 @@ impl PhotonicApp {
                             ("← / →", "Step one frame"),
                             ("Shift+← / Shift+→", "Previous / next edit point"),
                             ("I / O", "Set in / out point"),
+                            ("Alt+Space", "Audition source audio"),
+                            ("Shift+T", "Precision trim"),
+                            ("Alt+← / Alt+→", "Back / enter nested sequence"),
                             ("S", "Split clip at playhead"),
                             ("Del / Backspace", "Delete selected clip (Shift = ripple)"),
                             ("Ctrl+C / X / V", "Copy / cut / paste clip"),

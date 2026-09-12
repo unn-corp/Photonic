@@ -942,7 +942,8 @@ pub enum PanelAction {
     /// Several `TimelineCmd`s committed as ONE undo step (`Command::Batch`,
     /// via `CommandHistory::execute_discrete`) — every caption/TTS mutation
     /// (cue text/timing, split/merge, style cascade, auto-caption, voiceover
-    /// placement) routes through this single carrier.
+    /// placement), including transcript plans that cut synchronized media and
+    /// captions together, routes through this single carrier.
     CaptionEditBatch(Vec<photonic_core::timeline::TimelineCmd>),
 
     // ── Clip inspector / effects browser (video mode, 04 §4.1) ───────────────
@@ -1567,22 +1568,24 @@ pub(crate) fn draw_drawer(
     } else {
         "Search properties…"
     };
-    ui.horizontal(|ui| {
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut *ctx.prop_search)
-                .hint_text(search_hint)
-                .desired_width(ui.available_width() - 24.0),
-        );
-        if !ctx.prop_search.is_empty()
-            && ui
-                .small_button(ph::X)
-                .on_hover_text("Clear search")
-                .clicked()
-        {
-            ctx.prop_search.clear();
-            response.surrender_focus();
-        }
-    });
+    if group != DrawerGroup::Transcript {
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut *ctx.prop_search)
+                    .hint_text(search_hint)
+                    .desired_width(ui.available_width() - 24.0),
+            );
+            if !ctx.prop_search.is_empty()
+                && ui
+                    .small_button(ph::X)
+                    .on_hover_text("Clear search")
+                    .clicked()
+            {
+                ctx.prop_search.clear();
+                response.surrender_focus();
+            }
+        });
+    }
     ui.add_space(4.0);
 
     // An empty query matches everything; a non-empty query forces matching

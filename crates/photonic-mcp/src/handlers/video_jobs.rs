@@ -12,27 +12,25 @@
 //! tool then degrades to a structured `EngineUnavailable` error (10 §7's
 //! "fails with a clear error rather than blocking the rest of the surface").
 //!
-//! ## The shadow-document bridge
+//! ## Revisioned snapshot bridge
 //!
-//! `EngineSession` (02 §1) polls `Arc<std::sync::Mutex<{Document,
-//! CommandHistory}>>`, but `AppState` shares its document/history behind
-//! **tokio** mutexes (`server.rs:63`). Rather than fork the facade's lock
-//! type (photonic-video is another story's territory), the bridge binds the
-//! session to a *shadow* std-mutex pair and copies the `TimelineProject`
-//! (cheap `Clone`, 01) from the real document into the shadow before every
-//! engine-backed call ([`EngineBridge::sync_timeline`]), bumping the shadow
-//! history's revision (`CommandHistory::reset`) so the engine re-snapshots.
-//! Lock order is real-doc → shadow (never both shadow locks held while
-//! taking the real one), and the engine thread only ever `try_lock`s the
-//! shadow pair — no deadlock is possible across the three acquirers.
+//! The MCP document/history use Tokio locks; the engine consumes immutable
+//! `RenderSnapshot` publications. The bridge checks the real history revision
+//! under document → history lock order and clones content only on a change.
+//! Unchanged calls reuse the same Arc. Temporary format views receive their
+//! own publication generation while retaining the real document revision.
+//! A constructor-only std-mutex document pair preserves the legacy session API;
+//! published snapshots take precedence and do not copy or reset undo history.
 //!
-//! ## Job registry (§6)
+//! Transport callers serialize select/seek/inspect operations and wait for the
+//! published generation before relying on sequence state. GUI and MCP sessions
+//! remain independent. Embedded vector content is included when required.
 //!
-//! First async-job pattern in the MCP surface (searched: none existed).
-//! Start tools insert a [`JobHandle`] and return a `job_id` immediately;
-//! `get_job_status`/`cancel_job` poll/flag it; terminal jobs are retained
-//! [`JOB_RETENTION`] then evicted by the same background interval task that
-//! flushes debounced checkpoints (`server.rs::run`).
+//! ## Job registry
+//!
+//! At most four jobs are active. Completed jobs remain inspectable for up to
+//! `JOB_RETENTION`, subject to a bounded retained-entry limit. Cancellation
+//! flags a running worker; its terminal status releases the admission slot.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,9 +38,10 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use photonic_core::history::CommandHistory;
-use photonic_core::timeline::TimelineProject;
 use photonic_core::Document;
-use photonic_video::{EngineCmd, EngineFrame, EngineSession, ProxyMode, VideoEngine};
+use photonic_video::{
+    EngineCmd, EngineFrame, EngineSession, ProxyMode, RenderSnapshot, VideoEngine,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -55,11 +54,19 @@ use crate::server::AppState;
 #[derive(Default)]
 pub struct VideoEngineHandle {
     cell: OnceLock<Option<EngineBridge>>,
+    /// Retry receipts are scoped to this application session, independently of
+    /// whether a GPU engine has been initialized.
+    pub(crate) edit_plans: tokio::sync::Mutex<super::video_edits::EditPlanRegistry>,
 }
 
 impl VideoEngineHandle {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// None means not requested; Some(false) records a failed adapter request.
+    pub fn initialization_state(&self) -> Option<bool> {
+        self.cell.get().map(Option::is_some)
     }
 
     /// The bridge, creating engine + session on first use. `None` = no GPU
@@ -72,16 +79,25 @@ impl VideoEngineHandle {
 /// One `EngineSession` + the shadow document pair it snapshots from, plus
 /// the session-scoped state the MCP layer owns (proxy mode, transport lock).
 pub struct EngineBridge {
+    next_inspection_id: std::sync::atomic::AtomicU64,
+    pub(crate) readback: Arc<StdMutex<super::video_readback::FrameReadback>>,
     engine: VideoEngine,
     session: EngineSession,
-    shadow_doc: Arc<StdMutex<Document>>,
-    shadow_history: Arc<StdMutex<CommandHistory>>,
+    sync_state: StdMutex<BridgeSnapshot>,
     /// Serializes seek-then-wait transactions (`render_frame_at`, transport
     /// tools) so two concurrent calls can't interleave their target ticks.
     transport: tokio::sync::Mutex<()>,
     /// Last mode set via `set_proxy_mode` — `EngineStatus` doesn't echo it,
     /// so `render_frame_at` restores from here after a per-call override.
     proxy_mode: StdMutex<ProxyMode>,
+}
+
+#[derive(Default)]
+struct BridgeSnapshot {
+    cache_path: Option<std::path::PathBuf>,
+    base: Option<RenderSnapshot>,
+    format_override: Option<(photonic_core::timeline::SequenceId, usize)>,
+    generation: u64,
 }
 
 impl EngineBridge {
@@ -95,10 +111,13 @@ impl EngineBridge {
         let shadow_history = Arc::new(StdMutex::new(CommandHistory::new(1)));
         let session = engine.open_session(Arc::clone(&shadow_doc), Arc::clone(&shadow_history));
         Some(EngineBridge {
+            next_inspection_id: std::sync::atomic::AtomicU64::new(1),
+            readback: Arc::new(StdMutex::new(
+                super::video_readback::FrameReadback::default(),
+            )),
             engine,
             session,
-            shadow_doc,
-            shadow_history,
+            sync_state: StdMutex::new(BridgeSnapshot::default()),
             transport: tokio::sync::Mutex::new(()),
             proxy_mode: StdMutex::new(ProxyMode::default()),
         })
@@ -110,6 +129,10 @@ impl EngineBridge {
 
     pub fn session(&self) -> &EngineSession {
         &self.session
+    }
+
+    pub fn next_inspection_id(&self) -> u64 {
+        self.next_inspection_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Serialize a seek-then-wait transaction (held across the whole tool
@@ -127,47 +150,83 @@ impl EngineBridge {
         self.session.send(EngineCmd::SetProxyMode(mode));
     }
 
-    /// Copy the real document's timeline into the shadow document the engine
-    /// snapshots from (module docs). No-op when nothing changed, so repeated
-    /// readonly calls don't force the engine to re-snapshot/re-present.
+    /// Reuse the immutable revisioned snapshot when the document is unchanged.
+    /// Callers serialize transport so a concurrent status read cannot replace a
+    /// render's temporary format view halfway through its frame request.
     pub async fn sync(&self, state: &AppState) {
-        let timeline = state.document.lock().await.timeline.clone();
-        self.sync_timeline(timeline);
+        self.sync_with_format(state, None).await;
     }
 
-    /// Non-async form for callers that already hold/cloned the timeline.
-    pub fn sync_timeline(&self, timeline: Option<TimelineProject>) {
-        let mut doc = self.shadow_doc.lock().expect("shadow doc poisoned");
-        if doc.timeline == timeline {
+    pub async fn sync_with_format(
+        &self,
+        state: &AppState,
+        format_override: Option<(photonic_core::timeline::SequenceId, usize)>,
+    ) {
+        let document = state.document.lock().await;
+        let history = state.history.lock().await;
+        let revision = history.revision();
+        let mut current = self.sync_state.lock().expect("snapshot state poisoned");
+        let document_path = state
+            .document_path
+            .lock()
+            .expect("document path poisoned")
+            .clone();
+        let cache_path = photonic_video::media::proxy_cache_dir(document_path.as_deref());
+        if current.cache_path.as_ref() != Some(&cache_path)
+            && self.session.send(EngineCmd::SetPreviewCacheDir {
+                path: cache_path.clone(),
+            })
+        {
+            current.cache_path = Some(cache_path);
+        }
+        let unchanged = current
+            .base
+            .as_ref()
+            .is_some_and(|base| base.revision == revision);
+        if unchanged && current.format_override == format_override {
             return;
         }
-        doc.timeline = timeline;
-        drop(doc);
-        // `reset()` is the revision-bump primitive: the shadow history never
-        // carries commands (the real history owns undo), it exists purely so
-        // the engine's `changes_since` poll sees the timeline move.
-        self.shadow_history
-            .lock()
-            .expect("shadow history poisoned")
-            .reset();
+        if !unchanged {
+            current.base = Some(RenderSnapshot::from_document(&document, revision));
+        }
+        let mut view = current.base.as_ref().expect("snapshot initialized").clone();
+        if let (Some((sequence, index)), Some(project)) = (format_override, view.project.as_mut()) {
+            if project
+                .sequences
+                .get(&sequence)
+                .is_some_and(|seq| seq.active_format != index)
+            {
+                if let Some(sequence) = Arc::make_mut(project).sequences.get_mut(&sequence) {
+                    sequence.active_format = index;
+                }
+            }
+        }
+        current.generation = self.session.publish_snapshot(view);
+        current.format_override = format_override;
     }
 
-    /// The shadow revision the engine must reach to have snapshotted the
-    /// latest `sync_timeline` result.
     pub fn shadow_revision(&self) -> u64 {
-        self.shadow_history
+        self.sync_state
             .lock()
-            .expect("shadow history poisoned")
-            .revision()
+            .expect("snapshot state poisoned")
+            .base
+            .as_ref()
+            .map_or(0, |base| base.revision)
     }
 
-    /// Wait until the engine's published `doc_revision` catches up with the
-    /// shadow history (i.e. all future presents use the synced timeline).
+    pub fn snapshot_generation(&self) -> u64 {
+        self.sync_state
+            .lock()
+            .expect("snapshot state poisoned")
+            .generation
+    }
+
+    /// Wait until the engine consumes this bridge's publication generation.
     pub async fn wait_engine_synced(&self, timeout: Duration) -> bool {
-        let want = self.shadow_revision();
+        let want = self.snapshot_generation();
         let deadline = Instant::now() + timeout;
         loop {
-            if self.session.status().doc_revision >= want {
+            if self.session.status().snapshot_generation >= want {
                 return true;
             }
             if Instant::now() >= deadline {
@@ -259,6 +318,12 @@ pub struct JobHandle {
     pub finished: Option<Instant>,
 }
 
+pub const MAX_ACTIVE_JOBS: usize = 4;
+const MAX_RETAINED_JOBS: usize = 256;
+#[derive(Debug, thiserror::Error)]
+#[error("All {MAX_ACTIVE_JOBS} video job slots are occupied; poll or cancel an existing job before retrying")]
+pub struct JobAdmissionError;
+
 #[derive(Default)]
 pub struct JobRegistry {
     jobs: HashMap<JobId, JobHandle>,
@@ -271,7 +336,31 @@ impl JobRegistry {
 
     /// Insert a queued job; returns its id and the shared cancel flag the
     /// worker should poll.
-    pub fn start(&mut self, kind: impl Into<String>) -> (JobId, Arc<AtomicBool>) {
+    pub fn start(
+        &mut self,
+        kind: impl Into<String>,
+    ) -> Result<(JobId, Arc<AtomicBool>), JobAdmissionError> {
+        self.gc(JOB_RETENTION);
+        if self
+            .jobs
+            .values()
+            .filter(|job| !job.status.is_terminal())
+            .count()
+            >= MAX_ACTIVE_JOBS
+        {
+            return Err(JobAdmissionError);
+        }
+        if self.jobs.len() >= MAX_RETAINED_JOBS {
+            if let Some(oldest) = self
+                .jobs
+                .iter()
+                .filter(|(_, job)| job.status.is_terminal())
+                .min_by_key(|(_, job)| job.finished)
+                .map(|(id, _)| *id)
+            {
+                self.jobs.remove(&oldest);
+            }
+        }
         let id = Uuid::new_v4();
         let cancel = Arc::new(AtomicBool::new(false));
         self.jobs.insert(
@@ -284,7 +373,7 @@ impl JobRegistry {
                 finished: None,
             },
         );
-        (id, cancel)
+        Ok((id, cancel))
     }
 
     /// Update a job's status; stamps `finished` on the terminal transition.
@@ -343,9 +432,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn job_admission_is_bounded_and_terminal_jobs_release_capacity() {
+        let mut registry = JobRegistry::new();
+        let ids: Vec<_> = (0..MAX_ACTIVE_JOBS)
+            .map(|_| registry.start("fake").unwrap().0)
+            .collect();
+        assert!(registry.start("excess").is_err());
+        registry.set_status(ids[0], JobStatus::Done { result: json!({}) });
+        assert!(registry.start("next").is_ok());
+    }
+
+    #[tokio::test]
+    async fn unchanged_document_reuses_snapshot_generation() {
+        let state = AppState::headless_for_test();
+        let Some(bridge) = state.video_engine.bridge() else {
+            return;
+        };
+        bridge.sync(&state).await;
+        let first = bridge.snapshot_generation();
+        bridge.sync(&state).await;
+        assert_eq!(first, bridge.snapshot_generation());
+        state.history.lock().await.reset();
+        bridge.sync(&state).await;
+        assert!(bridge.snapshot_generation() > first);
+        assert_eq!(
+            bridge.shadow_revision(),
+            state.history.lock().await.revision()
+        );
+    }
+
+    #[test]
     fn job_registry_lifecycle_and_gc() {
         let mut reg = JobRegistry::new();
-        let (id, cancel) = reg.start("fake");
+        let (id, cancel) = reg.start("fake").unwrap();
         assert!(matches!(reg.get(id).unwrap().status, JobStatus::Queued));
 
         reg.set_status(
@@ -372,7 +491,7 @@ mod tests {
         assert_eq!(reg.request_cancel(id), None, "evicted ⇒ JobNotFound");
 
         // Live jobs are never GC'd regardless of age.
-        let (live, _) = reg.start("fake");
+        let (live, _) = reg.start("fake").unwrap();
         reg.gc(Duration::from_secs(0));
         assert!(reg.get(live).is_some(), "non-terminal job must survive GC");
     }

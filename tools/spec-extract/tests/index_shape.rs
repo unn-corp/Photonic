@@ -109,6 +109,16 @@ fn indexes_const_enum_and_fields_in_order() {
     assert_eq!(
         variant_names,
         vec![
+            // Cached timeline-preview controls are declared first so the
+            // engine command surface keeps the workflow family together.
+            "SetPreviewCacheDir",
+            "SetPreviewProfile",
+            "RenderPreview",
+            "CancelPreview",
+            "ClearPreview",
+            "InspectFrame",
+            "AuditionSource",
+            "StopSourceAudition",
             "Play",
             "Pause",
             "Seek",

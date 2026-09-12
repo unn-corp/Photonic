@@ -184,6 +184,24 @@ pub enum EncodePlanes {
 }
 
 impl EncodePlanes {
+    /// Stream planes in FFmpeg wire order without allocating a combined copy.
+    pub fn write_to(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
+        match self {
+            Self::Yuv420 { y, cb, cr, .. } => {
+                writer.write_all(y)?;
+                writer.write_all(cb)?;
+                writer.write_all(cr)
+            }
+            Self::Yuva420 { y, cb, cr, a, .. } | Self::Yuva444 { y, cb, cr, a, .. } => {
+                writer.write_all(y)?;
+                writer.write_all(cb)?;
+                writer.write_all(cr)?;
+                writer.write_all(a)
+            }
+            Self::Rgba8 { rgba, .. } => writer.write_all(rgba),
+        }
+    }
+
     pub fn dims(&self) -> (u32, u32) {
         match *self {
             EncodePlanes::Yuv420 { width, height, .. }
@@ -636,5 +654,21 @@ mod tests {
             .ffmpeg_pix_fmt(),
             "rgba"
         );
+    }
+
+    #[test]
+    fn streamed_planes_match_packed_wire_bytes() {
+        let rgba = [0.1, 0.2, 0.3, 0.5].repeat(15);
+        let cases = [
+            working_frame_to_rgba8(&rgba, 5, 3),
+            working_frame_to_yuv_planes(&rgba, 5, 3, Colorimetry::BT709_LIMITED, false, false),
+            working_frame_to_yuv_planes(&rgba, 5, 3, Colorimetry::BT709_LIMITED, true, false),
+            working_frame_to_yuv_planes(&rgba, 5, 3, Colorimetry::BT709_LIMITED, true, true),
+        ];
+        for planes in cases {
+            let mut bytes = Vec::new();
+            planes.write_to(&mut bytes).unwrap();
+            assert_eq!(bytes, planes.to_bytes());
+        }
     }
 }

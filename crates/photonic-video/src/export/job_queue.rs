@@ -115,6 +115,11 @@ impl RenderQueue {
         };
         {
             let mut g = self.inner.lock().expect("render queue lock");
+            if g.stop {
+                return Err(ExportError::Resolve(
+                    "render queue has been shut down".into(),
+                ));
+            }
             g.pending.push_back(entry);
         }
         self.wake.1.notify_one();
@@ -150,6 +155,9 @@ impl RenderQueue {
         let mut g = self.inner.lock().expect("render queue lock");
         // Running jobs live in `finished` with Running status — poison cancel.
         if let Some(j) = g.finished.iter_mut().find(|j| j.id == id) {
+            if !matches!(j.status, QueueJobStatus::Running { .. }) {
+                return false;
+            }
             j.cancel.store(true, Ordering::Relaxed);
             return true;
         }
@@ -183,8 +191,15 @@ impl RenderQueue {
         {
             let mut g = self.inner.lock().expect("render queue lock");
             g.stop = true;
-            for j in &g.pending {
+            for j in &g.finished {
+                if matches!(j.status, QueueJobStatus::Running { .. }) {
+                    j.cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            while let Some(mut j) = g.pending.pop_front() {
                 j.cancel.store(true, Ordering::Relaxed);
+                j.status = QueueJobStatus::Cancelled;
+                g.finished.push(j);
             }
         }
         self.wake.1.notify_one();
@@ -220,6 +235,15 @@ fn worker_main(
                     return;
                 }
                 if let Some(j) = g.pending.pop_front() {
+                    // Publish running under the same lock as removal, so
+                    // shutdown/cancel cannot miss a job between queues.
+                    let mut running = j.clone();
+                    running.status = QueueJobStatus::Running {
+                        frame: 0,
+                        total: 0,
+                        fps: 0.0,
+                    };
+                    g.finished.push(running);
                     break j;
                 }
                 // Release and wait.
@@ -233,9 +257,9 @@ fn worker_main(
 
         if job.cancel.load(Ordering::Relaxed) || matches!(job.status, QueueJobStatus::Cancelled) {
             let mut g = inner.lock().expect("render queue lock");
-            let mut done = job;
-            done.status = QueueJobStatus::Cancelled;
-            g.finished.push(done);
+            if let Some(done) = g.finished.iter_mut().find(|entry| entry.id == job.id) {
+                done.status = QueueJobStatus::Cancelled;
+            }
             continue;
         }
 
@@ -244,20 +268,6 @@ fn worker_main(
         let out_path = job.job.output.clone();
         let project = Arc::clone(&job.project);
         let export_job = job.job.clone();
-
-        // Mark running.
-        {
-            let mut g = inner.lock().expect("render queue lock");
-            // Stash a running placeholder in finished so status() can find it
-            // while the job is in flight (not in pending).
-            let mut running = job.clone();
-            running.status = QueueJobStatus::Running {
-                frame: 0,
-                total: 0,
-                fps: 0.0,
-            };
-            g.finished.push(running);
-        }
 
         let progress_id = id;
         let progress_inner = Arc::clone(&inner);
@@ -402,5 +412,44 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(q.list().len(), 2);
         q.shutdown();
+    }
+
+    #[test]
+    fn shutdown_cancels_running_and_pending_jobs_and_refuses_new_work() {
+        let queue = RenderQueue::new();
+        let project = tiny_project();
+        let sequence = *project.sequences.keys().next().unwrap();
+        let job = ExportJob {
+            sequence,
+            format_index: 0,
+            preset: video_only_preset(),
+            output: PathBuf::from("shutdown.mp4"),
+            range: None,
+            options: Default::default(),
+        };
+        let running = queue
+            .enqueue("running", project.clone(), job.clone())
+            .unwrap();
+        let pending = queue
+            .enqueue("pending", project.clone(), job.clone())
+            .unwrap();
+        let running_cancel = {
+            let mut inner = queue.inner.lock().unwrap();
+            let mut entry = inner.pending.pop_front().unwrap();
+            entry.status = QueueJobStatus::Running {
+                frame: 0,
+                total: 30,
+                fps: 0.0,
+            };
+            let cancel = Arc::clone(&entry.cancel);
+            inner.finished.push(entry);
+            cancel
+        };
+        queue.shutdown();
+        assert!(running_cancel.load(Ordering::Relaxed));
+        assert_eq!(queue.status(pending), Some(QueueJobStatus::Cancelled));
+        assert!(!queue.cancel(pending));
+        assert!(queue.status(running).is_some());
+        assert!(queue.enqueue("late", project, job).is_err());
     }
 }

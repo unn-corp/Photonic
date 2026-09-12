@@ -9,16 +9,16 @@
 //!
 //! Platform strategy (24-preview-media-load / Windows export path):
 //! - **Unix:** audio via a **named FIFO** (`mkfifo` / `libc::mkfifo`). A
-//!   background thread opens the FIFO for writing (blocks until ffmpeg opens
-//!   its reader) and writes the whole pre-mixed PCM buffer, then the FIFO is
-//!   closed and unlinked.
+//!   background thread opens and writes with nonblocking I/O, checking its
+//!   stop flag while FFmpeg has not opened the reader or the pipe is full.
+//!   The thread is joined before the FIFO is unlinked.
 //! - **Windows (and any non-unix):** audio is written to a **temp f32le file**
 //!   *before* ffmpeg is spawned, then passed as a second `-i` path. The temp
 //!   file is deleted on `finish`/`cancel`/drop. Same ffmpeg arg shape; no
 //!   concurrent open race.
 //!
-//! Audio is mixed offline in full before export starts (09's mixer), so there
-//! is no streaming/chunked write API — one buffer, one write, EOF.
+//! Audio is mixed offline in full before export starts (09's mixer). Writers
+//! pack it in fixed-size chunks, avoiding a second whole-track byte buffer.
 //!
 //! ## Encoder selection (D-03, §3.4, §3.7)
 //!
@@ -63,9 +63,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use photonic_core::timeline::FrameRate;
 
@@ -87,6 +88,12 @@ pub enum EncodeError {
     InvalidFifoPath,
     #[error("audio writer thread panicked")]
     AudioWriterPanicked,
+    #[error("encoder stderr reader thread panicked")]
+    StderrReaderPanicked,
+    #[error("export cancelled")]
+    Cancelled,
+    #[error("two-pass encoding is not supported by the streaming export path; disable two_pass")]
+    TwoPassUnsupported,
     #[error("encoder exited with status {status:?}; stderr tail:\n{stderr}")]
     EncoderExited { status: Option<i32>, stderr: String },
     /// K-F5 fail-closed: hardware preferred but no matching encoder was probed.
@@ -295,8 +302,17 @@ pub struct EncodeSpec<'a> {
     pub raw_encoder_args: &'a [String],
     /// K-F polish: burn-in drawtext filter.
     pub burn_in_timecode: bool,
-    /// K-F polish: two-pass encode hint (x264/x265).
+    /// Two-pass requests are rejected before staging inputs or spawning FFmpeg.
     pub two_pass: bool,
+}
+
+/// Validate options that cannot be fulfilled by the streaming encoder. Call
+/// before capability probing, audio mixing, rendering, or file creation.
+pub fn validate_encode_options(two_pass: bool) -> Result<(), EncodeError> {
+    if two_pass {
+        return Err(EncodeError::TwoPassUnsupported);
+    }
+    Ok(())
 }
 
 /// Best-effort CRF→bitrate translation for encoders without true CRF-mode
@@ -560,6 +576,7 @@ pub fn build_ffmpeg_args(
     video_pix_fmt: &str,
     audio_fifo: Option<&Path>,
 ) -> Result<Vec<String>, EncodeError> {
+    validate_encode_options(spec.two_pass)?;
     let mut args = vec![
         "-hide_banner".to_string(),
         "-nostdin".to_string(),
@@ -679,18 +696,6 @@ pub fn build_ffmpeg_args(
         }
     }
 
-    // Two-pass hint (K-F polish): x264/x265 multipass is multi-invocation and
-    // lives outside this single-pass pipe path. Surface the intent as a preset
-    // note via raw args when the caller did not already set one — encodes still
-    // complete single-pass; full 2-pass redesign is K-F residual beyond this.
-    if spec.two_pass {
-        tracing::info!(
-            target: "photonic_video::export",
-            "two_pass requested: single-pass pipe path records the intent; \
-             multipass redesign is a separate residual"
-        );
-    }
-
     if spec.preset.faststart {
         args.extend(["-movflags".into(), "+faststart".into()]);
     }
@@ -734,18 +739,26 @@ fn create_fifo(path: &Path) -> Result<(), EncodeError> {
 /// Write interleaved f32le PCM to `path` (Windows / non-unix second input).
 #[cfg_attr(unix, allow(dead_code))]
 fn write_pcm_file(path: &Path, samples: &[f32]) -> Result<(), EncodeError> {
-    let mut bytes = Vec::with_capacity(samples.len() * 4);
-    for s in samples {
-        bytes.extend_from_slice(&s.to_le_bytes());
+    let mut file = std::fs::File::create(path).map_err(EncodeError::Io)?;
+    let mut bytes = Vec::with_capacity(16_384);
+    for chunk in samples.chunks(4096) {
+        bytes.clear();
+        for sample in chunk {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        file.write_all(&bytes).map_err(EncodeError::Io)?;
     }
-    std::fs::write(path, bytes).map_err(EncodeError::Io)
+    Ok(())
 }
 
 /// Stage PCM for a second ffmpeg `-i` without requiring a platform FIFO.
 /// Public for headless tests of the Windows/non-unix path on any OS.
 pub fn stage_audio_tempfile(samples: &[f32]) -> Result<PathBuf, EncodeError> {
     let p = unique_audio_sidecar_path("f32le");
-    write_pcm_file(&p, samples)?;
+    if let Err(error) = write_pcm_file(&p, samples) {
+        let _ = std::fs::remove_file(&p);
+        return Err(error);
+    }
     Ok(p)
 }
 
@@ -759,21 +772,162 @@ impl AudioSidecar {
     fn path(&self) -> &Path {
         &self.path
     }
+}
 
-    fn cleanup(self) {
-        let _ = std::fs::remove_file(self.path);
+impl Drop for AudioSidecar {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Stage beside the destination so successful files publish by rename on the
+/// same filesystem. An image sequence publishes each completed image atomically;
+/// its existing filename-pattern API cannot promise an atomic directory swap.
+struct StagedOutput {
+    directory: PathBuf,
+    path: PathBuf,
+    destination: PathBuf,
+    image_sequence: bool,
+}
+
+impl StagedOutput {
+    fn new(destination: &Path, container: Container) -> Result<Self, EncodeError> {
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = destination.file_name().ok_or_else(|| {
+            EncodeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output must name a file",
+            ))
+        })?;
+        std::fs::create_dir_all(parent).map_err(EncodeError::Io)?;
+        let directory = parent.join(format!(".photonic-export-{}.tmp", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).map_err(EncodeError::Io)?;
+        Ok(Self {
+            path: directory.join(name),
+            directory,
+            destination: destination.to_path_buf(),
+            image_sequence: container == Container::ImageSequence,
+        })
+    }
+
+    fn publish(&self, cancel: &AtomicBool, interrupted: &AtomicBool) -> Result<(), EncodeError> {
+        let check_cancel = || {
+            if cancel.load(Ordering::Relaxed) || interrupted.load(Ordering::Relaxed) {
+                Err(EncodeError::Cancelled)
+            } else {
+                Ok(())
+            }
+        };
+        if self.image_sequence {
+            let parent = self.destination.parent().unwrap_or(Path::new("."));
+            let mut files: Vec<_> = std::fs::read_dir(&self.directory)
+                .map_err(EncodeError::Io)?
+                .collect::<Result<_, _>>()
+                .map_err(EncodeError::Io)?;
+            files.sort_by_key(|entry| entry.file_name());
+            for entry in files {
+                check_cancel()?;
+                std::fs::rename(entry.path(), parent.join(entry.file_name()))
+                    .map_err(EncodeError::Io)?;
+            }
+        } else {
+            check_cancel()?;
+            std::fs::rename(&self.path, &self.destination).map_err(EncodeError::Io)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StagedOutput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.directory);
+    }
+}
+
+const PROCESS_POLL: Duration = Duration::from_millis(10);
+
+/// A separate owner can interrupt a blocked stdin write or encoder flush.
+/// The process owner remains responsible for waiting and joining its workers.
+#[derive(Clone)]
+pub(super) struct EncoderInterrupt {
+    child: Arc<Mutex<Child>>,
+    stop: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl EncoderInterrupt {
+    pub(super) fn interrupt(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .kill();
+    }
+}
+
+/// Nonblocking FIFO open/write is essential: FFmpeg may exit before opening
+/// input 1, or stop reading it while a video write is pending. Both operations
+/// must observe cancellation so every audio writer can be joined.
+#[cfg(unix)]
+fn write_audio_fifo(path: &Path, samples: &[f32], stop: &AtomicBool) -> Result<(), EncodeError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+        {
+            Ok(file) => break file,
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                std::thread::sleep(PROCESS_POLL)
+            }
+            Err(error) => return Err(EncodeError::Io(error)),
+        }
+    };
+    let mut bytes = Vec::with_capacity(16_384);
+    for chunk in samples.chunks(4096) {
+        bytes.clear();
+        for sample in chunk {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        let mut remaining = bytes.as_slice();
+        while !remaining.is_empty() {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            match file.write(remaining) {
+                Ok(0) => return Err(EncodeError::Io(std::io::ErrorKind::WriteZero.into())),
+                Ok(n) => remaining = &remaining[n..],
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(PROCESS_POLL)
+                }
+                Err(error) => return Err(EncodeError::Io(error)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A running ffmpeg encode process: video frames go to stdin; if the preset
 /// has an audio track, a second input carries pre-mixed f32le PCM (FIFO on
 /// unix, temp file elsewhere — see module docs).
 pub struct EncoderProcess {
-    child: Child,
+    control: EncoderInterrupt,
     video_stdin: Option<ChildStdin>,
     audio_writer: Option<JoinHandle<Result<(), EncodeError>>>,
     audio_sidecar: Option<AudioSidecar>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    stderr_reader: Option<JoinHandle<()>>,
+    output: StagedOutput,
 }
 
 impl EncoderProcess {
@@ -786,60 +940,32 @@ impl EncoderProcess {
         spec: &EncodeSpec,
         audio_samples: Option<Vec<f32>>,
     ) -> Result<Self, EncodeError> {
+        validate_encode_options(spec.two_pass)?;
         let plane_kind = plane_kind_for(
             spec.preset.video.as_ref().map(|v| v.codec),
             spec.preset.alpha,
         );
-        let video_pix_fmt = plane_kind.ffmpeg_pix_fmt();
-
         let wants_audio =
             spec.preset.audio.is_some() && spec.audio.is_some() && audio_samples.is_some();
-
-        let (audio_sidecar, audio_writer) = if wants_audio {
-            let samples = audio_samples.expect("checked wants_audio");
+        let audio_path = wants_audio
+            .then(|| unique_audio_sidecar_path(if cfg!(unix) { "fifo" } else { "f32le" }));
+        // Resolve fallible options before creating a sidecar or worker.
+        let mut args = build_ffmpeg_args(
+            caps,
+            spec,
+            plane_kind.ffmpeg_pix_fmt(),
+            audio_path.as_deref(),
+        )?;
+        let output = StagedOutput::new(&spec.out_path, spec.preset.container)?;
+        if let Some(destination) = args.last_mut() {
+            *destination = output.path.to_string_lossy().into_owned();
+        }
+        let audio_sidecar = audio_path.map(|path| AudioSidecar { path });
+        if let Some(sidecar) = &audio_sidecar {
             #[cfg(unix)]
-            {
-                let p = unique_audio_sidecar_path("fifo");
-                create_fifo(&p)?;
-                let path_for_writer = p.clone();
-                let writer = std::thread::spawn(move || -> Result<(), EncodeError> {
-                    let mut f = std::fs::OpenOptions::new()
-                        .write(true)
-                        .open(&path_for_writer)
-                        .map_err(EncodeError::Io)?;
-                    let mut bytes = Vec::with_capacity(samples.len() * 4);
-                    for s in &samples {
-                        bytes.extend_from_slice(&s.to_le_bytes());
-                    }
-                    f.write_all(&bytes).map_err(EncodeError::Io)?;
-                    Ok(())
-                });
-                (Some(AudioSidecar { path: p }), Some(writer))
-            }
+            create_fifo(sidecar.path())?;
             #[cfg(not(unix))]
-            {
-                // Pre-write so ffmpeg can open a regular file as second -i.
-                let p = unique_audio_sidecar_path("f32le");
-                write_pcm_file(&p, &samples)?;
-                (Some(AudioSidecar { path: p }), None)
-            }
-        } else {
-            (None, None)
-        };
-
-        let audio_path = audio_sidecar.as_ref().map(|s| s.path().to_path_buf());
-        let args = match build_ffmpeg_args(caps, spec, video_pix_fmt, audio_path.as_deref()) {
-            Ok(a) => a,
-            Err(e) => {
-                if let Some(s) = audio_sidecar {
-                    s.cleanup();
-                }
-                return Err(e);
-            }
-        };
-
-        if let Some(parent) = spec.out_path.parent() {
-            std::fs::create_dir_all(parent).map_err(EncodeError::Io)?;
+            write_pcm_file(sidecar.path(), audio_samples.as_deref().unwrap_or_default())?;
         }
 
         let mut command = Command::new(&tools.ffmpeg);
@@ -848,100 +974,116 @@ impl EncoderProcess {
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        // 37 §2.2: SIGKILL this encoder if the editor process dies (Linux), so a
-        // hard kill can never leave ffmpeg finalizing a file behind our back.
         crate::media::child_registry::arm_parent_death_signal(&mut command);
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                if let Some(s) = audio_sidecar {
-                    s.cleanup();
-                }
-                return Err(EncodeError::Spawn(e));
-            }
-        };
-
-        // We requested `Stdio::piped()`, so stdin should be present — but if
-        // ffmpeg was killed / exited between spawn and here, `take` yields None.
-        // Return a typed error instead of panicking, and clean up.
-        let video_stdin = match child.stdin.take() {
-            Some(s) => s,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(s) = audio_sidecar {
-                    s.cleanup();
-                }
-                return Err(EncodeError::Io(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "ffmpeg stdin pipe unavailable (process exited during spawn)",
-                )));
-            }
-        };
-
-        let stderr_tail = Arc::new(Mutex::new(Vec::<String>::new()));
-        if let Some(stderr) = child.stderr.take() {
-            use std::io::{BufRead, BufReader};
-            let tail = Arc::clone(&stderr_tail);
-            std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    // Poison-tolerant: a panic elsewhere holding this lock must
-                    // not wedge stderr draining (a full pipe would deadlock
-                    // ffmpeg). The tail is advisory diagnostics, not invariants.
-                    let mut t = tail.lock().unwrap_or_else(PoisonError::into_inner);
-                    if t.len() == STDERR_TAIL {
-                        t.remove(0);
-                    }
-                    t.push(line);
-                }
-            });
-        }
-
-        Ok(EncoderProcess {
-            child,
-            video_stdin: Some(video_stdin),
-            audio_writer,
+        let mut child = command.spawn().map_err(EncodeError::Spawn)?;
+        let video_stdin = child.stdin.take();
+        let stderr = child.stderr.take();
+        let mut process = Self {
+            control: EncoderInterrupt {
+                child: Arc::new(Mutex::new(child)),
+                stop: Arc::new(AtomicBool::new(false)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+            video_stdin,
+            audio_writer: None,
             audio_sidecar,
-            stderr_tail,
-        })
+            stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            stderr_reader: None,
+            output,
+        };
+        if process.video_stdin.is_none() {
+            return Err(EncodeError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "ffmpeg stdin pipe unavailable",
+            )));
+        }
+        if let Some(stderr) = stderr {
+            use std::io::{BufRead, BufReader};
+            let tail = Arc::clone(&process.stderr_tail);
+            process.stderr_reader = Some(
+                std::thread::Builder::new()
+                    .name("photonic-encode-stderr".into())
+                    .spawn(move || {
+                        let reader = BufReader::new(stderr);
+                        for line in reader.lines().map_while(Result::ok) {
+                            let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+                            if tail.len() == STDERR_TAIL {
+                                tail.remove(0);
+                            }
+                            tail.push(line);
+                        }
+                    })
+                    .map_err(EncodeError::Spawn)?,
+            );
+        }
+        #[cfg(unix)]
+        if let Some(sidecar) = &process.audio_sidecar {
+            let path = sidecar.path.clone();
+            let samples = audio_samples.unwrap_or_default();
+            let stop = Arc::clone(&process.control.stop);
+            process.audio_writer = Some(
+                std::thread::Builder::new()
+                    .name("photonic-encode-audio".into())
+                    .spawn(move || write_audio_fifo(&path, &samples, &stop))
+                    .map_err(EncodeError::Spawn)?,
+            );
+        }
+        Ok(process)
     }
 
-    /// Write one frame's worth of already-converted plane bytes to the
-    /// encoder's rawvideo stdin.
+    pub(super) fn interrupt_handle(&self) -> EncoderInterrupt {
+        self.control.clone()
+    }
+
+    /// Write planes directly in rawvideo wire order. No concatenation buffer
+    /// is allocated for each frame; cancellation interrupts a blocked pipe by
+    /// killing the child through the independent control handle.
     pub fn write_video_frame(&mut self, planes: &EncodePlanes) -> Result<(), EncodeError> {
-        let bytes = planes.to_bytes();
-        // `video_stdin` is `Some` for the whole life of a live `EncoderProcess`
-        // (only `finish`/`cancel`, which consume `self`, take it). Guard against
-        // a None anyway so a misuse surfaces as a typed error, not a panic.
+        if self.control.stop.load(Ordering::Relaxed) {
+            return Err(EncodeError::Cancelled);
+        }
         let stdin = self.video_stdin.as_mut().ok_or_else(|| {
             EncodeError::Io(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
-                "video stdin already closed (finish/cancel called)",
+                "video stdin already closed",
             ))
         })?;
-        stdin.write_all(&bytes).map_err(EncodeError::Io)
+        planes.write_to(stdin).map_err(EncodeError::Io)
     }
 
-    /// Close stdin (signals video EOF), wait for the audio writer and the
-    /// process, and surface a non-zero exit as an error with the stderr tail.
-    pub fn finish(mut self) -> Result<(), EncodeError> {
+    /// Close inputs, wait for FFmpeg, join both I/O workers, then publish the
+    /// completed output. The child mutex is never held across the wait: another
+    /// thread can still interrupt a stalled codec flush.
+    pub fn finish(self) -> Result<(), EncodeError> {
+        self.finish_with_cancel(&AtomicBool::new(false))
+    }
+
+    pub(super) fn finish_with_cancel(mut self, cancel: &AtomicBool) -> Result<(), EncodeError> {
         drop(self.video_stdin.take());
-        if let Some(h) = self.audio_writer.take() {
-            match h.join() {
-                Ok(inner) => inner?,
-                Err(_) => return Err(EncodeError::AudioWriterPanicked),
+        let status = loop {
+            if cancel.load(Ordering::Relaxed) {
+                self.control.interrupt();
             }
-        }
-        let status = self.child.wait().map_err(EncodeError::Io)?;
-        if let Some(sidecar) = self.audio_sidecar.take() {
-            sidecar.cleanup();
+            let status = self
+                .control
+                .child
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .try_wait()
+                .map_err(EncodeError::Io)?;
+            if let Some(status) = status {
+                break status;
+            }
+            std::thread::sleep(PROCESS_POLL);
+        };
+        self.control.stop.store(true, Ordering::Relaxed);
+        let workers = self.join_workers();
+        if self.control.cancelled.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            return Err(EncodeError::Cancelled);
         }
         if !status.success() {
             return Err(EncodeError::EncoderExited {
                 status: status.code(),
-                // Poison-tolerant: recover the tail even if the drain thread
-                // panicked, so the exit error still carries diagnostics.
                 stderr: self
                     .stderr_tail
                     .lock()
@@ -949,30 +1091,51 @@ impl EncoderProcess {
                     .join("\n"),
             });
         }
-        Ok(())
+        workers?;
+        if self.control.cancelled.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed) {
+            return Err(EncodeError::Cancelled);
+        }
+        self.output.publish(cancel, &self.control.cancelled)
     }
 
-    /// Cancel mid-export (02 §7: "cancellable between frames"): kill the
-    /// process immediately, no attempt to produce a valid output file.
-    pub fn cancel(mut self) {
-        drop(self.video_stdin.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(sidecar) = self.audio_sidecar.take() {
-            sidecar.cleanup();
-        }
+    fn join_workers(&mut self) -> Result<(), EncodeError> {
+        let audio = self
+            .audio_writer
+            .take()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| EncodeError::AudioWriterPanicked)
+                    .and_then(|result| result)
+            })
+            .unwrap_or(Ok(()));
+        let stderr = self
+            .stderr_reader
+            .take()
+            .map(|handle| handle.join().map_err(|_| EncodeError::StderrReaderPanicked))
+            .unwrap_or(Ok(()));
+        // Join both before propagating either error.
+        audio.and(stderr)
+    }
+
+    /// Kill and reap the child, join I/O workers, and remove staged files.
+    pub fn cancel(self) {
+        drop(self);
     }
 }
 
 impl Drop for EncoderProcess {
     fn drop(&mut self) {
-        // Best-effort cleanup if neither `finish` nor `cancel` ran (e.g. a
-        // panic unwind) — kill-on-drop, mirroring decode/sidecar.rs.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(sidecar) = self.audio_sidecar.take() {
-            sidecar.cleanup();
-        }
+        self.control.interrupt();
+        drop(self.video_stdin.take());
+        let _ = self
+            .control
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .wait();
+        let _ = self.join_workers();
+        // Sidecar/output guards clean up after every worker has stopped.
     }
 }
 
@@ -1285,5 +1448,167 @@ mod tests {
         let caps = caps_with(&["png"]);
         let args = build_ffmpeg_args(&caps, &s, "rgba", None).unwrap();
         assert!(!args.iter().any(|a| a.contains("bt709")));
+    }
+
+    #[test]
+    fn two_pass_is_rejected_by_argument_builder() {
+        let preset = base_preset();
+        let mut spec = spec(&preset);
+        spec.two_pass = true;
+        assert!(matches!(
+            build_ffmpeg_args(&caps_with(&["libx264"]), &spec, "yuv420p", None),
+            Err(EncodeError::TwoPassUnsupported)
+        ));
+    }
+
+    #[cfg(unix)]
+    fn stalled_encoder(directory: &Path) -> FfmpegTools {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = directory.join("stalled-encoder.sh");
+        // exec keeps the sleeping process under the exact Child PID. It opens
+        // neither video nor audio, exercising both blocked input paths.
+        std::fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        FfmpegTools {
+            ffmpeg: executable,
+            ffprobe: PathBuf::from("ffprobe"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interrupt_unblocks_video_write_and_reaps_child_and_audio_writer() {
+        let directory =
+            std::env::temp_dir().join(format!("photonic-encoder-cancel-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let tools = stalled_encoder(&directory);
+        let preset = base_preset();
+        let mut spec = spec(&preset);
+        spec.out_path = directory.join("old.mp4");
+        std::fs::write(&spec.out_path, b"previous output").unwrap();
+        let mut process = EncoderProcess::spawn(
+            &tools,
+            &caps_with(&["libx264", "aac"]),
+            &spec,
+            Some(vec![0.0; 48_000]),
+        )
+        .unwrap();
+        let control = process.interrupt_handle();
+        let pid = control.child.lock().unwrap().id();
+        let sidecar = process.audio_sidecar.as_ref().unwrap().path.clone();
+        let staged = process.output.directory.clone();
+        let planes = EncodePlanes::Rgba8 {
+            width: 1024,
+            height: 1024,
+            rgba: vec![0; 1024 * 1024 * 4],
+        };
+        let start = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let join = scope.spawn(move || {
+                let result = process.write_video_frame(&planes);
+                drop(process);
+                result
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            control.interrupt();
+            assert!(join.join().unwrap().is_err());
+        });
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!sidecar.exists());
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&spec.out_path).unwrap(), b"previous output");
+        // waitpid must report ECHILD: Drop has already waited for this child.
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoder_exit_before_opening_audio_joins_fifo_writer() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("photonic-encoder-exit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("encoder.sh");
+        std::fs::write(&executable, "#!/bin/sh\necho rejected >&2\nexit 9\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = FfmpegTools {
+            ffmpeg: executable,
+            ffprobe: PathBuf::from("ffprobe"),
+        };
+        let preset = base_preset();
+        let mut spec = spec(&preset);
+        spec.out_path = directory.join("out.mp4");
+        let process = EncoderProcess::spawn(
+            &tools,
+            &caps_with(&["libx264"]),
+            &spec,
+            Some(vec![0.0; 48_000]),
+        )
+        .unwrap();
+        let sidecar = process.audio_sidecar.as_ref().unwrap().path.clone();
+        let staged = process.output.directory.clone();
+        let start = std::time::Instant::now();
+        assert!(
+            matches!(process.finish(), Err(EncodeError::EncoderExited { status: Some(9), stderr }) if stderr.contains("rejected"))
+        );
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!sidecar.exists());
+        assert!(!staged.exists());
+        assert!(!spec.out_path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_before_publication_keeps_existing_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("photonic-encoder-publish-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("encoder.sh");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nfor out; do :; done\nprintf complete > \"$out\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = FfmpegTools {
+            ffmpeg: executable,
+            ffprobe: PathBuf::from("ffprobe"),
+        };
+        let mut preset = base_preset();
+        preset.audio = None;
+        let mut spec = spec(&preset);
+        spec.out_path = directory.join("output.mp4");
+        std::fs::write(&spec.out_path, b"previous").unwrap();
+        let process = EncoderProcess::spawn(&tools, &caps_with(&["libx264"]), &spec, None).unwrap();
+        let staged = process.output.directory.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process
+            .control
+            .child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none()
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(PROCESS_POLL);
+        }
+        assert!(matches!(
+            process.finish_with_cancel(&AtomicBool::new(true)),
+            Err(EncodeError::Cancelled)
+        ));
+        assert_eq!(std::fs::read(&spec.out_path).unwrap(), b"previous");
+        assert!(!staged.exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -88,7 +88,14 @@ impl SourceMarksSession {
         if self.armed_asset != Some(asset.id) {
             return None;
         }
-        let (src_in, src_out) = self.resolved_range(default_duration)?;
+        let (mut src_in, mut src_out) = self.resolved_range(default_duration)?;
+        if let Some((start, end)) = source_bounds(asset) {
+            src_in = src_in.max(start);
+            src_out = src_out.min(end);
+        }
+        if src_out <= src_in {
+            return None;
+        }
         let kind = match asset.kind {
             AssetKind::Audio => TrackKind::Audio,
             AssetKind::Video | AssetKind::Image | AssetKind::VectorDoc => TrackKind::Video,
@@ -108,6 +115,39 @@ impl SourceMarksSession {
             name,
             kind,
         })
+    }
+}
+
+/// Available source-clock bounds, including a subclip's restriction.
+pub fn source_bounds(asset: &MediaAsset) -> Option<(Tick, Tick)> {
+    let duration = asset.probe.as_ref()?.duration;
+    let (start, end) = asset.subclip_range.unwrap_or((Tick::ZERO, duration));
+    let bounds = (start.max(Tick::ZERO), end.min(duration));
+    (bounds.1 > bounds.0).then_some(bounds)
+}
+
+impl SourceMarksSession {
+    pub fn audition_range(&self, asset: &MediaAsset) -> Option<(Tick, Tick)> {
+        if self.armed_asset != Some(asset.id) {
+            return None;
+        }
+        let (start, end) = source_bounds(asset)?;
+        let inn = self.mark_in.unwrap_or(self.source_time).clamp(start, end);
+        let out = self.mark_out.unwrap_or(end).clamp(start, end);
+        (out > inn).then_some((inn, out))
+    }
+    pub fn clamp_to_asset(&mut self, asset: &MediaAsset) {
+        if self.armed_asset != Some(asset.id) {
+            return;
+        }
+        if let Some((start, end)) = source_bounds(asset) {
+            if start > end {
+                return;
+            }
+            self.source_time = self.source_time.clamp(start, end);
+            self.mark_in = self.mark_in.map(|t| t.clamp(start, end));
+            self.mark_out = self.mark_out.map(|t| t.clamp(start, end));
+        }
     }
 }
 
@@ -132,6 +172,29 @@ mod tests {
     use super::*;
     use photonic_core::timeline::MediaAsset;
     use std::path::PathBuf;
+
+    #[test]
+    fn source_range_respects_subclip_and_does_not_invent_audio_duration() {
+        let mut asset = MediaAsset::from_file(AssetKind::Audio, "speech.wav");
+        let mut session = SourceMarksSession::default();
+        session.arm(asset.id, Tick::ZERO);
+        assert_eq!(session.audition_range(&asset), None);
+        asset.probe = Some(photonic_core::timeline::MediaProbe::basic(
+            Tick(100),
+            "wav",
+            "pcm",
+        ));
+        asset.subclip_range = Some((Tick(20), Tick(80)));
+        assert_eq!(session.audition_range(&asset), Some((Tick(20), Tick(80))));
+        session.set_in(Tick(10));
+        session.set_out(Tick(90));
+        session.clamp_to_asset(&asset);
+        assert_eq!(
+            session.pending_source(&asset, Tick(100)).unwrap().src_out,
+            Tick(80)
+        );
+        assert_eq!(session.mark_in, Some(Tick(20)));
+    }
 
     #[test]
     fn set_in_out_keeps_order() {

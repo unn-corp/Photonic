@@ -214,6 +214,7 @@ impl PhotonicApp {
             self.draw_empty_affordance(ui, doc, history, frame_rate);
             return;
         }
+        self.sync_sequence_view(doc);
         let seq_id = doc.timeline.as_ref().unwrap().active_sequence.unwrap();
 
         // Timeline-panel keyboard commands (spec 17 G1/G2/G3) — polled here, the
@@ -273,6 +274,17 @@ impl PhotonicApp {
             self.open_sequence_tabs = open_tabs;
             self.nested_sequence_breadcrumbs = breadcrumbs;
         }
+        if doc.timeline.as_ref().and_then(|p| p.active_sequence) != Some(seq_id) {
+            self.timeline_view = view;
+            self.playhead = playhead;
+            self.timeline_selection = selection;
+            self.sync_sequence_view(doc);
+            view = self.timeline_view;
+            playhead = self.playhead;
+            selection = std::mem::take(&mut self.timeline_selection);
+            target_video = None;
+            target_audio = None;
+        }
         // Active sequence may have changed via tab click — re-resolve.
         let seq_id = doc
             .timeline
@@ -280,6 +292,7 @@ impl PhotonicApp {
             .and_then(|p| p.active_sequence)
             .unwrap_or(seq_id);
 
+        let frame_rate = active_frame_rate(doc);
         let toolbar_rect = egui::Rect::from_min_size(
             egui::pos2(full.left(), tabs_rect.bottom()),
             egui::vec2(full.width(), button_strip_height(ui)),
@@ -578,6 +591,28 @@ impl PhotonicApp {
             tracks::draw_add_controls(ui, footer, doc, history, seq_id);
         }
 
+        // Transcript selection is a view overlay, independent of clip selection
+        // and history. The drawer also underlines words from selected clips.
+        if let Some((start, end)) = crate::panels::video::transcript::selected_range(ui.ctx(), doc)
+        {
+            let left = view
+                .tick_to_x(start, lanes_rect.left())
+                .max(lanes_rect.left());
+            let right = view
+                .tick_to_x(end, lanes_rect.left())
+                .min(lanes_rect.right());
+            if right > left {
+                ui.painter_at(lanes_rect).rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(left, lanes_rect.top()),
+                        egui::pos2(right, lanes_rect.bottom()),
+                    ),
+                    0.0,
+                    colors.selected_stroke.linear_multiply(0.12),
+                );
+            }
+        }
+
         // ── Ruler + playhead ────────────────────────────────────────────────
         ruler::draw_ruler(
             ui,
@@ -589,6 +624,14 @@ impl PhotonicApp {
             lane_left,
             &mut playhead,
         );
+
+        if let Some(sequence) = doc.timeline.as_ref().and_then(|p| p.sequences.get(&seq_id)) {
+            let status = self
+                .engine
+                .as_ref()
+                .map(|engine| engine.session().preview_status());
+            ruler::draw_preview_strip(ui, &view, ruler_rect, lane_left, sequence, status.as_ref());
+        }
 
         // ── Clip interaction (select / drag / marquee / context) ────────────
         let content_rect = egui::Rect::from_min_max(ruler_rect.min, lanes_rect.max);
@@ -748,6 +791,23 @@ impl PhotonicApp {
             }
         }
 
+        if let Some(trim) = self.precision_trim.as_ref() {
+            if let Some(cut) = doc
+                .timeline
+                .as_ref()
+                .and_then(|p| p.sequences.get(&trim.target.sequence))
+                .and_then(|s| s.track(trim.target.track))
+                .and_then(|t| t.clips.iter().find(|c| c.id == trim.target.incoming))
+                .map(|c| c.start)
+            {
+                let x = view.tick_to_x(cut, lane_left);
+                ui.painter_at(lanes_rect).vline(
+                    x,
+                    lanes_rect.y_range(),
+                    egui::Stroke::new(3., ui.visuals().selection.stroke.color),
+                );
+            }
+        }
         // Playhead line over everything (drawn last).
         ruler::draw_playhead_line(
             &ui.painter_at(content_rect),
@@ -812,6 +872,21 @@ impl PhotonicApp {
         }
         // Restore the media caches taken at the top of the frame.
         self.timeline_media = media_caches;
+        if let Some((clip, precision, cut)) = ui.data_mut(|data| {
+            data.remove_temp::<(ClipId, bool, Option<Tick>)>(egui::Id::new(
+                "nested_precision_request",
+            ))
+        }) {
+            self.timeline_selection = vec![clip];
+            if let Some(cut) = cut {
+                self.playhead = cut;
+            }
+            if precision {
+                self.toggle_precision_trim(doc, history);
+            } else {
+                self.enter_nested_sequence(doc, history);
+            }
+        }
     }
 }
 
@@ -1728,6 +1803,33 @@ fn self_interact(
         }
     }
 
+    if resp.double_clicked() {
+        if let Some((_, clip, _, zone)) = resp.interact_pointer_pos().and_then(hit_at) {
+            let precision = zone != interact::ClipZone::Body;
+            let cut = if precision {
+                doc.timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(&seq_id))
+                    .and_then(|s| s.tracks().flat_map(|t| &t.clips).find(|c| c.id == clip))
+                    .map(|c| {
+                        if zone == interact::ClipZone::LeftEdge {
+                            c.start
+                        } else {
+                            c.end()
+                        }
+                    })
+            } else {
+                None
+            };
+            ui.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("nested_precision_request"),
+                    (clip, precision, cut),
+                )
+            });
+        }
+    }
+
     // ── Drag start ──────────────────────────────────────────────────────────
     if resp.drag_started() {
         let mods = ui.input(|i| i.modifiers);
@@ -2392,6 +2494,31 @@ fn clip_context_menu(
     }
     if ui.button("Ripple delete").clicked() {
         ops_bridge::ripple_delete(doc, history, seq_id, track, clip);
+        ui.close_menu();
+    }
+    if ui.button("Precision trim… · Shift+T").clicked() {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nested_precision_request"),
+                (clip, true, None::<Tick>),
+            )
+        });
+        ui.close_menu();
+    }
+    let nested = doc
+        .timeline
+        .as_ref()
+        .and_then(|p| p.sequences.get(&seq_id))
+        .and_then(|s| s.track(track))
+        .and_then(|t| t.clips.iter().find(|c| c.id == clip))
+        .is_some_and(|c| matches!(c.source, ClipSource::NestedSequence { .. }));
+    if nested && ui.button("Enter nested sequence · Alt+→").clicked() {
+        ui.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("nested_precision_request"),
+                (clip, false, None::<Tick>),
+            )
+        });
         ui.close_menu();
     }
     // K-A6: frame-accurate position / in / out / duration form.

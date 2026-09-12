@@ -33,6 +33,10 @@ impl ArcWgpuAllocator {
 impl TextureAllocator for ArcWgpuAllocator {
     type Texture = Arc<wgpu::Texture>;
 
+    fn can_recycle(&self, texture: &Self::Texture) -> bool {
+        Arc::strong_count(texture) == 1 && Arc::weak_count(texture) == 0
+    }
+
     fn allocate(&mut self, bucket: (u32, u32)) -> Arc<wgpu::Texture> {
         Arc::new(self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("node_result_texture"),
@@ -77,6 +81,9 @@ pub struct NodeCache {
 }
 
 impl NodeCache {
+    pub fn set_budget_bytes(&mut self, budget_bytes: u64) {
+        self.pool.set_budget_bytes(budget_bytes);
+    }
     pub fn new(device: Arc<wgpu::Device>, budget_bytes: u64) -> Self {
         NodeCache {
             pool: TexturePool::new(ArcWgpuAllocator::new(device), budget_bytes),

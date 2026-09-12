@@ -1691,6 +1691,7 @@ fn variant_exhaustiveness_guard(cmd: &TimelineCmd) {
         TimelineCmd::AddMarkerCategory { .. } => {} // marker_category_crud_roundtrips
         TimelineCmd::RemoveMarkerCategory { .. } => {} // …_reassigns_markers_in_both_scopes
         TimelineCmd::SetMarkerCategory { .. } => {}
+        TimelineCmd::SetPreviewZones { .. } => {}
         TimelineCmd::SetWorkRange { .. } => {}
         TimelineCmd::AddBin { .. } => {}
         TimelineCmd::RemoveBin { .. } => {}

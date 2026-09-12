@@ -22,13 +22,14 @@ use photonic_core::timeline::{FrameRate, SequenceId, Tick, TimelineProject};
 use photonic_core::Document;
 use photonic_render::color::Colorimetry;
 
-use super::encoder::AudioStreamSpec;
+use super::encoder::{validate_encode_options, AudioStreamSpec};
 use super::offline_audio::{self, DEFAULT_EXPORT_SAMPLE_RATE};
 use super::presets::{self, ExportPreset, FrameRatePolicy, ResolutionSpec};
-use super::render_loop::{self, ExportError, ExportEvent, Frame, ResolvedExport};
+use super::render_loop::{self, ExportError, ExportEvent, ExportTarget, Frame, ResolvedExport};
+use crate::graph::compile::{fit_long_edge, DRAFT_MAX_LONG_EDGE};
 use crate::graph::eval::{read_texture_rgba16f, GpuContext};
 use crate::media::ffmpeg_locate::FfmpegTools;
-use crate::session::{EngineCmd, ExportJob, ProxyMode, VideoEngine};
+use crate::session::{EngineCmd, EngineFrame, ExportJob, ProxyMode, RenderSnapshot, VideoEngine};
 
 /// Best-effort system sleep inhibitor for export (K-F polish).
 ///
@@ -107,6 +108,7 @@ pub fn resolve_export_job(
     project: &TimelineProject,
     job: &ExportJob,
 ) -> Result<ResolvedExportJob, ExportError> {
+    validate_encode_options(job.options.two_pass)?;
     let seq = project
         .sequences
         .get(&job.sequence)
@@ -160,6 +162,15 @@ pub fn resolve_export_job(
              in P3 — the engine evaluates at format size and downscales only"
         )));
     }
+    let out_size = if job.options.preview_resolution {
+        let (pw, ph) = fit_long_edge(fw, fh, DRAFT_MAX_LONG_EDGE);
+        (
+            ((out_w as u64 * pw as u64 / fw as u64) as u32).max(1),
+            ((out_h as u64 * ph as u64 / fh as u64) as u32).max(1),
+        )
+    } else {
+        (out_w, out_h)
+    };
 
     // Keep the preset's audio spec (K-0.7): offline mix + mux lands in
     // `run_export_job`. Validation still rejects alpha-incompatible containers etc.
@@ -173,7 +184,7 @@ pub fn resolve_export_job(
     Ok(ResolvedExportJob {
         format_index,
         format_size: (fw, fh),
-        out_size: (out_w, out_h),
+        out_size,
         seq_rate,
         out_rate,
         start,
@@ -202,9 +213,205 @@ pub fn run_export_job(
     job: &ExportJob,
     tools: &FfmpegTools,
     cancel: &AtomicBool,
-    on_event: impl FnMut(ExportEvent),
+    mut on_event: impl FnMut(ExportEvent),
 ) -> Result<(), ExportError> {
-    let r = resolve_export_job(&project, job)?;
+    run_export_jobs(
+        gpu,
+        project,
+        std::slice::from_ref(job),
+        tools,
+        cancel,
+        |_, event| on_event(event),
+    )
+}
+
+/// Export several deliveries from one frozen project. Compatible deliveries
+/// share render/readback; different formats, ranges, rates, dimensions, proxy
+/// or preview choices get independent render sessions. At most four encoders
+/// run together, so a large batch cannot exhaust process/worker resources.
+/// Callbacks carry the original index in `jobs`; file publication is per output.
+pub fn run_export_jobs(
+    gpu: GpuContext,
+    project: Arc<TimelineProject>,
+    jobs: &[ExportJob],
+    tools: &FfmpegTools,
+    cancel: &AtomicBool,
+    on_event: impl FnMut(usize, ExportEvent),
+) -> Result<(), ExportError> {
+    run_export_jobs_inner(
+        gpu,
+        project,
+        None,
+        jobs,
+        tools,
+        cancel,
+        &mut |_, _, _| Ok(()),
+        on_event,
+    )
+}
+
+/// Export a complete immutable render snapshot, preserving embedded vectors
+/// alongside timeline state. Preview cache producers use this same native
+/// render path; no cached preview source is attached to the shadow session.
+pub fn run_export_snapshot(
+    gpu: GpuContext,
+    snapshot: &RenderSnapshot,
+    job: &ExportJob,
+    tools: &FfmpegTools,
+    cancel: &AtomicBool,
+    mut on_event: impl FnMut(ExportEvent),
+) -> Result<(), ExportError> {
+    run_export_snapshot_validated(
+        gpu,
+        snapshot,
+        job,
+        tools,
+        cancel,
+        |_, _, _| Ok(()),
+        |event| on_event(event),
+    )
+}
+
+/// Batch equivalent of [`run_export_snapshot`], sharing compatible rendered
+/// frames while retaining the source document needed by embedded vectors.
+pub fn run_export_jobs_snapshot(
+    gpu: GpuContext,
+    snapshot: &RenderSnapshot,
+    jobs: &[ExportJob],
+    tools: &FfmpegTools,
+    cancel: &AtomicBool,
+    on_event: impl FnMut(usize, ExportEvent),
+) -> Result<(), ExportError> {
+    let project = snapshot
+        .project
+        .as_ref()
+        .ok_or_else(|| ExportError::Resolve("render snapshot has no timeline".into()))?;
+    run_export_jobs_inner(
+        gpu,
+        Arc::clone(project),
+        Some(snapshot),
+        jobs,
+        tools,
+        cancel,
+        &mut |_, _, _| Ok(()),
+        on_event,
+    )
+}
+
+/// As [`run_export_snapshot`], with a frame validation callback before encoding.
+/// Preview producers use it to verify planned content hashes and codec fidelity
+/// constraints against the actual evaluated frame; an error poisons the export.
+pub fn run_export_snapshot_validated(
+    gpu: GpuContext,
+    snapshot: &RenderSnapshot,
+    job: &ExportJob,
+    tools: &FfmpegTools,
+    cancel: &AtomicBool,
+    mut validate: impl FnMut(u64, &EngineFrame, &[[f32; 4]]) -> Result<(), ExportError>,
+    mut on_event: impl FnMut(ExportEvent),
+) -> Result<(), ExportError> {
+    let project = snapshot
+        .project
+        .as_ref()
+        .ok_or_else(|| ExportError::Resolve("render snapshot has no timeline".into()))?;
+    run_export_jobs_inner(
+        gpu,
+        Arc::clone(project),
+        Some(snapshot),
+        std::slice::from_ref(job),
+        tools,
+        cancel,
+        &mut validate,
+        |_, event| on_event(event),
+    )
+}
+
+fn run_export_jobs_inner(
+    gpu: GpuContext,
+    project: Arc<TimelineProject>,
+    snapshot: Option<&RenderSnapshot>,
+    jobs: &[ExportJob],
+    tools: &FfmpegTools,
+    cancel: &AtomicBool,
+    validate: &mut dyn FnMut(u64, &EngineFrame, &[[f32; 4]]) -> Result<(), ExportError>,
+    mut on_event: impl FnMut(usize, ExportEvent),
+) -> Result<(), ExportError> {
+    let resolved: Vec<_> = jobs
+        .iter()
+        .map(|job| resolve_export_job(&project, job))
+        .collect::<Result<_, _>>()?;
+    for (index, job) in jobs.iter().enumerate() {
+        if jobs[..index].iter().any(|other| other.output == job.output) {
+            return Err(ExportError::Resolve(
+                "batch exports must use distinct output paths".into(),
+            ));
+        }
+    }
+    let groups = compatible_groups(jobs, &resolved);
+    for indices in groups {
+        if cancel.load(Ordering::Relaxed) {
+            for index in indices {
+                on_event(index, ExportEvent::Cancelled);
+            }
+            continue;
+        }
+        run_export_group(
+            gpu.clone(),
+            Arc::clone(&project),
+            snapshot,
+            jobs,
+            &resolved,
+            &indices,
+            tools,
+            cancel,
+            validate,
+            |index, event| on_event(indices[index], event),
+        )?;
+    }
+    Ok(())
+}
+
+fn compatible_groups(jobs: &[ExportJob], resolved: &[ResolvedExportJob]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    for (index, (job, r)) in jobs.iter().zip(resolved).enumerate() {
+        let group = groups.iter_mut().find(|indices| {
+            let first = indices[0];
+            let other = &jobs[first];
+            let q = &resolved[first];
+            indices.len() < render_loop::MAX_SHARED_OUTPUTS
+                && job.sequence == other.sequence
+                && r.format_index == q.format_index
+                && r.out_size == q.out_size
+                && r.out_rate == q.out_rate
+                && r.start == q.start
+                && r.end == q.end
+                && job.options.use_proxies == other.options.use_proxies
+                && job.options.preview_resolution == other.options.preview_resolution
+        });
+        if let Some(group) = group {
+            group.push(index);
+        } else {
+            groups.push(vec![index]);
+        }
+    }
+    groups
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_export_group(
+    gpu: GpuContext,
+    project: Arc<TimelineProject>,
+    snapshot: Option<&RenderSnapshot>,
+    jobs: &[ExportJob],
+    resolutions: &[ResolvedExportJob],
+    indices: &[usize],
+    tools: &FfmpegTools,
+    cancel: &AtomicBool,
+    validate: &mut dyn FnMut(u64, &EngineFrame, &[[f32; 4]]) -> Result<(), ExportError>,
+    mut on_event: impl FnMut(usize, ExportEvent),
+) -> Result<(), ExportError> {
+    let job = &jobs[indices[0]];
+    let r = &resolutions[indices[0]];
 
     // Frozen shadow project with the export format forced active.
     let mut frozen = (*project).clone();
@@ -213,13 +420,16 @@ pub fn run_export_job(
     }
 
     let engine = VideoEngine::new(gpu.clone());
-    let shadow_doc = {
-        let mut d = Document::new("export-shadow", 1.0, 1.0);
-        d.timeline = Some(frozen);
-        Arc::new(Mutex::new(d))
-    };
-    let shadow_history = Arc::new(Mutex::new(CommandHistory::new(1)));
+    let shadow_doc = Arc::new(Mutex::new(Document::new("export-shadow", 1.0, 1.0)));
+    let history = CommandHistory::new(1);
+    let expected_revision = snapshot.map_or(history.revision(), |snapshot| snapshot.revision);
+    let shadow_history = Arc::new(Mutex::new(history));
     let session = engine.open_session(shadow_doc, shadow_history);
+    let expected_generation = session.publish_snapshot(RenderSnapshot {
+        revision: expected_revision,
+        project: Some(Arc::new(frozen)),
+        document: snapshot.and_then(|snapshot| snapshot.document.clone()),
+    });
     let seq_id: SequenceId = job.sequence;
     session.send(EngineCmd::SetActiveSequence(seq_id));
     // K-F4: job options can request proxies / Draft resolution; default remains
@@ -230,72 +440,83 @@ pub fn run_export_job(
         ProxyMode::ForceOriginal
     };
     session.send(EngineCmd::SetProxyMode(proxy));
-    if job.options.preview_resolution {
-        session.send(EngineCmd::SetPreviewQuality(
-            crate::session::PreviewQuality::Draft,
-        ));
+    let quality = if job.options.preview_resolution {
+        crate::session::PreviewQuality::Draft
     } else {
-        session.send(EngineCmd::SetPreviewQuality(
-            crate::session::PreviewQuality::Full,
+        crate::session::PreviewQuality::Full
+    };
+    let expected_size = if job.options.preview_resolution {
+        fit_long_edge(r.format_size.0, r.format_size.1, DRAFT_MAX_LONG_EDGE)
+    } else {
+        r.format_size
+    };
+    session.send(EngineCmd::SetPreviewQuality(quality));
+
+    // Each output keeps its own audio/loudness semantics. Audio mixing is
+    // still offline before frame production; this pipeline overlaps video only.
+    let mut deliveries = Vec::with_capacity(indices.len());
+    for &index in indices {
+        if cancel.load(Ordering::Relaxed) {
+            session.shutdown();
+            for index in 0..indices.len() {
+                on_event(index, ExportEvent::Cancelled);
+            }
+            return Ok(());
+        }
+        let job = &jobs[index];
+        let r = &resolutions[index];
+        let (audio, samples) = if r.preset.audio.is_some() {
+            let sample_rate = if project.settings.audio_sample_rate > 0 {
+                project.settings.audio_sample_rate
+            } else {
+                DEFAULT_EXPORT_SAMPLE_RATE
+            };
+            let pcm = offline_audio::render_export_audio(
+                &project,
+                job.sequence,
+                r.start,
+                r.end,
+                Some(tools),
+                r.preset.loudness_target.as_ref(),
+            )?;
+            (
+                Some(AudioStreamSpec {
+                    sample_rate,
+                    channels: 2,
+                }),
+                Some(pcm),
+            )
+        } else {
+            (None, None)
+        };
+        deliveries.push((
+            ResolvedExport {
+                width: r.out_size.0,
+                height: r.out_size.1,
+                frame_rate: r.out_rate,
+                audio,
+                out_path: r.out_path.clone(),
+                colorimetry: Colorimetry::BT709_LIMITED,
+                prefer_hardware: job.options.prefer_hardware,
+                encoder_speed: job.options.encoder_speed.clone(),
+                raw_encoder_args: job.options.raw_encoder_args.clone(),
+                burn_in_timecode: job.options.burn_in_timecode,
+                two_pass: job.options.two_pass,
+            },
+            samples,
         ));
     }
-
-    // Offline mix for the export range (K-0.7). Silence when tools are missing
-    // still yields a length-correct PCM buffer so containers with an audio slot
-    // get a valid silent track rather than a broken mux.
-    let (audio_spec, audio_samples) = if r.preset.audio.is_some() {
-        let sample_rate = if project.settings.audio_sample_rate > 0 {
-            project.settings.audio_sample_rate
-        } else {
-            DEFAULT_EXPORT_SAMPLE_RATE
-        };
-        let pcm = offline_audio::render_export_audio(
-            &project,
-            job.sequence,
-            r.start,
-            r.end,
-            Some(tools),
-            r.preset.loudness_target.as_ref(),
-        )?;
-        (
-            Some(AudioStreamSpec {
-                sample_rate,
-                channels: 2,
-            }),
-            Some(pcm),
-        )
-    } else {
-        (None, None)
-    };
-
-    // K-F polish: best-effort sleep inhibit for the duration of this job.
-    let _sleep_guard = if job.options.inhibit_sleep {
-        Some(SleepInhibit::acquire())
-    } else {
-        None
-    };
-
-    let resolved = ResolvedExport {
-        width: r.out_size.0,
-        height: r.out_size.1,
-        frame_rate: r.out_rate,
-        audio: audio_spec,
-        out_path: r.out_path.clone(),
-        colorimetry: Colorimetry::BT709_LIMITED,
-        prefer_hardware: job.options.prefer_hardware,
-        encoder_speed: job.options.encoder_speed.clone(),
-        raw_encoder_args: job.options.raw_encoder_args.clone(),
-        burn_in_timecode: job.options.burn_in_timecode,
-        two_pass: job.options.two_pass,
-    };
-    let (fw, fh) = r.format_size;
+    let _sleep_guard = indices
+        .iter()
+        .any(|&index| jobs[index].options.inhibit_sleep)
+        .then(SleepInhibit::acquire);
     let (ow, oh) = r.out_size;
     let start = r.start;
     let seq_rate = r.seq_rate;
     let tpf_out = r.out_rate.ticks_per_frame().0.max(1);
 
     let mut prev = session.latest_frame();
-    let mut frame_fail: Option<String> = None;
+    let mut frame_fail: Option<ExportError> = None;
     let frame_source = |i: u64| -> Frame {
         // Output tick → nearest sequence frame (05 §6.2 retiming: the engine
         // presents exact sequence-grid ticks, so snap the output-grid tick).
@@ -304,9 +525,21 @@ pub fn run_export_job(
         session.send(EngineCmd::Seek(snapped));
         let deadline = Instant::now() + Duration::from_secs(30);
         let frame = loop {
+            if cancel.load(Ordering::Relaxed) {
+                break None;
+            }
             if let Some(f) = session.latest_frame() {
                 let fresh = prev.as_ref().map(|q| !Arc::ptr_eq(q, &f)).unwrap_or(true);
-                if fresh && f.time == snapped && f.sequence == seq_id {
+                if fresh
+                    && f.time == snapped
+                    && f.sequence == seq_id
+                    && f.doc_revision == expected_revision
+                    && f.snapshot_generation == expected_generation
+                    && f.preview_quality == quality
+                    && f.proxy_mode == proxy
+                    && f.logical_size == expected_size
+                    && f.preview_asset.is_none()
+                {
                     break Some(f);
                 }
             }
@@ -317,68 +550,112 @@ pub fn run_export_job(
         };
         match frame {
             Some(f) => {
+                if f.cached_preview {
+                    frame_fail = Some(ExportError::Resolve(
+                        "native export refused a cached playback preview".into(),
+                    ));
+                    cancel.store(true, Ordering::Relaxed);
+                    return Frame {
+                        width: ow,
+                        height: oh,
+                        rgba_premult: Vec::new(),
+                    };
+                }
                 prev = Some(Arc::clone(&f));
                 // Logical region only (bucket-padded texture, see render loop).
-                let px = read_texture_rgba16f(&gpu, &f.texture, fw, fh);
-                let px = if (ow, oh) == (fw, fh) {
+                let (render_w, render_h) = f.logical_size;
+                let px = read_texture_rgba16f(&gpu, &f.texture, render_w, render_h);
+                if let Err(error) = validate(i, &f, &px) {
+                    frame_fail = Some(error);
+                    cancel.store(true, Ordering::Relaxed);
+                    return Frame {
+                        width: ow,
+                        height: oh,
+                        rgba_premult: Vec::new(),
+                    };
+                }
+                let px = if (ow, oh) == (render_w, render_h) {
                     px
                 } else {
-                    box_downscale(&px, fw, fh, ow, oh)
+                    box_downscale(&px, render_w, render_h, ow, oh)
                 };
                 Frame {
                     width: ow,
                     height: oh,
-                    rgba_premult: px.iter().flat_map(|q| q.iter().copied()).collect(),
+                    rgba_premult: px.into_flattened(),
                 }
             }
             None => {
                 // Poison the run: flag the failure, cancel between frames
                 // (export_frames checks the flag before the next frame), and
                 // hand back a black filler so the closure contract holds.
-                frame_fail = Some(format!(
-                    "frame {i} (tick {}) was not produced within 30s",
-                    snapped.0
-                ));
-                cancel.store(true, Ordering::Relaxed);
+                if !cancel.load(Ordering::Relaxed) {
+                    frame_fail = Some(ExportError::RenderTimeout(format!(
+                        "frame {i} (tick {}) was not produced within 30s",
+                        snapped.0
+                    )));
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 Frame {
                     width: ow,
                     height: oh,
-                    rgba_premult: vec![0.0; (ow * oh * 4) as usize],
+                    rgba_premult: Vec::new(),
                 }
             }
         }
     };
 
-    let result = render_loop::export_frames(
+    let targets = deliveries
+        .iter_mut()
+        .zip(indices)
+        .map(|((resolved, samples), &index)| ExportTarget {
+            preset: &resolutions[index].preset,
+            resolved,
+            audio_samples: samples.take(),
+        })
+        .collect();
+    let mut completed = false;
+    let result = render_loop::export_frames_multi(
         tools,
-        &r.preset,
-        &resolved,
+        targets,
         r.total_frames,
         frame_source,
-        audio_samples,
         cancel,
-        on_event,
+        |index, event| {
+            if matches!(event, ExportEvent::Done) {
+                completed = true;
+            }
+            if !matches!(event, ExportEvent::Done) {
+                on_event(index, event);
+            }
+        },
     );
     session.shutdown();
 
     match (result, frame_fail) {
         // A frame timeout poisoned the run — surface it even though
         // `export_frames` returned Ok(Cancelled) off the poisoned flag.
-        (_, Some(msg)) => Err(ExportError::RenderTimeout(msg)),
+        (_, Some(error)) => Err(error),
         (Err(e), None) => Err(e),
         (Ok(()), None) => {
-            // K-D4: when the preset asks for stems, write one WAV per audio track
-            // beside the main output (independent encode path, same offline mix).
-            if r.preset.stems {
-                let _paths = offline_audio::write_stems_for_export(
-                    &project,
-                    job.sequence,
-                    r.start,
-                    r.end,
-                    &r.out_path,
-                    Some(tools),
-                    r.preset.loudness_target.as_ref(),
-                )?;
+            // Stems are generated only after a successful video/audio encode,
+            // never after a cancellation (which is also an Ok return).
+            if completed && !cancel.load(Ordering::Relaxed) {
+                for (output_index, &index) in indices.iter().enumerate() {
+                    let r = &resolutions[index];
+                    if r.preset.stems {
+                        offline_audio::write_stems_for_export(
+                            &project,
+                            jobs[index].sequence,
+                            r.start,
+                            r.end,
+                            &r.out_path,
+                            Some(tools),
+                            r.preset.loudness_target.as_ref(),
+                        )?;
+                    }
+                    on_event(output_index, ExportEvent::Done);
+                }
             }
             Ok(())
         }
@@ -415,4 +692,104 @@ fn box_downscale(src: &[[f32; 4]], w: u32, h: u32, ow: u32, oh: u32) -> Vec<[f32
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use photonic_core::timeline::{Sequence, SequenceFormat};
+
+    fn project_and_job() -> (TimelineProject, ExportJob) {
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("export", FrameRate::FPS_30, 1920, 1080);
+        // Equal dimensions do not imply equal framing: format-index/reframe
+        // identity must still partition shared output groups.
+        sequence
+            .formats
+            .push(SequenceFormat::new("alternate crop", 1920, 1080));
+        let id = sequence.id;
+        project.insert_sequence(sequence);
+        let job = ExportJob {
+            sequence: id,
+            format_index: 0,
+            preset: presets::built_in_presets()
+                .into_iter()
+                .find(|preset| preset.name == "Web H.264")
+                .unwrap(),
+            output: PathBuf::from("delivery.mp4"),
+            range: Some((Tick(0), Tick::from_seconds(1))),
+            options: Default::default(),
+        };
+        (project, job)
+    }
+
+    #[test]
+    fn resolve_rejects_two_pass_before_sequence_or_media_work() {
+        let (_, mut job) = project_and_job();
+        job.options.two_pass = true;
+        assert!(matches!(
+            resolve_export_job(&TimelineProject::new(), &job),
+            Err(ExportError::Encode(
+                super::super::encoder::EncodeError::TwoPassUnsupported
+            ))
+        ));
+    }
+
+    #[test]
+    fn preview_export_resolves_to_the_same_draft_scale_as_rendering() {
+        let (project, mut job) = project_and_job();
+        job.options.preview_resolution = true;
+        assert_eq!(
+            resolve_export_job(&project, &job).unwrap().out_size,
+            (960, 540)
+        );
+        job.preset.resolution = ResolutionSpec::Scale(0.5);
+        assert_eq!(
+            resolve_export_job(&project, &job).unwrap().out_size,
+            (480, 270)
+        );
+    }
+
+    #[test]
+    fn shared_groups_preserve_format_range_cadence_size_and_quality_semantics() {
+        let (project, job) = project_and_job();
+        let mut jobs = vec![job; 8];
+        jobs[1].preset.video.as_mut().unwrap().quality = presets::QualityMode::Crf(30.0);
+        jobs[2].format_index = 1;
+        jobs[3].range = Some((Tick::from_seconds(1), Tick::from_seconds(2)));
+        jobs[4].preset.frame_rate = FrameRatePolicy::Explicit(FrameRate::new(24, 1));
+        jobs[5].preset.resolution = ResolutionSpec::Scale(0.5);
+        jobs[6].options.use_proxies = true;
+        jobs[7].options.preview_resolution = true;
+        let resolved: Vec<_> = jobs
+            .iter()
+            .map(|job| resolve_export_job(&project, job).unwrap())
+            .collect();
+        assert_eq!(
+            compatible_groups(&jobs, &resolved),
+            vec![
+                vec![0, 1],
+                vec![2],
+                vec![3],
+                vec![4],
+                vec![5],
+                vec![6],
+                vec![7]
+            ]
+        );
+    }
+
+    #[test]
+    fn shared_groups_limit_live_encoder_children() {
+        let (project, job) = project_and_job();
+        let jobs = vec![job; 9];
+        let resolved: Vec<_> = jobs
+            .iter()
+            .map(|job| resolve_export_job(&project, job).unwrap())
+            .collect();
+        assert_eq!(
+            compatible_groups(&jobs, &resolved),
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8]]
+        );
+    }
 }

@@ -186,41 +186,17 @@ jobs:
         run: cargo deny check
 
   acceptance-stories:
-    name: QA-1 acceptance stories (AS-1/2/3, advisory)
-    # Same trigger scope as build-test: every push (main + feat/**) and every
-    # PR, never on the nightly cron.
+    name: Video outcomes (software Vulkan + strict acceptance)
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    #
-    # ── NON-BLOCKING ── TODO(QA-1): flip `continue-on-error` to false once the
-    # blockers below are cleared. Do not treat a green tick on this job as
-    # evidence the stories passed — read the step log.
-    #
-    # Blocker 1 (interface): CLEARED. `scripts/run-acceptance-stories.sh` is
-    #   the single documented entry point and is called directly below; the
-    #   placeholder glue that used to live here is gone. Verified on a GPU box:
-    #   all three stories pass 32/32 steps, "0 skipped, 0 failed", runner exit
-    #   0 — and its failure paths are proven too (dead server → SERVER-FAIL
-    #   exit 1; live-but-wrong server → 8 failed, exit 1).
-    #
-    # Blocker 2 (environment): GitHub's ubuntu-latest has no GPU. The scripts
-    #   use the adapter-skip convention (docs/specs/video-editor/
-    #   11-testing-phasing.md §3.4), so engine-backed steps SKIP rather than
-    #   FAIL without an adapter — which means a "pass" here can be mostly
-    #   skips. Mesa/lavapipe is installed below to give wgpu a software
-    #   Vulkan adapter; until the log shows the engine steps actually running
-    #   (not skipping), this job is coverage theatre and must stay advisory.
-    #
-    #   The scripts now expose `--strict` / `PHOTONIC_AS_STRICT=1`, which
-    #   promotes an environment skip to a failure. It is deliberately left
-    #   OFF here: per the flag's own docstring it is for a runner that IS
-    #   supposed to have a GPU + ffmpeg, and ubuntu-latest is not. Flip
-    #   PHOTONIC_AS_STRICT to '1' in the step env *at the same time* as
-    #   dropping continue-on-error, once this job moves to a GPU-capable
-    #   runner — the two changes are a pair, and either alone is wrong
-    #   (strict on a GPU-less runner = always red; blocking without strict =
-    #   green runs that verified nothing).
-    continue-on-error: true
+    # This lane proves render/edit/export correctness with Mesa software Vulkan.
+    # It makes no realtime hardware performance claim. Missing adapters/codecs
+    # fail the lane instead of turning required checks into silent skips.
+    env:
+      PHOTONIC_REQUIRE_GPU: "1"
+      PHOTONIC_AS_STRICT: "1"
+      WGPU_BACKEND: vulkan
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -238,14 +214,16 @@ jobs:
             libasound2-dev \
             ffmpeg
 
-      # Software Vulkan (lavapipe) so wgpu can enumerate an adapter on a
-      # GPU-less runner; see Blocker 2 above. Advisory: if this does not
-      # produce a usable adapter the stories just SKIP their engine steps.
+      # A software adapter is sufficient for deterministic pixel assertions.
       - name: Install software Vulkan adapter (lavapipe)
         run: |
           sudo apt-get install -y --no-install-recommends \
             libvulkan1 mesa-vulkan-drivers vulkan-tools
-          vulkaninfo --summary || echo "no Vulkan adapter — engine steps will SKIP"
+          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/photonic-xdg"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          vulkaninfo --summary
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -253,25 +231,21 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
 
-      # `scripts/run-acceptance-stories.sh` owns the whole recipe: it builds
-      # photonic-app, then per story picks a free ephemeral port, starts its own
-      # headless server, waits for `/mcp` to answer a real `initialize`, runs
-      # the story, and tears the server down. One server PER story is load-
-      # bearing, not tidiness — the MCP surface mutates a single in-process
-      # document, so a shared server would let AS-2 inherit AS-1's sequences.
-      - name: Run AS-1 / AS-2 / AS-3 acceptance stories
-        # Debug build on purpose: compile time dominates here, and the work a
-        # release build would speed up (engine rendering) is exactly what SKIPs
-        # on a GPU-less runner. Add --release together with --strict when this
-        # job moves to a GPU-capable runner.
+      - name: Required agent and GPU rendering outcomes
         run: |
-          scripts/run-acceptance-stories.sh \
+          cargo test -p photonic-mcp --locked --test ai_contracts --test video_agent_workflows
+          cargo test -p photonic-mcp --locked --lib full_render_resolves_one_pixel_detail_after_preview
+          cargo test -p photonic-mcp --locked --lib video_readback::tests
+          cargo test -p photonic-video --locked --lib changing_processing_canvas_preserves_full_detail_in_cached_outputs
+          cargo test -p photonic-video --locked --lib production_session_serves_cache_with_codec_tolerance_and_undo_reuse
+
+      - name: Run AS-1 / AS-2 / AS-3 acceptance stories
+        run: |
+          scripts/run-acceptance-stories.sh --strict \
             --log-dir "${RUNNER_TEMP}/as-logs" \
             --out-dir "${RUNNER_TEMP}/as-exports"
 
-      # The per-story server logs are the only way to tell a real pass from a
-      # run that skipped every engine step (Blocker 2). Upload them always, and
-      # AS-2's deliverable exports with them.
+      # Always retain evidence, including failures and export artifacts.
       - name: Upload acceptance-story logs and exports
         if: always()
         uses: actions/upload-artifact@v4

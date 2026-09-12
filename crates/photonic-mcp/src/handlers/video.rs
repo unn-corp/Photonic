@@ -43,15 +43,15 @@ use photonic_core::timeline::{
 use photonic_core::Color;
 use photonic_video::export::convert as export_convert;
 use photonic_video::export::presets as export_presets;
-use photonic_video::export::render_loop;
 use photonic_video::graph::eval::read_texture_rgba16f;
 use photonic_video::graph::ScopeTapPoint;
 use photonic_video::media::ffmpeg_locate;
 use photonic_video::media::probe as video_probe;
 use photonic_video::media::proxy as video_proxy;
-use photonic_video::{EngineCmd, ProxyMode};
+use photonic_video::{EngineCmd, EngineSession, PreviewQuality, ProxyMode};
 use serde_json::{json, Value};
 use std::sync::atomic::Ordering;
+#[cfg(test)]
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 
@@ -82,7 +82,7 @@ fn err_code(code: &str, msg: impl Into<String>) -> ToolResult {
 
 /// Design rule 3: `at_ticks` > `at_tc` > `at_seconds`. `at_tc` requires a
 /// resolvable sequence (frame rate) — `MissingSequenceContext` otherwise.
-fn resolve_tick(
+pub(crate) fn resolve_tick(
     ticks: Option<i64>,
     tc: Option<&str>,
     seconds: Option<f64>,
@@ -141,7 +141,7 @@ fn locate_clip(p: &TimelineProject, clip: ClipId) -> Option<(SequenceId, TrackId
 // move/delete intent across `ops::clips_in_link_group` so linked A/V pairs
 // move and delete as a unit. MCP has no dependency on the GUI crate, so this
 // is a parallel implementation over the same core primitive (`ops::*`),
-// mirroring `ops_bridge::link_partners` / `expand_link_group_move` /
+// mirroring `ops_bridge::link_partners` / `ops::move_linked_clip` /
 // `expand_link_group_delete` / `commit_group` field-for-field — an
 // agent-driven `move_clip`/`remove_clip` must leave a linked partner in the
 // same state a GUI drag/delete would. Trim intentionally does NOT propagate
@@ -174,38 +174,6 @@ fn link_partners(
             s.tracks()
                 .find(|t| t.clips.iter().any(|c| c.id == id))
                 .map(|t| (t.id, id))
-        })
-        .collect()
-}
-
-/// Expand a move-by-`delta` edit on `clip` to every linked partner. Each
-/// partner shifts by the IDENTICAL tick delta on ITS OWN track (never
-/// reassigned to a different track — only the dragged/moved clip's own track
-/// can change). A partner that can't take the shift (would go negative, or
-/// collides with a neighbour on its own track) is silently dropped from the
-/// batch rather than blocking the primary move.
-fn expand_link_group_move(
-    p: &TimelineProject,
-    seq: SequenceId,
-    track: TrackId,
-    clip: ClipId,
-    delta: Tick,
-) -> Vec<TimelineCmd> {
-    if delta.0 == 0 {
-        return Vec::new();
-    }
-    let Some(s) = p.sequences.get(&seq) else {
-        return Vec::new();
-    };
-    link_partners(p, seq, track, clip)
-        .into_iter()
-        .filter_map(|(ptrack, pclip)| {
-            let start = s.track(ptrack)?.clips.iter().find(|c| c.id == pclip)?.start;
-            let new_start = start + delta;
-            if new_start.0 < 0 {
-                return None;
-            }
-            ops::move_clip(p, seq, ptrack, pclip, new_start).ok()
         })
         .collect()
 }
@@ -1236,7 +1204,7 @@ pub async fn move_clip(state: &AppState, args: MoveClipArgs) -> ToolResult {
         Ok(t) => t,
         Err(e) => return e,
     };
-    match ops::move_clip_to_track(
+    match ops::move_linked_clip(
         project,
         seq_id,
         track_id,
@@ -1244,24 +1212,10 @@ pub async fn move_clip(state: &AppState, args: MoveClipArgs) -> ToolResult {
         new_start,
         args.new_track_id,
     ) {
-        Ok(cmd) => {
-            let old_start = match &cmd {
-                TimelineCmd::MoveClip { old_start, .. } => *old_start,
-                _ => unreachable!("ops::move_clip_to_track always returns MoveClip"),
-            };
-            // Fan the move across the link group (same track_id used whether
-            // this is a same-track or cross-track move — a linked partner
-            // rides along on ITS OWN track, never reassigned).
-            let mut cmds = vec![cmd];
-            cmds.extend(expand_link_group_move(
-                project,
-                seq_id,
-                track_id,
-                args.clip_id,
-                new_start - old_start,
-            ));
+        Ok(cmds) if cmds.is_empty() => ToolResult::text("No clips moved"),
+        Ok(cmds) => {
             history.execute_discrete(batch_or_single(cmds), &mut doc);
-            ToolResult::text("Moved clip")
+            ToolResult::text("Moved linked clip unit")
         }
         Err(e) => map_edit_error(e),
     }
@@ -1312,6 +1266,10 @@ pub async fn move_clips(state: &AppState, args: MoveClipsArgs) -> ToolResult {
     }
     let seq_id = seq_id.expect("clip_ids is non-empty and every id resolved");
 
+    let moving = match ops::linked_moving_set(project, seq_id, &moving) {
+        Ok(moving) => moving,
+        Err(error) => return map_edit_error(error),
+    };
     match ops::move_clips(
         project,
         seq_id,
@@ -1772,7 +1730,7 @@ pub async fn extract_edit(state: &AppState, args: ExtractEditArgs) -> ToolResult
 // `add_edit_all_tracks`/`close_gap` mirror `photonic_gui::app::timeline::
 // ops_bridge`'s `split_all_tracks`/`close_gap_plan`/`close_gap_changes`/
 // `close_gaps_at_playhead` field-for-field. MCP has no dependency on the GUI
-// crate (see the link-group note above `expand_link_group_move`) so this is a
+// crate (see the link-group note above `ops::move_linked_clip`) so this is a
 // parallel implementation over the same core primitives (`ops::split_clip`,
 // `TimelineCmd::RippleEdit` built directly — the same pattern `ops::
 // ripple_trim`/`extract_edit` already use internally).
@@ -4520,7 +4478,7 @@ pub async fn list_bins(state: &AppState, _args: ListBinsArgs) -> ToolResult {
 /// "fails with a clear error rather than blocking the rest of the surface").
 /// `EngineUnavailable` extends the §8 taxonomy — §8 has no code for a missing
 /// GPU adapter because §2 assumed a GUI-shared `GpuContext`.
-fn engine_bridge(state: &AppState) -> Result<&EngineBridge, ToolResult> {
+pub(crate) fn engine_bridge(state: &AppState) -> Result<&EngineBridge, ToolResult> {
     state.video_engine.bridge().ok_or_else(|| {
         err_code(
             "EngineUnavailable",
@@ -4567,8 +4525,28 @@ fn engine_status_json(status: &photonic_video::EngineStatus) -> serde_json::Valu
             "resident_entries": status.cache.resident_entries,
             "resident_bytes": status.cache.resident_bytes,
         },
+        "source_audition":status.source_audition.as_ref().map(|source|json!({"asset_id":source.asset,"start_ticks":source.range.0.0,"end_ticks":source.range.1.0,"playhead_ticks":source.playhead.0,"playing":source.playing,"has_audio":source.has_audio})),
+        "source_audition_error":status.source_audition_error,
+        "memory": {
+            "decoded_ring_bytes":status.memory.decoded_ring_bytes,"decoded_ring_budget_bytes":status.memory.decoded_ring_budget_bytes,
+            "upload_bytes":status.memory.upload_bytes,"still_bytes":status.memory.still_bytes,"vector_bytes":status.memory.vector_bytes,
+            "graph_bytes":status.memory.graph_bytes,"gpu_cache_bytes":status.memory.gpu_cache_bytes,"gpu_cache_budget_bytes":status.memory.gpu_cache_budget_bytes,
+            "raster_jobs":status.memory.raster_jobs,"raster_job_byte_limit":status.memory.raster_job_byte_limit,"pressure":status.memory.pressure,
+            "scope":"managed per-session caches; excludes externally retained textures, renderer scratch, FFmpeg and audio internals"
+        },
+        "readiness": {"requested":status.readiness.requested,"ready":status.readiness.ready,
+            "pending_source_builds":status.readiness.pending_source_builds,"pending_rasters":status.readiness.pending_rasters,
+            "capacity_limited":status.readiness.capacity_limited,"failed_sources":status.readiness.failed_sources},
+        "command_admission":{"pending":status.command_admission.pending,"coalesced":status.command_admission.coalesced,"rejected":status.command_admission.rejected},
         "audio_xruns": status.audio_xruns,
         "doc_revision": status.doc_revision,
+        "snapshot_generation": status.snapshot_generation,
+        "frames_published": status.frames_published,
+        "evaluations": status.evaluations,
+        "evaluation_misses": status.evaluation_misses,
+        "last_evaluate_micros": status.last_evaluate_micros,
+        "buffering": status.buffering,
+        "preview_quality": format!("{:?}", status.preview_quality).to_ascii_lowercase(),
         "active_sequence": status.active_sequence,
         "last_error": status.last_error.as_ref().map(|d| json!({
             "code": d.code.as_str(),
@@ -4658,6 +4636,13 @@ pub async fn play(state: &AppState, args: PlayArgs) -> ToolResult {
     }
     let _transport = bridge.lock_transport().await;
     bridge.sync(state).await;
+    if !bridge.wait_engine_synced(Duration::from_secs(10)).await {
+        return err_code(
+            "EngineBusy",
+            "Engine has not synchronized the document snapshot",
+        )
+        .with_data(json!({"retryable":true,"snapshot_generation":bridge.snapshot_generation()}));
+    }
     if let Some(seq) = args.sequence_id {
         bridge.session().send(EngineCmd::SetActiveSequence(seq));
     }
@@ -4668,12 +4653,11 @@ pub async fn play(state: &AppState, args: PlayArgs) -> ToolResult {
     // the engine's lazy cpal open falls back internally, so `play` succeeds
     // rather than raising AudioDeviceUnavailable (10 §7's degraded row).
     let status = wait_status(bridge, Duration::from_secs(2), |s| s.playing).await;
-    ToolResult::text(if status.playing {
-        "playback started"
-    } else {
-        "play sent (engine did not confirm within 2s)"
-    })
-    .with_data(engine_status_json(&status))
+    if !status.playing {
+        return err_code("TransportNotConfirmed", "Playback did not start within 2s")
+            .with_data(engine_status_json(&status));
+    }
+    ToolResult::text("playback started").with_data(engine_status_json(&status))
 }
 
 pub async fn pause(state: &AppState, _args: PauseArgs) -> ToolResult {
@@ -4716,6 +4700,13 @@ pub async fn seek(state: &AppState, args: SeekArgs) -> ToolResult {
     }
     let _transport = bridge.lock_transport().await;
     bridge.sync(state).await;
+    if !bridge.wait_engine_synced(Duration::from_secs(10)).await {
+        return err_code(
+            "EngineBusy",
+            "Engine has not synchronized the document snapshot",
+        )
+        .with_data(json!({"retryable":true,"snapshot_generation":bridge.snapshot_generation()}));
+    }
     // The engine presents exact frame-start ticks (02 §4); snap the target so
     // the fresh-frame wait matches what will actually be published.
     let snapped = fr.frame_start(fr.frame_at(t));
@@ -4740,6 +4731,13 @@ pub async fn seek(state: &AppState, args: SeekArgs) -> ToolResult {
         Duration::from_secs(5),
     )
     .await;
+    if !was_playing && (status.playhead != t || status.active_sequence != Some(args.sequence_id)) {
+        return err_code(
+            "TransportNotConfirmed",
+            "Engine did not reach the requested seek target",
+        )
+        .with_data(engine_status_json(&status));
+    }
     ToolResult::text(format!("seeked to tick {}", t.0)).with_data(engine_status_json(&status))
 }
 
@@ -4751,6 +4749,13 @@ pub async fn step(state: &AppState, args: StepArgs) -> ToolResult {
     };
     let _transport = bridge.lock_transport().await;
     bridge.sync(state).await;
+    if !bridge.wait_engine_synced(Duration::from_secs(10)).await {
+        return err_code(
+            "EngineBusy",
+            "Engine has not synchronized the document snapshot",
+        )
+        .with_data(json!({"retryable":true,"snapshot_generation":bridge.snapshot_generation()}));
+    }
     // Step is relative, so reading a stale `before` would compound into a
     // stale result (the finding's "step responses lagged"). Sample the current
     // status, compute the exact frame the engine will snap to (mirrors
@@ -4828,6 +4833,13 @@ pub async fn set_loop_range(state: &AppState, args: SetLoopRangeArgs) -> ToolRes
     };
     let _transport = bridge.lock_transport().await;
     bridge.sync(state).await;
+    if !bridge.wait_engine_synced(Duration::from_secs(10)).await {
+        return err_code(
+            "EngineBusy",
+            "Engine has not synchronized the document snapshot",
+        )
+        .with_data(json!({"retryable":true,"snapshot_generation":bridge.snapshot_generation()}));
+    }
     bridge
         .session()
         .send(EngineCmd::SetActiveSequence(args.sequence_id));
@@ -4852,6 +4864,7 @@ pub async fn set_proxy_mode(state: &AppState, args: SetProxyModeArgs) -> ToolRes
         ProxyModeArg::ForceProxy => ProxyMode::ForceProxy,
         ProxyModeArg::ForceOriginal => ProxyMode::ForceOriginal,
     };
+    let _transport = bridge.lock_transport().await;
     bridge.set_proxy_mode(mode);
     ToolResult::text(format!("proxy mode set to {mode:?}")).with_data(json!({
         "mode": format!("{mode:?}"),
@@ -4867,6 +4880,7 @@ pub async fn get_engine_status(state: &AppState, _args: GetEngineStatusArgs) -> 
         Ok(b) => b,
         Err(e) => return e,
     };
+    let _transport = bridge.lock_transport().await;
     bridge.sync(state).await;
     let synced = bridge.wait_engine_synced(Duration::from_secs(2)).await;
     let status = bridge.session().status();
@@ -4882,17 +4896,40 @@ pub async fn get_engine_status(state: &AppState, _args: GetEngineStatusArgs) -> 
 
 // ─── render_frame_at (10 §3.14 / §4) ─────────────────────────────────────────
 
+/// Restore temporary render settings on success, error, or future cancellation.
+struct RenderSettingsGuard<'a> {
+    session: &'a EngineSession,
+    proxy_mode: ProxyMode,
+    preview_quality: PreviewQuality,
+    scope_tap: Option<ScopeTapPoint>,
+}
+
+impl Drop for RenderSettingsGuard<'_> {
+    fn drop(&mut self) {
+        self.session.send(EngineCmd::SetProxyMode(self.proxy_mode));
+        self.session
+            .send(EngineCmd::SetPreviewQuality(self.preview_quality));
+        if let Some(tap) = self.scope_tap {
+            self.session.send(EngineCmd::SetScopeTap(tap));
+        }
+    }
+}
+
 pub async fn render_frame_at(state: &AppState, args: RenderFrameAtArgs) -> ToolResult {
     tracing::debug!("tool: render_frame_at");
     let bridge = match engine_bridge(state) {
         Ok(b) => b,
         Err(e) => return e,
     };
+    let expected_revision = state.history.lock().await.revision();
     let seq_id = args.sequence_id;
     let (fr, formats, active_format) = match sequence_render_info(state, seq_id).await {
         Ok(v) => v,
         Err(e) => return e,
     };
+    if formats.is_empty() {
+        return err_code("NoFormat", "Sequence has no render format");
+    }
     if let Some(fi) = args.format_index {
         if fi >= formats.len() {
             return ToolResult::error(format!(
@@ -4929,45 +4966,60 @@ pub async fn render_frame_at(state: &AppState, args: RenderFrameAtArgs) -> ToolR
         return ToolResult::error("scale must be in (0, 1]");
     }
     let output_format = args.output_format.unwrap_or_default();
+    if u64::from(w) * u64::from(h) > 16_777_216 {
+        return err_code("FrameTooLarge", "Frame inspection is limited to 16 million source pixels; use a smaller sequence format");
+    }
 
     let started = Instant::now();
     let _transport = bridge.lock_transport().await;
 
-    // Per-call format override applied to the SHADOW timeline only — the real
-    // document's `active_format` is untouched (this tool is readonly).
-    {
-        let mut timeline = state.document.lock().await.timeline.clone();
-        if let Some(p) = timeline.as_mut() {
-            if let Some(s) = p.sequences.get_mut(&seq_id) {
-                s.active_format = format_index;
-            }
-        }
-        bridge.sync_timeline(timeline);
+    bridge
+        .sync_with_format(state, Some((seq_id, format_index)))
+        .await;
+    if bridge.shadow_revision() != expected_revision {
+        return err_code("RevisionConflict", "Document changed while preparing the frame; retry inspection").with_data(json!({"actual_revision":bridge.shadow_revision(),"expected_revision":expected_revision}));
     }
     if !bridge.wait_engine_synced(Duration::from_secs(10)).await {
         return ToolResult::error("engine did not pick up the document snapshot within 10s");
     }
 
-    // Per-call quality via the session proxy-mode knob (the engine's only
-    // quality input, 02 §6) — restored to the sticky `set_proxy_mode` choice
-    // below. In P3 preview/full render identically (no proxies exist yet);
-    // the flag still flows into `Quality` so cache hashes stay honest.
-    let restore_mode = bridge.proxy_mode();
-    let call_mode = match args.quality {
-        RenderQualityArg::Preview => ProxyMode::ForceProxy,
-        RenderQualityArg::Full => ProxyMode::ForceOriginal,
+    // Media choice and processing resolution are independent. Full must use
+    // originals AND the full processing canvas, even on a Draft session.
+    let _settings = RenderSettingsGuard {
+        session: bridge.session(),
+        proxy_mode: bridge.proxy_mode(),
+        preview_quality: bridge.session().requested_preview_quality(),
+        scope_tap: Some(bridge.session().status().scope_tap),
     };
-    bridge.session().send(EngineCmd::SetProxyMode(call_mode));
+    let (call_mode, call_quality) = match args.quality {
+        RenderQualityArg::Preview => (ProxyMode::ForceProxy, PreviewQuality::Draft),
+        RenderQualityArg::Full => (ProxyMode::ForceOriginal, PreviewQuality::Full),
+    };
     let prev = bridge.session().latest_frame();
-    bridge.session().send(EngineCmd::SetActiveSequence(seq_id));
-    if !bridge.session().send(EngineCmd::Seek(snapped)) {
-        bridge.session().send(EngineCmd::SetProxyMode(restore_mode));
-        return ToolResult::error("engine session has shut down");
+    let request_id = bridge.next_inspection_id();
+    if !bridge.session().send(EngineCmd::InspectFrame {
+        request_id,
+        sequence: seq_id,
+        time: snapped,
+        proxy_mode: call_mode,
+        quality: call_quality,
+        scope_tap: ScopeTapPoint::Program,
+    }) {
+        return err_code("EngineBusy", "Engine command queue is full or closed")
+            .with_data(json!({"retryable":true}));
     }
 
     let frame = bridge
         .wait_fresh_frame(prev, Duration::from_secs(30), |f| {
-            f.time == snapped && f.sequence == seq_id
+            f.time == snapped
+                && f.sequence == seq_id
+                && f.preview_asset.is_none()
+                && f.logical_size == (w, h)
+                && f.doc_revision == bridge.shadow_revision()
+                && f.snapshot_generation == bridge.snapshot_generation()
+                && f.inspection_request_id == Some(request_id)
+                && f.preview_quality == call_quality
+                && f.proxy_mode == call_mode
         })
         .await;
     let result = match frame {
@@ -4976,23 +5028,67 @@ pub async fn render_frame_at(state: &AppState, args: RenderFrameAtArgs) -> ToolR
             // to the texture pool's 64 px bucket (see photonic-video
             // session.rs::pad_to_pool_bucket); content sits top-left at the
             // sequence-format size.
-            let pixels = read_texture_rgba16f(bridge.engine().gpu(), &frame.texture, w, h);
-            build_render_result(
-                pixels,
-                w,
-                h,
-                scale,
-                output_format,
-                snapped,
-                started.elapsed(),
-            )
+            let output_size = if output_format == RenderOutputFormatArg::Png {
+                (
+                    ((w as f64 * scale).round() as u32).clamp(1, w),
+                    ((h as f64 * scale).round() as u32).clamp(1, h),
+                )
+            } else {
+                (w, h)
+            };
+            let readback = std::sync::Arc::clone(&bridge.readback);
+            let gpu = bridge.engine().gpu().clone();
+            let texture = std::sync::Arc::clone(&frame.texture);
+            let mut result = match tokio::task::spawn_blocking(move || {
+                let pixels = readback
+                    .lock()
+                    .map_err(|_| "readback state poisoned".to_string())?
+                    .read(&gpu, &texture, (w, h), output_size)?;
+                Ok::<_, String>(build_render_result(
+                    pixels,
+                    output_size.0,
+                    output_size.1,
+                    if output_format == RenderOutputFormatArg::Png {
+                        1.0
+                    } else {
+                        scale
+                    },
+                    output_format,
+                    snapped,
+                    started.elapsed(),
+                ))
+            })
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(error)) => return err_code("ReadbackFailed", error),
+                Err(error) => return err_code("ReadbackFailed", error.to_string()),
+            };
+            if result.is_error != Some(true) {
+                let mut data = result.structured_content.take().unwrap_or_default();
+                data["sequence_id"] = json!(seq_id);
+                data["revision"] = json!(frame.doc_revision);
+                data["snapshot_generation"] = json!(frame.snapshot_generation);
+                data["inspection_request_id"] = json!(request_id);
+                data["format_index"] = json!(format_index);
+                data["quality"] = json!(match args.quality {
+                    RenderQualityArg::Full => "full",
+                    RenderQualityArg::Preview => "preview",
+                });
+                data["processing_quality"] =
+                    json!(format!("{:?}", frame.preview_quality).to_ascii_lowercase());
+                data["source_width"] = json!(w);
+                data["source_height"] = json!(h);
+                data["gpu_downscaled"] = json!(output_size != (w, h));
+                result = result.with_data(data);
+            }
+            result
         }
         None => ToolResult::error(
             "engine did not produce the requested frame within 30s — cold-seek decode \
              cost can dominate (see tool description)",
         ),
     };
-    bridge.session().send(EngineCmd::SetProxyMode(restore_mode));
     result
 }
 
@@ -5087,7 +5183,7 @@ fn build_render_result(
         RenderOutputFormatArg::Png => {
             // Reuse the export path's color math (single source of truth):
             // unpremultiply + linear→sRGB transfer + quantize.
-            let flat: Vec<f32> = pixels.iter().flat_map(|p| p.iter().copied()).collect();
+            let flat = pixels.into_flattened();
             let rgba8 = match export_convert::working_frame_to_rgba8(&flat, ow, oh) {
                 export_convert::EncodePlanes::Rgba8 { rgba, .. } => rgba,
                 _ => return ToolResult::error("internal error: unexpected plane kind"),
@@ -5178,11 +5274,10 @@ pub async fn probe_media(state: &AppState, args: ProbeMediaArgs) -> ToolResult {
             )
         }
     };
-    let (job_id, cancel) = state
-        .video_jobs
-        .lock()
-        .expect("job registry poisoned")
-        .start("probe_media");
+    let (job_id, cancel) = match state.video_jobs.lock().expect("job registry poisoned").start("probe_media") {
+        Ok(job) => job,
+        Err(error) => return ToolResult::error_with_code("JobCapacityExceeded", error.to_string()).with_data(json!({"retryable":true,"max_active_jobs":crate::handlers::video_jobs::MAX_ACTIVE_JOBS})),
+    };
     let jobs = std::sync::Arc::clone(&state.video_jobs);
     let document = std::sync::Arc::clone(&state.document);
     let history = std::sync::Arc::clone(&state.history);
@@ -5349,11 +5444,10 @@ pub async fn generate_proxies(state: &AppState, args: GenerateProxiesArgs) -> To
             .with_data(json!({ "skipped": skipped }));
     }
 
-    let (job_id, cancel) = state
-        .video_jobs
-        .lock()
-        .expect("job registry poisoned")
-        .start("generate_proxies");
+    let (job_id, cancel) = match state.video_jobs.lock().expect("job registry poisoned").start("generate_proxies") {
+        Ok(job) => job,
+        Err(error) => return ToolResult::error_with_code("JobCapacityExceeded", error.to_string()).with_data(json!({"retryable":true,"max_active_jobs":crate::handlers::video_jobs::MAX_ACTIVE_JOBS})),
+    };
     let jobs = std::sync::Arc::clone(&state.video_jobs);
     let document = std::sync::Arc::clone(&state.document);
     let history = std::sync::Arc::clone(&state.history);
@@ -5762,11 +5856,10 @@ pub async fn transcode_media(state: &AppState, args: TranscodeMediaArgs) -> Tool
     if out_path == input {
         return ToolResult::error("out_path must differ from the source file");
     }
-    let (job_id, cancel) = state
-        .video_jobs
-        .lock()
-        .expect("job registry poisoned")
-        .start("transcode_media");
+    let (job_id, cancel) = match state.video_jobs.lock().expect("job registry poisoned").start("transcode_media") {
+        Ok(job) => job,
+        Err(error) => return ToolResult::error_with_code("JobCapacityExceeded", error.to_string()).with_data(json!({"retryable":true,"max_active_jobs":crate::handlers::video_jobs::MAX_ACTIVE_JOBS})),
+    };
     let jobs = std::sync::Arc::clone(&state.video_jobs);
     let out_clone = out_path.clone();
     std::thread::spawn(move || {
@@ -5867,7 +5960,7 @@ pub async fn transcode_media(state: &AppState, args: TranscodeMediaArgs) -> Tool
 
 // ─── Export (10 §3.15) + job tools (10 §6) ───────────────────────────────────
 
-fn find_export_preset(name: &str) -> Option<export_presets::ExportPreset> {
+pub(crate) fn find_export_preset(name: &str) -> Option<export_presets::ExportPreset> {
     export_presets::built_in_presets()
         .into_iter()
         .chain(export_presets::load_custom_presets().unwrap_or_default())
@@ -5875,260 +5968,7 @@ fn find_export_preset(name: &str) -> Option<export_presets::ExportPreset> {
 }
 
 pub async fn export_sequence(state: &AppState, args: ExportSequenceArgs) -> ToolResult {
-    tracing::debug!("tool: export_sequence {}", args.sequence_id);
-    let _checked_out = match crate::path_guard::check_path(
-        state,
-        &args.out_path,
-        photonic_core::PathAccess::Write,
-    ) {
-        Ok(p) => p,
-        Err(e) => return e,
-    };
-
-    let bridge = match engine_bridge(state) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    let tools = match ffmpeg_locate::locate() {
-        Ok(t) => t,
-        Err(e) => {
-            return err_code(
-                "FfmpegUnavailable",
-                format!("ffmpeg not found ({e}) — set PHOTONIC_FFMPEG_DIR or install ffmpeg"),
-            )
-        }
-    };
-    let seq_id = args.sequence_id;
-    // Snapshot the timeline NOW — the export renders this state even if the
-    // document keeps being edited (the worker gets a frozen clone).
-    let Some(project) = state.document.lock().await.timeline.clone() else {
-        return ToolResult::error("no timeline project");
-    };
-    let project = std::sync::Arc::new(project);
-    let Some(seq) = project.sequences.get(&seq_id) else {
-        return ToolResult::error(format!("sequence {seq_id} not found"));
-    };
-    let seq_rate = seq.frame_rate;
-    if let Some(fi) = args.format_index {
-        if fi >= seq.formats.len() {
-            return ToolResult::error(format!(
-                "format_index {fi} out of range — sequence has {} format(s)",
-                seq.formats.len()
-            ));
-        }
-    }
-    let format_index = args
-        .format_index
-        .unwrap_or(seq.active_format)
-        .min(seq.formats.len().saturating_sub(1));
-    // Explicit range (if any) resolves to concrete ticks here (needs the seq
-    // rate for tc/seconds); `None` defers to the sequence work-range/extent
-    // inside `resolve_export_job`.
-    let range = match &args.range {
-        Some(r) => {
-            let s = match resolve_tick(
-                r.start_ticks,
-                r.start_tc.as_deref(),
-                r.start_seconds,
-                Some(seq_rate),
-            ) {
-                Ok(t) => t,
-                Err(e) => return e,
-            };
-            let e2 = match resolve_tick(
-                r.end_ticks,
-                r.end_tc.as_deref(),
-                r.end_seconds,
-                Some(seq_rate),
-            ) {
-                Ok(t) => t,
-                Err(e) => return e,
-            };
-            Some((s, e2))
-        }
-        None => None,
-    };
-
-    let preset_name = args
-        .preset
-        .clone()
-        .unwrap_or_else(|| "Web H.264".to_string());
-    let Some(mut preset) = find_export_preset(&preset_name) else {
-        let names: Vec<String> = export_presets::built_in_presets()
-            .into_iter()
-            .chain(export_presets::load_custom_presets().unwrap_or_default())
-            .map(|p| p.name)
-            .collect();
-        return ToolResult::error(format!(
-            "no export preset named {preset_name:?} — available: {names:?}"
-        ));
-    };
-    if let Some(o) = &args.overrides {
-        match (o.width, o.height) {
-            (Some(w), Some(h)) => {
-                preset.resolution = export_presets::ResolutionSpec::Explicit { w, h }
-            }
-            (None, None) => {}
-            _ => {
-                return ToolResult::error(
-                    "overrides.width and overrides.height must be given together",
-                )
-            }
-        }
-        if let Some(fr) = o.frame_rate {
-            preset.frame_rate = export_presets::FrameRatePolicy::Explicit(fr);
-        }
-    }
-    // K-0.7: sequence audio is mixed offline and muxed when the preset has an
-    // audio slot (previously stripped for a video-only P3 export).
-    let audio_requested = preset.audio.is_some();
-
-    // Build the abstract job and resolve it through the ONE export path so the
-    // synchronous response numbers match what the worker will render exactly.
-    let job = photonic_video::ExportJob {
-        sequence: seq_id,
-        format_index,
-        preset,
-        output: std::path::PathBuf::from(&args.out_path),
-        range,
-        options: Default::default(),
-    };
-    let resolved = match photonic_video::export::job::resolve_export_job(&project, &job) {
-        Ok(r) => r,
-        Err(e) => return err_code("ExportResolveFailed", e.to_string()),
-    };
-    let out_path = job.output.clone();
-    let (out_w, out_h) = resolved.out_size;
-    let total_frames = resolved.total_frames;
-
-    let gpu = bridge.engine().gpu().clone();
-    let (job_id, cancel) = state
-        .video_jobs
-        .lock()
-        .expect("job registry poisoned")
-        .start("export_sequence");
-    let jobs = std::sync::Arc::clone(&state.video_jobs);
-    let params = ExportJobParams {
-        gpu,
-        project: std::sync::Arc::clone(&project),
-        job,
-        out_path: out_path.clone(),
-        total_frames,
-        tools,
-    };
-    std::thread::spawn(move || run_export_job(jobs, job_id, cancel, params));
-
-    ToolResult::text(format!(
-        "export job started — {total_frames} frame(s) at {out_w}x{out_h} to {} — poll get_job_status",
-        out_path.display()
-    ))
-    .with_data(json!({
-        "job_id": job_id,
-        "total_frames": total_frames,
-        "width": out_w,
-        "height": out_h,
-        "preset": preset_name,
-        "audio": if audio_requested {
-            "muxed — offline sequence mix (K-0.7)"
-        } else {
-            "none in preset"
-        },
-    }))
-}
-
-struct ExportJobParams {
-    gpu: photonic_video::GpuContext,
-    project: std::sync::Arc<TimelineProject>,
-    job: photonic_video::ExportJob,
-    out_path: std::path::PathBuf,
-    total_frames: u64,
-    tools: ffmpeg_locate::FfmpegTools,
-}
-
-/// Export worker (10 §6): a thin adapter over the single relocated export path
-/// [`photonic_video::export::job::run_export_job`] — it maps that fn's
-/// `ExportEvent` stream and terminal `Result` onto the MCP job registry. The
-/// render/encode logic (dedicated session, seek-then-wait, downscale, encoder)
-/// all lives in `photonic-video` so the GUI and MCP share one code path.
-fn run_export_job(
-    jobs: std::sync::Arc<StdMutex<crate::handlers::video_jobs::JobRegistry>>,
-    job_id: crate::handlers::video_jobs::JobId,
-    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    p: ExportJobParams,
-) {
-    set_job_status(
-        &jobs,
-        job_id,
-        JobStatus::Running {
-            progress: 0.0,
-            message: "starting engine session".into(),
-        },
-    );
-    let jobs_ev = std::sync::Arc::clone(&jobs);
-    let on_event = |event: render_loop::ExportEvent| {
-        if let render_loop::ExportEvent::Progress(pr) = event {
-            set_job_status(
-                &jobs_ev,
-                job_id,
-                JobStatus::Running {
-                    progress: if pr.total > 0 {
-                        pr.frame as f32 / pr.total as f32
-                    } else {
-                        0.0
-                    },
-                    message: format!(
-                        "{}/{} frames ({:.1} fps, eta {:.0}s)",
-                        pr.frame,
-                        pr.total,
-                        pr.fps,
-                        pr.eta.as_secs_f32()
-                    ),
-                },
-            );
-        }
-    };
-    let result = photonic_video::export::job::run_export_job(
-        p.gpu,
-        std::sync::Arc::clone(&p.project),
-        &p.job,
-        &p.tools,
-        &cancel,
-        on_event,
-    );
-    match result {
-        Err(render_loop::ExportError::RenderTimeout(msg)) => set_job_status(
-            &jobs,
-            job_id,
-            JobStatus::Failed {
-                error_code: "RenderTimeout".into(),
-                message: msg,
-            },
-        ),
-        Err(e) => set_job_status(
-            &jobs,
-            job_id,
-            JobStatus::Failed {
-                error_code: "ExportFailed".into(),
-                message: e.to_string(),
-            },
-        ),
-        Ok(()) => {
-            if cancel.load(Ordering::Relaxed) {
-                set_job_status(&jobs, job_id, JobStatus::Cancelled);
-            } else {
-                set_job_status(
-                    &jobs,
-                    job_id,
-                    JobStatus::Done {
-                        result: json!({
-                            "output_path": p.out_path,
-                            "total_frames": p.total_frames,
-                        }),
-                    },
-                );
-            }
-        }
-    }
+    super::video_export::export_sequence(state, args).await
 }
 
 pub async fn get_job_status(state: &AppState, args: GetJobStatusArgs) -> ToolResult {
@@ -6479,11 +6319,10 @@ pub async fn auto_caption(state: &AppState, args: AutoCaptionArgs) -> ToolResult
         }
     };
 
-    let (job_id, cancel) = state
-        .video_jobs
-        .lock()
-        .expect("job registry poisoned")
-        .start("auto_caption");
+    let (job_id, cancel) = match state.video_jobs.lock().expect("job registry poisoned").start("auto_caption") {
+        Ok(job) => job,
+        Err(error) => return ToolResult::error_with_code("JobCapacityExceeded", error.to_string()).with_data(json!({"retryable":true,"max_active_jobs":crate::handlers::video_jobs::MAX_ACTIVE_JOBS})),
+    };
     let jobs = std::sync::Arc::clone(&state.video_jobs);
     let document = std::sync::Arc::clone(&state.document);
     let history = std::sync::Arc::clone(&state.history);
@@ -7277,11 +7116,10 @@ pub async fn generate_voiceover(state: &AppState, args: GenerateVoiceoverArgs) -
         .clone()
         .unwrap_or_else(|| "mock-voice".to_string());
 
-    let (job_id, cancel) = state
-        .video_jobs
-        .lock()
-        .expect("job registry poisoned")
-        .start("generate_voiceover");
+    let (job_id, cancel) = match state.video_jobs.lock().expect("job registry poisoned").start("generate_voiceover") {
+        Ok(job) => job,
+        Err(error) => return ToolResult::error_with_code("JobCapacityExceeded", error.to_string()).with_data(json!({"retryable":true,"max_active_jobs":crate::handlers::video_jobs::MAX_ACTIVE_JOBS})),
+    };
     let jobs = std::sync::Arc::clone(&state.video_jobs);
     let document = std::sync::Arc::clone(&state.document);
     let history = std::sync::Arc::clone(&state.history);
@@ -7838,39 +7676,43 @@ async fn render_scope_tap_pixels(
     let snapped = fr.frame_start(fr.frame_at(t));
 
     let _transport = bridge.lock_transport().await;
-    {
-        let mut timeline = state.document.lock().await.timeline.clone();
-        if let Some(p) = timeline.as_mut() {
-            if let Some(s) = p.sequences.get_mut(&seq_id) {
-                s.active_format = fi;
-            }
-        }
-        bridge.sync_timeline(timeline);
-    }
+    bridge.sync_with_format(state, Some((seq_id, fi))).await;
     if !bridge.wait_engine_synced(Duration::from_secs(10)).await {
         return Err(ToolResult::error(
             "engine did not pick up the document snapshot within 10s",
         ));
     }
-    let restore = bridge.proxy_mode();
-    bridge
-        .session()
-        .send(EngineCmd::SetProxyMode(ProxyMode::ForceOriginal));
-    bridge.session().send(EngineCmd::SetScopeTap(want));
+    let _settings = RenderSettingsGuard {
+        session: bridge.session(),
+        proxy_mode: bridge.proxy_mode(),
+        preview_quality: bridge.session().requested_preview_quality(),
+        scope_tap: Some(bridge.session().status().scope_tap),
+    };
     let prev = bridge.session().latest_frame();
-    bridge.session().send(EngineCmd::SetActiveSequence(seq_id));
-    bridge.session().send(EngineCmd::Seek(snapped));
+    let request_id = bridge.next_inspection_id();
+    if !bridge.session().send(EngineCmd::InspectFrame {
+        request_id,
+        sequence: seq_id,
+        time: snapped,
+        proxy_mode: ProxyMode::ForceOriginal,
+        quality: PreviewQuality::Full,
+        scope_tap: want,
+    }) {
+        return Err(
+            err_code("EngineBusy", "Engine command queue is full or closed")
+                .with_data(json!({"retryable":true})),
+        );
+    }
     let frame = bridge
         .wait_fresh_frame(prev, Duration::from_secs(30), |f| {
-            f.time == snapped && f.sequence == seq_id
+            f.time == snapped
+                && f.sequence == seq_id
+                && f.preview_quality == PreviewQuality::Full
+                && f.snapshot_generation == bridge.snapshot_generation()
+                && f.inspection_request_id == Some(request_id)
+                && f.proxy_mode == ProxyMode::ForceOriginal
         })
         .await;
-    bridge.session().send(EngineCmd::SetProxyMode(restore));
-    // Leave the engine on the default tap: a readonly tool must not leave the
-    // session pinned to one clip's texture for the next caller (design rule 5).
-    bridge
-        .session()
-        .send(EngineCmd::SetScopeTap(ScopeTapPoint::Program));
     let Some(frame) = frame else {
         return Err(ToolResult::error(
             "engine did not produce the requested frame within 30s",
@@ -12254,7 +12096,7 @@ mod tests {
         assert_eq!(r.is_error, Some(true));
         assert_eq!(data(&r)["error_code"], "JobNotFound");
 
-        let (job_id, cancel) = state.video_jobs.lock().unwrap().start("fake");
+        let (job_id, cancel) = state.video_jobs.lock().unwrap().start("fake").unwrap();
         let jid = json!({ "job_id": job_id });
 
         let r = call(&state, "get_job_status", jid.clone()).await;
@@ -12431,6 +12273,74 @@ mod tests {
     ///
     /// Spawned on a large-stack thread: macOS CI Metal + full-quality eval
     /// overflowed the default tokio worker stack (`stack overflow, aborting`).
+    #[tokio::test]
+    async fn full_render_resolves_one_pixel_detail_after_preview() {
+        let state = test_state();
+        if !engine_available(&state).await {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        }
+        let path =
+            std::env::temp_dir().join(format!("photonic-detail-{}.png", uuid::Uuid::new_v4()));
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _fixture = Fixture(path.clone());
+        image::RgbaImage::from_fn(1920, 64, |x, _| {
+            let c = if x % 2 == 0 { 0 } else { 255 };
+            image::Rgba([c, c, c, 255])
+        })
+        .save(&path)
+        .unwrap();
+        let mut project = TimelineProject::new();
+        let asset = project
+            .media
+            .insert(photonic_core::timeline::MediaAsset::from_file(
+                AssetKind::Image,
+                path,
+            ));
+        let mut seq = Sequence::new("detail", FrameRate::FPS_30, 1920, 64);
+        let sequence_id = seq.id;
+        let mut track = Track::new(photonic_core::timeline::TrackKind::Video, "V1");
+        track.clips.push(Clip::new(
+            ClipSource::Asset { asset },
+            Tick(0),
+            Tick(TICKS_PER_SECOND),
+        ));
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        project.active_sequence = Some(sequence_id);
+        state.document.lock().await.timeline = Some(project);
+        state.history.lock().await.reset();
+        let preview = call(&state, "render_frame_at", json!({
+            "sequence_id": sequence_id, "at_ticks": 0, "quality": "preview", "output_format": "raw_rgba16f"
+        })).await;
+        assert_ne!(preview.is_error, Some(true));
+        let full = call(&state, "render_frame_at", json!({
+            "sequence_id": sequence_id, "at_ticks": 0, "quality": "full", "output_format": "raw_rgba16f"
+        })).await;
+        assert_ne!(full.is_error, Some(true));
+        let payload = data(&full);
+        let bytes = general_purpose::STANDARD
+            .decode(payload["data_base64"].as_str().unwrap())
+            .unwrap();
+        let red = |x: usize| u16::from_le_bytes([bytes[x * 8], bytes[x * 8 + 1]]);
+        assert!(
+            red(200) < 0x1400,
+            "Full must preserve the black source pixel"
+        );
+        assert!(
+            red(201) > 0x3bf0,
+            "Full must preserve the white source pixel"
+        );
+    }
+
     #[test]
     fn render_frame_at_is_deterministic() {
         std::thread::Builder::new()

@@ -406,8 +406,15 @@ impl GpuContext {
 /// Resolves source ops (`DecodeVideo`/`DecodeStill`/`RasterVector`) to working
 /// textures. The session implements it over decode rings + the headless vector
 /// renderer; tests that use only `SolidColor`/`Merge` never trigger it. A `None`
-/// return means "not available yet" — the evaluator substitutes transparent.
+/// return means "not available yet" — dependent results remain incomplete.
 pub trait GpuFrameSource {
+    /// Source context absent from the graph, including vector document updates
+    /// and approximate samples. Change it whenever identical source ops can
+    /// resolve to different pixels. Zero retains the default exact namespace.
+    fn cache_namespace(&self) -> u64 {
+        0
+    }
+
     fn video_texture(
         &mut self,
         gpu: &GpuContext,
@@ -500,6 +507,7 @@ pub struct Evaluator {
     /// target — the next frame would then render another node into the texture
     /// the scopes are still measuring.
     pinned_tap: Option<crate::graph::ir::ContentHash>,
+    source_namespace: u64,
 }
 
 impl Evaluator {
@@ -522,6 +530,7 @@ impl Evaluator {
             caption,
             pinned_output: None,
             pinned_tap: None,
+            source_namespace: 0,
         }
     }
 
@@ -531,6 +540,26 @@ impl Evaluator {
 
     pub fn cache_stats(&self) -> CacheStats {
         self.cache.stats()
+    }
+
+    pub fn set_cache_budget_bytes(&mut self, bytes: u64) {
+        self.cache.set_budget_bytes(bytes);
+    }
+
+    fn evaluation_hash(
+        &self,
+        hash: crate::graph::ir::ContentHash,
+        w: u32,
+        h: u32,
+    ) -> crate::graph::ir::ContentHash {
+        let mut hash = evaluation_hash(hash, w, h);
+        if self.source_namespace != 0 {
+            // Exact evaluation keeps its stable namespace; approximations must
+            // never satisfy a later paused/export lookup for the same tick.
+            hash.0 ^= (self.source_namespace as u128) << 64;
+            hash.0 ^= 0x7363_7275_625f_6170_7072_6f78_696d_6174_u128;
+        }
+        hash
     }
 
     /// Evict cached results whose content hash matches `pred` (asset relink /
@@ -585,6 +614,7 @@ impl Evaluator {
         source: &mut dyn GpuFrameSource,
         tap: Option<crate::graph::ir::IrNodeId>,
     ) -> (Option<GpuFrame>, Option<GpuFrame>) {
+        self.source_namespace = source.cache_namespace();
         let (cw, ch) = (canvas.0.max(1), canvas.1.max(1));
         let mut results: Vec<Option<GpuFrame>> = (0..graph.nodes.len()).map(|_| None).collect();
 
@@ -601,8 +631,10 @@ impl Evaluator {
                     src_time,
                     proxy,
                 } => match source.video_texture(&self.gpu, *asset, *src_time, *proxy) {
-                    Some(frame) => self.normalize_source_cached(node.content_hash, frame, cw, ch),
-                    None => self.transparent(cw, ch),
+                    Some(frame) => {
+                        Some(self.normalize_source_cached(node.content_hash, frame, cw, ch))
+                    }
+                    None => None,
                 },
                 // K-C8: the still is requested at the LOGICAL canvas size
                 // (`cw`/`ch` — already preview-scaled by `preview_canvas`), not
@@ -610,9 +642,9 @@ impl Evaluator {
                 IrOp::DecodeStill { asset } => {
                     match source.still_texture(&self.gpu, *asset, cw, ch) {
                         Some(frame) => {
-                            self.normalize_source_cached(node.content_hash, frame, cw, ch)
+                            Some(self.normalize_source_cached(node.content_hash, frame, cw, ch))
                         }
-                        None => self.transparent(cw, ch),
+                        None => None,
                     }
                 }
                 IrOp::RasterVector {
@@ -621,12 +653,27 @@ impl Evaluator {
                     w,
                     h,
                 } => match source.vector_texture(&self.gpu, *vref, *doc_state, *w, *h) {
-                    Some(frame) => self.normalize_source_cached(node.content_hash, frame, cw, ch),
-                    None => self.transparent(cw, ch),
+                    Some(frame) => {
+                        Some(self.normalize_source_cached(node.content_hash, frame, cw, ch))
+                    }
+                    None => None,
                 },
-                _ => self.render_cached(node, &inputs, cw, ch),
+                _ if inputs.len() == node.inputs.len() => {
+                    Some(self.render_cached(node, &inputs, cw, ch))
+                }
+                _ => None,
             };
-            results[i] = Some(out);
+            results[i] = out;
+        }
+
+        // All source nodes above are visited, including independent misses, so
+        // they can request work concurrently. Keep the last complete program
+        // and scope pins until the requested output is actually ready.
+        if graph
+            .output
+            .is_some_and(|id| results[id.0 as usize].is_none())
+        {
+            return (None, None);
         }
 
         // The scope tap (K-E2): a node already computed above. Pinned like the
@@ -634,9 +681,12 @@ impl Evaluator {
         let tap_hit = tap
             .filter(|id| (id.0 as usize) < graph.nodes.len())
             .and_then(|id| {
-                results[id.0 as usize]
-                    .clone()
-                    .map(|frame| (graph.nodes[id.0 as usize].content_hash, frame))
+                results[id.0 as usize].clone().map(|frame| {
+                    (
+                        self.evaluation_hash(graph.nodes[id.0 as usize].content_hash, cw, ch),
+                        frame,
+                    )
+                })
             });
         match &tap_hit {
             Some((hash, _)) => {
@@ -658,7 +708,7 @@ impl Evaluator {
         let Some(out_node) = graph.output else {
             return (None, tap_tex);
         };
-        let out_hash = graph.nodes[out_node.0 as usize].content_hash;
+        let out_hash = self.evaluation_hash(graph.nodes[out_node.0 as usize].content_hash, cw, ch);
         // Pin the displayed output; unpin the previous one (03 §3.4 exception 1).
         if let Some(prev) = self.pinned_output.replace(out_hash) {
             if prev != out_hash {
@@ -684,12 +734,13 @@ impl Evaluator {
             width: w,
             height: h,
         };
-        let (target, valid) = self.cache.lookup_or_alloc(node.content_hash, desc);
+        let hash = self.evaluation_hash(node.content_hash, cw, ch);
+        let (target, valid) = self.cache.lookup_or_alloc(hash, desc);
         if valid {
             return GpuFrame::new(target, w, h);
         }
         self.render_op(&node.op, inputs, &target, w, h);
-        self.cache.mark_rendered(node.content_hash);
+        self.cache.mark_rendered(hash);
         GpuFrame::new(target, w, h)
     }
 
@@ -703,6 +754,7 @@ impl Evaluator {
         if source.width == width && source.height == height {
             return source;
         }
+        let hash = self.evaluation_hash(hash, width, height);
         let desc = TextureDesc { width, height };
         let (target, valid) = self.cache.lookup_or_alloc(hash, desc);
         if !valid {
@@ -1425,27 +1477,23 @@ impl Evaluator {
             },
         }
     }
+}
 
-    /// A cached transparent texture of size `(w, h)` (fresh, filled once).
-    fn transparent(&mut self, w: u32, h: u32) -> GpuFrame {
-        // Key transparents in a reserved high-bit namespace so fillers never
-        // collide with real content hashes (xxh3 fills the low 120 bits; the top
-        // byte 0xFE is reserved here).
-        let hash =
-            crate::graph::ir::ContentHash((0xFE_u128 << 120) | ((w as u128) << 32) | h as u128);
-        let (tex, valid) = self.cache.lookup_or_alloc(
-            hash,
-            TextureDesc {
-                width: w,
-                height: h,
-            },
-        );
-        if !valid {
-            self.passes.fill(&self.gpu, &tex, [0.0; 4]);
-            self.cache.mark_rendered(hash);
-        }
-        GpuFrame::new(tex, w, h)
-    }
+/// The processing canvas affects every dependency, including outputs with an
+/// explicit size. A full-size output made from Draft inputs must never satisfy
+/// a later Full evaluation of the same compiled graph.
+fn evaluation_hash(
+    hash: crate::graph::ir::ContentHash,
+    width: u32,
+    height: u32,
+) -> crate::graph::ir::ContentHash {
+    let mut key = [0u8; 24];
+    key[..16].copy_from_slice(&hash.0.to_le_bytes());
+    key[16..20].copy_from_slice(&width.to_le_bytes());
+    key[20..].copy_from_slice(&height.to_le_bytes());
+    // Keep the top byte clear, matching compiled hashes and reserving 0xFE
+    // for transparent fillers.
+    crate::graph::ir::ContentHash(xxhash_rust::xxh3::xxh3_128(&key) & ((1u128 << 120) - 1))
 }
 
 /// The output size of a computed op.
@@ -4498,6 +4546,63 @@ mod tests {
     }
 
     #[test]
+    fn changing_processing_canvas_preserves_full_detail_in_cached_outputs() {
+        let Some(gpu) = GpuContext::request_blocking() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            eprintln!("no GPU adapter; skipping processing-canvas regression");
+            return;
+        };
+        // An explicit output size stays unchanged between Draft and Full. The
+        // one-pixel pattern exposes accidental reuse of a downsampled input.
+        for (w, h) in [(1920, 1080), (3840, 2160)] {
+            let pattern = patterned_image(w, h);
+            let mut source = PatternSource {
+                frame: GpuFrame::new(upload_pattern(&gpu, &pattern), w, h),
+            };
+            let graph = FrameGraph {
+                nodes: vec![
+                    IrNode {
+                        op: IrOp::DecodeStill {
+                            asset: AssetId::new(),
+                        },
+                        inputs: vec![],
+                        content_hash: ContentHash(710),
+                    },
+                    IrNode {
+                        op: IrOp::Output { w, h },
+                        inputs: vec![(IrNodeId(0), OutPort::default())],
+                        content_hash: ContentHash(711),
+                    },
+                ],
+                output: Some(IrNodeId(1)),
+            };
+            let mut reused = Evaluator::new(gpu.clone());
+            let draft = reused.evaluate(&graph, (960, 540), &mut source).unwrap();
+            let draft_pixels = read_texture_rgba16f(&gpu, &draft, w, h);
+            let full = reused.evaluate(&graph, (w, h), &mut source).unwrap();
+            let full_pixels = read_texture_rgba16f(&gpu, &full, w, h);
+            let mut fresh = Evaluator::new(gpu.clone());
+            let reference = fresh.evaluate(&graph, (w, h), &mut source).unwrap();
+            let reference_pixels = read_texture_rgba16f(&gpu, &reference, w, h);
+            assert_eq!(
+                full_pixels, reference_pixels,
+                "reused Full differs at {w}x{h}"
+            );
+            assert!(
+                full_pixels[201][0] - full_pixels[200][0] > 0.9,
+                "Full lost detail at {w}x{h}"
+            );
+            assert!(
+                (draft_pixels[201][0] - draft_pixels[200][0]).abs() < 0.1,
+                "Draft fixture must lose one-pixel detail"
+            );
+        }
+    }
+
+    #[test]
     fn output_does_not_stretch_bucket_padding_into_logical_frame() {
         let Some(gpu) = GpuContext::request_blocking() else {
             eprintln!("no GPU adapter; skipping logical-output padding policy");
@@ -5702,5 +5807,129 @@ mod tests {
                 assert_graph_gpu_matches_cpu(&transition_graph(op, inc, outg), 1e-3);
             }
         }
+    }
+
+    #[test]
+    fn t005_incomplete_graph_drains_sources_without_poisoning_cache_or_retained_frames() {
+        let Some(gpu) = GpuContext::request_blocking() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        struct Delayed {
+            frame: GpuFrame,
+            ready: bool,
+            calls: usize,
+            namespace: u64,
+        }
+        impl GpuFrameSource for Delayed {
+            fn cache_namespace(&self) -> u64 {
+                self.namespace
+            }
+            fn video_texture(
+                &mut self,
+                _: &GpuContext,
+                _: AssetId,
+                _: Tick,
+                _: bool,
+            ) -> Option<GpuFrame> {
+                None
+            }
+            fn still_texture(
+                &mut self,
+                _: &GpuContext,
+                _: AssetId,
+                _: u32,
+                _: u32,
+            ) -> Option<GpuFrame> {
+                self.calls += 1;
+                self.ready.then(|| self.frame.clone())
+            }
+            fn vector_texture(
+                &mut self,
+                _: &GpuContext,
+                _: VectorRef,
+                _: VectorStateKey,
+                _: u32,
+                _: u32,
+            ) -> Option<GpuFrame> {
+                None
+            }
+        }
+        let mut red = Image::new(8, 8);
+        red.pixels.fill([1.0, 0.0, 0.0, 1.0]);
+        let mut source = Delayed {
+            frame: GpuFrame::new(upload_pattern(&gpu, &red), 8, 8),
+            ready: false,
+            calls: 0,
+            namespace: 0,
+        };
+        let graph = FrameGraph {
+            nodes: vec![
+                IrNode {
+                    op: IrOp::DecodeStill {
+                        asset: AssetId::new(),
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(900),
+                },
+                IrNode {
+                    op: IrOp::DecodeStill {
+                        asset: AssetId::new(),
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(901),
+                },
+                IrNode {
+                    op: IrOp::Merge {
+                        mode: BlendMode::Normal,
+                        opacity: 1.0,
+                    },
+                    inputs: vec![
+                        (IrNodeId(0), OutPort::default()),
+                        (IrNodeId(1), OutPort::default()),
+                    ],
+                    content_hash: ContentHash(902),
+                },
+                IrNode {
+                    op: IrOp::Output { w: 8, h: 8 },
+                    inputs: vec![(IrNodeId(2), OutPort::default())],
+                    content_hash: ContentHash(903),
+                },
+            ],
+            output: Some(IrNodeId(3)),
+        };
+        let mut evaluator = Evaluator::new(gpu.clone());
+        assert!(evaluator.evaluate(&graph, (8, 8), &mut source).is_none());
+        assert_eq!(source.calls, 2);
+        assert_eq!(evaluator.cache_stats().resident_entries, 0);
+        source.ready = true;
+        let retained = evaluator.evaluate(&graph, (8, 8), &mut source).unwrap();
+        let pixels = read_texture_rgba16f(&gpu, &retained, 8, 8);
+        assert!(pixels[0][0] > 0.99);
+        source.ready = false;
+        assert!(evaluator.evaluate(&graph, (8, 8), &mut source).is_none());
+        source.ready = true;
+        let mut blue = Image::new(8, 8);
+        blue.pixels.fill([0.0, 0.0, 1.0, 1.0]);
+        source.frame = GpuFrame::new(upload_pattern(&gpu, &blue), 8, 8);
+        source.namespace = 1;
+        let approximate = evaluator.evaluate(&graph, (8, 8), &mut source).unwrap();
+        assert!(read_texture_rgba16f(&gpu, &approximate, 8, 8)[0][2] > 0.99);
+        source.namespace = 0;
+        source.frame = GpuFrame::new(upload_pattern(&gpu, &red), 8, 8);
+        let exact = evaluator.evaluate(&graph, (8, 8), &mut source).unwrap();
+        assert_eq!(read_texture_rgba16f(&gpu, &exact, 8, 8), pixels);
+        evaluator.invalidate_matching(|_| true);
+        source.frame = GpuFrame::new(upload_pattern(&gpu, &blue), 8, 8);
+        let replacement = evaluator.evaluate(&graph, (8, 8), &mut source).unwrap();
+        assert!(read_texture_rgba16f(&gpu, &replacement, 8, 8)[0][2] > 0.99);
+        assert_eq!(
+            read_texture_rgba16f(&gpu, &retained, 8, 8),
+            pixels,
+            "retained Arc was overwritten during recycling"
+        );
     }
 }

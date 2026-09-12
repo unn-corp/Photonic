@@ -668,30 +668,108 @@ pub struct ConvertToGrayscaleArgs {
 #[derive(Debug, Serialize)]
 pub struct ToolResult {
     pub content: Vec<ContentItem>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "structuredContent")]
+    pub structured_content: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "isError")]
     pub is_error: Option<bool>,
+    /// Index of the JSON compatibility block, if one has been added. Updating
+    /// data replaces that block, keeping it consistent with structuredContent.
+    #[serde(skip)]
+    data_content_index: Option<usize>,
+}
+
+/// Stable fields available on every tool execution error. Domain handlers may
+/// supply a more specific `error_code` and additional JSON diagnostic fields.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ToolErrorData {
+    pub error_code: String,
+    pub message: String,
+    #[serde(flatten)]
+    pub details: serde_json::Map<String, Value>,
 }
 
 impl ToolResult {
     pub fn text(msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        let structured_content = Some(serde_json::json!({ "message": msg }));
         Self {
             content: vec![ContentItem::text(msg)],
+            structured_content,
             is_error: None,
+            data_content_index: None,
         }
     }
 
     pub fn error(msg: impl Into<String>) -> Self {
-        Self {
-            content: vec![ContentItem::text(msg)],
-            is_error: Some(true),
-        }
+        Self::error_with_code("ToolExecutionError", msg)
     }
 
+    /// Construct an execution error with a machine-readable domain code.
+    pub fn error_with_code(code: impl Into<String>, msg: impl Into<String>) -> Self {
+        let msg = msg.into();
+        let data = serde_json::json!(ToolErrorData {
+            error_code: code.into(),
+            message: msg.clone(),
+            details: serde_json::Map::new(),
+        });
+        let mut result = Self {
+            content: vec![ContentItem::text(msg)],
+            structured_content: None,
+            is_error: Some(true),
+            data_content_index: None,
+        };
+        result.set_data(data);
+        result
+    }
+
+    /// Expose native structured output alongside the legacy JSON text block.
+    ///
+    /// Success data replaces the text-only `{message}` payload. Error data
+    /// augments the stable error fields; supplied string codes override the
+    /// generic code, while later diagnostics retain earlier fields. Repeated
+    /// calls keep a single JSON block so old content parsers see current data.
     pub fn with_data(mut self, data: impl Serialize) -> Self {
-        if let Ok(v) = serde_json::to_value(data) {
-            self.content.push(ContentItem::json(v));
+        let data = match serde_json::to_value(data) {
+            Ok(data) => data,
+            Err(error) => {
+                return Self::error_with_code(
+                    "SerializationFailed",
+                    format!("Could not serialize tool output: {error}"),
+                );
+            }
+        };
+        if self.is_error == Some(true) {
+            let mut merged = self.structured_content.take().unwrap_or_default();
+            if let Some(fields) = merged.as_object_mut() {
+                if let Value::Object(data) = data {
+                    for (key, value) in data {
+                        // These two fields keep their documented types even
+                        // when a handler supplies malformed diagnostic data.
+                        if matches!(key.as_str(), "error_code" | "message") && !value.is_string() {
+                            continue;
+                        }
+                        fields.insert(key, value);
+                    }
+                } else {
+                    fields.insert("details".into(), data);
+                }
+            }
+            self.set_data(merged);
+        } else {
+            self.set_data(data);
         }
         self
+    }
+
+    fn set_data(&mut self, data: Value) {
+        let content = ContentItem::json(&data);
+        if let Some(index) = self.data_content_index {
+            self.content[index] = content;
+        } else {
+            self.data_content_index = Some(self.content.len());
+            self.content.push(content);
+        }
+        self.structured_content = Some(data);
     }
 
     pub fn with_image(mut self, base64_png: String) -> Self {
@@ -721,7 +799,7 @@ impl ContentItem {
         Self::Text { text: msg.into() }
     }
 
-    pub fn json(v: Value) -> Self {
+    pub fn json(v: impl Serialize) -> Self {
         Self::Text {
             text: serde_json::to_string_pretty(&v).unwrap_or_default(),
         }

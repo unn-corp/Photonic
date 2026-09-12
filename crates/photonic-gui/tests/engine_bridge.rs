@@ -87,10 +87,13 @@ fn bridge_mirrors_document_and_presents_to_egui_texture() {
     // is padded up (192) — exactly what the monitor's UV crop compensates for.
     assert!(tex.0 .0 >= 320 && tex.0 .1 >= 180);
 
-    // 3. Status flows: the engine observed the mirrored revision bump.
+    // 3. Status flows: the engine observed the immutable snapshot published
+    // by the bridge. A freshly-created history legitimately starts at
+    // revision zero; generation is the snapshot-observation barrier.
     let status = bridge.status();
     assert!(
-        status.doc_revision > 0,
-        "engine snapshot revision not bumped"
+        status.snapshot_generation > 0,
+        "engine snapshot not observed"
     );
+    assert_eq!(status.doc_revision, history.revision());
 }

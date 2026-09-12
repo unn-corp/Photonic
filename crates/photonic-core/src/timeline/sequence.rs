@@ -198,8 +198,15 @@ impl Default for ProjectVideoSettings {
     }
 }
 
-/// A sequence: a stack of tracks with a frame rate and one or more aspect
-/// formats.
+/// User-declared region for cached playback. Rendered chunks remain sidecar
+/// cache state and never enter document history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewZone {
+    pub start: Tick,
+    pub end: Tick,
+}
+
+/// A sequence: a stack of tracks with a frame rate and one or more aspect formats.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sequence {
     pub id: SequenceId,
@@ -237,6 +244,8 @@ pub struct Sequence {
     /// In/out for preview + export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_range: Option<(Tick, Tick)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_zones: Vec<PreviewZone>,
     /// Sequence start timecode offset (K-A12). Display labels are
     /// `start_timecode + playhead`. Default zero (legacy files). Deliveries
     /// often use `01:00:00:00` (`frame_rate.frame_start(nominal_fps * 3600)`).
@@ -266,6 +275,7 @@ impl Sequence {
             master_effects: Vec::new(),
             master_grade: None,
             work_range: None,
+            preview_zones: Vec::new(),
             start_timecode: Tick::ZERO,
         }
     }

@@ -283,8 +283,43 @@ impl PhotonicApp {
             "video.extend_edit" => self.timeline_extend_edit_to_playhead(doc, history),
             "video.roll_prev_to_playhead" => self.timeline_roll_to_playhead(doc, history, true),
             "video.roll_next_to_playhead" => self.timeline_roll_to_playhead(doc, history, false),
+            "video.add_preview_zone"
+            | "video.remove_preview_zone"
+            | "video.remove_all_preview_zones"
+            | "video.render_preview"
+            | "video.stop_preview_render" => self.video_preview_action(doc, history, id),
+            "video.audition_source" => self.video_audition_source(doc),
+            "video.stop_source_audition" => self.source_panel_command(
+                doc,
+                crate::panels::video::source_monitor::SourceCommand::Stop,
+            ),
+            "video.precision_trim" => self.toggle_precision_trim(doc, history),
+            "video.enter_nested_sequence" => self.enter_nested_sequence(doc, history),
+            "video.leave_nested_sequence" => self.leave_nested_sequence(doc, history),
             "video.match_frame" => self.timeline_match_frame(doc),
             "video.reveal_in_project" => self.timeline_reveal_in_project(doc),
+            "video.open_transcript"
+            | "video.remove_transcript_selection"
+            | "video.find_fillers" => {
+                self.open_drawer = Some(DrawerGroup::Transcript);
+                self.transcript_panel_open = true;
+                if let Some(sequence) = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|project| project.active_sequence)
+                {
+                    use crate::panels::video::transcript::TranscriptCommand;
+                    let command = match id {
+                        "video.remove_transcript_selection" => {
+                            Some(TranscriptCommand::RemoveSelection)
+                        }
+                        "video.find_fillers" => Some(TranscriptCommand::FindFillers),
+                        _ => None,
+                    };
+                    self.pending_transcript_command =
+                        command.map(|command| (doc.id, sequence, command));
+                }
+            }
             "video.edit_duration" => self.timeline_open_edit_duration(doc),
             "video.freeze_frame" => self.timeline_freeze_frame(doc, history),
             "video.alpha_view" => {
@@ -2216,6 +2251,10 @@ impl PhotonicApp {
             return;
         }
 
+        if self.precision_keyboard(ctx, doc, history) {
+            return;
+        }
+
         // K-A7: while grab is active, arrow keys / Enter / Esc own the keyboard
         // so they never step the playhead or fire unrelated timeline verbs.
         if self.timeline_grab.is_some() {
@@ -2260,6 +2299,19 @@ impl PhotonicApp {
             "video.roll_next_to_playhead",
             "video.match_frame",
             "video.reveal_in_project",
+            "video.add_preview_zone",
+            "video.remove_preview_zone",
+            "video.remove_all_preview_zones",
+            "video.render_preview",
+            "video.stop_preview_render",
+            "video.audition_source",
+            "video.stop_source_audition",
+            "video.precision_trim",
+            "video.enter_nested_sequence",
+            "video.leave_nested_sequence",
+            "video.open_transcript",
+            "video.remove_transcript_selection",
+            "video.find_fillers",
             // `video.grab_item` is dispatched from `handle_video_keyboard` only
             // (avoids double-toggle when both pollers run in one frame).
             "video.edit_duration",

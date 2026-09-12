@@ -9,6 +9,7 @@ mod demos;
 use demos::*;
 mod hit_test;
 use hit_test::*;
+mod editing_workflows;
 /// G-10 source marks (session-only). `pub` so UI-path integration tests can
 /// drive the same types the transport and command palette use.
 pub mod source_marks;
@@ -988,6 +989,12 @@ pub struct PhotonicApp {
     pub(crate) transcript_panel_open: bool,
     /// [transcript, 17 G-18] Scroll offset (px) of the transcript word list.
     pub(crate) transcript_scroll: f32,
+    /// Document-scoped transcript action waiting for the drawer's egui context.
+    pub(crate) pending_transcript_command: Option<(
+        uuid::Uuid,
+        SequenceId,
+        panels::video::transcript::TranscriptCommand,
+    )>,
     /// [timeline-panel, 17 G-13] Armed modal timeline tool (see
     /// `TimelineTool`'s doc comment). Read directly off `self` by
     /// `app/timeline/mod.rs`'s mini-toolbar once that story lands.
@@ -1002,6 +1009,10 @@ pub struct PhotonicApp {
     /// [seq_tabs, 17 G-16/G-17] Breadcrumb stack of sequence ids drilled
     /// into via nested-sequence navigation — empty at the top level.
     pub(crate) nested_sequence_breadcrumbs: Vec<SequenceId>,
+    pub(crate) precision_trim: Option<editing_workflows::PrecisionTrimSession>,
+    pub(crate) sequence_views:
+        std::collections::HashMap<(uuid::Uuid, SequenceId), editing_workflows::SequenceViewState>,
+    pub(crate) view_sequence: Option<(uuid::Uuid, SequenceId)>,
 
     /// Canvas-space position where the current drag began (shape creation).
     drag_start_canvas: Option<(f64, f64)>,
@@ -1662,9 +1673,13 @@ impl Default for PhotonicApp {
             multicam_view_open: false,
             transcript_panel_open: false,
             transcript_scroll: 0.0,
+            pending_transcript_command: None,
             timeline_tool: TimelineTool::default(),
             open_sequence_tabs: Vec::new(),
             nested_sequence_breadcrumbs: Vec::new(),
+            precision_trim: None,
+            sequence_views: std::collections::HashMap::new(),
+            view_sequence: None,
             drag_start_canvas: None,
             pen_points: Vec::new(),
             moving: false,
@@ -2404,6 +2419,15 @@ impl PhotonicApp {
             export_dialog_open: &mut self.export_dialog_open,
             last_export_preset: &mut self.last_export_preset,
             playhead: self.playhead,
+            source_marks: &mut self.source_marks,
+            source_audition: self
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.status().source_audition.clone()),
+            source_audition_error: self
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.status().source_audition_error.clone()),
             source_monitor_scrub: &mut self.source_monitor_scrub,
             multicam_active_angle: &mut self.multicam_active_angle,
             multicam_view_open: &mut self.multicam_view_open,
@@ -2425,6 +2449,21 @@ impl PhotonicApp {
         history: &CommandHistory,
         group: DrawerGroup,
     ) {
+        if group == DrawerGroup::Transcript {
+            if let Some((document_id, sequence_id, command)) =
+                self.pending_transcript_command.take()
+            {
+                if document_id == doc.id
+                    && doc
+                        .timeline
+                        .as_ref()
+                        .and_then(|project| project.active_sequence)
+                        == Some(sequence_id)
+                {
+                    panels::video::transcript::request_command(ui.ctx(), command);
+                }
+            }
+        }
         let selected_node = self.selected_id.and_then(|id| doc.nodes.get(&id));
         let selection_count = doc.selection.node_ids.len();
         let selected_ids = doc.selection.node_ids.iter().cloned().collect::<Vec<_>>();
@@ -2535,6 +2574,15 @@ impl PhotonicApp {
                 export_dialog_open: &mut self.export_dialog_open,
                 last_export_preset: &mut self.last_export_preset,
                 playhead: self.playhead,
+                source_marks: &mut self.source_marks,
+                source_audition: self
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.status().source_audition.clone()),
+                source_audition_error: self
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.status().source_audition_error.clone()),
                 source_monitor_scrub: &mut self.source_monitor_scrub,
                 multicam_active_angle: &mut self.multicam_active_angle,
                 multicam_view_open: &mut self.multicam_view_open,

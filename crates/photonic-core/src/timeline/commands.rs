@@ -748,6 +748,12 @@ pub enum TimelineCmd {
         new: MarkerCategory,
     },
     /// Set (or clear, with `None`) a sequence's preview/export work range.
+    /// User intent for background preview rendering (33 §3).
+    SetPreviewZones {
+        seq: SequenceId,
+        old: Vec<super::sequence::PreviewZone>,
+        new: Vec<super::sequence::PreviewZone>,
+    },
     SetWorkRange {
         seq: SequenceId,
         old: Option<(Tick, Tick)>,
@@ -1834,6 +1840,7 @@ impl TimelineCmd {
             TimelineCmd::AddMarkerCategory { .. } => "Add marker category".into(),
             TimelineCmd::RemoveMarkerCategory { .. } => "Remove marker category".into(),
             TimelineCmd::SetMarkerCategory { .. } => "Edit marker category".into(),
+            TimelineCmd::SetPreviewZones { .. } => "Set preview zones".into(),
             TimelineCmd::SetWorkRange { .. } => "Set work range".into(),
             TimelineCmd::AddBin { .. } => "Add bin".into(),
             TimelineCmd::RemoveBin { .. } => "Remove bin".into(),
@@ -2329,6 +2336,11 @@ impl TimelineCmd {
                     *c = new.clone();
                 }
             }
+            TimelineCmd::SetPreviewZones { seq, new, .. } => {
+                if let Some(sequence) = p.sequences.get_mut(seq) {
+                    sequence.preview_zones = new.clone();
+                }
+            }
             TimelineCmd::SetWorkRange { seq, new, .. } => {
                 if let Some(s) = p.sequences.get_mut(seq) {
                     s.work_range = *new;
@@ -2776,6 +2788,11 @@ impl TimelineCmd {
             },
             TimelineCmd::SetMarkerCategory { id, old, new } => TimelineCmd::SetMarkerCategory {
                 id: *id,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            TimelineCmd::SetPreviewZones { seq, old, new } => TimelineCmd::SetPreviewZones {
+                seq: *seq,
                 old: new.clone(),
                 new: old.clone(),
             },

@@ -1477,6 +1477,9 @@ pub enum TranscodePresetArg {
 
 #[derive(Debug, Deserialize)]
 pub struct ExportSequenceArgs {
+    /// Reject export if the live document has changed since inspection.
+    #[serde(default)]
+    pub expected_revision: Option<u64>,
     pub sequence_id: SequenceId,
     pub out_path: String,
     /// Preset name (built-in or custom); default `"Web H.264"`.

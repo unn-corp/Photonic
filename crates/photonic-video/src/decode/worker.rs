@@ -66,12 +66,17 @@ struct Ctrl {
 pub struct DecodeWorker {
     ctrl: Arc<Ctrl>,
     join: Option<JoinHandle<()>>,
+    cancellation: super::sidecar::DecodeCancellation,
 }
 
 impl DecodeWorker {
     /// Spawn a worker that keeps `decode`'s ring pumped ahead of the steered
     /// playhead. `rate` is the source frame rate (for the look-ahead target).
     pub fn spawn(decode: Arc<Mutex<DecodeSource>>, rate: FrameRate) -> Self {
+        let cancellation = decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancellation();
         let ctrl = Arc::new(Ctrl {
             steer: Mutex::new(Steer {
                 target: None,
@@ -87,6 +92,7 @@ impl DecodeWorker {
             .expect("spawn decode worker thread");
         DecodeWorker {
             ctrl,
+            cancellation,
             join: Some(join),
         }
     }
@@ -121,6 +127,7 @@ impl Drop for DecodeWorker {
             let mut g = self.ctrl.steer.lock().unwrap_or_else(|e| e.into_inner());
             g.stop = true;
         }
+        self.cancellation.cancel();
         self.ctrl.wake.notify_all();
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -205,5 +212,63 @@ fn wait_timeout_tolerant<'a, T>(
     match cvar.wait_timeout(guard, dur) {
         Ok((g, _)) => g,
         Err(poisoned) => poisoned.into_inner().0,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::decode::scheduler::{PtsKind, SourceParams};
+    use crate::decode::{PixFmt, SharedRing};
+    use crate::media::ffmpeg_locate::FfmpegTools;
+    use crate::media::keyframe_index::KeyframeIndex;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    #[test]
+    fn t005_worker_drop_interrupts_a_blocked_decode_pipe() {
+        let path =
+            std::env::temp_dir().join(format!("photonic-stalled-decoder-{}", uuid::Uuid::new_v4()));
+        let marker = std::path::PathBuf::from(format!("{}.started", path.display()));
+        std::fs::write(&path,b"#!/bin/sh\ncase \"$*\" in *-hwaccels*) exit 0;; esac\n: > \"$0.started\"\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = FfmpegTools {
+            ffmpeg: path.clone(),
+            ffprobe: path.clone(),
+        };
+        let params = SourceParams {
+            input: path.clone(),
+            width: 2,
+            height: 2,
+            pix_fmt: PixFmt::Yuv420p,
+            pts_kind: PtsKind::Cfr(FrameRate::FPS_30),
+            keyframes: KeyframeIndex {
+                keyframes: vec![Tick::ZERO],
+            },
+        };
+        let decode = Arc::new(Mutex::new(DecodeSource::new(
+            tools,
+            params,
+            SharedRing::preview(),
+        )));
+        let worker = DecodeWorker::spawn(decode, FrameRate::FPS_30);
+        worker.steer(Tick::ZERO);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            marker.exists(),
+            "mock process did not reach its blocking read"
+        );
+        let start = Instant::now();
+        drop(worker);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown waited for the blocked pipe: {:?}",
+            start.elapsed()
+        );
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(marker);
     }
 }

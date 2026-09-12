@@ -32,4 +32,12 @@ pub mod transforms;
 pub mod typography;
 pub mod utility;
 pub mod video;
+pub mod video_edits;
+pub mod video_inspect;
 pub mod video_jobs;
+pub(crate) mod video_readback;
+pub mod video_transcript;
+
+pub mod video_export;
+
+pub mod video_workflows;

@@ -587,3 +587,82 @@ mod tests {
         }
     }
 }
+
+/// Cached-playback status uses the same tick axis as the ruler. The thin
+/// coloured stroke is instrumentation; it does not cover ruler text or clips.
+pub(crate) fn draw_preview_strip(
+    ui: &mut egui::Ui,
+    view: &TimelineView,
+    ruler_rect: egui::Rect,
+    lane_left: f32,
+    sequence: &Sequence,
+    status: Option<&photonic_video::preview::PreviewStatusSnapshot>,
+) {
+    use photonic_video::preview::ChunkState;
+    let painter = ui.painter_at(ruler_rect);
+    let y = ruler_rect.bottom() - 2.0;
+    let red = ui.visuals().error_fg_color;
+    let yellow = ui.visuals().warn_fg_color;
+    // DESIGN.md `success`: export/render pipeline completion token.
+    let green = egui::Color32::from_rgb(0x64, 0xc8, 0x7a);
+    for (index, zone) in sequence.preview_zones.iter().enumerate() {
+        let left = view.tick_to_x(zone.start, lane_left).max(ruler_rect.left());
+        let right = view.tick_to_x(zone.end, lane_left).min(ruler_rect.right());
+        if right <= left {
+            continue;
+        }
+        painter.line_segment(
+            [egui::pos2(left, y), egui::pos2(right, y)],
+            egui::Stroke::new(3.0, red),
+        );
+        if let Some(status) = status {
+            for chunk in status.chunks.iter().filter(|chunk| {
+                chunk.sequence == sequence.id
+                    && chunk.format_index == sequence.active_format
+                    && chunk.start < zone.end
+                    && zone.start < chunk.end
+            }) {
+                let start = view
+                    .tick_to_x(chunk.start.max(zone.start), lane_left)
+                    .max(left);
+                let end = view
+                    .tick_to_x(chunk.end.min(zone.end), lane_left)
+                    .min(right);
+                if end <= start {
+                    continue;
+                }
+                let color = match chunk.state {
+                    ChunkState::Rendered => green,
+                    ChunkState::Queued | ChunkState::Rendering | ChunkState::Paused => yellow,
+                    _ => red,
+                };
+                painter.line_segment(
+                    [egui::pos2(start, y), egui::pos2(end, y)],
+                    egui::Stroke::new(3.0, color),
+                );
+                let rect =
+                    egui::Rect::from_min_max(egui::pos2(start, y - 3.0), egui::pos2(end, y + 2.0));
+                ui.interact(
+                    rect,
+                    ui.id().with(("preview_chunk", index, chunk.start.0)),
+                    egui::Sense::hover(),
+                )
+                .on_hover_ui(|ui| {
+                    ui.label(format!(
+                        "Playback preview: {:?} ({}/{})",
+                        chunk.state, chunk.frame, chunk.total
+                    ));
+                    if let Some(error) = &chunk.error {
+                        ui.label(error);
+                    }
+                    if status.cache.pressure {
+                        ui.label(format!(
+                            "Cache pressure: {} evicted, {} renders could not fit",
+                            status.cache.evicted, status.cache.rejected
+                        ));
+                    }
+                });
+            }
+        }
+    }
+}

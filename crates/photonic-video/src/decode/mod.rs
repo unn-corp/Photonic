@@ -108,6 +108,13 @@ pub enum DecodedPlanes {
 }
 
 impl DecodedPlanes {
+    /// Bytes owned by the contiguous decoded payload (including spare capacity).
+    pub fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Yuv420 { data, .. } | Self::Yuva444 { data, .. } => data.capacity() as u64,
+        }
+    }
+
     /// Construct a 4:2:0 frame from FFmpeg's tightly packed `yuv420p` payload.
     ///
     /// This validates the public input in every build. A malformed contiguous
@@ -255,6 +262,8 @@ fn assert_payload_len(pix_fmt: PixFmt, width: u32, height: u32, got: usize) {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecodeError {
+    #[error("decode cancelled")]
+    Cancelled,
     #[error("failed to spawn ffmpeg: {0}")]
     Spawn(#[source] std::io::Error),
     #[error("pipe read error: {0}")]

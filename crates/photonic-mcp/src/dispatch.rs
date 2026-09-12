@@ -76,6 +76,51 @@ fn document_changed(before: &Document, after: &Document) -> bool {
     serde_json::to_value(before).ok() != serde_json::to_value(after).ok()
 }
 
+/// Keep transcript speech in the document/undo history rather than duplicating
+/// it into the separate tool audit log. Nested edit plans follow the same rule.
+fn audit_arguments(name: &str, mut args: Value) -> Value {
+    match name {
+        "edit_transcript_word" => {
+            if let Some(text) = args.get_mut("text") {
+                *text = json!("[transcript text]");
+            }
+        }
+        "remove_filler_words" => {
+            if let Some(matches) = args.get_mut("matches").and_then(Value::as_array_mut) {
+                for token in matches {
+                    if let Some(text) = token.get_mut("text") {
+                        *text = json!("[transcript text]");
+                    }
+                }
+            }
+        }
+        "apply_video_edit_plan" => {
+            if let Some(operations) = args.get_mut("operations").and_then(Value::as_array_mut) {
+                for operation in operations {
+                    if let Some(tool) = operation
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    {
+                        if let Some(arguments) = operation.get_mut("arguments") {
+                            *arguments = audit_arguments(&tool, arguments.take());
+                        }
+                    }
+                }
+            }
+        }
+        "execute_action" => {
+            if let Some(tool) = args.get("name").and_then(Value::as_str).map(str::to_owned) {
+                if let Some(arguments) = args.get_mut("arguments") {
+                    *arguments = audit_arguments(&tool, arguments.take());
+                }
+            }
+        }
+        _ => {}
+    }
+    args
+}
+
 /// Entry point for a single MCP tool call.
 ///
 /// `pub` (29 §3 / CAP-019): the out-of-crate acceptance-story harness scripts
@@ -88,7 +133,12 @@ pub async fn dispatch_tool(
     args: Value,
 ) -> Result<ToolResult, String> {
     let start = std::time::Instant::now();
-    let snapshot_before = if needs_document_snapshot(name) {
+    let effective_name = if name == "execute_action" {
+        args["name"].as_str().unwrap_or(name)
+    } else {
+        name
+    };
+    let snapshot_before = if needs_document_snapshot(effective_name) {
         Some(state.document.lock().await.clone())
     } else {
         None
@@ -98,7 +148,12 @@ pub async fn dispatch_tool(
     } else {
         None
     };
-    let output = dispatch_tool_inner(state, name, args.clone()).await;
+    let output = match dispatch_tool_inner(state, name, args.clone()).await {
+        Err(message) if crate::catalog::tool_schema(name).is_some() => Ok(ToolOutput::readonly(
+            ToolResult::error_with_code("InvalidArguments", message),
+        )),
+        output => output,
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Direct handlers leave the history head unchanged. Turn their completed
@@ -150,7 +205,7 @@ pub async fn dispatch_tool(
         id: 0, // assigned by AuditLog::record
         timestamp: audit_timestamp(),
         tool_name: name.to_string(),
-        args,
+        args: audit_arguments(name, args),
         result_summary,
         duration_ms,
         is_error,
@@ -175,6 +230,135 @@ pub(crate) async fn dispatch_tool_inner(
     args: Value,
 ) -> Result<ToolOutput, String> {
     match name {
+        "set_preview_zones" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video_workflows::set_preview_zones(state, args).await,
+            ))
+        }
+        "precision_trim" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video_workflows::precision_trim(state, args).await,
+            ))
+        }
+        "cancel_preview" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::cancel_preview(state, args).await,
+            ))
+        }
+        "get_preview_status" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::get_preview_status(state, args).await,
+            ))
+        }
+        "audition_source" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::audition_source(state, args).await,
+            ))
+        }
+        "render_preview" | "clear_preview" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::preview_command(state, args, name == "clear_preview")
+                    .await,
+            ))
+        }
+        "stop_source_audition" => {
+            let _: handlers::video_inspect::EmptyArgs =
+                serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::stop_source_audition(state).await,
+            ))
+        }
+        "get_transcript" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_transcript::get_transcript(state, args).await,
+            ))
+        }
+        "edit_transcript_word" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::mutating(
+                handlers::video_transcript::edit_transcript_word(state, args).await,
+            ))
+        }
+        "delete_transcript_range" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::mutating(
+                handlers::video_transcript::delete_transcript_range(state, args).await,
+            ))
+        }
+        "find_filler_words" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_transcript::find_filler_words(state, args).await,
+            ))
+        }
+        "remove_filler_words" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::mutating(
+                handlers::video_transcript::remove_filler_words(state, args).await,
+            ))
+        }
+        "get_video_capabilities" => {
+            let _: handlers::video_inspect::EmptyArgs =
+                serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_inspect::get_video_capabilities(state).await,
+            ))
+        }
+        "render_frames_at" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_inspect::render_frames_at(state, args).await,
+            ))
+        }
+        "get_timeline_snapshot" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_inspect::get_timeline_snapshot(state, args).await,
+            ))
+        }
+        "apply_video_edit_plan" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            let result = handlers::video_edits::apply_video_edit_plan(state, args).await;
+            let mutated = result
+                .structured_content
+                .as_ref()
+                .is_some_and(|data| data["undo_steps"] == 1 && data["replayed"] == false);
+            Ok(if mutated {
+                ToolOutput::mutating(result)
+            } else {
+                ToolOutput::readonly(result)
+            })
+        }
+        "get_action_schema" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("name is required")?;
+            let result = match crate::catalog::tool_schema(name) {
+                Some(schema) => {
+                    ToolResult::text(format!("Complete schema for {name}")).with_data(schema)
+                }
+                None => {
+                    ToolResult::error_with_code("UnknownTool", format!("No action named {name}"))
+                }
+            };
+            Ok(ToolOutput::readonly(result))
+        }
         // ── Mutating tools (write to the document) ──────────────────────────────
         "search_actions" => {
             let query = args
@@ -204,6 +388,12 @@ pub(crate) async fn dispatch_tool_inner(
                 )));
             }
             let nested = args.get("arguments").cloned().unwrap_or(json!({}));
+            if crate::catalog::tool_schema(&action).is_none() {
+                return Ok(ToolOutput::readonly(ToolResult::error_with_code(
+                    "UnknownAction",
+                    format!("Unknown action: {action}"),
+                )));
+            }
             // Box::pin: async recursion through dispatch_tool_inner.
             return Box::pin(dispatch_tool_inner(state, &action, nested)).await;
         }
@@ -2921,6 +3111,12 @@ pub(crate) async fn dispatch_tool_inner(
         // time (10 §6: "the export itself never mutates the timeline");
         // preset save/delete are app-config side effects, not document
         // mutations (10 §3.15).
+        "export_sequences" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_export::export_sequences(state, args).await,
+            ))
+        }
         "export_sequence" => {
             let a: ExportSequenceArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::readonly(

@@ -9,6 +9,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use photonic_core::timeline::Tick;
@@ -33,7 +34,7 @@ const STDERR_TAIL: usize = 16;
 /// handed to the reader separately (so the reader can own it without a
 /// self-referential borrow on the `Sidecar`).
 pub struct Sidecar {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stderr_tail: Arc<Mutex<Vec<String>>>,
 }
 
@@ -48,6 +49,15 @@ impl Sidecar {
         cfg: &SidecarConfig,
         use_cuda: bool,
     ) -> Result<(Self, ChildStdout), DecodeError> {
+        Self::spawn_with_decoder(tools, cfg, use_cuda, None)
+    }
+
+    pub(crate) fn spawn_with_decoder(
+        tools: &FfmpegTools,
+        cfg: &SidecarConfig,
+        use_cuda: bool,
+        decoder: Option<&str>,
+    ) -> Result<(Self, ChildStdout), DecodeError> {
         let seek_secs = format!("{:.6}", cfg.seek.as_seconds_f64());
         let mut command = Command::new(&tools.ffmpeg);
         command.args(["-hide_banner", "-nostdin", "-loglevel", "error"]);
@@ -57,6 +67,9 @@ impl Sidecar {
         // attempt fails.
         if use_cuda {
             command.args(["-hwaccel", "cuda"]);
+        }
+        if let Some(decoder) = decoder {
+            command.args(["-c:v", decoder]);
         }
         command
             .arg("-ss")
@@ -100,21 +113,42 @@ impl Sidecar {
         if let Some(stderr) = child.stderr.take() {
             let tail = Arc::clone(&stderr_tail);
             std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    // Poison-tolerant: a panic elsewhere holding this lock must
-                    // not wedge stderr draining (a full pipe would deadlock
-                    // ffmpeg). The tail is advisory diagnostics, not invariants.
-                    let mut t = tail.lock().unwrap_or_else(PoisonError::into_inner);
-                    if t.len() == STDERR_TAIL {
-                        t.remove(0);
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::with_capacity(4096);
+                loop {
+                    let available = match reader.fill_buf() {
+                        Ok(bytes) if !bytes.is_empty() => bytes,
+                        _ => break,
+                    };
+                    let newline = available.iter().position(|byte| *byte == b'\n');
+                    let consumed = newline.map_or(available.len(), |index| index + 1);
+                    let keep = consumed.min(4096_usize.saturating_sub(line.len()));
+                    line.extend_from_slice(&available[..keep]);
+                    reader.consume(consumed);
+                    if newline.is_some() {
+                        let text = String::from_utf8_lossy(&line).trim_end().to_owned();
+                        line.clear();
+                        let mut t = tail.lock().unwrap_or_else(PoisonError::into_inner);
+                        if t.len() == STDERR_TAIL {
+                            t.remove(0);
+                        }
+                        t.push(text);
                     }
-                    t.push(line);
                 }
             });
         }
 
-        Ok((Sidecar { child, stderr_tail }, stdout))
+        Ok((
+            Sidecar {
+                child: Arc::new(Mutex::new(child)),
+                stderr_tail,
+            },
+            stdout,
+        ))
+    }
+
+    pub(crate) fn child_handle(&self) -> Arc<Mutex<Child>> {
+        Arc::clone(&self.child)
     }
 
     /// The last lines ffmpeg wrote to stderr (for a `DecodeError` message).
@@ -128,15 +162,58 @@ impl Sidecar {
 
     /// Whether the process has exited (non-blocking check).
     pub fn has_exited(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+        matches!(
+            self.child
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .try_wait(),
+            Ok(Some(_))
+        )
     }
 }
 
 impl Drop for Sidecar {
     fn drop(&mut self) {
         // Kill-on-drop (02 §3). Ignore errors — the process may already be gone.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Cancellation handle independent of the decoder mutex. Killing the active
+/// child interrupts a blocked raw-frame read before its worker is joined.
+#[derive(Clone, Default)]
+pub(crate) struct DecodeCancellation(Arc<CancellationState>);
+#[derive(Default)]
+struct CancellationState {
+    cancelled: AtomicBool,
+    child: Mutex<Option<Arc<Mutex<Child>>>>,
+}
+impl DecodeCancellation {
+    pub(crate) fn cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::Acquire)
+    }
+    pub(crate) fn register(&self, child: Arc<Mutex<Child>>) -> bool {
+        let mut active = self.0.child.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.cancelled() {
+            let _ = child.lock().unwrap_or_else(PoisonError::into_inner).kill();
+            return false;
+        }
+        *active = Some(child);
+        true
+    }
+    pub(crate) fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::Release);
+        if let Some(child) = self
+            .0
+            .child
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = child.lock().unwrap_or_else(PoisonError::into_inner).kill();
+        }
     }
 }
 
