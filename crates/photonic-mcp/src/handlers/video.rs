@@ -11633,10 +11633,12 @@ mod tests {
         let state = test_state();
         let old = scratch_dir("old");
         let new = scratch_dir("new");
+        let canonical_new = std::fs::canonicalize(&new).unwrap();
         let names = ["a.mp4", "b.mp4", "c.mp4"];
         for (i, n) in names.iter().enumerate() {
             std::fs::write(old.join(n), format!("clip bytes {i}").as_bytes()).unwrap();
         }
+        let canonical_old = std::fs::canonicalize(&old).unwrap();
         let ids = import_from(&state, &old, &names).await;
 
         // Nothing is offline yet — the inventory tool must say so, or the test
@@ -11669,7 +11671,7 @@ mod tests {
         assert!(d["relinked"][0]["hash"] == json!("match"));
         assert_eq!(
             asset_path(&state, &ids[0]).await,
-            old.join("a.mp4").to_string_lossy(),
+            canonical_old.join("a.mp4").to_string_lossy(),
             "a dry run must not move anything"
         );
 
@@ -11685,7 +11687,7 @@ mod tests {
         for (i, n) in names.iter().enumerate() {
             assert_eq!(
                 asset_path(&state, &ids[i]).await,
-                new.join(n).to_string_lossy()
+                canonical_new.join(n).to_string_lossy()
             );
         }
 
@@ -11695,7 +11697,7 @@ mod tests {
         for (i, n) in names.iter().enumerate() {
             assert_eq!(
                 asset_path(&state, &ids[i]).await,
-                old.join(n).to_string_lossy(),
+                canonical_old.join(n).to_string_lossy(),
                 "one undo must restore every relinked asset"
             );
         }
@@ -11712,8 +11714,10 @@ mod tests {
         let state = test_state();
         let old = scratch_dir("old");
         let new = scratch_dir("new");
+        let canonical_new = std::fs::canonicalize(&new).unwrap();
         std::fs::write(old.join("a.mp4"), b"the real take, all of it").unwrap();
         std::fs::write(old.join("b.mp4"), b"second clip bytes").unwrap();
+        let canonical_old = std::fs::canonicalize(&old).unwrap();
         let ids = import_from(&state, &old, &["a.mp4", "b.mp4"]).await;
 
         std::fs::remove_file(old.join("a.mp4")).unwrap();
@@ -11746,12 +11750,12 @@ mod tests {
 
         assert_eq!(
             asset_path(&state, &ids[0]).await,
-            old.join("a.mp4").to_string_lossy(),
+            canonical_old.join("a.mp4").to_string_lossy(),
             "the mismatched asset must stay offline, not silently rebind"
         );
         assert_eq!(
             asset_path(&state, &ids[1]).await,
-            new.join("b_final.mp4").to_string_lossy()
+            canonical_new.join("b_final.mp4").to_string_lossy()
         );
 
         // With consent it binds — and re-identifies the asset so the pool no

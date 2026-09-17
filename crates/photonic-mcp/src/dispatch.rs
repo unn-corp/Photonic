@@ -3818,13 +3818,14 @@ mod tests {
         );
         let contents = std::fs::read_to_string(&path).unwrap();
         let (loaded, _) = photonic_core::load_photon(&contents).unwrap();
+        let canonical_path = std::fs::canonicalize(&path).unwrap();
         assert_eq!(
             (loaded.artboards.len(), loaded.nodes.len()),
             expected_counts
         );
         assert_eq!(
             state.document_path.lock().unwrap().as_deref(),
-            Some(path.as_path())
+            Some(canonical_path.as_path())
         );
 
         let repeat = dispatch_tool(&state, "save_document", json!({}))
