@@ -13,9 +13,8 @@ use crate::{
     },
 };
 use glyphon::{
-    Attrs, Buffer, Cache, Color as GlyphonColor, FontSystem, Metrics, Resolution, Shaping,
-    Style as GlyphonStyle, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
-    Weight,
+    Buffer, Cache, Color as GlyphonColor, FontSystem, Resolution, SwashCache, TextArea, TextAtlas,
+    TextBounds, TextRenderer, Viewport,
 };
 use image::{ImageBuffer, Rgba};
 use photonic_core::{
@@ -210,6 +209,10 @@ pub(crate) struct TextSnapshot {
     pub(crate) font_weight: u16,
     /// Font style: 0=Normal, 1=Italic, 2=Oblique.
     pub(crate) font_style: u8,
+    /// Letter spacing in physical pixels.
+    pub(crate) letter_spacing: f32,
+    /// Whether glyphs are stacked top-to-bottom.
+    pub(crate) vertical: bool,
     /// RGBA 0-255 fill colour.
     pub(crate) color: [u8; 4],
     pub(crate) screen_x: f32,
@@ -633,19 +636,41 @@ impl PhotonicRenderer {
     /// Measure the rendered dimensions of a text string using glyphon layout.
     /// Returns `(width, height)` in document units (same coordinate space as `font_size`).
     pub fn measure_text(&mut self, content: &str, font_family: &str, font_size: f64) -> (f64, f64) {
-        let fs = font_size as f32;
-        let line_height = fs * 1.2;
-        let mut buf = Buffer::new(&mut self.font_system, Metrics::new(fs, line_height));
-        buf.set_size(&mut self.font_system, None, None);
-        let attrs = Attrs::new().family(crate::text_outline::cosmic_family(font_family));
-        buf.set_text(&mut self.font_system, content, attrs, Shaping::Advanced);
-        buf.shape_until_scroll(&mut self.font_system, false);
+        self.measure_text_with_layout(
+            content,
+            font_family,
+            font_size,
+            crate::TextLayoutOptions::default(),
+        )
+    }
+
+    /// Measure text using the same layout settings used by the live and
+    /// outline renderers.
+    pub fn measure_text_with_layout(
+        &mut self,
+        content: &str,
+        font_family: &str,
+        font_size: f64,
+        options: crate::TextLayoutOptions,
+    ) -> (f64, f64) {
+        let buf = crate::text_layout::layout_text_buffer(
+            &mut self.font_system,
+            content,
+            font_family,
+            font_size as f32,
+            options,
+        );
         let width = buf.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max);
         let height = buf
             .layout_runs()
             .map(|r| r.line_height)
             .fold(0.0_f32, |a, h| a + h);
-        let height = if height == 0.0 { line_height } else { height };
+        let fallback_height = (font_size as f32 * options.line_height_mul.max(0.1)).max(0.01);
+        let height = if height == 0.0 {
+            fallback_height
+        } else {
+            height
+        };
         (width as f64, height as f64)
     }
 
@@ -790,39 +815,44 @@ impl PhotonicRenderer {
                     SceneNodeKind::Text(text_node) => {
                         // Text-on-path: render glyph outlines along the spine as
                         // vector fills instead of flat glyphon text.
-                        if let Some(spine_node) =
-                            text_node.path_spine_id.and_then(|id| doc.get_node(&id))
-                        {
-                            if let SceneNodeKind::Path(spine) = &spine_node.kind {
-                                let mut bez = spine.path_data.to_bez_path();
-                                bez.apply_affine(kurbo::Affine::new(spine_node.transform.matrix));
-                                let spine_doc = PathData::from_bez_path(&bez);
+                        if !text_node.vertical {
+                            if let Some(spine_node) =
+                                text_node.path_spine_id.and_then(|id| doc.get_node(&id))
+                            {
+                                if let SceneNodeKind::Path(spine) = &spine_node.kind {
+                                    let mut bez = spine.path_data.to_bez_path();
+                                    bez.apply_affine(kurbo::Affine::new(
+                                        spine_node.transform.matrix,
+                                    ));
+                                    let spine_doc = PathData::from_bez_path(&bez);
 
-                                let opacity = text_node.fill.opacity * node.opacity * layer_opacity;
-                                let rgba = match &text_node.fill.kind {
-                                    FillKind::Solid(c) => [c.r, c.g, c.b, c.a * opacity],
-                                    _ => [0.0, 0.0, 0.0, opacity],
-                                };
-                                let params = crate::text_path::TextOnPathParams {
-                                    content: &text_node.content,
-                                    font_family: &text_node.font_family,
-                                    font_size: text_node.font_size,
-                                    font_weight: text_node.font_weight,
-                                    font_style: text_node.font_style,
-                                    line_height: text_node.line_height,
-                                    letter_spacing: text_node.letter_spacing,
-                                    align: text_node.align,
-                                    path_offset: text_node.path_offset,
-                                };
-                                let glyphs = crate::text_path::layout_text_on_path(
-                                    &mut self.font_system,
-                                    &params,
-                                    &spine_doc,
-                                );
-                                if !glyphs.is_empty() {
-                                    self.pending_path_text.push((glyphs, rgba));
+                                    let opacity =
+                                        text_node.fill.opacity * node.opacity * layer_opacity;
+                                    let rgba = match &text_node.fill.kind {
+                                        FillKind::Solid(c) => [c.r, c.g, c.b, c.a * opacity],
+                                        _ => [0.0, 0.0, 0.0, opacity],
+                                    };
+                                    let params = crate::text_path::TextOnPathParams {
+                                        content: &text_node.content,
+                                        font_family: &text_node.font_family,
+                                        font_size: text_node.font_size,
+                                        font_weight: text_node.font_weight,
+                                        font_style: text_node.font_style,
+                                        line_height: text_node.line_height,
+                                        letter_spacing: text_node.letter_spacing,
+                                        align: text_node.align,
+                                        path_offset: text_node.path_offset,
+                                    };
+                                    let glyphs = crate::text_path::layout_text_on_path(
+                                        &mut self.font_system,
+                                        &params,
+                                        &spine_doc,
+                                    );
+                                    if !glyphs.is_empty() {
+                                        self.pending_path_text.push((glyphs, rgba));
+                                    }
+                                    continue; // handled — skip flat glyphon text
                                 }
-                                continue; // handled — skip flat glyphon text
                             }
                         }
                         let (doc_x, doc_y) = node.transform.apply(0.0, 0.0);
@@ -860,6 +890,8 @@ impl PhotonicRenderer {
                             line_height_mul: text_node.line_height as f32,
                             font_weight: text_node.font_weight,
                             font_style: font_style_u8,
+                            letter_spacing: (text_node.letter_spacing * zoom as f64) as f32,
+                            vertical: text_node.vertical,
                             color,
                             screen_x,
                             screen_y,
