@@ -11,11 +11,11 @@
 //! about glyphon.
 
 use glyphon::cosmic_text::fontdb;
-use glyphon::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style as GlyphonStyle, Weight};
+use glyphon::{Family, FontSystem};
 use kurbo::{Affine, BezPath};
 use photonic_core::{
     document::Document,
-    node::{FontStyle, NodeId, PathNode, SceneNodeKind, TextNode},
+    node::{NodeId, PathNode, SceneNodeKind, TextNode},
     path::PathData,
 };
 use ttf_parser::{GlyphId, OutlineBuilder};
@@ -182,20 +182,19 @@ pub fn resolve_document_font(
     } else {
         &node.content
     };
-    let font_size = node.font_size.max(0.01) as f32;
-    let mut buf = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.2));
-    buf.set_size(font_system, None, None);
-    let glyph_style = match node.font_style {
-        FontStyle::Italic => GlyphonStyle::Italic,
-        FontStyle::Oblique => GlyphonStyle::Oblique,
-        FontStyle::Normal => GlyphonStyle::Normal,
-    };
-    let attrs = Attrs::new()
-        .family(cosmic_family(&node.font_family))
-        .weight(Weight(node.font_weight))
-        .style(glyph_style);
-    buf.set_text(font_system, probe, attrs, Shaping::Advanced);
-    buf.shape_until_scroll(font_system, false);
+    let buf = crate::text_layout::layout_text_buffer(
+        font_system,
+        probe,
+        &node.font_family,
+        node.font_size as f32,
+        crate::TextLayoutOptions {
+            font_weight: node.font_weight,
+            font_style: node.font_style,
+            line_height_mul: node.line_height as f32,
+            letter_spacing: node.letter_spacing as f32,
+            vertical: node.vertical,
+        },
+    );
 
     let font_id = buf
         .layout_runs()
@@ -225,25 +224,19 @@ pub fn layout_text_flat(font_system: &mut FontSystem, node: &TextNode) -> PathDa
         return PathData::new();
     }
 
-    let font_size = node.font_size.max(0.01) as f32;
-    let line_height = font_size * node.line_height.max(0.1) as f32;
-
-    let mut buf = Buffer::new(font_system, Metrics::new(font_size, line_height));
-    // Unbounded layout so all content is shaped even without a fixed width.
-    buf.set_size(font_system, None, None);
-
-    let glyph_style = match node.font_style {
-        FontStyle::Italic => GlyphonStyle::Italic,
-        FontStyle::Oblique => GlyphonStyle::Oblique,
-        FontStyle::Normal => GlyphonStyle::Normal,
-    };
-    let attrs = Attrs::new()
-        .family(cosmic_family(&node.font_family))
-        .weight(Weight(node.font_weight))
-        .style(glyph_style);
-
-    buf.set_text(font_system, &node.content, attrs, Shaping::Advanced);
-    buf.shape_until_scroll(font_system, false);
+    let buf = crate::text_layout::layout_text_buffer(
+        font_system,
+        &node.content,
+        &node.font_family,
+        node.font_size as f32,
+        crate::TextLayoutOptions {
+            font_weight: node.font_weight,
+            font_style: node.font_style,
+            line_height_mul: node.line_height as f32,
+            letter_spacing: node.letter_spacing as f32,
+            vertical: node.vertical,
+        },
+    );
 
     let mut merged = BezPath::new();
     // Warn once if glyphon substituted a different family/weight than requested,
@@ -299,10 +292,13 @@ pub fn layout_text_flat(font_system: &mut FontSystem, node: &TextNode) -> PathDa
             //          for CJK or glyphs that sit on/below the baseline)
             // The font-unit outline is Y-up; we flip it to Y-down by scaling Y
             // by -scale and then translating so the origin lands on the baseline.
-            let gx = align_offset
-                + g.x as f64
-                + node.letter_spacing * i as f64
-                + g.x_offset as f64 * g.font_size as f64;
+            let letter_spacing = if node.vertical {
+                0.0
+            } else {
+                node.letter_spacing * i as f64
+            };
+            let gx =
+                align_offset + g.x as f64 + letter_spacing + g.x_offset as f64 * g.font_size as f64;
             let gy = baseline_y + g.y as f64 + g.y_offset as f64 * g.font_size as f64;
 
             let scale = g.font_size as f64 / units;
@@ -330,8 +326,10 @@ pub fn layout_text_flat(font_system: &mut FontSystem, node: &TextNode) -> PathDa
 
 /// Return a **clone** of `doc` in which every visible [`TextNode`] (including
 /// nodes nested inside groups at any depth) has been replaced by a [`PathNode`]
-/// carrying the glyph outlines produced by [`layout_text_flat`] (or, when the
-/// text follows a path spine, by [`crate::text_path::layout_text_on_path`]).
+/// carrying the glyph outlines produced by [`layout_text_flat`] (or, when a
+/// horizontal text node follows a path spine, by
+/// [`crate::text_path::layout_text_on_path`]). Vertical text uses the flat
+/// top-to-bottom layout even if a stale path-spine association is present.
 ///
 /// The original `doc` is never mutated (undo-safe). The returned document is
 /// suitable for a single-use font-free export; it should **not** be inserted
@@ -367,41 +365,45 @@ pub fn outline_document_text(doc: &Document, font_system: &mut FontSystem) -> Do
         };
         let text = text.clone(); // clone to release the borrow on node
 
-        let path_data = if let Some(spine_id) = text.path_spine_id {
-            // Text-on-path: use the existing on-path layout
-            let spine = clone.nodes.get(&spine_id).and_then(|n| match &n.kind {
-                SceneNodeKind::Path(p) => Some(p.path_data.clone()),
-                _ => None,
-            });
-            if let Some(spine_path) = spine {
-                use crate::text_path::{layout_text_on_path, TextOnPathParams};
-                let params = TextOnPathParams {
-                    content: &text.content,
-                    font_family: &text.font_family,
-                    font_size: text.font_size,
-                    font_weight: text.font_weight,
-                    font_style: text.font_style,
-                    line_height: text.line_height,
-                    letter_spacing: text.letter_spacing,
-                    align: text.align,
-                    path_offset: text.path_offset,
-                };
-                let glyph_paths = layout_text_on_path(font_system, &params, &spine_path);
-                if glyph_paths.is_empty() {
-                    PathData::new()
-                } else {
-                    // Merge all per-glyph paths into one compound path.
-                    use kurbo::BezPath;
-                    let mut merged = BezPath::new();
-                    for gp in &glyph_paths {
-                        for el in gp.to_bez_path().iter() {
-                            merged.push(el);
+        let path_data = if !text.vertical {
+            if let Some(spine_id) = text.path_spine_id {
+                // Text-on-path: use the existing on-path layout.
+                let spine = clone.nodes.get(&spine_id).and_then(|n| match &n.kind {
+                    SceneNodeKind::Path(p) => Some(p.path_data.clone()),
+                    _ => None,
+                });
+                if let Some(spine_path) = spine {
+                    use crate::text_path::{layout_text_on_path, TextOnPathParams};
+                    let params = TextOnPathParams {
+                        content: &text.content,
+                        font_family: &text.font_family,
+                        font_size: text.font_size,
+                        font_weight: text.font_weight,
+                        font_style: text.font_style,
+                        line_height: text.line_height,
+                        letter_spacing: text.letter_spacing,
+                        align: text.align,
+                        path_offset: text.path_offset,
+                    };
+                    let glyph_paths = layout_text_on_path(font_system, &params, &spine_path);
+                    if glyph_paths.is_empty() {
+                        PathData::new()
+                    } else {
+                        // Merge all per-glyph paths into one compound path.
+                        use kurbo::BezPath;
+                        let mut merged = BezPath::new();
+                        for gp in &glyph_paths {
+                            for el in gp.to_bez_path().iter() {
+                                merged.push(el);
+                            }
                         }
+                        PathData::from_bez_path(&merged)
                     }
-                    PathData::from_bez_path(&merged)
+                } else {
+                    // Spine node not found; fall back to flat layout.
+                    layout_text_flat(font_system, &text)
                 }
             } else {
-                // Spine node not found; fall back to flat layout.
                 layout_text_flat(font_system, &text)
             }
         } else {
@@ -432,7 +434,7 @@ mod tests {
     use super::*;
     use photonic_core::{
         document::Document,
-        node::{SceneNode, SceneNodeKind, TextNode},
+        node::{FontStyle, SceneNode, SceneNodeKind, TextNode},
     };
 
     fn make_doc_with_text(content: &str) -> (Document, NodeId) {
@@ -495,6 +497,36 @@ mod tests {
             bb.max_y() < 80.0,
             "max_y unexpectedly far below buffer top: {}",
             bb.max_y()
+        );
+    }
+
+    /// Vertical text must stack successive characters down the page instead of
+    /// retaining the horizontal run's wide bounding box.
+    #[test]
+    fn layout_text_flat_vertical_stacks_characters() {
+        let mut fs = FontSystem::new();
+
+        let mut horizontal = TextNode::new("ABC");
+        horizontal.font_size = 32.0;
+        let horizontal = layout_text_flat(&mut fs, &horizontal).bounding_box();
+
+        let mut vertical = TextNode::new("ABC");
+        vertical.font_size = 32.0;
+        vertical.vertical = true;
+        let vertical = layout_text_flat(&mut fs, &vertical).bounding_box();
+
+        let (Some(horizontal), Some(vertical)) = (horizontal, vertical) else {
+            eprintln!("no system font available — skipping vertical layout check");
+            return;
+        };
+
+        assert!(
+            vertical.height() > horizontal.height() * 2.0,
+            "vertical text should advance down the page: horizontal={horizontal:?}, vertical={vertical:?}"
+        );
+        assert!(
+            vertical.height() > vertical.width() * 2.0,
+            "vertical text should be taller than it is wide: {vertical:?}"
         );
     }
 

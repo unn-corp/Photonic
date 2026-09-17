@@ -24,10 +24,12 @@ pub struct RasterImage {
     pub pixels: Vec<u8>,
 }
 
-/// Maximum width or height accepted by MCP raster operations.
+/// Maximum width or height accepted by raster imports and MCP raster operations.
 pub const MAX_RASTER_DIMENSION: u32 = 16_384;
-/// Maximum number of RGBA pixels accepted by MCP raster operations.
+/// Maximum number of RGBA pixels accepted by raster imports and MCP operations.
 pub const MAX_RASTER_PIXELS: usize = 64 * 1024 * 1024;
+/// Maximum encoded byte length accepted by one raster import.
+pub const MAX_RASTER_ENCODED_BYTES: usize = 64 * 1024 * 1024;
 /// Maximum decoder allocation budget for one encoded raster import.
 pub const MAX_RASTER_DECODED_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -97,7 +99,7 @@ impl RasterImage {
     /// Decode a PNG/JPEG/WebP/etc. encoded image into an RGBA8 buffer.
     pub fn from_encoded(bytes: &[u8]) -> Result<Self, String> {
         let img = decode_encoded(bytes)?;
-        let rgba = img.to_rgba8();
+        let rgba = img.into_rgba8();
         let (width, height) = rgba.dimensions();
         Self::from_rgba(width, height, rgba.into_raw())
     }
@@ -211,13 +213,15 @@ impl RasterImage {
 }
 
 fn decode_encoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    validate_encoded_raster_size(bytes.len())?;
+
     // Read only the encoded header first so a malicious image cannot make the
     // decoder allocate its full pixel buffer before the project limit is known.
     let reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;
     let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
-    checked_raster_pixel_count(width, height)?;
+    checked_import_raster_pixel_count(width, height)?;
     if width > MAX_RASTER_DIMENSION || height > MAX_RASTER_DIMENSION {
         return Err(format!(
             "raster dimensions {width}x{height} exceed the maximum of {MAX_RASTER_DIMENSION}x{MAX_RASTER_DIMENSION}"
@@ -233,6 +237,31 @@ fn decode_encoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     limits.max_alloc = Some(MAX_RASTER_DECODED_BYTES);
     reader.limits(limits);
     reader.decode().map_err(|e| e.to_string())
+}
+
+fn validate_encoded_raster_size(encoded_len: usize) -> Result<(), String> {
+    if encoded_len > MAX_RASTER_ENCODED_BYTES {
+        return Err(format!(
+            "encoded raster is {encoded_len} bytes, exceeding the {MAX_RASTER_ENCODED_BYTES}-byte import limit"
+        ));
+    }
+    Ok(())
+}
+
+fn checked_import_raster_pixel_count(width: u32, height: u32) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err("raster dimensions must be non-zero".to_string());
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "raster dimensions overflow pixel count".to_string())?;
+    if pixels > MAX_RASTER_PIXELS {
+        return Err(format!(
+            "raster dimensions {}x{} contain {} pixels, exceeding the {}-pixel import budget",
+            width, height, pixels, MAX_RASTER_PIXELS
+        ));
+    }
+    Ok(pixels)
 }
 
 pub(crate) fn checked_raster_pixel_count(width: u32, height: u32) -> Result<usize, String> {
@@ -414,13 +443,34 @@ mod tests {
     }
 
     #[test]
+    fn encoded_image_rejects_pixel_count_over_import_limit() {
+        // This is below the decoder byte limit for PPM, so it exercises the
+        // application-level checked width × height budget specifically.
+        let width = 8_193;
+        let height = 8_192;
+        let header = format!("P6\n{width} {height}\n255\n");
+
+        let err = RasterImage::from_encoded(header.as_bytes()).unwrap_err();
+        assert!(err.contains("import budget"), "{err}");
+    }
+
+    #[test]
+    fn encoded_size_validator_rejects_bytes_over_limit() {
+        assert!(validate_encoded_raster_size(MAX_RASTER_ENCODED_BYTES).is_ok());
+        let err = validate_encoded_raster_size(MAX_RASTER_ENCODED_BYTES + 1).unwrap_err();
+
+        assert!(err.contains("import limit"), "{err}");
+    }
+
+    #[test]
     fn encoded_image_rejects_decoded_bytes_over_limit() {
         // A header-only PPM is enough to exercise ImageReader's allocation
         // check: it rejects the advertised decoded size before reading pixels.
-        let width = MAX_RASTER_DIMENSION;
-        let height = (MAX_RASTER_DECODED_BYTES / 3 / u64::from(width) + 1) as u32;
-        assert!(height <= MAX_RASTER_DIMENSION);
-        let header = format!("P6\n{width} {height}\n255\n");
+        let width = (MAX_RASTER_PIXELS as u32).isqrt();
+        let height = MAX_RASTER_PIXELS as u32 / width;
+        assert_eq!(width * height, MAX_RASTER_PIXELS as u32);
+        assert!(width <= MAX_RASTER_DIMENSION && height <= MAX_RASTER_DIMENSION);
+        let header = format!("P6\n{width} {height}\n65535\n");
 
         let err = RasterImage::from_encoded(header.as_bytes()).unwrap_err();
         assert!(err.to_ascii_lowercase().contains("limit"), "{err}");

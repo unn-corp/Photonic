@@ -2,6 +2,7 @@
 pub mod dispatch;
 
 pub mod handlers;
+pub(crate) mod procedural_work;
 pub mod protocol;
 pub mod schema_gen;
 pub mod server;

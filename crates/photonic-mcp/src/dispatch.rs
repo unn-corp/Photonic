@@ -1,4 +1,5 @@
 use crate::handlers;
+use crate::procedural_work;
 use crate::protocol::*;
 use crate::server::{AppState, ToolOutput};
 use photonic_core::{audit_timestamp, AuditEntry, Command, Document};
@@ -209,18 +210,27 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "create_spiral" => {
             let a: CreateSpiralArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_spiral_work(a.turns, a.segments_per_turn) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_spiral(state, a).await,
             ))
         }
         "create_grid" => {
             let a: CreateGridArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_rectangular_grid_work(a.cols, a.rows) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_grid(state, a).await,
             ))
         }
         "create_polar_grid" => {
             let a: CreatePolarGridArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_polar_grid_work(a.rings, a.sectors) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_polar_grid(state, a).await,
             ))
@@ -399,7 +409,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "flatten_artwork" => {
-            let a: FlattenArtworkArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FlattenArtworkArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::layers::flatten_artwork(state, a).await,
             ))
@@ -424,6 +434,9 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "create_array" => {
             let a: CreateArrayArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_array_work(&a) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_array(state, a).await,
             ))
@@ -441,16 +454,25 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "find_replace_style" => {
-            let a: FindReplaceStyleArgs = serde_json::from_value(args).unwrap_or_default();
-            Ok(ToolOutput::mutating(
-                handlers::nodes::find_replace_style(state, a).await,
-            ))
+            let a: FindReplaceStyleArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::find_replace_style(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "find_replace_text" => {
             let a: FindReplaceTextArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::find_replace_text(state, a).await,
-            ))
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::find_replace_text(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "layout_nodes" => {
             let a: LayoutNodesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -479,13 +501,17 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "auto_name_nodes" => {
-            let a: AutoNameNodesArgs = serde_json::from_value(args).unwrap_or_default();
-            Ok(ToolOutput::mutating(
-                handlers::nodes::auto_name_nodes(state, a).await,
-            ))
+            let a: AutoNameNodesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::auto_name_nodes(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "add_anchor_points" => {
-            let a: AddAnchorPointsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AddAnchorPointsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::add_anchor_points(state, a).await,
             ))
@@ -624,31 +650,31 @@ pub(crate) async fn dispatch_tool_inner(
             handlers::nodes::get_selection(state).await,
         )),
         "flatten_group" => {
-            let a: FlattenGroupArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FlattenGroupArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::flatten_group(state, a).await,
             ))
         }
         "center_on_canvas" => {
-            let a: CenterOnCanvasArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: CenterOnCanvasArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::center_on_canvas(state, a).await,
             ))
         }
         "remove_fill" => {
-            let a: RemoveStyleArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: RemoveStyleArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::remove_fill(state, a).await,
             ))
         }
         "remove_stroke" => {
-            let a: RemoveStyleArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: RemoveStyleArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::remove_stroke(state, a).await,
             ))
         }
         "fit_to_canvas" => {
-            let a: FitToCanvasArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FitToCanvasArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::fit_to_canvas(state, a).await,
             ))
@@ -662,6 +688,9 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "scatter_copies" => {
             let a: ScatterCopiesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_scatter_work(a.count) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::scatter_copies(state, a).await,
             ))
@@ -731,13 +760,13 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_all" => {
-            let a: SelectAllArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SelectAllArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_all(state, a).await,
             ))
         }
         "deselect_all" => {
-            let a: DeselectAllArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: DeselectAllArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::deselect_all(state, a).await,
             ))
@@ -761,7 +790,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "swap_fill_stroke" => {
-            let a: SwapFillStrokeArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SwapFillStrokeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::swap_fill_stroke(state, a).await,
             ))
@@ -854,48 +883,61 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "create_flare" => {
             let a: CreateFlareArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_flare_work(
+                a.ray_count.unwrap_or(12).max(2),
+                a.ring_count.unwrap_or(3),
+            ) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_flare(state, a).await,
             ))
         }
         "clean_up" => {
-            let a: CleanUpArgs = serde_json::from_value(args).unwrap_or_default();
-            Ok(ToolOutput::mutating(
-                handlers::nodes::clean_up(state, a).await,
-            ))
+            let a: CleanUpArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let dry_run = a.dry_run.unwrap_or(false);
+            let result = handlers::nodes::clean_up(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "join_paths" => {
-            let a: JoinPathsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: JoinPathsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::join_paths(state, a).await,
             ))
         }
         "pathfinder_crop" => {
-            let a: PathfinderCropArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderCropArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_crop(state, a).await,
             ))
         }
         "pathfinder_minus_back" => {
-            let a: PathfinderMinusBackArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderMinusBackArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_minus_back(state, a).await,
             ))
         }
         "pathfinder_minus_front" => {
-            let a: PathfinderMinusFrontArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderMinusFrontArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_minus_front(state, a).await,
             ))
         }
         "pathfinder_trim" => {
-            let a: PathfinderTrimArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderTrimArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_trim(state, a).await,
             ))
         }
         "pathfinder_outline" => {
-            let a: PathfinderOutlineArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderOutlineArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_outline(state, a).await,
             ))
@@ -921,13 +963,15 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "reverse_path_direction" => {
-            let a: ReversePathDirectionArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ReversePathDirectionArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::reverse_path_direction(state, a).await,
             ))
         }
         "average_anchor_points" => {
-            let a: AverageAnchorPointsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AverageAnchorPointsArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::average_anchor_points(state, a).await,
             ))
@@ -947,7 +991,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_same" => {
-            let a: SelectSameArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SelectSameArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_same(state, a).await,
             ))
@@ -968,7 +1012,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "undo" => {
-            let a: UndoRedoArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: UndoRedoArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             let (result, moved) = handlers::document::undo(state, a).await;
             Ok(if moved {
                 ToolOutput::mutating(result)
@@ -977,7 +1021,7 @@ pub(crate) async fn dispatch_tool_inner(
             })
         }
         "redo" => {
-            let a: UndoRedoArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: UndoRedoArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             let (result, moved) = handlers::document::redo(state, a).await;
             Ok(if moved {
                 ToolOutput::mutating(result)
@@ -1148,12 +1192,16 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "simplify_path" => {
             let a: SimplifyPathArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
-            Ok(ToolOutput::mutating(
-                handlers::nodes::simplify_path(state, a).await,
-            ))
+            let dry_run = a.dry_run;
+            let result = handlers::nodes::simplify_path(state, a).await;
+            Ok(if dry_run {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
         }
         "smooth_path" => {
-            let a: SmoothPathArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SmoothPathArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::smooth_path(state, a).await,
             ))
@@ -1240,25 +1288,27 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "adjust_colors" => {
-            let a: AdjustColorsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AdjustColorsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::adjust_colors(state, a).await,
             ))
         }
         "make_compound_path" => {
-            let a: MakeCompoundPathArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: MakeCompoundPathArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::make_compound_path(state, a).await,
             ))
         }
         "make_live_boolean" => {
-            let a: MakeLiveBooleanArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: MakeLiveBooleanArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::make_live_boolean(state, a).await,
             ))
         }
         "release_compound_path" => {
-            let a: ReleaseCompoundPathArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ReleaseCompoundPathArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::release_compound_path(state, a).await,
             ))
@@ -1284,6 +1334,9 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "split_into_grid" => {
             let a: SplitIntoGridArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_split_work(a.rows, a.cols) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::split_into_grid(state, a).await,
             ))
@@ -1332,7 +1385,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "clear_guides" => {
-            let a: ClearGuidesArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ClearGuidesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::clear_guides(state, a).await,
             ))
@@ -1344,13 +1397,14 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "convert_anchor_points" => {
-            let a: ConvertAnchorPointsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ConvertAnchorPointsArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::convert_anchor_points(state, a).await,
             ))
         }
         "lasso_select" => {
-            let a: LassoSelectArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: LassoSelectArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::lasso_select(state, a).await,
             ))
@@ -1370,7 +1424,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_by_kind" => {
-            let a: SelectByKindArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SelectByKindArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_by_kind(state, a).await,
             ))
@@ -1390,7 +1444,8 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "exit_isolation_mode" => {
-            let a: ExitIsolationModeArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ExitIsolationModeArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::exit_isolation_mode(state, a).await,
             ))
@@ -1457,12 +1512,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_similar" => {
-            let a: SelectSimilarArgs = serde_json::from_value(args).unwrap_or(SelectSimilarArgs {
-                node_ids: vec![],
-                match_by: None,
-                tolerance: None,
-                additive: false,
-            });
+            let a: SelectSimilarArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_similar(state, a).await,
             ))
@@ -2194,6 +2244,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     fn test_state() -> AppState {
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -2205,6 +2256,253 @@ mod tests {
             config: McpServerConfig::default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(new_clipboard_ring()),
+        }
+    }
+
+    async fn seed_dry_run_document(state: &AppState) -> (Uuid, Uuid, Uuid, Uuid) {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+
+        let mut style_path = PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0));
+        style_path.fill = Fill::solid(Color::from_hex("#112233").unwrap());
+        let style_node = SceneNode::new("rectangle", layer_id, SceneNodeKind::Path(style_path));
+        let style_id = style_node.id;
+        doc.add_node(style_node, Some(layer_id));
+
+        let text_node = SceneNode::new(
+            "headline",
+            layer_id,
+            SceneNodeKind::Text(TextNode::new("before")),
+        );
+        let text_id = text_node.id;
+        doc.add_node(text_node, Some(layer_id));
+
+        let simplify_node = SceneNode::new(
+            "path",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(
+                PathData::from_svg("M 0 0 L 10 0 L 20 5 L 30 0 L 40 0").unwrap(),
+            )),
+        );
+        let simplify_id = simplify_node.id;
+        doc.add_node(simplify_node, Some(layer_id));
+
+        let cleanup_node = SceneNode::new(
+            "cleanup target",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::new())),
+        );
+        let cleanup_id = cleanup_node.id;
+        doc.add_node(cleanup_node, Some(layer_id));
+
+        (style_id, text_id, simplify_id, cleanup_id)
+    }
+
+    async fn document_snapshot(state: &AppState) -> Value {
+        serde_json::to_value(&*state.document.lock().await).unwrap()
+    }
+
+    async fn history_snapshot(state: &AppState) -> Value {
+        serde_json::to_value(state.history.lock().await.snapshot_state()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn dry_run_routes_are_read_only_through_dispatcher() {
+        let state = test_state();
+        let (style_id, text_id, simplify_id, _cleanup_id) = seed_dry_run_document(&state).await;
+        let cases = [
+            (
+                "find_replace_style",
+                json!({
+                    "fill_color": "#112233",
+                    "new_fill_color": "#445566",
+                    "node_ids": [style_id],
+                    "dry_run": true
+                }),
+            ),
+            (
+                "find_replace_text",
+                json!({
+                    "find": "before",
+                    "replace": "after",
+                    "node_ids": [text_id],
+                    "dry_run": true
+                }),
+            ),
+            ("auto_name_nodes", json!({ "dry_run": true })),
+            (
+                "simplify_path",
+                json!({
+                    "node_id": simplify_id,
+                    "tolerance": 1.0,
+                    "dry_run": true
+                }),
+            ),
+            ("clean_up", json!({ "dry_run": true })),
+        ];
+
+        for (name, args) in cases {
+            let before_document = document_snapshot(&state).await;
+            let before_history = history_snapshot(&state).await;
+
+            let route = dispatch_tool_inner(&state, name, args.clone())
+                .await
+                .unwrap();
+            assert!(!route.mutates, "{name} dry run must be read-only");
+            assert_ne!(route.result.is_error, Some(true), "{name} dry run failed");
+
+            let result = dispatch_tool(&state, name, args).await.unwrap();
+            assert_ne!(result.is_error, Some(true), "{name} dry run failed");
+            assert_eq!(
+                document_snapshot(&state).await,
+                before_document,
+                "{name} dry run changed the document"
+            );
+            assert_eq!(
+                history_snapshot(&state).await,
+                before_history,
+                "{name} dry run changed persistent history"
+            );
+
+            let checkpoint_count = {
+                let doc = state.document.lock().await;
+                let mut history = state.history.lock().await;
+                history.tick_mcp_checkpoint(&doc);
+                history.list_checkpoints().len()
+            };
+            assert_eq!(checkpoint_count, 0, "{name} dry run created a checkpoint");
+        }
+    }
+
+    #[tokio::test]
+    async fn dry_run_capable_routes_remain_mutating_when_applied() {
+        let state = test_state();
+        let (style_id, text_id, simplify_id, cleanup_id) = seed_dry_run_document(&state).await;
+        let cases = [
+            (
+                "find_replace_style",
+                json!({
+                    "fill_color": "#112233",
+                    "new_fill_color": "#445566",
+                    "node_ids": [style_id],
+                    "dry_run": false
+                }),
+            ),
+            (
+                "find_replace_text",
+                json!({
+                    "find": "before",
+                    "replace": "after",
+                    "node_ids": [text_id],
+                    "dry_run": false
+                }),
+            ),
+            ("auto_name_nodes", json!({ "dry_run": false })),
+            (
+                "simplify_path",
+                json!({
+                    "node_id": simplify_id,
+                    "tolerance": 1.0,
+                    "dry_run": false
+                }),
+            ),
+            ("clean_up", json!({ "dry_run": false })),
+        ];
+
+        for (name, args) in cases {
+            let before_document = document_snapshot(&state).await;
+            let before_history = history_snapshot(&state).await;
+
+            let route = dispatch_tool_inner(&state, name, args).await.unwrap();
+            assert!(route.mutates, "{name} must be mutating when applied");
+            assert_ne!(route.result.is_error, Some(true), "{name} mutation failed");
+            assert_ne!(
+                document_snapshot(&state).await,
+                before_document,
+                "{name} did not change the document"
+            );
+            assert_ne!(
+                history_snapshot(&state).await,
+                before_history,
+                "{name} did not record history"
+            );
+        }
+
+        assert!(!state.document.lock().await.nodes.contains_key(&cleanup_id));
+    }
+
+    #[tokio::test]
+    async fn create_shape_rejects_too_few_polygon_and_star_sides_without_mutation() {
+        for shape_type in ["polygon", "star"] {
+            for sides in [0, 1, 2] {
+                let state = test_state();
+                let before_document = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let before_history = state.history.lock().await.current_node();
+
+                let result = dispatch_tool(
+                    &state,
+                    "create_shape",
+                    json!({
+                        "shape_type": shape_type,
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 10.0,
+                        "height": 10.0,
+                        "sides": sides
+                    }),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    result.is_error,
+                    Some(true),
+                    "{shape_type} with {sides} sides should be rejected"
+                );
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before_document,
+                    "rejected {shape_type} request changed the document"
+                );
+                let history = state.history.lock().await;
+                assert_eq!(
+                    history.current_node(),
+                    before_history,
+                    "rejected {shape_type} request changed history"
+                );
+                assert_eq!(history.undo_depth(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_shape_accepts_minimum_and_default_polygon_and_star_sides() {
+        for (shape_type, sides) in [
+            ("polygon", Some(3)),
+            ("star", Some(3)),
+            ("polygon", None),
+            ("star", None),
+        ] {
+            let state = test_state();
+            let mut args = json!({
+                "shape_type": shape_type,
+                "x": 0.0,
+                "y": 0.0,
+                "width": 10.0,
+                "height": 10.0
+            });
+            if let Some(sides) = sides {
+                args["sides"] = json!(sides);
+            }
+
+            let result = dispatch_tool(&state, "create_shape", args).await.unwrap();
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "{shape_type} with {sides:?} sides should succeed"
+            );
+            assert_eq!(state.document.lock().await.nodes.len(), 1);
+            assert_eq!(state.history.lock().await.undo_depth(), 1);
         }
     }
 
@@ -2387,6 +2685,438 @@ mod tests {
         assert!(!entry.is_error);
     }
 
+    async fn add_array_source(state: &AppState) -> uuid::Uuid {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+        let source = SceneNode::new(
+            "Array source",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0))),
+        );
+        let source_id = source.id;
+        doc.add_node(source, Some(layer_id));
+        source_id
+    }
+
+    #[tokio::test]
+    async fn create_array_rejects_grid_product_overflow_and_over_cap() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let cases = [
+            (
+                "overflow",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": usize::MAX,
+                    "cols": 2
+                }),
+            ),
+            (
+                "over cap",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": MAX_ARRAY_GRID_CELLS + 1,
+                    "cols": 1
+                }),
+            ),
+        ];
+
+        for (label, args) in cases {
+            let result = dispatch_tool(&state, "create_array", args)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: dispatch failed: {error}"));
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{label}: expected ToolResult error"
+            );
+            assert_eq!(
+                state.document.lock().await.nodes.len(),
+                1,
+                "{label}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{label}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_array_grid_and_radial_keep_copy_counts_and_single_undo_steps() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let grid = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "grid" }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(grid.is_error, Some(true));
+        assert_eq!(
+            structured_data(&grid)["node_ids"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+
+        let radial = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "radial", "count": 4 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(radial.is_error, Some(true));
+        assert_eq!(
+            structured_data(&radial)["node_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn procedural_generation_rejects_over_budget_without_document_mutation() {
+        let cases = [
+            "scatter_count",
+            "split_count",
+            "split_product",
+            "spiral_count",
+            "spiral_product",
+            "spiral_huge_finite_turns",
+            "rectangular_grid_count",
+            "rectangular_grid_u32_max",
+            "polar_grid_count",
+            "polar_grid_u32_max",
+            "array_radial_count",
+            "flare_ray_count",
+            "flare_ring_count",
+            "flare_product",
+        ];
+
+        for case in cases {
+            let state = test_state();
+            let (tool, args) = match case {
+                "scatter_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "scatter_copies",
+                        json!({
+                            "node_id": source_id,
+                            "count": MAX_GENERATED_WORK + 1,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "width": 10.0,
+                            "height": 10.0
+                        }),
+                    )
+                }
+                "split_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "split_into_grid",
+                        json!({
+                            "node_id": source_id,
+                            "rows": MAX_GENERATED_WORK + 1,
+                            "cols": 1
+                        }),
+                    )
+                }
+                "split_product" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "split_into_grid",
+                        json!({ "node_id": source_id, "rows": 101, "cols": 100 }),
+                    )
+                }
+                "spiral_count" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 1.0,
+                        "segments_per_turn": MAX_GENERATED_WORK + 1
+                    }),
+                ),
+                "spiral_product" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 3.0,
+                        "segments_per_turn": 4_000
+                    }),
+                ),
+                "spiral_huge_finite_turns" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 1.0e308,
+                        "segments_per_turn": 16
+                    }),
+                ),
+                "rectangular_grid_count" => (
+                    "create_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 100.0,
+                        "height": 100.0,
+                        "cols": MAX_GENERATED_WORK,
+                        "rows": MAX_GENERATED_WORK
+                    }),
+                ),
+                "rectangular_grid_u32_max" => (
+                    "create_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 100.0,
+                        "height": 100.0,
+                        "cols": u32::MAX,
+                        "rows": 1
+                    }),
+                ),
+                "polar_grid_count" => (
+                    "create_polar_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "rings": MAX_GENERATED_WORK,
+                        "sectors": MAX_GENERATED_WORK
+                    }),
+                ),
+                "polar_grid_u32_max" => (
+                    "create_polar_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "rings": u32::MAX,
+                        "sectors": 1
+                    }),
+                ),
+                "array_radial_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "create_array",
+                        json!({
+                            "node_id": source_id,
+                            "mode": "radial",
+                            "count": MAX_GENERATED_WORK + 1
+                        }),
+                    )
+                }
+                "flare_ray_count" => (
+                    "create_flare",
+                    json!({ "cx": 0.0, "cy": 0.0, "ray_count": MAX_GENERATED_WORK + 1 }),
+                ),
+                "flare_ring_count" => (
+                    "create_flare",
+                    json!({ "cx": 0.0, "cy": 0.0, "ring_count": MAX_GENERATED_WORK + 1 }),
+                ),
+                "flare_product" => (
+                    "create_flare",
+                    json!({
+                        "cx": 0.0,
+                        "cy": 0.0,
+                        "ray_count": 5_000,
+                        "ring_count": 5_000
+                    }),
+                ),
+                _ => unreachable!("unknown test case"),
+            };
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let result = dispatch_tool(&state, tool, args)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: dispatch failed: {error}"));
+
+            assert_eq!(result.is_error, Some(true), "{case}: expected rejection");
+            if case == "array_radial_count" {
+                let message = result
+                    .content
+                    .first()
+                    .and_then(|item| match item {
+                        ContentItem::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                assert!(
+                    message.contains("create_array"),
+                    "{case}: expected work-budget error, got {message:?}"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before,
+                "{case}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{case}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn split_into_grid_rejects_overflow_before_document_lookup() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+        let result = dispatch_tool(
+            &state,
+            "split_into_grid",
+            json!({
+                "node_id": source_id,
+                "rows": usize::MAX,
+                "cols": 2
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn procedural_generation_accepts_representative_valid_counts() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let scatter = dispatch_tool(
+            &state,
+            "scatter_copies",
+            json!({
+                "node_id": source_id,
+                "count": 2,
+                "x": 0.0,
+                "y": 0.0,
+                "width": 10.0,
+                "height": 10.0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(scatter.is_error, Some(true));
+
+        let spiral = dispatch_tool(
+            &state,
+            "create_spiral",
+            json!({
+                "x": 20.0,
+                "y": 20.0,
+                "outer_radius": 10.0,
+                "turns": 1.0,
+                "segments_per_turn": 4
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(spiral.is_error, Some(true));
+
+        let flare = dispatch_tool(
+            &state,
+            "create_flare",
+            json!({ "cx": 30.0, "cy": 30.0, "ray_count": 2, "ring_count": 0 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(flare.is_error, Some(true));
+
+        let split = dispatch_tool(
+            &state,
+            "split_into_grid",
+            json!({ "node_id": source_id, "rows": 2, "cols": 2, "keep_original": true }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(split.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn grid_generators_create_expected_path_sizes() {
+        let state = test_state();
+
+        let rectangular = dispatch_tool(
+            &state,
+            "create_grid",
+            json!({
+                "x": 0.0,
+                "y": 0.0,
+                "width": 100.0,
+                "height": 80.0,
+                "cols": 2,
+                "rows": 3
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rectangular.is_error, Some(true));
+        let rectangular_id = structured_data(&rectangular)["node_id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        {
+            let doc = state.document.lock().await;
+            let SceneNodeKind::Path(path) = &doc.nodes[&rectangular_id].kind else {
+                panic!("rectangular grid should create a path");
+            };
+            assert_eq!(path.path_data.to_bez_path().elements().len(), 14);
+        }
+
+        let polar = dispatch_tool(
+            &state,
+            "create_polar_grid",
+            json!({
+                "x": 0.0,
+                "y": 0.0,
+                "outer_radius": 100.0,
+                "inner_radius": 10.0,
+                "rings": 2,
+                "sectors": 3
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(polar.is_error, Some(true));
+        let polar_id = structured_data(&polar)["node_id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        let doc = state.document.lock().await;
+        let SceneNodeKind::Path(path) = &doc.nodes[&polar_id].kind else {
+            panic!("polar grid should create a path");
+        };
+        assert_eq!(path.path_data.to_bez_path().elements().len(), 24);
+    }
+
     async fn swatch_state(with_matching_node: bool) -> AppState {
         let state = test_state();
         let mut doc = state.document.lock().await;
@@ -2536,6 +3266,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_document_template_preserves_guide_metadata_and_geometry() {
+        let state = test_state();
+        let mut standard = Guide::new(GuideOrientation::Horizontal, 24.5);
+        standard.color = Some([0.2, 0.4, 0.8, 0.9]);
+        standard.locked = true;
+
+        let mut angled = Guide::new(GuideOrientation::Vertical, -100.0);
+        angled.color = Some([0.9, 0.3, 0.1, 0.75]);
+        angled.locked = true;
+        angled.angle_degrees = Some(37.5);
+        angled.position_x = 123.25;
+        angled.position_y = 45.75;
+
+        let template_guides = vec![standard.clone(), angled.clone()];
+        let mut template = Document::new("guide template", 640.0, 480.0);
+        template.guides = template_guides.clone();
+
+        let result = dispatch_tool(
+            &state,
+            "apply_document_template",
+            json!({ "template_json": template.to_json().unwrap() }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let doc = state.document.lock().await;
+        assert_eq!(doc.guides.len(), template_guides.len());
+        for (applied, source) in doc.guides.iter().zip(template_guides.iter()) {
+            assert_ne!(applied.id, source.id);
+            assert_eq!(applied.orientation, source.orientation);
+            assert_eq!(applied.position, source.position);
+            assert_eq!(applied.color, source.color);
+            assert_eq!(applied.locked, source.locked);
+            assert_eq!(applied.angle_degrees, source.angle_degrees);
+            assert_eq!(applied.position_x, source.position_x);
+            assert_eq!(applied.position_y, source.position_y);
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_document_template_deduplicates_standard_and_angled_guides_separately() {
+        let state = test_state();
+        let mut existing_standard = Guide::new(GuideOrientation::Horizontal, 12.0);
+        existing_standard.color = Some([0.1, 0.2, 0.3, 1.0]);
+
+        let mut existing_angled = Guide::new(GuideOrientation::Vertical, -50.0);
+        existing_angled.angle_degrees = Some(30.0);
+        existing_angled.position_x = 40.0;
+        existing_angled.position_y = 50.0;
+
+        {
+            let mut doc = state.document.lock().await;
+            doc.guides.extend([existing_standard, existing_angled]);
+        }
+
+        let mut duplicate_standard = Guide::new(GuideOrientation::Horizontal, 12.25);
+        duplicate_standard.color = Some([0.9, 0.9, 0.9, 1.0]);
+
+        let mut duplicate_angled = Guide::new(GuideOrientation::Vertical, 999.0);
+        duplicate_angled.angle_degrees = Some(30.25);
+        duplicate_angled.position_x = 40.25;
+        duplicate_angled.position_y = 50.25;
+
+        // This line intentionally shares the standard guide's orientation and
+        // position, but its angle/origin make it a distinct angled guide.
+        let mut distinct_angled = Guide::new(GuideOrientation::Horizontal, 12.25);
+        distinct_angled.angle_degrees = Some(45.0);
+        distinct_angled.position_x = 80.0;
+        distinct_angled.position_y = 90.0;
+
+        let distinct_standard = Guide::new(GuideOrientation::Vertical, 37.0);
+        let template_guides = vec![
+            duplicate_standard,
+            duplicate_angled,
+            distinct_angled.clone(),
+            distinct_standard.clone(),
+        ];
+        let mut template = Document::new("guide template", 640.0, 480.0);
+        template.guides = template_guides;
+
+        let result = dispatch_tool(
+            &state,
+            "apply_document_template",
+            json!({ "template_json": template.to_json().unwrap() }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let doc = state.document.lock().await;
+        assert_eq!(doc.guides.len(), 4);
+        assert!(doc.guides.iter().any(|guide| {
+            guide.angle_degrees == distinct_angled.angle_degrees
+                && guide.position_x == distinct_angled.position_x
+                && guide.position_y == distinct_angled.position_y
+        }));
+        assert!(doc.guides.iter().any(|guide| {
+            guide.angle_degrees.is_none()
+                && guide.orientation == distinct_standard.orientation
+                && guide.position == distinct_standard.position
+        }));
+    }
+
+    #[tokio::test]
     async fn undo_and_redo_report_mutation_only_when_history_moves() {
         let state = test_state();
 
@@ -2568,6 +3403,160 @@ mod tests {
             .await
             .unwrap();
         assert!(!output.mutates, "redo at the history tip must be read-only");
+    }
+
+    #[tokio::test]
+    async fn flatten_artwork_rejects_malformed_target_name_without_mutation() {
+        let state = test_state();
+        {
+            let mut doc = state.document.lock().await;
+            let bottom_id = doc.active_layer_id.expect("default layer");
+            doc.layers.get_mut(&bottom_id).unwrap().name = "Bottom".to_string();
+            doc.add_layer(Layer::new("Top"));
+        }
+
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let history_before = {
+            let history = state.history.lock().await;
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth(),
+            )
+        };
+
+        let result = dispatch_tool(&state, "flatten_artwork", json!({ "target_name": 42 })).await;
+        let error = match result {
+            Ok(_) => panic!("malformed target_name must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("string"),
+            "unexpected argument error: {error}"
+        );
+
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before,
+            "invalid arguments must not flatten the document"
+        );
+        let history = state.history.lock().await;
+        assert_eq!(
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth()
+            ),
+            history_before,
+            "invalid arguments must not change history"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_up_rejects_malformed_dry_run_without_mutation() {
+        let state = test_state();
+        let empty_text_id = {
+            let mut doc = state.document.lock().await;
+            let layer_id = doc.active_layer_id.expect("default layer");
+            doc.add_node(
+                SceneNode::new(
+                    "Empty text",
+                    layer_id,
+                    SceneNodeKind::Text(TextNode::new("   ")),
+                ),
+                Some(layer_id),
+            )
+        };
+
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let history_before = {
+            let history = state.history.lock().await;
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth(),
+            )
+        };
+
+        let result = dispatch_tool(&state, "clean_up", json!({ "dry_run": "yes" })).await;
+        let error = match result {
+            Ok(_) => panic!("malformed dry_run must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("boolean"),
+            "unexpected argument error: {error}"
+        );
+
+        assert!(
+            state
+                .document
+                .lock()
+                .await
+                .nodes
+                .contains_key(&empty_text_id),
+            "invalid arguments must not delete the removable node"
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before,
+            "invalid arguments must not change the document"
+        );
+        let history = state.history.lock().await;
+        assert_eq!(
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth()
+            ),
+            history_before,
+            "invalid arguments must not change history"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_empty_mutating_arguments_keep_documented_defaults() {
+        let flatten_state = test_state();
+        {
+            let mut doc = flatten_state.document.lock().await;
+            let bottom_id = doc.active_layer_id.expect("default layer");
+            doc.layers.get_mut(&bottom_id).unwrap().name = "Bottom".to_string();
+            doc.add_layer(Layer::new("Top"));
+        }
+
+        let flattened = dispatch_tool(&flatten_state, "flatten_artwork", json!({}))
+            .await
+            .unwrap();
+        assert_ne!(flattened.is_error, Some(true));
+        {
+            let doc = flatten_state.document.lock().await;
+            assert_eq!(doc.layer_order.len(), 1);
+            assert_eq!(doc.layers[&doc.layer_order[0]].name, "Bottom");
+        }
+
+        let cleanup_state = test_state();
+        let empty_text_id = {
+            let mut doc = cleanup_state.document.lock().await;
+            let layer_id = doc.active_layer_id.expect("default layer");
+            doc.add_node(
+                SceneNode::new(
+                    "Empty text",
+                    layer_id,
+                    SceneNodeKind::Text(TextNode::new("")),
+                ),
+                Some(layer_id),
+            )
+        };
+        let cleaned = dispatch_tool(&cleanup_state, "clean_up", json!({}))
+            .await
+            .unwrap();
+        assert_ne!(cleaned.is_error, Some(true));
+        assert!(!cleanup_state
+            .document
+            .lock()
+            .await
+            .nodes
+            .contains_key(&empty_text_id));
     }
 
     #[tokio::test]

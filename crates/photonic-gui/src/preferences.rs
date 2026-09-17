@@ -2,6 +2,7 @@ use crate::commands::KeyBinding;
 use crate::hotbar::{HotbarBucket, HotbarMode};
 use crate::panels::{DrawerGroup, RightDrawerGroup};
 use crate::tools::Tool;
+use photonic_core::write_atomic_file;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -348,19 +349,56 @@ impl AppPreferences {
             Ok(j) => j,
             Err(_) => return Self::default(),
         };
-        serde_json::from_str(&json).unwrap_or_default()
+        match serde_json::from_str(&json) {
+            Ok(preferences) => preferences,
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to parse application preferences; using defaults"
+                );
+                Self::default()
+            }
+        }
     }
 
-    /// Serialize and write to disk, silently ignoring errors.
+    /// Serialize and atomically write to disk.
+    ///
+    /// Persistence failures are logged and leave any existing preferences file
+    /// untouched. Keeping this method infallible preserves the existing call
+    /// sites while making failed writes observable.
     pub fn save(&self) {
         let Some(path) = Self::prefs_path() else {
+            tracing::error!("unable to persist application preferences: no config directory");
             return;
         };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if let Err(error) = std::fs::create_dir_all(parent) {
+                tracing::error!(
+                    path = %parent.display(),
+                    error = %error,
+                    "failed to create application preferences directory"
+                );
+                return;
+            }
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, json);
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(json) => json,
+            Err(error) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to serialize application preferences"
+                );
+                return;
+            }
+        };
+        if let Err(error) = write_atomic_file(&path, json.as_bytes()) {
+            tracing::error!(
+                path = %path.display(),
+                error = %error,
+                "failed to persist application preferences"
+            );
         }
     }
 }

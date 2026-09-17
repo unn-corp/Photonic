@@ -515,9 +515,9 @@ pub struct OffsetPathArgs {
 pub struct SplitIntoGridArgs {
     /// UUID of the source path node whose bounding box defines the grid area.
     pub node_id: Uuid,
-    /// Number of rows (≥ 1).
+    /// Number of rows (≥ 1). The total grid size may not exceed [`MAX_GENERATED_WORK`].
     pub rows: usize,
-    /// Number of columns (≥ 1).
+    /// Number of columns (≥ 1). The total grid size may not exceed [`MAX_GENERATED_WORK`].
     pub cols: usize,
     /// Horizontal gutter width in document units between columns (default 0).
     #[serde(default)]

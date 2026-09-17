@@ -101,26 +101,24 @@ impl PhotonicRenderer {
             let mut buffers: Vec<Buffer> = Vec::with_capacity(self.pending_texts.len());
             for snap in self.pending_texts.iter() {
                 let font_size = snap.font_size.max(1.0);
-                let line_height = font_size * snap.line_height_mul;
-                let mut buf =
-                    Buffer::new(&mut self.font_system, Metrics::new(font_size, line_height));
-                buf.set_size(&mut self.font_system, None, None);
-                let glyph_style = match snap.font_style {
-                    1 => GlyphonStyle::Italic,
-                    2 => GlyphonStyle::Oblique,
-                    _ => GlyphonStyle::Normal,
+                let font_style = match snap.font_style {
+                    1 => photonic_core::node::FontStyle::Italic,
+                    2 => photonic_core::node::FontStyle::Oblique,
+                    _ => photonic_core::node::FontStyle::Normal,
                 };
-                let attrs = Attrs::new()
-                    .family(crate::text_outline::cosmic_family(&snap.font_family))
-                    .weight(Weight(snap.font_weight))
-                    .style(glyph_style);
-                buf.set_text(
+                let buf = crate::text_layout::layout_text_buffer(
                     &mut self.font_system,
                     &snap.content,
-                    attrs,
-                    Shaping::Advanced,
+                    &snap.font_family,
+                    font_size,
+                    crate::TextLayoutOptions {
+                        font_weight: snap.font_weight,
+                        font_style,
+                        line_height_mul: snap.line_height_mul,
+                        letter_spacing: snap.letter_spacing,
+                        vertical: snap.vertical,
+                    },
                 );
-                buf.shape_until_scroll(&mut self.font_system, false);
                 buffers.push(buf);
             }
 

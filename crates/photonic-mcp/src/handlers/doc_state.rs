@@ -11,6 +11,7 @@ use photonic_core::node::SceneNodeKind;
 use photonic_core::style::FillKind;
 use serde_json::json;
 use std::collections::BTreeSet;
+use uuid::Uuid;
 
 pub async fn get_document_state(state: &AppState, args: GetDocumentStateArgs) -> ToolResult {
     tracing::debug!("tool: get_document_state");
@@ -552,16 +553,28 @@ pub async fn apply_document_template(
         doc.height = template.height;
     }
 
-    // 2. Guides — add only those not already present (deduplicate by axis+position).
-    use photonic_core::document::Guide;
+    // 2. Guides — deduplicate standard guides by axis+position and angled lines
+    // by angle+origin. Their remaining metadata is preserved when copied.
     let mut guides_added = 0usize;
     for tg in &template.guides {
         let already = doc
             .guides
             .iter()
-            .any(|g| g.orientation == tg.orientation && (g.position - tg.position).abs() < 0.5);
+            .any(|g| match (g.angle_degrees, tg.angle_degrees) {
+                (None, None) => {
+                    g.orientation == tg.orientation && (g.position - tg.position).abs() < 0.5
+                }
+                (Some(angle), Some(template_angle)) => {
+                    (angle - template_angle).abs() < 0.5
+                        && (g.position_x - tg.position_x).abs() < 0.5
+                        && (g.position_y - tg.position_y).abs() < 0.5
+                }
+                _ => false,
+            });
         if !already {
-            doc.guides.push(Guide::new(tg.orientation, tg.position));
+            let mut guide = tg.clone();
+            guide.id = Uuid::new_v4();
+            doc.guides.push(guide);
             guides_added += 1;
         }
     }
