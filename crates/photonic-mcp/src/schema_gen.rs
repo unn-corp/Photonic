@@ -297,7 +297,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "create_raster_layer",
-                "description": "Create a blank raster (pixel) layer of a given size — a transparent canvas to paint on, or filled with a solid color. Edit with brush_stroke, gradient_fill, apply_filter, etc.",
+                "description": "Create a blank raster (pixel) layer of a given size — a transparent canvas to paint on, or filled with a solid color. Edit with brush_stroke, gradient_fill, apply_filter, etc. Dimensions are limited to 16384 pixels per side and 67108864 pixels total.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1963,11 +1963,11 @@ pub fn tool_list() -> Value {
                         },
                         "width": {
                             "type": "integer",
-                            "description": "Output width in pixels. Omit to use current canvas width."
+                            "description": "Output width in pixels (maximum 16384; paired resize maximum 67108864 pixels). Omit to use current canvas width."
                         },
                         "height": {
                             "type": "integer",
-                            "description": "Output height in pixels. Omit to use current canvas height."
+                            "description": "Output height in pixels (maximum 16384; paired resize maximum 67108864 pixels). Omit to use current canvas height."
                         },
                         "quality": {
                             "type": "integer",
@@ -2549,7 +2549,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "export_audit_log",
-                "description": "Export the complete in-memory MCP audit log as a JSON array (oldest first). Includes every tool call recorded since the server started, up to 1000 entries.",
+                "description": "Export the retained in-memory MCP audit log as a JSON array (oldest first). Argument summaries are bounded, and the formatted response is capped at 256 KiB; when the retained buffer does not fit, only the oldest entries that fit are returned.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {}
@@ -4278,7 +4278,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "set_document_bleed",
-                "description": "Set the print bleed and/or slug margins for the document. Bleed is the extra artwork bled past the trim edge (typically 3 mm) to prevent white borders after cutting. Slug is the additional area outside bleed reserved for printer marks and file info. Values persist in the .photonic file. Provide only the fields you want to change.",
+                "description": "Set the print bleed and/or slug margins for the document. Bleed is the extra artwork bled past the trim edge (typically 3 mm) to prevent white borders after cutting. Slug is the additional area outside bleed reserved for printer marks and file info. Values persist in the .photon file. Provide only the fields you want to change.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -4295,7 +4295,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "set_document_color_mode",
-                "description": "Set the document color mode to RGB or CMYK. CMYK is required for print-production PDF/X output. The mode persists in the .photonic file and is used as the default color space when exporting PDF without an explicit color_mode override.",
+                "description": "Set the document color mode to RGB or CMYK. CMYK is required for print-production PDF/X output. The mode persists in the .photon file and is used as the default color space when exporting PDF without an explicit color_mode override.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -4311,7 +4311,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "set_document_dpi",
-                "description": "Set the document resolution (DPI) — the honored physical-size property on export: exported PDF/raster physical size = pixel size / dpi × 72 pt. A 1050×600 px document at 300 DPI exports at 252×144 pt (3.5×2 in); the same pixels at 72 DPI export at 1050×600 pt. Presets set this automatically (e.g. 300 for print). Default is 72 (px ≡ pt). Persists in the .photonic file.",
+                "description": "Set the document resolution (DPI) — the honored physical-size property on export: exported PDF/raster physical size = pixel size / dpi × 72 pt. A 1050×600 px document at 300 DPI exports at 252×144 pt (3.5×2 in); the same pixels at 72 DPI export at 1050×600 pt. Presets set this automatically (e.g. 300 for print). Default is 72 (px ≡ pt). Persists in the .photon file.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

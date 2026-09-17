@@ -24,7 +24,7 @@ Insert a new anchor point at the midpoint of every segment in the selected path 
 
 Attach a non-printing text comment to a node or to the document as a whole.
 
-Annotations are stored in the `.photon` file but are completely invisible in all export formats (SVG, PNG, ICO). They are not part of the undo/redo history.
+Annotations are stored in the `.photonic` file but are completely invisible in all export formats (SVG, PNG, ICO). They are not part of the undo/redo history.
 
 Use cases:
 - AI agents recording *why* a design decision was made: "Chose this radius because the brief said 'approachable'."
@@ -2095,7 +2095,7 @@ Export the current canvas as a raster image (PNG, JPEG, WebP, GIF, or TIFF). Ret
 
 PNG is lossless with optional transparency. JPEG is lossy with configurable quality (1–100) and always has a white background. WebP is lossy with transparency support and configurable quality. TIFF is lossless with full RGBA support, suitable for print workflows. Use this to obtain a file-ready raster export without the GUI file menu.
 
-Optionally specify width/height to resize the output. Each supplied dimension is limited to 16384 pixels per side and a paired resize is limited to 67108864 pixels total. If omitted, the capture uses the current canvas dimensions.
+Optionally specify width/height to resize the output. If omitted, the capture uses the current canvas dimensions.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -2918,9 +2918,9 @@ _No parameters._
 
 Return the most recent MCP tool calls recorded since the server started.
 
-Each entry includes: `id` (sequential), `timestamp` (ISO 8601), `tool_name`, `args` (a bounded structural summary), `result_summary` (first 200 chars of result text), `duration_ms`, and `is_error`. Responses are capped at a fixed byte budget.
+Each entry includes: `id` (sequential), `timestamp` (ISO 8601), `tool_name`, `args` (full arguments), `result_summary` (first 200 chars of result text), `duration_ms`, and `is_error`.
 
-Useful for multi-agent accountability: see what was called, by whom (if the calling agent passes an `author` in its args), and with which bounded parameters.
+Useful for multi-agent accountability: see exactly what was called, by whom (if the calling agent passes an `author` in its args), and with what parameters.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
