@@ -77,10 +77,12 @@ type FrameKey = (Tick, SequenceId, usize);
 /// (tests, GPU-less hosts) and every caller falls back to the pre-P3
 /// wall-clock placeholder paths.
 pub struct EngineBridge {
+    // Field drop order is declaration order.  Join the engine session before
+    // releasing the GPU owner it can still access during shutdown.
+    pub(crate) session: EngineSession,
     /// Kept alive for the session's lifetime (owns the shared `GpuContext`).
     #[allow(dead_code)]
     engine: VideoEngine,
-    pub(crate) session: EngineSession,
 
     // ── Snapshot mirror (lock-flavor bridge) ────────────────────────────────
     last_synced_revision: Option<u64>,

@@ -232,7 +232,9 @@ mod tests {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
-            .unwrap()
+            // A failed fixture assertion must not turn every later serialized
+            // FFmpeg test into a misleading PoisonError cascade.
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     use photonic_core::timeline::MediaProbe;
 
