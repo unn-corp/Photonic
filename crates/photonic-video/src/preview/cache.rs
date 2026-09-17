@@ -447,7 +447,16 @@ impl PreviewCache {
         if self.available_bytes() == 0 {
             return Err(PreviewError::BudgetExhausted);
         }
-        let directory = self.root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+        // Stage beside the immutable destination. Windows can reject moving a
+        // non-empty directory between parents even on the same volume, while
+        // a sibling rename preserves the atomic publication contract on every
+        // supported platform.
+        let destination = self.directory(signature.key);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| PreviewError::Invalid("preview destination has no parent".into()))?;
+        std::fs::create_dir_all(parent)?;
+        let directory = parent.join(format!(".staging-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory)?;
         let path = directory.join(format!("media.{}", signature.context.profile.extension()));
         Ok(ChunkStaging {

@@ -129,7 +129,6 @@ fn walkdir_shallow(root: &Path) -> Vec<(PathBuf, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
     fn summarize_classifies_proxy_and_poster() {
@@ -139,11 +138,8 @@ mod tests {
         let cache = cache_dir_for_project(&project);
         let _ = std::fs::remove_dir_all(&cache);
         std::fs::create_dir_all(&cache).unwrap();
-        let mut f = std::fs::File::create(cache.join("abc.proxy.mp4")).unwrap();
-        f.write_all(&[0u8; 1000]).unwrap();
-        let mut f = std::fs::File::create(cache.join("abc.poster.png")).unwrap();
-        f.write_all(&[0u8; 200]).unwrap();
-        drop(f);
+        std::fs::write(cache.join("abc.proxy.mp4"), [0u8; 1000]).unwrap();
+        std::fs::write(cache.join("abc.poster.png"), [0u8; 200]).unwrap();
 
         let report = summarize_cache(Some(&project));
         assert!(report.total_bytes >= 1200);
