@@ -19,6 +19,7 @@ pub mod color_convert;
 pub mod color_popup;
 pub mod commands;
 pub mod disk_search;
+mod file_io;
 pub mod global_search;
 pub mod hotbar;
 pub mod lightfall;
@@ -37,6 +38,7 @@ pub mod welcome;
 
 pub use app::engine::EngineBridge;
 pub use app::{NativeClipboardPaste, PhotonicApp};
+pub(crate) use file_io::read_svg_file;
 pub use preferences::AppPreferences;
 pub use theme::{build_dark_theme, build_light_theme};
 pub use tools::Tool;

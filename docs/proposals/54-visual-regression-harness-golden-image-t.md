@@ -16,7 +16,7 @@ perceptual-diff comparison loop wired into CI.
 
 **In**
 - A Rust test binary (or integration test) that drives `HeadlessRenderer` against a
-  corpus of `.photonic` fixture documents and diffs the output against committed PNG goldens.
+  corpus of `.photon` fixture documents and diffs the output against committed PNG goldens.
 - Fixture coverage: each blend mode, linear/radial/fluid/mesh gradients, stroke styles,
   variable-width strokes, text layout, text-on-path, patterns, image nodes, boolean
   compound paths.
@@ -34,8 +34,8 @@ perceptual-diff comparison loop wired into CI.
 
 ### 1. Fixture corpus
 
-Create `crates/photonic-render/tests/fixtures/` with one `.photonic` JSON file per
-feature. Naming convention: `blend_multiply.photonic`, `gradient_mesh_2x2.photonic`, etc.
+Create `crates/photonic-render/tests/fixtures/` with one `.photon` JSON file per
+feature. Naming convention: `blend_multiply.photon`, `gradient_mesh_2x2.photon`, etc.
 Fixtures are minimal — a single artboard with just enough objects to exercise one
 feature. Commit them; they are the ground truth inputs.
 
@@ -46,7 +46,7 @@ the same stem. This directory is committed and diff'd by the test.
 
 ```rust
 // Pseudocode outline — not an implementation
-for each fixture in tests/fixtures/*.photonic {
+for each fixture in tests/fixtures/*.photon {
     let doc = Document::from_json(fixture_bytes);
     let renderer = HeadlessRenderer::new(512, 512).await; // from headless.rs
     let pixels = renderer.render(&doc, ExportOptions::default()).await;

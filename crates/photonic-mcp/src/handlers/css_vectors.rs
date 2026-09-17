@@ -61,6 +61,10 @@ pub async fn create_vectors_from_css(
     }
     let mut nodes = Vec::new();
     let mut roots = Vec::new();
+    let fingerprint_provenance = format!(
+        "css-vector-v{} fingerprint={}",
+        CONTRACT_VERSION, plan.fingerprint
+    );
     for (i, root) in plan.roots.iter().enumerate() {
         let id = lower(root, layer_id, &mut nodes);
         // A caller-supplied root name applies only to a single selected root.
@@ -72,10 +76,14 @@ pub async fn create_vectors_from_css(
             }
         }
         if let Some(n) = nodes.iter_mut().find(|n: &&mut SceneNode| n.id == id) {
-            n.prompt_history.push(format!(
-                "css-vector-v{} fingerprint={} css={}",
-                CONTRACT_VERSION, plan.fingerprint, args.css
-            ));
+            // Keep the source available for inspection without retaining a
+            // full copy on every root when a stylesheet produces many roots.
+            let provenance = if i == 0 {
+                format!("{fingerprint_provenance} css={}", args.css)
+            } else {
+                fingerprint_provenance.clone()
+            };
+            n.prompt_history.push(provenance);
         }
         roots.push(id);
     }
@@ -174,7 +182,7 @@ fn counts(nodes: &[SceneNode]) -> (usize, usize, usize) {
 mod tests {
     use super::*;
     use crate::server::McpServerConfig;
-    use photonic_core::{history::CommandHistory, AuditLog, Document};
+    use photonic_core::{css_vectors::MAX_ELEMENTS, history::CommandHistory, AuditLog, Document};
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio::sync::Mutex;
 
@@ -261,5 +269,53 @@ mod tests {
             assert!(doc.nodes.contains_key(&id));
         }
         assert_eq!(state.history.lock().await.undo_depth(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_root_provenance_keeps_full_css_source_once() {
+        let state = test_state();
+        let css: String = (0..=MAX_ELEMENTS)
+            .map(|i| format!(".item-{i} {{ width: 1px; height: 1px; }}"))
+            .collect();
+        let result = create_vectors_from_css(
+            &state,
+            CreateVectorsFromCssArgs {
+                css: css.clone(),
+                selector: None,
+                origin: None,
+                viewport: None,
+                layer_id: None,
+                group_name: None,
+                strict: false,
+                dry_run: false,
+            },
+        )
+        .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+
+        let plan = plan_json(&result);
+        let root_ids = plan["root_node_ids"].as_array().unwrap();
+        assert_eq!(root_ids.len(), MAX_ELEMENTS);
+        let doc = state.document.lock().await;
+        let full_source_marker = format!("css={css}");
+        let root_nodes: Vec<_> = root_ids
+            .iter()
+            .map(|id| Uuid::parse_str(id.as_str().unwrap()).unwrap())
+            .filter_map(|id| doc.nodes.get(&id))
+            .collect();
+        assert_eq!(root_nodes.len(), MAX_ELEMENTS);
+        let fingerprint_marker = format!("css-vector-v{} fingerprint=", CONTRACT_VERSION);
+        let fingerprint_entries = root_nodes
+            .iter()
+            .flat_map(|node| node.prompt_history.iter())
+            .filter(|entry| entry.starts_with(&fingerprint_marker))
+            .count();
+        assert_eq!(fingerprint_entries, MAX_ELEMENTS);
+        let full_source_entries = root_nodes
+            .iter()
+            .flat_map(|node| node.prompt_history.iter())
+            .filter(|entry| entry.contains(&full_source_marker))
+            .count();
+        assert_eq!(full_source_entries, 1);
     }
 }

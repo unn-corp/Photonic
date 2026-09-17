@@ -6,12 +6,39 @@ use crate::{
     style::{Gradient, GradientStop, LineCap, LineJoin},
     Color, Document, Fill, PathData, SceneNode, SceneNodeKind, Stroke, Transform,
 };
+use kurbo::{BezPath, PathEl};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt;
 use thiserror::Error;
 use uuid::Uuid;
 
 // ─── Error ────────────────────────────────────────────────────────────────────
+
+/// The independently bounded resources used while importing an SVG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImportLimit {
+    InputBytes,
+    Elements,
+    Depth,
+    TextBytes,
+    CssBytes,
+    PathPoints,
+}
+
+impl fmt::Display for ImportLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::InputBytes => "input bytes",
+            Self::Elements => "elements",
+            Self::Depth => "nesting depth",
+            Self::TextBytes => "text bytes",
+            Self::CssBytes => "CSS bytes",
+            Self::PathPoints => "path points",
+        };
+        f.write_str(name)
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ImportError {
@@ -19,12 +46,151 @@ pub enum ImportError {
     Xml(#[from] roxmltree::Error),
     #[error("The file does not appear to be an SVG")]
     NotSvg,
+    #[error("SVG import {limit} limit exceeded (maximum {max})")]
+    LimitExceeded { limit: ImportLimit, max: usize },
+}
+
+/// Maximum UTF-8 input accepted by [`import_svg`].
+pub const MAX_SVG_INPUT_BYTES: usize = 512 * 1024;
+/// Maximum number of XML elements traversed by the importer.
+pub const MAX_SVG_ELEMENTS: usize = 4_096;
+/// Maximum element nesting below the root `<svg>` element.
+pub const MAX_SVG_DEPTH: usize = 64;
+/// Maximum text content retained from imported `<text>` elements.
+pub const MAX_SVG_TEXT_BYTES: usize = 256 * 1024;
+/// Maximum CSS content retained from `<style>` and inline style attributes.
+pub const MAX_SVG_CSS_BYTES: usize = 256 * 1024;
+/// Maximum number of point-bearing path elements retained across the document.
+pub const MAX_SVG_PATH_POINTS: usize = 100_000;
+
+#[derive(Default)]
+struct ImportState {
+    elements: usize,
+    text_bytes: usize,
+    css_bytes: usize,
+    path_points: usize,
+}
+
+impl ImportState {
+    fn visit_element(&mut self, depth: usize) -> Result<(), ImportError> {
+        if depth > MAX_SVG_DEPTH {
+            return Err(ImportError::LimitExceeded {
+                limit: ImportLimit::Depth,
+                max: MAX_SVG_DEPTH,
+            });
+        }
+        add_limited(
+            &mut self.elements,
+            1,
+            MAX_SVG_ELEMENTS,
+            ImportLimit::Elements,
+        )
+    }
+
+    fn ensure_depth(&self, depth: usize) -> Result<(), ImportError> {
+        if depth > MAX_SVG_DEPTH {
+            Err(ImportError::LimitExceeded {
+                limit: ImportLimit::Depth,
+                max: MAX_SVG_DEPTH,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn add_text_bytes(&mut self, amount: usize) -> Result<(), ImportError> {
+        add_limited(
+            &mut self.text_bytes,
+            amount,
+            MAX_SVG_TEXT_BYTES,
+            ImportLimit::TextBytes,
+        )
+    }
+
+    fn add_css_bytes(&mut self, amount: usize) -> Result<(), ImportError> {
+        add_limited(
+            &mut self.css_bytes,
+            amount,
+            MAX_SVG_CSS_BYTES,
+            ImportLimit::CssBytes,
+        )
+    }
+
+    fn ensure_path_points(&self, amount: usize) -> Result<(), ImportError> {
+        if self.path_points.checked_add(amount).is_none()
+            || self.path_points.saturating_add(amount) > MAX_SVG_PATH_POINTS
+        {
+            Err(ImportError::LimitExceeded {
+                limit: ImportLimit::PathPoints,
+                max: MAX_SVG_PATH_POINTS,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn add_path_points(&mut self, amount: usize) -> Result<(), ImportError> {
+        add_limited(
+            &mut self.path_points,
+            amount,
+            MAX_SVG_PATH_POINTS,
+            ImportLimit::PathPoints,
+        )
+    }
+}
+
+fn add_limited(
+    value: &mut usize,
+    amount: usize,
+    max: usize,
+    limit: ImportLimit,
+) -> Result<(), ImportError> {
+    let next = value
+        .checked_add(amount)
+        .ok_or(ImportError::LimitExceeded { limit, max })?;
+    if next > max {
+        return Err(ImportError::LimitExceeded { limit, max });
+    }
+    *value = next;
+    Ok(())
+}
+
+/// Visit every element iteratively, enforcing the tree-wide element and depth
+/// limits before any recursive scene-graph construction starts.
+fn walk_elements<'a, 'input, F>(
+    root: roxmltree::Node<'a, 'input>,
+    state: &mut ImportState,
+    mut visit: F,
+) -> Result<(), ImportError>
+where
+    F: FnMut(roxmltree::Node<'a, 'input>, usize, &mut ImportState) -> Result<(), ImportError>,
+{
+    let mut pending = vec![(root, 0usize)];
+    while let Some((node, depth)) = pending.pop() {
+        if !node.is_element() {
+            continue;
+        }
+        state.visit_element(depth)?;
+        visit(node, depth, state)?;
+
+        for child in node.children().filter(|child| child.is_element()).rev() {
+            pending.push((child, depth.saturating_add(1)));
+        }
+    }
+    Ok(())
 }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
 /// Parse an SVG string and return a Photonic [`Document`].
 pub fn import_svg(svg_text: &str) -> Result<Document, ImportError> {
+    if svg_text.len() > MAX_SVG_INPUT_BYTES {
+        return Err(ImportError::LimitExceeded {
+            limit: ImportLimit::InputBytes,
+            max: MAX_SVG_INPUT_BYTES,
+        });
+    }
+
     // roxmltree deliberately rejects every DTD. SVG editors commonly emit the
     // standard SVG 1.1 external doctype even though the document does not rely
     // on it. Remove the declaration without resolving external resources.
@@ -39,9 +205,10 @@ pub fn import_svg(svg_text: &str) -> Result<Document, ImportError> {
     let (doc_width, doc_height) = parse_viewport(&root);
     let mut doc = Document::new("Imported SVG", doc_width, doc_height);
     let layer_id = doc.active_layer_id.unwrap();
+    let mut state = ImportState::default();
 
     // First pass: collect CSS rules and gradient defs from <defs> / <style>
-    let ctx = build_context(&root);
+    let ctx = build_context(&root, &mut state)?;
 
     let default_style = ComputedStyle::default();
 
@@ -55,7 +222,15 @@ pub fn import_svg(svg_text: &str) -> Result<Document, ImportError> {
         ) {
             continue;
         }
-        if let Some(node_id) = import_element(&child, &mut doc, layer_id, &default_style, &ctx) {
+        if let Some(node_id) = import_element(
+            &child,
+            &mut doc,
+            layer_id,
+            &default_style,
+            &ctx,
+            &mut state,
+            1,
+        )? {
             doc.layers
                 .get_mut(&layer_id)
                 .unwrap()
@@ -136,25 +311,25 @@ enum GradientUnits {
     UserSpaceOnUse,
 }
 
-fn build_context(root: &roxmltree::Node) -> SvgContext {
+fn build_context(
+    root: &roxmltree::Node,
+    state: &mut ImportState,
+) -> Result<SvgContext, ImportError> {
     let (doc_width, doc_height) = parse_viewport(root);
     let mut css_rules: HashMap<String, CssProps> = HashMap::new();
     let mut gradients: HashMap<String, ParsedGradient> = HashMap::new();
 
     // Scan the entire tree, not just direct children of <svg>. Illustrator and
     // most other tools nest the <style> block and gradient defs inside <defs>,
-    // and <style> can appear at any depth. Walking descendants() makes
+    // and <style> can appear at any depth. The bounded iterative walk makes
     // CSS-class fills (`.cls-1 { fill: #... }`) and gradients resolve regardless
     // of nesting — the previous code only matched <style>/<defs> that were
     // direct children of the root <svg>, so class-based colors silently
     // imported as the default black fill.
-    for node in root.descendants() {
-        if !node.is_element() {
-            continue;
-        }
+    walk_elements(*root, state, |node, _depth, state| {
         match node.tag_name().name() {
             "style" => {
-                let css = element_text(&node);
+                let css = element_text(&node, state)?;
                 if !css.trim().is_empty() {
                     parse_css_into(&css, &mut css_rules);
                 }
@@ -170,7 +345,7 @@ fn build_context(root: &roxmltree::Node) -> SvgContext {
                         parse_percentage_or_number(node.attribute("x2").unwrap_or("100%"), units);
                     let y2 =
                         parse_percentage_or_number(node.attribute("y2").unwrap_or("0%"), units);
-                    let stops = parse_gradient_stops(&node);
+                    let stops = parse_gradient_stops(&node, state)?;
                     let href = node
                         .attribute("href")
                         .or_else(|| node.attribute("xlink:href"))
@@ -195,7 +370,7 @@ fn build_context(root: &roxmltree::Node) -> SvgContext {
                     let cy =
                         parse_percentage_or_number(node.attribute("cy").unwrap_or("50%"), units);
                     let r = parse_percentage_or_number(node.attribute("r").unwrap_or("50%"), units);
-                    let stops = parse_gradient_stops(&node);
+                    let stops = parse_gradient_stops(&node, state)?;
                     let href = node
                         .attribute("href")
                         .or_else(|| node.attribute("xlink:href"))
@@ -214,7 +389,8 @@ fn build_context(root: &roxmltree::Node) -> SvgContext {
             }
             _ => {}
         }
-    }
+        Ok(())
+    })?;
 
     // Resolve href stop inheritance (one level deep is sufficient for most SVGs)
     let ids: Vec<String> = gradients.keys().cloned().collect();
@@ -231,12 +407,12 @@ fn build_context(root: &roxmltree::Node) -> SvgContext {
         }
     }
 
-    SvgContext {
+    Ok(SvgContext {
         css_rules,
         gradients,
         doc_width,
         doc_height,
-    }
+    })
 }
 
 // ─── CSS parsing ──────────────────────────────────────────────────────────────
@@ -244,16 +420,8 @@ fn build_context(root: &roxmltree::Node) -> SvgContext {
 /// Concatenate all text (including CDATA) found under an element. `<style>`
 /// content is usually a single text node, but it may be wrapped in CDATA or
 /// split into several segments — this gathers all of it.
-fn element_text(node: &roxmltree::Node) -> String {
-    let mut s = String::new();
-    for d in node.descendants() {
-        if d.is_text() {
-            if let Some(t) = d.text() {
-                s.push_str(t);
-            }
-        }
-    }
-    s
+fn element_text(node: &roxmltree::Node, state: &mut ImportState) -> Result<String, ImportError> {
+    collect_descendant_text(*node, state, ImportLimit::CssBytes)
 }
 
 fn parse_css_into(css: &str, out: &mut HashMap<String, CssProps>) {
@@ -306,11 +474,17 @@ fn parse_css_into(css: &str, out: &mut HashMap<String, CssProps>) {
 
 // ─── Gradient stop parsing ────────────────────────────────────────────────────
 
-fn parse_gradient_stops(node: &roxmltree::Node) -> Vec<GradientStop> {
+fn parse_gradient_stops(
+    node: &roxmltree::Node,
+    state: &mut ImportState,
+) -> Result<Vec<GradientStop>, ImportError> {
     let mut stops = Vec::new();
     for child in node.children() {
         if !child.is_element() || child.tag_name().name() != "stop" {
             continue;
+        }
+        if let Some(style_attr) = child.attribute("style") {
+            state.add_css_bytes(style_attr.len())?;
         }
         let offset = child
             .attribute("offset")
@@ -341,7 +515,7 @@ fn parse_gradient_stops(node: &roxmltree::Node) -> Vec<GradientStop> {
 
         stops.push(GradientStop::new(offset, color));
     }
-    stops
+    Ok(stops)
 }
 
 fn parse_stop_offset(s: &str) -> f32 {
@@ -444,13 +618,16 @@ fn import_element(
     layer_id: LayerId,
     parent_style: &ComputedStyle,
     ctx: &SvgContext,
-) -> Option<Uuid> {
+    state: &mut ImportState,
+    depth: usize,
+) -> Result<Option<Uuid>, ImportError> {
+    state.ensure_depth(depth)?;
     let tag = node.tag_name().name();
 
-    let style = resolve_style(node, parent_style, ctx);
+    let style = resolve_style(node, parent_style, ctx, state)?;
 
     if !style.display || !style.visibility {
-        return None;
+        return Ok(None);
     }
 
     let local_transform = node
@@ -471,12 +648,20 @@ fn import_element(
                 ) {
                     continue;
                 }
-                if let Some(child_id) = import_element(&child, doc, layer_id, &style, ctx) {
+                if let Some(child_id) = import_element(
+                    &child,
+                    doc,
+                    layer_id,
+                    &style,
+                    ctx,
+                    state,
+                    depth.saturating_add(1),
+                )? {
                     children.push(child_id);
                 }
             }
             if children.is_empty() {
-                return None;
+                return Ok(None);
             }
             let id = Uuid::new_v4();
             let name = node.attribute("id").unwrap_or("Group").to_string();
@@ -513,12 +698,16 @@ fn import_element(
                     symbol_stroke_override: None,
                 },
             );
-            Some(id)
+            Ok(Some(id))
         }
 
         "path" | "rect" | "circle" | "ellipse" | "line" | "polyline" | "polygon" => {
-            let d = element_to_path_d(node)?;
-            let path_data = PathData::from_svg(&d).ok()?;
+            let Some(d) = element_to_path_d(node, state)? else {
+                return Ok(None);
+            };
+            let Some(path_data) = bounded_path_data(&d, state)? else {
+                return Ok(None);
+            };
 
             // For objectBoundingBox gradients we need the shape's bounds
             let bbox = path_data.bounding_box();
@@ -559,13 +748,13 @@ fn import_element(
                     symbol_stroke_override: None,
                 },
             );
-            Some(id)
+            Ok(Some(id))
         }
 
         "text" => {
-            let content = collect_text_content(node);
+            let content = collect_text_content(node, state)?;
             if content.trim().is_empty() {
-                return None;
+                return Ok(None);
             }
             let x = parse_length(node.attribute("x").unwrap_or("0"));
             let y = parse_length(node.attribute("y").unwrap_or("0"));
@@ -630,10 +819,10 @@ fn import_element(
                     symbol_stroke_override: None,
                 },
             );
-            Some(id)
+            Ok(Some(id))
         }
 
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -645,7 +834,8 @@ fn resolve_style(
     node: &roxmltree::Node,
     parent: &ComputedStyle,
     ctx: &SvgContext,
-) -> ComputedStyle {
+    state: &mut ImportState,
+) -> Result<ComputedStyle, ImportError> {
     let mut s = parent.clone();
     // Each node has its own opacity and blend mode unless it declares one
     // (neither is inherited from the parent group).
@@ -693,6 +883,7 @@ fn resolve_style(
 
     // 4. Inline style — highest priority, overrides everything
     if let Some(style_str) = node.attribute("style") {
+        state.add_css_bytes(style_str.len())?;
         for decl in style_str.split(';') {
             let decl = decl.trim();
             if decl.is_empty() {
@@ -708,7 +899,7 @@ fn resolve_style(
 
     // Apply the merged map to our style struct
     apply_props(&merged, &mut s);
-    s
+    Ok(s)
 }
 
 fn is_presentation_attr(name: &str) -> bool {
@@ -972,7 +1163,8 @@ fn parse_color(s: &str) -> Option<Color> {
         return None;
     }
 
-    if let Some(hex) = s.strip_prefix('#') {
+    if s.starts_with('#') {
+        let hex = &s[1..];
         return match hex.len() {
             3 => {
                 let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()? as f32 / 255.0;
@@ -1066,9 +1258,12 @@ fn parse_color(s: &str) -> Option<Color> {
 
 // ─── Shape → SVG path data conversion ────────────────────────────────────────
 
-fn element_to_path_d(node: &roxmltree::Node) -> Option<String> {
+fn element_to_path_d(
+    node: &roxmltree::Node,
+    state: &mut ImportState,
+) -> Result<Option<String>, ImportError> {
     match node.tag_name().name() {
-        "path" => Some(node.attribute("d")?.to_string()),
+        "path" => Ok(node.attribute("d").map(str::to_string)),
 
         "rect" => {
             let x = parse_length(node.attribute("x").unwrap_or("0"));
@@ -1076,7 +1271,7 @@ fn element_to_path_d(node: &roxmltree::Node) -> Option<String> {
             let w = parse_length(node.attribute("width").unwrap_or("0"));
             let h = parse_length(node.attribute("height").unwrap_or("0"));
             if w <= 0.0 || h <= 0.0 {
-                return None;
+                return Ok(None);
             }
             let rx = node
                 .attribute("rx")
@@ -1091,7 +1286,14 @@ fn element_to_path_d(node: &roxmltree::Node) -> Option<String> {
                 (Some(rx), Some(ry)) => (rx, ry),
                 (None, None) => (0.0, 0.0),
             };
-            Some(rect_to_path_d(x, y, w, h, rx.min(w / 2.0), ry.min(h / 2.0)))
+            Ok(Some(rect_to_path_d(
+                x,
+                y,
+                w,
+                h,
+                rx.min(w / 2.0),
+                ry.min(h / 2.0),
+            )))
         }
 
         "circle" => {
@@ -1099,9 +1301,9 @@ fn element_to_path_d(node: &roxmltree::Node) -> Option<String> {
             let cy = parse_length(node.attribute("cy").unwrap_or("0"));
             let r = parse_length(node.attribute("r").unwrap_or("0"));
             if r <= 0.0 {
-                return None;
+                return Ok(None);
             }
-            Some(ellipse_to_path_d(cx, cy, r, r))
+            Ok(Some(ellipse_to_path_d(cx, cy, r, r)))
         }
 
         "ellipse" => {
@@ -1110,9 +1312,9 @@ fn element_to_path_d(node: &roxmltree::Node) -> Option<String> {
             let rx = parse_length(node.attribute("rx").unwrap_or("0"));
             let ry = parse_length(node.attribute("ry").unwrap_or("0"));
             if rx <= 0.0 || ry <= 0.0 {
-                return None;
+                return Ok(None);
             }
-            Some(ellipse_to_path_d(cx, cy, rx, ry))
+            Ok(Some(ellipse_to_path_d(cx, cy, rx, ry)))
         }
 
         "line" => {
@@ -1120,14 +1322,34 @@ fn element_to_path_d(node: &roxmltree::Node) -> Option<String> {
             let y1 = parse_length(node.attribute("y1").unwrap_or("0"));
             let x2 = parse_length(node.attribute("x2").unwrap_or("0"));
             let y2 = parse_length(node.attribute("y2").unwrap_or("0"));
-            Some(format!("M {x1} {y1} L {x2} {y2}"))
+            Ok(Some(format!("M {x1} {y1} L {x2} {y2}")))
         }
 
-        "polyline" => polyline_to_path_d(node.attribute("points")?, false),
-        "polygon" => polyline_to_path_d(node.attribute("points")?, true),
+        "polyline" => match node.attribute("points") {
+            Some(points) => polyline_to_path_d(points, false, state),
+            None => Ok(None),
+        },
+        "polygon" => match node.attribute("points") {
+            Some(points) => polyline_to_path_d(points, true, state),
+            None => Ok(None),
+        },
 
-        _ => None,
+        _ => Ok(None),
     }
+}
+
+fn bounded_path_data(d: &str, state: &mut ImportState) -> Result<Option<PathData>, ImportError> {
+    let parsed = match BezPath::from_svg(d) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let point_count = parsed
+        .elements()
+        .iter()
+        .filter(|element| !matches!(element, PathEl::ClosePath))
+        .count();
+    state.add_path_points(point_count)?;
+    Ok(PathData::from_svg(d).ok())
 }
 
 fn rect_to_path_d(x: f64, y: f64, w: f64, h: f64, rx: f64, ry: f64) -> String {
@@ -1158,15 +1380,31 @@ fn ellipse_to_path_d(cx: f64, cy: f64, rx: f64, ry: f64) -> String {
     )
 }
 
-fn polyline_to_path_d(points_attr: &str, close: bool) -> Option<String> {
+fn polyline_to_path_d(
+    points_attr: &str,
+    close: bool,
+    state: &mut ImportState,
+) -> Result<Option<String>, ImportError> {
+    // Check the numeric point count before building the coordinate vector so a
+    // wide polyline cannot force an oversized temporary allocation.
+    let coordinate_count = points_attr
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse::<f64>().ok())
+        .count();
+    if coordinate_count < 4 || coordinate_count % 2 != 0 {
+        return Ok(None);
+    }
+    state.ensure_path_points(coordinate_count / 2)?;
+
     let coords: Vec<f64> = points_attr
         .split(|c: char| c.is_whitespace() || c == ',')
         .filter(|s| !s.is_empty())
         .filter_map(|s| s.parse().ok())
         .collect();
 
-    if coords.len() < 4 || !coords.len().is_multiple_of(2) {
-        return None;
+    if coords.len() < 4 || coords.len() % 2 != 0 {
+        return Ok(None);
     }
 
     let mut d = format!("M {} {}", coords[0], coords[1]);
@@ -1176,21 +1414,40 @@ fn polyline_to_path_d(points_attr: &str, close: bool) -> Option<String> {
     if close {
         d.push_str(" Z");
     }
-    Some(d)
+    Ok(Some(d))
 }
 
 // ─── Text content collection ──────────────────────────────────────────────────
 
-fn collect_text_content(node: &roxmltree::Node) -> String {
+fn collect_text_content(
+    node: &roxmltree::Node,
+    state: &mut ImportState,
+) -> Result<String, ImportError> {
+    collect_descendant_text(*node, state, ImportLimit::TextBytes)
+}
+
+fn collect_descendant_text(
+    node: roxmltree::Node<'_, '_>,
+    state: &mut ImportState,
+    limit: ImportLimit,
+) -> Result<String, ImportError> {
     let mut out = String::new();
-    for child in node.children() {
+    let mut pending: Vec<roxmltree::Node<'_, '_>> = node.children().rev().collect();
+    while let Some(child) = pending.pop() {
         if child.is_text() {
-            out.push_str(child.text().unwrap_or(""));
-        } else if child.is_element() {
-            out.push_str(&collect_text_content(&child));
+            if let Some(text) = child.text() {
+                match limit {
+                    ImportLimit::TextBytes => state.add_text_bytes(text.len())?,
+                    ImportLimit::CssBytes => state.add_css_bytes(text.len())?,
+                    _ => unreachable!("text collection uses a text or CSS limit"),
+                }
+                out.push_str(text);
+            }
+        } else {
+            pending.extend(child.children().rev());
         }
     }
-    out
+    Ok(out)
 }
 
 // ─── Transform attribute parsing ─────────────────────────────────────────────
@@ -1379,5 +1636,75 @@ mod tests {
 
         let doc = import_svg(svg).expect("standard external SVG doctype should be accepted");
         assert_eq!(doc.nodes.len(), 1);
+    }
+
+    fn assert_limit(svg: &str, expected: ImportLimit) {
+        let error = import_svg(svg).expect_err("adversarial SVG should be rejected");
+        assert!(
+            matches!(error, ImportError::LimitExceeded { limit, .. } if limit == expected),
+            "expected {expected:?} limit, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_input_is_rejected_before_xml_parsing() {
+        let svg = "x".repeat(MAX_SVG_INPUT_BYTES + 1);
+        assert_limit(&svg, ImportLimit::InputBytes);
+    }
+
+    #[test]
+    fn deeply_nested_groups_hit_the_depth_limit() {
+        let mut svg =
+            String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">"#);
+        for _ in 0..=MAX_SVG_DEPTH {
+            svg.push_str("<g>");
+        }
+        svg.push_str(r#"<path d="M0 0 L1 0 L1 1 Z"/>"#);
+        for _ in 0..=MAX_SVG_DEPTH {
+            svg.push_str("</g>");
+        }
+        svg.push_str("</svg>");
+
+        assert_limit(&svg, ImportLimit::Depth);
+    }
+
+    #[test]
+    fn wide_element_tree_hits_the_element_limit() {
+        let mut svg =
+            String::from(r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">"#);
+        for _ in 0..MAX_SVG_ELEMENTS {
+            svg.push_str(r#"<path d="M0 0 L1 0 L1 1 Z"/>"#);
+        }
+        svg.push_str("</svg>");
+
+        assert_limit(&svg, ImportLimit::Elements);
+    }
+
+    #[test]
+    fn oversized_text_and_css_are_rejected() {
+        let text = "x".repeat(MAX_SVG_TEXT_BYTES + 1);
+        let text_svg =
+            format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><text>{text}</text></svg>"#);
+        assert_limit(&text_svg, ImportLimit::TextBytes);
+
+        let css = "x".repeat(MAX_SVG_CSS_BYTES + 1);
+        let css_svg =
+            format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><style>{css}</style></svg>"#);
+        assert_limit(&css_svg, ImportLimit::CssBytes);
+    }
+
+    #[test]
+    fn excessive_path_points_are_rejected() {
+        let mut path = String::from("M0 0");
+        for _ in 0..=MAX_SVG_PATH_POINTS {
+            path.push_str("l0 0");
+        }
+        let svg = format!(r#"<svg xmlns="http://www.w3.org/2000/svg"><path d="{path}"/></svg>"#);
+
+        assert!(
+            svg.len() <= MAX_SVG_INPUT_BYTES,
+            "path fixture must exercise the path limit, not the input limit"
+        );
+        assert_limit(&svg, ImportLimit::PathPoints);
     }
 }

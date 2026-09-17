@@ -270,7 +270,7 @@ Complete inventory of features implemented as of 2026-03-23.
 | `delete_grammar_rule` | Delete a named design grammar rule. GUI: "✕" button per rule row. |
 | `apply_flex_layout` | Redistribute children of a group in a flex-like row or column arrangement with configurable gap, cross-axis alignment, and padding. Children are sorted by current position along the main axis before redistribution. GUI: "Apply Flex (row/column, gap=8)" buttons in Group Operations section (visible when group with 2+ children selected). Single undo step. |
 | `apply_stack_layout` | Stack all children of a group at the same position (Z-stack), aligning each child within the union bounding box. Configurable align_h (left/center/right) and align_v (top/center/bottom). GUI: "Stack (center)" button in Group Operations panel. |
-| `set_document_bleed` | Set the print bleed and/or slug margins (in mm) for the document. Values persist in the .photonic file. Supports partial updates — pass only the field you want to change. GUI: "Print Settings" collapsing panel in Document Info section with Bleed/Slug DragValues and Apply button. |
+| `set_document_bleed` | Set the print bleed and/or slug margins (in mm) for the document. Values persist in the .photon file. Supports partial updates — pass only the field you want to change. GUI: "Print Settings" collapsing panel in Document Info section with Bleed/Slug DragValues and Apply button. |
 | `get_document_bleed` | Return the current document bleed and slug values in millimetres. Read-only. |
 | `list_history` | Return the most recent edit history entries from the undo stack, newest first. Returns step index and description for each entry. Useful for AI agents auditing what was changed and for deciding which node to revert with `undo_node`. Read-only. GUI: "Edit History" collapsing panel with ⟳ refresh button. |
 | `jump_to_history` | Jump the document state to any undo-stack index by issuing the required sequence of undo or redo operations. Index 0 is the oldest recorded state; current undo depth is the present state. GUI: "Jump to step" DragValue slider + Jump button in the Edit History panel. |
@@ -282,7 +282,7 @@ Complete inventory of features implemented as of 2026-03-23.
 | `copy_appearance` | Copy fill, stroke, and/or opacity from a source node to one or more target nodes (eyedropper-style). Each attribute toggled independently. GUI: "Copy Appearance" CollapsingHeader with Fill/Stroke/Opacity checkboxes + Apply Eyedropper button (visible when 2+ nodes selected). |
 | `apply_grid_layout` | Arrange children of a group in a uniform grid: left-to-right, top-to-bottom with configurable column count, horizontal gap, vertical gap, and padding. Column width and row height are set to the maximum child dimensions. GUI: "Grid (3 cols)" and "Grid (4 cols)" buttons in Group Operations panel (visible when group with 2+ children selected). Single undo step. |
 | `add_construction_line` | Add an infinite non-printing angled reference line through any document point. Parameters: x, y origin, angle_degrees (0=horizontal, 90=vertical), optional hex color. Renders as an overlay in the editor and is excluded from all exports. GUI: "Construction Lines" collapsing panel in Document Info section with X/Y/angle DragValues and quick H/V/45° buttons. |
-| `set_artboard_margins` | Set the artboard safe-area margins (top, right, bottom, left) in document units. Values persist in the .photonic file. Supports partial updates. GUI: "Artboard Margins" collapsing panel in Document Info section with T/R/B/L DragValues, Apply and Reset buttons. Blue margin rectangle rendered as canvas overlay when guides are visible. |
+| `set_artboard_margins` | Set the artboard safe-area margins (top, right, bottom, left) in document units. Values persist in the .photon file. Supports partial updates. GUI: "Artboard Margins" collapsing panel in Document Info section with T/R/B/L DragValues, Apply and Reset buttons. Blue margin rectangle rendered as canvas overlay when guides are visible. |
 | `get_artboard_margins` | Return the current artboard safe-area margin values in document units. Read-only. |
 | `link_text_frames` | Link two text nodes as a threaded text chain so content overflow flows from the upstream frame into the downstream frame. Stores next_frame/prev_frame references on TextNode. Supports undo. GUI: "Text Frame Threading" collapsing panel in text node properties with Link/Unlink buttons (active when two text nodes co-selected). |
 | `unlink_text_frames` | Remove a text node from its thread chain, severing both upstream and downstream frame links. Supports undo. |
@@ -334,8 +334,8 @@ Complete inventory of features implemented as of 2026-03-23.
 ### Audit Log
 | Tool | Description |
 |---|---|
-| `list_audit_log` | Return the most recent N MCP tool calls (default 50) with timestamp, tool name, full args, result summary, and duration; newest first |
-| `export_audit_log` | Export the complete in-memory audit log as a JSON array (oldest first); includes every call since server start, up to 1000 entries |
+| `list_audit_log` | Return the most recent N MCP tool calls (default 50) with timestamp, tool name, bounded argument summaries, result summary, and duration; newest first; response is byte-capped |
+| `export_audit_log` | Export the retained in-memory audit log as a JSON array (oldest first); bounded argument summaries and a 256 KiB response cap apply |
 
 ### Clipboard History
 | Tool | Description |
@@ -522,7 +522,7 @@ Context-sensitive actions with scroll-wheel pagination (8 items per page):
 
 | Format | Direction |
 |---|---|
-| `.photonic` | Native JSON document format — read/write |
+| `.photon` | Native JSON document format — read/write |
 | `.svg` | Vector — import and export |
 | `.png` | Raster — export |
 | `.ico` | Windows icon — export |

@@ -4,6 +4,8 @@ use std::collections::VecDeque;
 
 /// Maximum combined compact-serialized size of retained argument values.
 pub const MAX_AUDIT_ARGUMENT_BYTES: usize = 1024 * 1024;
+/// Maximum size of a formatted audit list or export response.
+pub const MAX_AUDIT_EXPORT_BYTES: usize = 256 * 1024;
 
 const MAX_AUDIT_ARGUMENT_BYTES_PER_ENTRY: usize = 8 * 1024;
 const MAX_AUDIT_ENTRIES: usize = 1000;
@@ -390,6 +392,33 @@ mod tests {
     }
 
     #[test]
+    fn summarizes_binary_like_string_arguments() {
+        let args = serde_json::json!({
+            "image_data": format!(
+                "data:image/png;base64,{}",
+                "A".repeat(MAX_AUDIT_ARGUMENT_BYTES_PER_ENTRY * 4)
+            ),
+        });
+        let mut log = AuditLog::new();
+        log.record(entry(args, false));
+
+        let retained = log.entries().front().expect("entry retained");
+        assert_eq!(
+            retained.args["image_data"][AUDIT_SUMMARY_MARKER]["truncated"],
+            true
+        );
+        assert_eq!(
+            retained.args["image_data"][AUDIT_SUMMARY_MARKER]["type"],
+            "string"
+        );
+        assert!(retained.args["image_data"]["preview"]
+            .as_str()
+            .expect("string preview")
+            .starts_with("data:image/png;base64,"));
+        assert!(log.argument_bytes() <= MAX_AUDIT_ARGUMENT_BYTES);
+    }
+
+    #[test]
     fn enforces_total_serialized_argument_budget() {
         let mut fields = Map::new();
         for index in 0..MAX_AUDIT_SUMMARY_ITEMS {
@@ -401,7 +430,7 @@ mod tests {
         let args = Value::Object(fields);
         let mut log = AuditLog::new();
 
-        for _ in 0..300 {
+        for _ in 0..1000 {
             log.record(entry(args.clone(), false));
         }
 
@@ -416,7 +445,7 @@ mod tests {
             .sum();
         assert_eq!(serialized_bytes, log.argument_bytes());
         assert!(serialized_bytes <= MAX_AUDIT_ARGUMENT_BYTES);
-        assert!(log.entries().len() < 300);
-        assert_eq!(log.total_recorded(), 300);
+        assert!(log.entries().len() < 1000);
+        assert_eq!(log.total_recorded(), 1000);
     }
 }

@@ -1,7 +1,8 @@
 //! Protocol `2026-07-28` envelope + dual-mode lifecycle tests.
 //!
 //! Drive the real axum router (same as `transport_auth`) so headers and body
-//! limits are exercised. Open secret (`None`) so auth does not obscure failures.
+//! limits are exercised. Requests use a fixed test secret so authentication does
+//! not obscure protocol failures.
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -11,10 +12,13 @@ use photonic_core::{AuditLog, Document};
 use photonic_mcp::handlers;
 use photonic_mcp::protocol::{ProtocolMode, PROTOCOL_2026_07_28};
 use photonic_mcp::server::{build_router, AppState, McpServerConfig};
+use photonic_mcp::MCP_SECRET_HEADER;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
 use tower::ServiceExt;
+
+const TEST_SECRET: &str = "protocol-test-secret";
 
 fn test_state(mode: ProtocolMode) -> AppState {
     let (tx, _rx) = std::sync::mpsc::channel();
@@ -25,7 +29,7 @@ fn test_state(mode: ProtocolMode) -> AppState {
         capture_tx: Arc::new(StdMutex::new(tx)),
         config: McpServerConfig {
             port: 0,
-            secret: None,
+            secret: Some(TEST_SECRET.to_string()),
             protocol_mode: mode,
         },
         path_policy: photonic_core::PathPolicy::desktop_default(),
@@ -40,7 +44,8 @@ fn post(body: Value, headers: &[(&str, &str)]) -> Request<Body> {
     let mut builder = Request::builder()
         .method("POST")
         .uri("/mcp")
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header(MCP_SECRET_HEADER, TEST_SECRET);
     for (n, v) in headers {
         builder = builder.header(*n, *v);
     }

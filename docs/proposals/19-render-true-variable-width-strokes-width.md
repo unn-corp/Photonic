@@ -8,7 +8,7 @@
 
 - `Stroke::width_profile_id: Option<Uuid>` (`style.rs`) links a stroke to a
   `WidthProfile` in `Document::width_profiles`. Additive + `#[serde(default)]`,
-  so existing `.photonic` documents load unchanged.
+  so existing `.photon` documents load unchanged.
 - `tessellate_stroke_variable(path, widths)` (`tessellator.rs`) flattens the
   path, offsets each vertex by the linearly-interpolated half-width along its
   normal, and triangulates a filled ribbon — true varying width, not the average.
@@ -119,7 +119,7 @@ makes the tessellator consume per-segment widths.
   lyon's `path_offset` approach. Need to prototype which is simpler.
 - **End-cap geometry:** variable-width strokes need caps that taper rather than cap at
   a uniform width; the cap shape at t=0 and t=1 depends on the profile value there.
-- **Round-trip:** `.photonic` serializes `Stroke` — adding `width_profile_id` is
+- **Round-trip:** `.photon` serializes `Stroke` — adding `width_profile_id` is
   additive and backward-compatible with `#[serde(default)]`.
 
 ## Acceptance Criteria
@@ -128,7 +128,7 @@ makes the tessellator consume per-segment widths.
       on-canvas and in headless export.
 - [ ] `average_width()` is no longer the rendering fallback (only used as a legacy hint).
 - [ ] SVG export produces an outlined `<path>` that matches on-canvas appearance.
-- [ ] Round-trips through `.photonic` save/load without data loss.
+- [ ] Round-trips through `.photon` save/load without data loss.
 - [ ] Uniform strokes (no `width_profile_id`) are unaffected.
 
 ## Effort Estimate

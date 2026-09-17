@@ -252,7 +252,7 @@ Binary entry point. Reads CLI arguments and selects a mode:
 
 | Mode | Command | Behaviour |
 |---|---|---|
-| GUI (default) | `photonic [file.photonic]` | Full window + egui + wgpu |
+| GUI (default) | `photonic [file.photon]` | Full window + egui + wgpu |
 | MCP server | `photonic mcp [--port N]` | Headless tokio HTTP server |
 | Lua REPL | `photonic repl` | Interactive scripting |
 | MCP proxy | `photonic proxy` | CLI client to remote MCP |
@@ -290,6 +290,6 @@ Screenshot requests travel via a `tokio::sync::oneshot` channel: the MCP handler
 
 ## Serialization strategy
 
-- Human-readable JSON everywhere (`.photonic` files are plain text).
+- Human-readable JSON everywhere (`.photon` files are plain text).
 - Serde `skip_serializing_if` prunes defaults: identity transforms, `opacity = 1.0`, `visible = true`, empty tag lists.
 - Path data is stored as an SVG path string and parsed back to `kurbo::BezPath` on demand.

@@ -41,7 +41,8 @@ Pattern B (`search_actions` / compact `tools/list`), and MCPB packaging:
 → **[docs/specs/mcp-2026-07-28.md](docs/specs/mcp-2026-07-28.md)** · full tool reference **[docs/mcp-api.md](docs/mcp-api.md)**
 
 ```bash
-# HTTP (loopback). Token auto-written unless --mcp-secret is set.
+# HTTP (loopback). A session token is generated and written securely unless
+# --mcp-secret or PHOTONIC_MCP_SECRET supplies one.
 cargo run -p photonic-app -- --headless --mcp-port 7842
 
 # Stdio (Content-Length; MCPB / Inspector)
@@ -87,7 +88,7 @@ photonic/
 │   ├── architecture.md    # Crate design and internals
 │   ├── mcp-api.md         # MCP tool reference
 │   ├── specs/mcp-2026-07-28.md  # Protocol, PathPolicy, Pattern B, MCPB
-│   └── file-format.md     # .photonic file format
+│   └── file-format.md     # .photon file format
 └── ROADMAP.md             # Planned features
 ```
 
@@ -99,7 +100,7 @@ photonic/
 | [docs/raster-editing.md](docs/raster-editing.md) | Raster (pixel) editing subsystem — model, ops, MCP surface, phasing |
 | [docs/mcp-api.md](docs/mcp-api.md) | Every MCP tool with parameters and examples |
 | [docs/specs/mcp-2026-07-28.md](docs/specs/mcp-2026-07-28.md) | MCP protocol 2026-07-28, auth, PathPolicy, Pattern B, MCPB packaging |
-| [docs/file-format.md](docs/file-format.md) | `.photonic` JSON schema reference |
+| [docs/file-format.md](docs/file-format.md) | `.photon` JSON schema reference |
 
 ## Crates at a Glance
 

@@ -15,68 +15,405 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write # needed to create the Release and upload assets
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  ZIPSIGN_VERSION: "0.2.1"
+  ZIPSIGN_SHA256: bc5d02b6a44b677c4c412fca9eb5c9b08f255692b30f6943248437b6add1f5c6
+  PHOTONIC_PUBLIC_KEY_SHA256: 34642dd944fd2940db6f08843aa8a2c31e66e5df16901b6d9be52c8509b1243d
 
 jobs:
+  # Tags are accepted only when they resolve to a commit already reachable
+  # from protected main. This is the approved release-branch path; repository
+  # administrators may additionally protect v* tags with a tag ruleset.
+  validate_release:
+    name: Validate release provenance
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Require a reviewed release commit
+        shell: bash
+        env:
+          DEFAULT_BRANCH: main
+          TAG_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release runs require a version tag such as v1.2.3" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin \
+            "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          tag_commit="$(git rev-parse --verify "$TAG_COMMIT^{commit}")"
+          main_ref="refs/remotes/origin/$DEFAULT_BRANCH"
+
+          if ! git merge-base --is-ancestor "$tag_commit" "$main_ref"; then
+            echo "::error::${GITHUB_REF_NAME} does not point to a commit in protected $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+
+          echo "${GITHUB_REF_NAME} points to reviewed commit $tag_commit on $DEFAULT_BRANCH"
+
   build:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    needs: validate_release
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
         include:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            archive: photonic-x86_64-unknown-linux-gnu.tar.gz
+            archive_kind: tar
+            archive_member: photonic
           - os: macos-13
             target: x86_64-apple-darwin
+            archive: photonic-x86_64-apple-darwin.tar.gz
+            archive_kind: tar
+            archive_member: photonic
           - os: macos-14
             target: aarch64-apple-darwin
+            archive: photonic-aarch64-apple-darwin.tar.gz
+            archive_kind: tar
+            archive_member: photonic
           - os: windows-2022
             target: x86_64-pc-windows-msvc
+            archive: photonic-x86_64-pc-windows-msvc.zip
+            archive_kind: zip
+            archive_member: photonic.exe
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
+          toolchain: "1.96.0"
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
         with:
           key: ${{ matrix.target }}
 
-      - name: Install zipsign
-        run: cargo install zipsign --locked
-
       - name: Build
-        run: cargo build --release -p photonic-app --target ${{ matrix.target }}
+        run: cargo build --locked --release -p photonic-app --target ${{ matrix.target }}
 
-      - name: Decode signing key
-        env:
-          KEY_B64: ${{ secrets.PHOTONIC_SIGNING_KEY }}
-        run: python -c "import base64,os; open('signing.priv','wb').write(base64.b64decode(os.environ['KEY_B64']))"
-
-      - name: Package + sign (unix)
+      - name: Package unsigned archive (unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          ASSET="photonic-${{ matrix.target }}.tar.gz"
-          tar -czf "$ASSET" -C "target/${{ matrix.target }}/release" photonic
-          zipsign sign tar "$ASSET" signing.priv
-          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          set -euo pipefail
+          mkdir -p release-out
+          tar -czf "release-out/${{ matrix.archive }}" \
+            -C "target/${{ matrix.target }}/release" "${{ matrix.archive_member }}"
+          python - "release-out/${{ matrix.archive }}" <<'PY'
+          import hashlib
+          import pathlib
+          import sys
 
-      - name: Package + sign (windows)
+          archive = pathlib.Path(sys.argv[1])
+          digest = hashlib.sha256()
+          with archive.open("rb") as input_file:
+              for chunk in iter(lambda: input_file.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          archive.with_name(archive.name + ".sha256").write_text(
+              f"{digest.hexdigest()}  {archive.name}\n", encoding="ascii"
+          )
+          PY
+
+      - name: Package unsigned archive (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $asset = "photonic-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Force -Path release-out | Out-Null
+          $asset = "release-out/${{ matrix.archive }}"
           Compress-Archive -Path "target/${{ matrix.target }}/release/photonic.exe" -DestinationPath $asset
-          zipsign sign zip $asset signing.priv
-          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $asset).Hash.ToLowerInvariant()
+          "$hash  $([IO.Path]::GetFileName($asset))" |
+            Set-Content -LiteralPath "$asset.sha256" -Encoding ascii
 
-      - name: Clean up signing key
-        if: always()
-        run: rm -f signing.priv
+      - name: Upload unsigned archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: release-out/*
+          if-no-files-found: error
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 1
+
+  sign:
+    name: Sign ${{ matrix.target }}
+    needs: [validate_release, build]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            archive: photonic-x86_64-unknown-linux-gnu.tar.gz
+            archive_kind: tar
+            archive_member: photonic
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: photonic-x86_64-apple-darwin.tar.gz
+            archive_kind: tar
+            archive_member: photonic
+          - os: macos-14
+            target: aarch64-apple-darwin
+            archive: photonic-aarch64-apple-darwin.tar.gz
+            archive_kind: tar
+            archive_member: photonic
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: photonic-x86_64-pc-windows-msvc.zip
+            archive_kind: zip
+            archive_member: photonic.exe
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Download unsigned archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: unsigned-${{ matrix.target }}
+          path: unsigned
+
+      # This runs before the signing key is materialized. The build job is not
+      # trusted with the key, so the signing runner checks both the transferred
+      # archive and the exact member it is allowed to contain.
+      - name: Verify archive contents, digest, and release key
         shell: bash
+        env:
+          ARCHIVE_PATH: unsigned/${{ matrix.archive }}
+          CHECKSUM_PATH: unsigned/${{ matrix.archive }}.sha256
+          ARCHIVE_KIND: ${{ matrix.archive_kind }}
+          ARCHIVE_MEMBER: ${{ matrix.archive_member }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib
+          import os
+          import stat
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          root = Path("unsigned")
+          archive = Path(os.environ["ARCHIVE_PATH"])
+          checksum = Path(os.environ["CHECKSUM_PATH"])
+          expected_entries = {
+              archive.relative_to(root).as_posix(),
+              checksum.relative_to(root).as_posix(),
+          }
+          actual_entries = {
+              path.relative_to(root).as_posix() for path in root.rglob("*")
+          }
+          if actual_entries != expected_entries:
+              raise SystemExit(
+                  f"unexpected artifact files: {sorted(actual_entries)}"
+              )
+          if (
+              not archive.is_file()
+              or archive.is_symlink()
+              or not checksum.is_file()
+              or checksum.is_symlink()
+          ):
+              raise SystemExit("artifact manifest and archive must be regular files")
+
+          checksum_parts = checksum.read_text(encoding="ascii").split()
+          if len(checksum_parts) != 2 or checksum_parts[1].lstrip("*") != archive.name:
+              raise SystemExit("checksum manifest does not name the expected archive")
+          expected_digest = checksum_parts[0].lower()
+          if len(expected_digest) != 64 or any(
+              char not in "0123456789abcdef" for char in expected_digest
+          ):
+              raise SystemExit("checksum manifest contains an invalid SHA-256")
+
+          digest = hashlib.sha256()
+          with archive.open("rb") as handle:
+              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          if digest.hexdigest() != expected_digest:
+              raise SystemExit("unsigned archive digest does not match its manifest")
+
+          public_key = Path("release/photonic-signing.pub")
+          if public_key.stat().st_size != 32:
+              raise SystemExit("release public key must be exactly 32 bytes")
+          public_digest = hashlib.sha256(public_key.read_bytes()).hexdigest()
+          if public_digest != os.environ["PHOTONIC_PUBLIC_KEY_SHA256"]:
+              raise SystemExit("release public key digest is not the reviewed key")
+
+          member_name = os.environ["ARCHIVE_MEMBER"]
+          if os.environ["ARCHIVE_KIND"] == "tar":
+              with tarfile.open(archive, "r:gz") as container:
+                  members = container.getmembers()
+                  if len(members) != 1:
+                      raise SystemExit("tar archive must contain exactly one member")
+                  member = members[0]
+                  if (
+                      member.name != member_name
+                      or not member.isfile()
+                      or member.size <= 0
+                  ):
+                      raise SystemExit("tar archive contains an unexpected member")
+          elif os.environ["ARCHIVE_KIND"] == "zip":
+              with zipfile.ZipFile(archive) as container:
+                  members = container.infolist()
+                  if len(members) != 1:
+                      raise SystemExit("zip archive must contain exactly one member")
+                  member = members[0]
+                  mode = (member.external_attr >> 16) & 0o170000
+                  if (
+                      member.filename != member_name
+                      or member.is_dir()
+                      or mode not in (0, stat.S_IFREG)
+                      or member.file_size <= 0
+                  ):
+                      raise SystemExit("zip archive contains an unexpected member")
+          else:
+              raise SystemExit("unsupported archive type")
+          print(f"verified {archive} ({expected_digest})")
+          PY
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.96.0"
+
+      # Download the exact crates.io source archive, verify its published
+      # checksum before extraction, then build only that verified source with
+      # its lockfile. No signing secret exists while this code executes.
+      - name: Install checksum-verified zipsign
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$RUNNER_TEMP/zipsign.crate" "$RUNNER_TEMP/zipsign-source" \
+            "$ZIPSIGN_VERSION" "$ZIPSIGN_SHA256" <<'PY'
+          import hashlib
+          import os
+          import sys
+          import tarfile
+          import urllib.request
+          from pathlib import Path, PurePosixPath
+
+          crate_path = Path(sys.argv[1])
+          source_root = Path(sys.argv[2])
+          version = sys.argv[3]
+          expected_digest = sys.argv[4]
+          url = f"https://static.crates.io/crates/zipsign/zipsign-{version}.crate"
+          request = urllib.request.Request(
+              url, headers={"User-Agent": "Photonic release workflow"}
+          )
+          with urllib.request.urlopen(request, timeout=120) as response, crate_path.open("wb") as output:
+              total = 0
+              while chunk := response.read(1024 * 1024):
+                  total += len(chunk)
+                  if total > 16 * 1024 * 1024:
+                      raise SystemExit("zipsign crate is unexpectedly large")
+                  output.write(chunk)
+
+          digest = hashlib.sha256(crate_path.read_bytes()).hexdigest()
+          if digest != expected_digest:
+              raise SystemExit(
+                  f"zipsign crate digest mismatch: expected {expected_digest}, got {digest}"
+              )
+
+          if source_root.exists():
+              raise SystemExit("zipsign extraction directory already exists")
+          source_root.mkdir(parents=True)
+          prefix = f"zipsign-{version}/"
+          seen = set()
+          with tarfile.open(crate_path, "r:gz") as crate:
+              for member in crate.getmembers():
+                  name = member.name
+                  relative = PurePosixPath(name[len(prefix):]) if name.startswith(prefix) else None
+                  if (
+                      name != prefix[:-1]
+                      and relative is None
+                  ) or (
+                      relative is not None
+                      and (relative.is_absolute() or ".." in relative.parts)
+                  ):
+                      raise SystemExit("zipsign crate contains an unsafe path")
+                  if name in seen or member.issym() or member.islnk():
+                      raise SystemExit("zipsign crate contains an unsafe entry")
+                  if not (member.isdir() or member.isfile()):
+                      raise SystemExit("zipsign crate contains a special file")
+                  seen.add(name)
+              crate.extractall(source_root)
+          print(f"verified zipsign {version} crate ({digest})")
+          PY
+          cargo install --locked \
+            --path "$RUNNER_TEMP/zipsign-source/zipsign-$ZIPSIGN_VERSION" \
+            --root "$RUNNER_TEMP/zipsign"
+          echo "$RUNNER_TEMP/zipsign/bin" >> "$GITHUB_PATH"
+
+      - name: Verify zipsign version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(zipsign --version)" = "zipsign $ZIPSIGN_VERSION"
+
+      # The key is intentionally the last materialized input. Everything above
+      # is complete before this step can read the signing secret.
+      - name: Decode signing key
+        env:
+          KEY_B64: ${{ secrets.PHOTONIC_SIGNING_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import os
+
+          key = base64.b64decode(os.environ["KEY_B64"], validate=True)
+          if len(key) != 64:
+              raise SystemExit("signing key must be a 64-byte Ed25519 keypair")
+          path = os.path.join(os.environ["RUNNER_TEMP"], "photonic-signing.priv")
+          descriptor = os.open(
+              path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+          )
+          with os.fdopen(descriptor, "wb") as output:
+              output.write(key)
+          PY
+
+      - name: Sign and verify archive
+        shell: bash
+        env:
+          ARCHIVE_PATH: unsigned/${{ matrix.archive }}
+          ARCHIVE_KIND: ${{ matrix.archive_kind }}
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/photonic-signing.priv"
+          derived_public_key="$RUNNER_TEMP/photonic-signing.pub"
+          zipsign gen-key "$key_path" "$derived_public_key" --extract
+          python - "$derived_public_key" release/photonic-signing.pub <<'PY'
+          import pathlib
+          import sys
+
+          if pathlib.Path(sys.argv[1]).read_bytes() != pathlib.Path(sys.argv[2]).read_bytes():
+              raise SystemExit("signing key does not match the committed public key")
+          PY
+          zipsign sign "$ARCHIVE_KIND" "$ARCHIVE_PATH" "$key_path"
+          zipsign verify "$ARCHIVE_KIND" "$ARCHIVE_PATH" release/photonic-signing.pub
 
       # Extract this tag's CHANGELOG section as the release body. Done once, on
       # Linux, to avoid relying on awk on the Windows runner; the other matrix
@@ -98,15 +435,20 @@ jobs:
 
       - name: Publish to release (with notes)
         if: runner.os == 'Linux'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: ${{ env.ASSET }}
+          files: unsigned/${{ matrix.archive }}
           fail_on_unmatched_files: true
           body_path: RELEASE_BODY.md
 
       - name: Publish to release
         if: runner.os != 'Linux'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: ${{ env.ASSET }}
+          files: unsigned/${{ matrix.archive }}
           fail_on_unmatched_files: true
+
+      - name: Clean up signing key
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/photonic-signing.priv" "$RUNNER_TEMP/photonic-signing.pub"

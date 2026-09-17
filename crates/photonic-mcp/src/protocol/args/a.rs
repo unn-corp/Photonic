@@ -78,12 +78,14 @@ pub struct ImportDesignTokensArgs {
 /// Arguments for `list_audit_log` tool
 #[derive(Debug, Deserialize, Default)]
 pub struct ListAuditLogArgs {
-    /// Maximum number of entries to return (default 50, capped at 1000).
+    /// Maximum number of entries to return (default 50, capped at 1000 and the
+    /// audit response byte budget).
     #[serde(default)]
     pub limit: Option<usize>,
 }
 
-/// Arguments for `export_audit_log` tool (no parameters needed).
+/// Arguments for `export_audit_log` tool (no parameters needed; the response
+/// is bounded by the audit export byte budget).
 #[derive(Debug, Deserialize, Default)]
 pub struct ExportAuditLogArgs {}
 
@@ -1227,9 +1229,11 @@ pub struct ExportRasterArgs {
     /// Output format: "png" (default), "jpeg", "webp", "gif", or "tiff".
     #[serde(default)]
     pub format: Option<String>,
-    /// Output width in pixels. Defaults to document width.
+    /// Output width in pixels. Defaults to document width. When resizing, the
+    /// dimensions must be at most 16384×16384 and 67108864 pixels total.
     pub width: Option<u32>,
-    /// Output height in pixels. Defaults to document height.
+    /// Output height in pixels. Defaults to document height. When resizing, the
+    /// dimensions must be at most 16384×16384 and 67108864 pixels total.
     pub height: Option<u32>,
     /// JPEG quality 1–100 (default: 90). Ignored for PNG.
     pub quality: Option<u8>,

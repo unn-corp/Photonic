@@ -163,7 +163,10 @@ impl PhotonicApp {
         let dir = recovery_dir()?;
         self.untitled_counter += 1;
         let stem = sanitize_stem(&self.tabs[idx].title);
-        let path = dir.join(format!("{stem}-{}.photon", self.untitled_counter));
+        let path = dir.join(format!(
+            "{stem}-{}.{}",
+            self.untitled_counter, PHOTON_FILE_EXTENSION
+        ));
         if let Some(t) = self.tabs.get_mut(idx) {
             t.recovery_path = Some(path.clone());
         }

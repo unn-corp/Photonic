@@ -3,7 +3,7 @@
 Photonic began life as a **vector** editor (paths, booleans, gradients, text).
 This document specifies the **raster** subsystem that brings Photoshop-grade
 pixel editing into the same document, the same scene graph, the same MCP tool
-surface, and the same undo history — so a single `.photonic` file can hold a
+surface, and the same undo history — so a single `.photon` file can hold a
 retouched photograph *and* vector annotation on top of it.
 
 The north star: **a Photoshop user should be able to do their core work here**
@@ -160,8 +160,17 @@ pub struct RasterImage {
 }
 ```
 Serialized as `{ "width", "height", "png": "<base64>" }` — PNG-compressed via
-the `image` crate, base64 for JSON transport. Keeps `.photonic` files text and
+the `image` crate, base64 for JSON transport. Keeps `.photon` files text and
 diffable while staying compact.
+
+### Encoded raster import limits
+
+All encoded raster inputs — including persisted PNG data and the GUI/MCP image
+and pattern tools — pass through `RasterImage::from_encoded`. To keep a
+compressed image from expanding into an unbounded pixel buffer, Photonic
+rejects imports wider or taller than **16,384 px** or whose decoder allocation
+budget exceeds **256 MiB**. The policy applies before Photonic materializes the
+RGBA8 raster buffer.
 
 ### `Mask` (`raster/mask.rs`)
 ```rust

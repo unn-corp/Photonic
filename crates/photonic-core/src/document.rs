@@ -679,11 +679,11 @@ pub struct Document {
     #[serde(skip)]
     pub selection: Selection,
     /// Design annotations and review comments.
-    /// Persisted in `.photonic` files; stripped from all export formats.
+    /// Persisted in `.photon` files; stripped from all export formats.
     #[serde(default)]
     pub annotations: HashMap<AnnotationId, Annotation>,
     /// Ruler guides — horizontal and vertical reference lines.
-    /// Persisted in `.photonic` files; stripped from all export formats.
+    /// Persisted in `.photon` files; stripped from all export formats.
     #[serde(default)]
     pub guides: Vec<Guide>,
     /// Most recently used fill/stroke colors (capped at 20, deduped).
@@ -765,7 +765,7 @@ pub struct Document {
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
     /// Dimension annotations — measurement lines showing distances between node pairs.
-    /// Persisted in `.photonic` files; stripped from all export formats.
+    /// Persisted in `.photon` files; stripped from all export formats.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dimensions: Vec<DimensionAnnotation>,
     /// Artboards — named crop/export rectangles in the shared coordinate space.

@@ -34,7 +34,7 @@ Please include as much of the following as you can:
 ### Scope notes
 
 Photonic runs an **MCP server** (JSON-RPC over HTTP) and a **Lua scripting**
-engine, and parses `.photonic`/SVG files. Reports involving these surfaces are
+engine, and parses `.photon`/SVG files. Reports involving these surfaces are
 especially valuable:
 
 - The MCP server is intended for **local** use. Issues that let a remote or

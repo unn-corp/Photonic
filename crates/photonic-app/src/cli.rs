@@ -4,6 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
+use photonic_mcp::MCP_SECRET_HEADER;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
@@ -11,17 +12,17 @@ use crate::args::CliCommand;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
-pub fn run(server: &str, command: CliCommand) -> Result<()> {
+pub fn run(server: &str, secret: Option<&str>, command: CliCommand) -> Result<()> {
     let host_port = parse_host_port(server);
     match command {
-        CliCommand::McpProxy => crate::mcp_proxy::run(&host_port),
+        CliCommand::McpProxy => crate::mcp_proxy::run(&host_port, secret),
         CliCommand::Run { script } => crate::script::run_script(&script),
-        CliCommand::Status => cmd_status(&host_port),
-        CliCommand::List => cmd_list(&host_port),
-        CliCommand::Screenshot { output } => cmd_screenshot(&host_port, &output),
-        CliCommand::Clear => cmd_clear(&host_port),
-        CliCommand::Undo { steps } => cmd_undo_redo(&host_port, "undo", steps.unwrap_or(1)),
-        CliCommand::Redo { steps } => cmd_undo_redo(&host_port, "redo", steps.unwrap_or(1)),
+        CliCommand::Status => cmd_status(&host_port, secret),
+        CliCommand::List => cmd_list(&host_port, secret),
+        CliCommand::Screenshot { output } => cmd_screenshot(&host_port, secret, &output),
+        CliCommand::Clear => cmd_clear(&host_port, secret),
+        CliCommand::Undo { steps } => cmd_undo_redo(&host_port, secret, "undo", steps.unwrap_or(1)),
+        CliCommand::Redo { steps } => cmd_undo_redo(&host_port, secret, "redo", steps.unwrap_or(1)),
         CliCommand::Rect {
             x,
             y,
@@ -31,6 +32,7 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             name,
         } => cmd_create_shape(
             &host_port,
+            secret,
             "rectangle",
             x,
             y,
@@ -50,6 +52,7 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             name,
         } => cmd_create_shape(
             &host_port,
+            secret,
             "ellipse",
             x,
             y,
@@ -70,6 +73,7 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             name,
         } => cmd_create_shape(
             &host_port,
+            secret,
             "polygon",
             x,
             y,
@@ -91,6 +95,7 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             name,
         } => cmd_create_shape(
             &host_port,
+            secret,
             "star",
             x,
             y,
@@ -109,14 +114,15 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             name,
         } => cmd_create_path(
             &host_port,
+            secret,
             &data,
             &fill,
             stroke.as_deref(),
             stroke_width,
             name.as_deref(),
         ),
-        CliCommand::Layer { name } => cmd_create_layer(&host_port, &name),
-        CliCommand::Node { id_or_name } => cmd_get_node(&host_port, &id_or_name),
+        CliCommand::Layer { name } => cmd_create_layer(&host_port, secret, &name),
+        CliCommand::Node { id_or_name } => cmd_get_node(&host_port, secret, &id_or_name),
         CliCommand::Update {
             id,
             name,
@@ -126,6 +132,7 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             hide,
         } => cmd_update_node(
             &host_port,
+            secret,
             &id,
             name.as_deref(),
             fill.as_deref(),
@@ -133,24 +140,25 @@ pub fn run(server: &str, command: CliCommand) -> Result<()> {
             show,
             hide,
         ),
-        CliCommand::Delete { ids } => cmd_delete_nodes(&host_port, &ids),
+        CliCommand::Delete { ids } => cmd_delete_nodes(&host_port, secret, &ids),
         CliCommand::Move { id, dx, dy } => {
-            cmd_transform(&host_port, &id, "translate", dx, dy, 0.0, 0.0, 0.0)
+            cmd_transform(&host_port, secret, &id, "translate", dx, dy, 0.0, 0.0, 0.0)
         }
         CliCommand::Rotate { id, angle, cx, cy } => {
-            cmd_transform(&host_port, &id, "rotate", 0.0, 0.0, angle, cx, cy)
+            cmd_transform(&host_port, secret, &id, "rotate", 0.0, 0.0, angle, cx, cy)
         }
         CliCommand::Scale { id, sx, sy, cx, cy } => {
-            cmd_transform(&host_port, &id, "scale", sx, sy, 0.0, cx, cy)
+            cmd_transform(&host_port, secret, &id, "scale", sx, sy, 0.0, cx, cy)
         }
     }
 }
 
 // ─── Command handlers ─────────────────────────────────────────────────────────
 
-fn cmd_status(host: &str) -> Result<()> {
+fn cmd_status(host: &str, secret: Option<&str>) -> Result<()> {
     let result = send_rpc(
         host,
+        secret,
         &json!({
             "jsonrpc": "2.0", "id": 1,
             "method": "initialize",
@@ -170,9 +178,10 @@ fn cmd_status(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(host: &str) -> Result<()> {
+fn cmd_list(host: &str, secret: Option<&str>) -> Result<()> {
     let result = call_tool(
         host,
+        secret,
         "get_document_state",
         json!({ "include_path_data": false }),
     )?;
@@ -222,9 +231,9 @@ fn cmd_list(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_screenshot(host: &str, output: &PathBuf) -> Result<()> {
+fn cmd_screenshot(host: &str, secret: Option<&str>, output: &PathBuf) -> Result<()> {
     println!("Requesting screenshot…");
-    let result = call_tool(host, "screenshot", json!({}))?;
+    let result = call_tool(host, secret, "screenshot", json!({}))?;
 
     // Find the image content item
     let content = result["content"]
@@ -251,10 +260,11 @@ fn cmd_screenshot(host: &str, output: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn cmd_clear(host: &str) -> Result<()> {
+fn cmd_clear(host: &str, secret: Option<&str>) -> Result<()> {
     // Get all node IDs first
     let state = call_tool(
         host,
+        secret,
         "get_document_state",
         json!({ "include_path_data": false }),
     )?;
@@ -278,14 +288,14 @@ fn cmd_clear(host: &str) -> Result<()> {
     }
 
     let count = all_ids.len();
-    let result = call_tool(host, "delete_nodes", json!({ "node_ids": all_ids }))?;
+    let result = call_tool(host, secret, "delete_nodes", json!({ "node_ids": all_ids }))?;
     println!("✓  Cleared {} node(s) from canvas", count);
     print_tool_text(&result);
     Ok(())
 }
 
-fn cmd_undo_redo(host: &str, op: &str, steps: u32) -> Result<()> {
-    let result = call_tool(host, op, json!({ "steps": steps }))?;
+fn cmd_undo_redo(host: &str, secret: Option<&str>, op: &str, steps: u32) -> Result<()> {
+    let result = call_tool(host, secret, op, json!({ "steps": steps }))?;
     print_tool_text(&result);
     Ok(())
 }
@@ -293,6 +303,7 @@ fn cmd_undo_redo(host: &str, op: &str, steps: u32) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn cmd_create_shape(
     host: &str,
+    secret: Option<&str>,
     shape_type: &str,
     x: f64,
     y: f64,
@@ -320,7 +331,7 @@ fn cmd_create_shape(
         args["name"] = json!(n);
     }
 
-    let result = call_tool(host, "create_shape", args)?;
+    let result = call_tool(host, secret, "create_shape", args)?;
     println!("✓  Created {}", shape_type);
     print_tool_text(&result);
     Ok(())
@@ -339,15 +350,30 @@ fn parse_host_port(server: &str) -> String {
         .to_string()
 }
 
+fn require_secret(secret: Option<&str>) -> Result<&str> {
+    let Some(secret) = secret.filter(|secret| !secret.trim().is_empty()) else {
+        bail!("MCP authentication requires --mcp-secret or PHOTONIC_MCP_SECRET");
+    };
+    if secret.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        bail!("MCP secret cannot contain CR or LF characters");
+    }
+    Ok(secret)
+}
+
+fn build_http_request(host_port: &str, secret: Option<&str>, body: &Value) -> Result<String> {
+    let secret = require_secret(secret)?;
+    let body_str = body.to_string();
+    Ok(format!(
+        "POST /mcp HTTP/1.0\r\nHost: {host_port}\r\nContent-Type: application/json\r\n{MCP_SECRET_HEADER}: {secret}\r\nContent-Length: {}\r\n\r\n{body_str}",
+        body_str.len()
+    ))
+}
+
 /// Send a raw JSON-RPC request and return the `result` field.
-fn send_rpc(host_port: &str, body: &Value) -> Result<Value> {
+fn send_rpc(host_port: &str, secret: Option<&str>, body: &Value) -> Result<Value> {
     use std::io::{Read, Write};
 
-    let body_str = body.to_string();
-    let request = format!(
-        "POST /mcp HTTP/1.0\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body_str}",
-        body_str.len()
-    );
+    let request = build_http_request(host_port, secret, body)?;
 
     let mut stream = std::net::TcpStream::connect(host_port).map_err(|e| {
         anyhow::anyhow!(
@@ -383,9 +409,10 @@ fn send_rpc(host_port: &str, body: &Value) -> Result<Value> {
 }
 
 /// Call a tool via `tools/call` and return the full `ToolResult` value.
-fn call_tool(host_port: &str, tool: &str, args: Value) -> Result<Value> {
+fn call_tool(host_port: &str, secret: Option<&str>, tool: &str, args: Value) -> Result<Value> {
     send_rpc(
         host_port,
+        secret,
         &json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -426,6 +453,7 @@ fn extract_doc_state(result: &Value) -> Option<Value> {
 
 fn cmd_create_path(
     host: &str,
+    secret: Option<&str>,
     data: &str,
     fill: &str,
     stroke: Option<&str>,
@@ -442,31 +470,32 @@ fn cmd_create_path(
     if let Some(n) = name {
         args["name"] = json!(n);
     }
-    let result = call_tool(host, "create_path", args)?;
+    let result = call_tool(host, secret, "create_path", args)?;
     print_tool_text(&result);
     Ok(())
 }
 
-fn cmd_create_layer(host: &str, name: &str) -> Result<()> {
-    let result = call_tool(host, "create_layer", json!({ "name": name }))?;
+fn cmd_create_layer(host: &str, secret: Option<&str>, name: &str) -> Result<()> {
+    let result = call_tool(host, secret, "create_layer", json!({ "name": name }))?;
     print_tool_text(&result);
     Ok(())
 }
 
-fn cmd_get_node(host: &str, id_or_name: &str) -> Result<()> {
+fn cmd_get_node(host: &str, secret: Option<&str>, id_or_name: &str) -> Result<()> {
     // Try as UUID first, then fall back to name search.
     let args = if uuid::Uuid::parse_str(id_or_name).is_ok() {
         json!({ "node_id": id_or_name })
     } else {
         json!({ "name": id_or_name })
     };
-    let result = call_tool(host, "get_node", args)?;
+    let result = call_tool(host, secret, "get_node", args)?;
     print_tool_text(&result);
     Ok(())
 }
 
 fn cmd_update_node(
     host: &str,
+    secret: Option<&str>,
     id: &str,
     name: Option<&str>,
     fill: Option<&str>,
@@ -490,19 +519,20 @@ fn cmd_update_node(
     if hide {
         args["visible"] = json!(false);
     }
-    let result = call_tool(host, "update_node", args)?;
+    let result = call_tool(host, secret, "update_node", args)?;
     print_tool_text(&result);
     Ok(())
 }
 
-fn cmd_delete_nodes(host: &str, ids: &[String]) -> Result<()> {
-    let result = call_tool(host, "delete_nodes", json!({ "node_ids": ids }))?;
+fn cmd_delete_nodes(host: &str, secret: Option<&str>, ids: &[String]) -> Result<()> {
+    let result = call_tool(host, secret, "delete_nodes", json!({ "node_ids": ids }))?;
     print_tool_text(&result);
     Ok(())
 }
 
 fn cmd_transform(
     host: &str,
+    secret: Option<&str>,
     id: &str,
     operation: &str,
     x_or_sx: f64,
@@ -529,7 +559,35 @@ fn cmd_transform(
         }),
         _ => unreachable!(),
     };
-    let result = call_tool(host, "apply_transform", args)?;
+    let result = call_tool(host, secret, "apply_transform", args)?;
     print_tool_text(&result);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_http_request;
+    use serde_json::json;
+
+    #[test]
+    fn cli_requests_include_the_mcp_secret_header() {
+        let request = build_http_request(
+            "127.0.0.1:7842",
+            Some("test-secret"),
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize"
+            }),
+        )
+        .unwrap();
+
+        assert!(request.contains("x-mcp-secret: test-secret\r\n"));
+    }
+
+    #[test]
+    fn cli_requests_require_a_non_empty_secret() {
+        assert!(build_http_request("127.0.0.1:7842", None, &json!({})).is_err());
+        assert!(build_http_request("127.0.0.1:7842", Some("  "), &json!({})).is_err());
+    }
 }

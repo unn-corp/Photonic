@@ -39,14 +39,14 @@ impl PhotonicApp {
         let path = match existing {
             Some(p) => p,
             None => {
-                let default_name = format!("{}.photon", self.tabs[idx].title);
+                let default_name = format!("{}.{}", self.tabs[idx].title, PHOTON_FILE_EXTENSION);
                 let dialog = rfd::FileDialog::new()
-                    .add_filter("Photonic", &["photon"])
+                    .add_filter("Photonic", &[PHOTON_FILE_EXTENSION])
                     .set_file_name(&default_name);
                 match run_file_dialog(move || dialog.save_file()) {
                     Some(p) => {
                         if p.extension().is_none() {
-                            p.with_extension("photon")
+                            p.with_extension(PHOTON_FILE_EXTENSION)
                         } else {
                             p
                         }

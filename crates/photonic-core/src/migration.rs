@@ -1,4 +1,4 @@
-//! `.photonic` file-format versioning and forward migration.
+//! `.photon` file-format versioning and forward migration.
 //!
 //! Documents carry a `format_version` (see [`crate::document::CURRENT_FORMAT_VERSION`]).
 //! Rather than deserialize straight into [`Document`](crate::document::Document) and

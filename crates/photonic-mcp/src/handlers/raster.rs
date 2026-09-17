@@ -16,7 +16,7 @@ use photonic_core::{
     node::{NodeId, RasterNode, SceneNode, SceneNodeKind},
     raster::{
         adjust::AdjustmentSpec, advanced, brush, filter, geometry, image::RasterImage, mask::Mask,
-        repair, warp,
+        repair, validate_raster_dimensions, warp,
     },
 };
 use serde::Deserialize;
@@ -279,12 +279,18 @@ pub struct CreateRasterLayerArgs {
 }
 
 pub async fn create_raster_layer(state: &AppState, args: CreateRasterLayerArgs) -> ToolResult {
-    if args.width == 0 || args.height == 0 {
-        return ToolResult::error("width and height must be > 0");
+    if let Err(error) = validate_raster_dimensions(args.width, args.height) {
+        return ToolResult::error(error);
     }
-    let image = match &args.fill {
-        Some(c) => RasterImage::filled(args.width, args.height, parse_color_value(c, [0, 0, 0, 0])),
-        None => RasterImage::new(args.width, args.height),
+    let image_result = match &args.fill {
+        Some(c) => {
+            RasterImage::try_filled(args.width, args.height, parse_color_value(c, [0, 0, 0, 0]))
+        }
+        None => RasterImage::try_new(args.width, args.height),
+    };
+    let image = match image_result {
+        Ok(image) => image,
+        Err(error) => return ToolResult::error(format!("Could not create raster layer: {error}")),
     };
     let name = args.name.unwrap_or_else(|| "Raster Layer".to_string());
     let mut node = SceneNode::new(
@@ -1271,5 +1277,67 @@ mod tests {
             .expect("placed image overlaps an artboard");
         assert_eq!(owner.id, a2_id, "image should belong to A2");
         assert_ne!(owner.id, a1_id, "image must not belong to A1");
+    }
+
+    #[tokio::test]
+    async fn create_raster_layer_rejects_invalid_dimensions_without_mutation() {
+        let invalid_dimensions = [
+            (0, 1),
+            (1, 0),
+            (photonic_core::raster::MAX_RASTER_DIMENSION + 1, 1),
+            (8193, 8192),
+            (u32::MAX, u32::MAX),
+        ];
+
+        for (width, height) in invalid_dimensions {
+            let state = test_state(Document::new("t", 200.0, 200.0));
+            let before = serde_json::to_value(&*state.document.lock().await)
+                .expect("document should serialize");
+
+            let result = create_raster_layer(
+                &state,
+                CreateRasterLayerArgs {
+                    width,
+                    height,
+                    x: 0.0,
+                    y: 0.0,
+                    fill: None,
+                    name: None,
+                    layer_id: None,
+                },
+            )
+            .await;
+
+            assert_eq!(result.is_error, Some(true), "{width}x{height} must fail");
+            let after = serde_json::to_value(&*state.document.lock().await)
+                .expect("document should serialize");
+            assert_eq!(
+                after, before,
+                "rejected dimensions must not mutate document"
+            );
+            assert_eq!(state.history.lock().await.undo_depth(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn create_raster_layer_accepts_small_dimensions() {
+        let state = test_state(Document::new("t", 200.0, 200.0));
+        let result = create_raster_layer(
+            &state,
+            CreateRasterLayerArgs {
+                width: 2,
+                height: 3,
+                x: 0.0,
+                y: 0.0,
+                fill: Some(json!("#102030ff")),
+                name: Some("small".to_string()),
+                layer_id: None,
+            },
+        )
+        .await;
+
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
     }
 }

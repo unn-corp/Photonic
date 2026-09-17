@@ -3,7 +3,9 @@
     "photonic": {
       "command": "photonic",
       "args": ["--headless", "--mcp-port", "7842"],
-      "env": {}
+      "env": {
+        "PHOTONIC_MCP_SECRET": "${PHOTONIC_MCP_SECRET}"
+      }
     }
   }
 }

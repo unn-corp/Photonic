@@ -22,7 +22,9 @@ pub mod mask;
 pub mod repair;
 pub mod warp;
 
-pub use image::{luma, RasterImage};
+pub use image::{
+    luma, validate_raster_dimensions, RasterImage, MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS,
+};
 pub use mask::Mask;
 
 /// Linearly interpolate two RGBA pixels by `t` (0..1).

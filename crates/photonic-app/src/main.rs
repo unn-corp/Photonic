@@ -3,6 +3,9 @@
 #![expect(clippy::manual_clamp, clippy::too_many_arguments)]
 
 mod args;
+#[cfg(test)]
+#[allow(dead_code)]
+mod claude_client;
 mod cli;
 mod mcp_proxy;
 mod repl;
@@ -132,6 +135,11 @@ fn looks_like_svg_clipboard_text(text: &str) -> bool {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let cli_secret = args
+        .mcp_secret
+        .clone()
+        .or_else(|| std::env::var("PHOTONIC_MCP_SECRET").ok())
+        .or_else(|| photonic_mcp::auth::read_token().ok());
 
     // ── CLI client mode: a subcommand was given ───────────────────────────────
     if let Some(command) = args.command {
@@ -139,7 +147,7 @@ fn main() -> Result<()> {
             .with(fmt::layer())
             .with(EnvFilter::new("warn"))
             .init();
-        return cli::run(&args.server, command);
+        return cli::run(&args.server, cli_secret.as_deref(), command);
     }
 
     // ── Server / GUI mode: full logging ──────────────────────────────────────

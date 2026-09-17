@@ -18,7 +18,9 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
-const EXT: &str = "photon";
+use photonic_core::PHOTON_FILE_EXTENSION;
+
+const EXT: &str = PHOTON_FILE_EXTENSION;
 const MAX_DEPTH: usize = 40;
 
 /// Directory names skipped during a walk (heavy build/cache/system dirs).
@@ -239,7 +241,7 @@ fn os_index(root: &Path) -> Option<Vec<PathBuf>> {
     let out = Command::new("mdfind")
         .arg("-onlyin")
         .arg(root)
-        .arg(r#"kMDItemFSName == "*.photon"c"#)
+        .arg(format!(r#"kMDItemFSName == "*.{EXT}"c"#))
         .output()
         .ok()?;
     if !out.status.success() {
@@ -258,7 +260,7 @@ fn os_index(root: &Path) -> Option<Vec<PathBuf>> {
 fn os_index(root: &Path) -> Option<Vec<PathBuf>> {
     let root_str = root.to_string_lossy().into_owned();
     for cmd in ["plocate", "locate"] {
-        if let Ok(out) = Command::new(cmd).arg("-i").arg("*.photon").output() {
+        if let Ok(out) = Command::new(cmd).arg("-i").arg(format!("*.{EXT}")).output() {
             if out.status.success() {
                 let s = String::from_utf8_lossy(&out.stdout);
                 let v: Vec<PathBuf> = s

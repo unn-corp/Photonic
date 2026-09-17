@@ -15,7 +15,7 @@ new wgpu texture pipeline, and a Links panel for managing externally linked imag
 **In:**
 - `ImageNode` struct: source (embedded bytes or external path), transform (reuses
   `SceneNode.transform`), crop rect, opacity.
-- Embedded mode: PNG/JPEG bytes stored as base64 in `.photonic` serialization.
+- Embedded mode: PNG/JPEG bytes stored as base64 in `.photon` serialization.
 - Linked mode: absolute file path + last-modified timestamp; file read on load/relink.
 - GPU render: a new `wgpu::RenderPipeline` (image pipeline) samples a `wgpu::Texture`
   into the MSAA framebuffer with the node transform applied.
@@ -88,7 +88,7 @@ new wgpu texture pipeline, and a Links panel for managing externally linked imag
 
 ## Risks & open questions
 
-- **Large embedded images** balloon `.photonic` file size; consider an optional external
+- **Large embedded images** balloon `.photon` file size; consider an optional external
   sidecar store or reference-counted blob storage.
 - **wgpu texture format**: PNG RGBA vs JPEG RGB — need format conversion on upload.
 - **Crop + transform order**: does the crop rect apply in image-local coordinates (before
@@ -102,7 +102,7 @@ new wgpu texture pipeline, and a Links panel for managing externally linked imag
 
 - [ ] PNG and JPEG can be placed (embedded), moved, scaled, cropped, and rendered on
       canvas and in headless PNG export.
-- [ ] Embedded images survive save/reload (`.photonic` round-trip).
+- [ ] Embedded images survive save/reload (`.photon` round-trip).
 - [ ] Linked images load from disk on open; missing links show a placeholder, not a crash.
 - [ ] SVG export produces a valid `<image>` element with correct dimensions.
 - [ ] `place_image`, `place_linked_image`, `relink_image`, `embed_image` MCP tools work.

@@ -173,6 +173,12 @@ impl McpServer {
 
     /// Start listening. This blocks the current task.
     pub async fn run(self) -> anyhow::Result<()> {
+        if usable_secret(self.state.config.secret.as_deref()).is_none() {
+            anyhow::bail!(
+                "MCP server requires a non-empty shared secret; pass --mcp-secret or set PHOTONIC_MCP_SECRET"
+            );
+        }
+
         let port = self.state.config.port;
 
         // Background task: flush debounced MCP checkpoint every 10 s.
@@ -244,8 +250,8 @@ async fn require_authentication(
 }
 
 fn is_authorized(headers: &HeaderMap, secret: Option<&str>) -> bool {
-    let Some(secret) = secret else {
-        return true;
+    let Some(secret) = usable_secret(secret) else {
+        return false;
     };
 
     let header_secret = headers
@@ -263,6 +269,10 @@ fn is_authorized(headers: &HeaderMap, secret: Option<&str>) -> bool {
         .into_iter()
         .flatten()
         .any(|provided| bool::from(secret.as_bytes().ct_eq(provided.as_bytes())))
+}
+
+fn usable_secret(secret: Option<&str>) -> Option<&str> {
+    secret.filter(|secret| !secret.trim().is_empty())
 }
 
 /// Main MCP JSON-RPC handler (HTTP).
@@ -560,24 +570,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_secret_preserves_local_development_behavior() {
+    async fn missing_secret_rejects_before_dispatch() {
         let base =
             std::env::temp_dir().join(format!("photonic-mcp-no-auth-{}", uuid::Uuid::new_v4()));
-        let path = base.join("allowed.photon");
+        let path = base.join("rejected.photon");
         let app = build_router(test_state(None));
 
         let response = app.oneshot(save_request(&path, None)).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(path.exists());
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!path.exists(), "missing server secret must not dispatch");
 
-        std::fs::remove_dir_all(base).unwrap();
+        let _ = std::fs::remove_dir_all(base);
     }
 
     async fn post_json(request: Value) -> (StatusCode, Vec<u8>) {
-        let response = build_router(test_state(None))
+        let response = build_router(test_state(Some("test-secret")))
             .oneshot(
                 Request::post("/mcp")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(MCP_SECRET_HEADER, "test-secret")
                     .body(Body::from(request.to_string()))
                     .unwrap(),
             )
@@ -631,13 +642,14 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_endpoint_does_not_enable_cross_origin_requests() {
-        let app = build_router(test_state(None));
+        let app = build_router(test_state(Some("test-secret")));
         let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::OPTIONS)
                     .uri("/mcp")
                     .header(header::ORIGIN, "https://evil.example")
+                    .header(MCP_SECRET_HEADER, "test-secret")
                     .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
                     .header(
                         header::ACCESS_CONTROL_REQUEST_HEADERS,

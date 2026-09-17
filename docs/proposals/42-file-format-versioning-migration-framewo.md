@@ -39,7 +39,7 @@
 
 ## Summary
 
-The `.photonic` JSON format has `format_version: u32` (constant `CURRENT_FORMAT_VERSION = 1`, `document.rs:66`) and a guard in `Document::from_str` (line 895–902) that rejects future versions. However, there is no forward migration: if a document saved by a future build adds a new field (e.g. `ImageNode` from M3, artboard constraints, appearance stacks), the current loader either silently drops it (serde `#[serde(default)]`) or fails. As the model grows, this becomes a compatibility liability. There is also no Package/Collect: documents that reference linked assets or fonts cannot be moved without manual file gathering.
+The `.photon` JSON format has `format_version: u32` (constant `CURRENT_FORMAT_VERSION = 1`, `document.rs:66`) and a guard in `Document::from_str` (line 895–902) that rejects future versions. However, there is no forward migration: if a document saved by a future build adds a new field (e.g. `ImageNode` from M3, artboard constraints, appearance stacks), the current loader either silently drops it (serde `#[serde(default)]`) or fails. As the model grows, this becomes a compatibility liability. There is also no Package/Collect: documents that reference linked assets or fonts cannot be moved without manual file gathering.
 
 ## Scope (in / out)
 
@@ -48,7 +48,7 @@ The `.photonic` JSON format has `format_version: u32` (constant `CURRENT_FORMAT_
 - Policy: `CURRENT_FORMAT_VERSION` bumped on every field addition or structural change; each bump gets a corresponding migration function.
 - A schema changelog (committed to `docs/format-versions.md`).
 - On open: warn (non-fatal) if the version is newer than `CURRENT_FORMAT_VERSION` (unknown version, load with defaults); refuse if the gap is beyond a configurable compatibility window.
-- **Package Document**: collect all linked asset paths (embedded images, linked images, referenced fonts) into a target folder; update links in the saved `.photonic` to relative paths.
+- **Package Document**: collect all linked asset paths (embedded images, linked images, referenced fonts) into a target folder; update links in the saved `.photon` to relative paths.
 
 **Out:**
 - Binary / CBOR format — out of scope; JSON remains the canonical format.
@@ -106,7 +106,7 @@ pub fn package_document(
 - Walk `Document::fonts` (if a font list is added) for embedded/referenced font paths.
 - Copy each asset to `target_dir/Links/` (images) or `target_dir/Fonts/` (fonts).
 - If `relink_to_relative`, rewrite the path strings in the document to relative paths.
-- Write the updated document JSON to `target_dir/<docname>.photonic`.
+- Write the updated document JSON to `target_dir/<docname>.photon`.
 - Return a `PackageManifest` listing all copied files.
 
 7. **MCP tool**: `package_document(output_dir, copy_fonts, copy_linked_images)`.

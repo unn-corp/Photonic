@@ -130,11 +130,9 @@ async fn bearer_scheme_is_case_insensitive() {
 }
 
 #[tokio::test]
-async fn no_secret_configured_allows_request() {
-    // `McpServerConfig::default()` (secret: None) is used by in-process test
-    // states; the middleware must fall through rather than fail closed.
+async fn no_secret_configured_rejects_request() {
     let res = send(None, mcp_post(&[])).await;
-    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
 
 // ── §8 row 2: no CORS surface at all ────────────────────────────────────────

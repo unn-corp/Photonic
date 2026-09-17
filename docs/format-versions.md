@@ -1,6 +1,6 @@
-# `.photonic` Format Version Changelog
+# `.photon` Format Version Changelog
 
-The `.photonic` file is JSON with a top-level `format_version` integer. On open,
+The `.photon` file is JSON with a top-level `format_version` integer. On open,
 the loader migrates the raw JSON forward to the current version through an
 ordered chain of migrations (`crates/photonic-core/src/migration.rs`) before
 deserializing into `Document`.

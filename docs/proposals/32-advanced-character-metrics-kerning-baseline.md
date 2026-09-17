@@ -14,7 +14,7 @@
   `font_style`, which it previously dropped — parity with the windowed path.)
 - **Model (`photonic-core/src/node.rs`).** `TextNode` gains `baseline_shift: f64` and
   `script_position: ScriptPosition { Normal, Superscript, Subscript }`, both
-  `#[serde(default)]` so existing `.photonic` files load unchanged. `ScriptPosition`
+  `#[serde(default)]` so existing `.photon` files load unchanged. `ScriptPosition`
   exposes `size_scale()` (0.58× for super/sub), `baseline_offset_em()` (+0.33em super,
   −0.10em sub), and string parse/format helpers. The exhaustive `TextNode` literal in
   `import.rs` is updated too.
@@ -130,7 +130,7 @@ model called out as deferred phase 2.
    render test if one exists for measure_text.
 2. **Model + defaults:** add `baseline_shift`, `script_position` (+ `ScriptPosition` enum,
    `#[serde(rename_all="snake_case")]`) to `TextNode` and `new()`. Default values keep all
-   existing `.photonic` files loading unchanged (serde defaults).
+   existing `.photon` files loading unchanged (serde defaults).
 3. **Renderer:** extend `TextSnapshot` with `baseline_shift` + `script` and derive the
    effective size/top at the snapshot site. Node-level shift = one TextArea, no span logic.
 4. **SVG export:** append `baseline-shift` + adjusted `font-size` attrs.

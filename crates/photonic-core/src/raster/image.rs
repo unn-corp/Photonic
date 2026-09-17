@@ -7,6 +7,13 @@
 
 use base64::Engine;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::io::Cursor;
+
+/// Maximum number of pixels in one persisted raster image or mask.
+///
+/// This keeps decoded project data bounded while still allowing the largest
+/// built-in 24×36 inch, 300-DPI print preset (77,760,000 pixels).
+pub(crate) const MAX_PERSISTED_RASTER_PIXELS: usize = 100_000_000;
 
 /// An 8-bit RGBA raster image with straight alpha.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,25 +24,52 @@ pub struct RasterImage {
     pub pixels: Vec<u8>,
 }
 
+/// Maximum width or height accepted by MCP raster operations.
+pub const MAX_RASTER_DIMENSION: u32 = 16_384;
+/// Maximum number of RGBA pixels accepted by MCP raster operations.
+pub const MAX_RASTER_PIXELS: usize = 64 * 1024 * 1024;
+/// Maximum decoder allocation budget for one encoded raster import.
+pub const MAX_RASTER_DECODED_BYTES: u64 = 256 * 1024 * 1024;
+
 impl RasterImage {
     /// A fully transparent image of the given size.
     pub fn new(width: u32, height: u32) -> Self {
         let w = width.max(1);
         let h = height.max(1);
-        Self {
-            width: w,
-            height: h,
-            pixels: vec![0u8; (w as usize) * (h as usize) * 4],
-        }
+        Self::try_new(w, h).unwrap_or_else(|error| panic!("invalid raster dimensions: {error}"))
+    }
+
+    /// A fully transparent image of the given size, returning errors instead of
+    /// panicking when the RGBA buffer length cannot be represented or allocated.
+    pub fn try_new(width: u32, height: u32) -> Result<Self, String> {
+        let pixel_len = checked_pixel_len(width, height)?;
+        let mut pixels = Vec::new();
+        pixels
+            .try_reserve_exact(pixel_len)
+            .map_err(|error| format!("could not allocate raster pixel buffer: {error}"))?;
+        pixels.resize(pixel_len, 0);
+        Ok(Self {
+            width,
+            height,
+            pixels,
+        })
     }
 
     /// An image filled with a single RGBA color.
     pub fn filled(width: u32, height: u32, rgba: [u8; 4]) -> Self {
-        let mut img = Self::new(width, height);
+        let w = width.max(1);
+        let h = height.max(1);
+        Self::try_filled(w, h, rgba)
+            .unwrap_or_else(|error| panic!("invalid raster dimensions: {error}"))
+    }
+
+    /// An image filled with a single RGBA color, returning allocation errors.
+    pub fn try_filled(width: u32, height: u32, rgba: [u8; 4]) -> Result<Self, String> {
+        let mut img = Self::try_new(width, height)?;
         for px in img.pixels.chunks_exact_mut(4) {
             px.copy_from_slice(&rgba);
         }
-        img
+        Ok(img)
     }
 
     /// Build from raw RGBA bytes. Errors if the length doesn't match `w*h*4`.
@@ -62,7 +96,7 @@ impl RasterImage {
 
     /// Decode a PNG/JPEG/WebP/etc. encoded image into an RGBA8 buffer.
     pub fn from_encoded(bytes: &[u8]) -> Result<Self, String> {
-        let img = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+        let img = decode_encoded(bytes)?;
         let rgba = img.to_rgba8();
         let (width, height) = rgba.dimensions();
         Self::from_rgba(width, height, rgba.into_raw())
@@ -176,14 +210,76 @@ impl RasterImage {
     }
 }
 
+fn decode_encoded(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    // Read only the encoded header first so a malicious image cannot make the
+    // decoder allocate its full pixel buffer before the project limit is known.
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let (width, height) = reader.into_dimensions().map_err(|e| e.to_string())?;
+    checked_raster_pixel_count(width, height)?;
+    if width > MAX_RASTER_DIMENSION || height > MAX_RASTER_DIMENSION {
+        return Err(format!(
+            "raster dimensions {width}x{height} exceed the maximum of {MAX_RASTER_DIMENSION}x{MAX_RASTER_DIMENSION}"
+        ));
+    }
+
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_RASTER_DIMENSION);
+    limits.max_image_height = Some(MAX_RASTER_DIMENSION);
+    limits.max_alloc = Some(MAX_RASTER_DECODED_BYTES);
+    reader.limits(limits);
+    reader.decode().map_err(|e| e.to_string())
+}
+
+pub(crate) fn checked_raster_pixel_count(width: u32, height: u32) -> Result<usize, String> {
+    if width == 0 || height == 0 {
+        return Err("raster dimensions must be non-zero".to_string());
+    }
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| "raster dimensions overflow pixel count".to_string())?;
+    if pixels > MAX_PERSISTED_RASTER_PIXELS {
+        return Err(format!(
+            "raster dimensions {}x{} exceed maximum of {} pixels",
+            width, height, MAX_PERSISTED_RASTER_PIXELS
+        ));
+    }
+    Ok(pixels)
+}
+
 fn checked_pixel_len(width: u32, height: u32) -> Result<usize, String> {
     if width == 0 || height == 0 {
         return Err("image dimensions must be non-zero".to_string());
     }
-    (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|pixels| pixels.checked_mul(4))
+    checked_raster_pixel_count(width, height)?
+        .checked_mul(4)
         .ok_or_else(|| "image dimensions overflow pixel buffer length".to_string())
+}
+
+/// Validate raster dimensions before a caller-controlled operation allocates or
+/// resizes an RGBA image. The returned error is suitable for surfacing through an
+/// MCP tool result.
+pub fn validate_raster_dimensions(width: u32, height: u32) -> Result<(), String> {
+    let pixel_len = checked_pixel_len(width, height)?;
+    if width > MAX_RASTER_DIMENSION || height > MAX_RASTER_DIMENSION {
+        return Err(format!(
+            "raster dimensions {}x{} exceed the maximum of {}x{}",
+            width, height, MAX_RASTER_DIMENSION, MAX_RASTER_DIMENSION
+        ));
+    }
+
+    let pixels = pixel_len / 4;
+    if pixels > MAX_RASTER_PIXELS {
+        return Err(format!(
+            "raster dimensions {}x{} contain {} pixels, exceeding the {}-pixel budget",
+            width, height, pixels, MAX_RASTER_PIXELS
+        ));
+    }
+    Ok(())
 }
 
 // ── sRGB luminance ─────────────────────────────────────────────────────────────
@@ -219,6 +315,8 @@ impl Serialize for RasterImage {
 impl<'de> Deserialize<'de> for RasterImage {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let repr = RasterImageRepr::deserialize(d)?;
+        let expected =
+            checked_pixel_len(repr.width, repr.height).map_err(serde::de::Error::custom)?;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(repr.png.as_bytes())
             .map_err(serde::de::Error::custom)?;
@@ -229,8 +327,6 @@ impl<'de> Deserialize<'de> for RasterImage {
                 repr.width, repr.height, img.width, img.height
             )));
         }
-        let expected =
-            checked_pixel_len(repr.width, repr.height).map_err(serde::de::Error::custom)?;
         if img.pixels.len() != expected {
             return Err(serde::de::Error::custom(format!(
                 "pixel buffer length {} does not match {}x{}x4 = {}",
@@ -279,6 +375,25 @@ mod tests {
     }
 
     #[test]
+    fn raster_dimension_validator_enforces_boundaries() {
+        assert!(validate_raster_dimensions(0, 1).is_err());
+        assert!(validate_raster_dimensions(1, 0).is_err());
+        assert!(validate_raster_dimensions(MAX_RASTER_DIMENSION, 1).is_ok());
+        assert!(validate_raster_dimensions(MAX_RASTER_DIMENSION + 1, 1).is_err());
+        assert!(validate_raster_dimensions(8192, 8192).is_ok());
+        assert!(validate_raster_dimensions(8193, 8192).is_err());
+    }
+
+    #[test]
+    fn try_new_rejects_extreme_dimensions() {
+        let error = RasterImage::try_new(u32::MAX, u32::MAX).unwrap_err();
+        assert!(
+            error.contains("overflow") || error.contains("exceed maximum"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn png_roundtrip() {
         let mut img = RasterImage::filled(8, 6, [200, 100, 50, 255]);
         img.set_pixel(0, 0, [1, 2, 3, 255]);
@@ -288,6 +403,27 @@ mod tests {
         assert_eq!(back.height, 6);
         assert_eq!(back.pixel(0, 0), [1, 2, 3, 255]);
         assert_eq!(back.pixel(7, 5), [200, 100, 50, 255]);
+    }
+
+    #[test]
+    fn encoded_image_rejects_dimensions_over_limit() {
+        let encoded = RasterImage::new(MAX_RASTER_DIMENSION + 1, 1).to_png();
+        let err = RasterImage::from_encoded(&encoded).unwrap_err();
+
+        assert!(err.contains("exceed the maximum"), "{err}");
+    }
+
+    #[test]
+    fn encoded_image_rejects_decoded_bytes_over_limit() {
+        // A header-only PPM is enough to exercise ImageReader's allocation
+        // check: it rejects the advertised decoded size before reading pixels.
+        let width = MAX_RASTER_DIMENSION;
+        let height = (MAX_RASTER_DECODED_BYTES / 3 / u64::from(width) + 1) as u32;
+        assert!(height <= MAX_RASTER_DIMENSION);
+        let header = format!("P6\n{width} {height}\n255\n");
+
+        let err = RasterImage::from_encoded(header.as_bytes()).unwrap_err();
+        assert!(err.to_ascii_lowercase().contains("limit"), "{err}");
     }
 
     #[test]
@@ -309,6 +445,16 @@ mod tests {
 
         let err = serde_json::from_value::<RasterImage>(value).unwrap_err();
         assert!(err.to_string().contains("do not match decoded dimensions"));
+    }
+
+    #[test]
+    fn serde_rejects_oversized_dimensions_before_decoding() {
+        let img = RasterImage::filled(1, 1, [1, 2, 3, 255]);
+        let mut value = serde_json::to_value(&img).unwrap();
+        value["width"] = serde_json::json!((MAX_PERSISTED_RASTER_PIXELS + 1) as u64);
+
+        let err = serde_json::from_value::<RasterImage>(value).unwrap_err();
+        assert!(err.to_string().contains("exceed maximum"));
     }
 
     #[test]

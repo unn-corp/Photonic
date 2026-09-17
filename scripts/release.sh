@@ -64,6 +64,11 @@ TODAY="$(date +%F)"
 [ -f "$CHANGELOG" ]   || die "no CHANGELOG.md at repo root"
 command -v git >/dev/null || die "git not found"
 
+RELEASE_BRANCH="main"
+CURRENT_BRANCH="$(git branch --show-current)"
+[ "$CURRENT_BRANCH" = "$RELEASE_BRANCH" ] \
+  || die "releases must be cut from protected '$RELEASE_BRANCH' (currently on '${CURRENT_BRANCH:-detached HEAD}')"
+
 if [ -n "$(git status --porcelain)" ]; then
   die "working tree is dirty — commit or stash first"
 fi

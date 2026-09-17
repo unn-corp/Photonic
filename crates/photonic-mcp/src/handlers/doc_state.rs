@@ -1,3 +1,4 @@
+use crate::handlers::shared::spatial::world_aabb;
 use crate::protocol::{
     AddConstructionLineArgs, AddDimensionArgs, ApplyDocumentTemplateArgs, DiffCheckpointsArgs,
     FitToMarginsArgs, GetCanvasOverviewArgs, GetDocumentStateArgs, JumpToHistoryArgs,
@@ -627,18 +628,10 @@ pub async fn get_canvas_overview(state: &AppState, args: GetCanvasOverviewArgs) 
         // World-space position origin
         let (wx, wy) = node.transform.apply(0.0, 0.0);
 
-        // Approximate bounds using local_bounds() transformed by the node transform
-        let (bx, by, bw, bh) = if let Some(lb) = node.local_bounds() {
-            let (x0, y0) = node.transform.apply(lb.x0, lb.y0);
-            let (x1, y1) = node.transform.apply(lb.x1, lb.y1);
-            let nx = x0.min(x1);
-            let ny = y0.min(y1);
-            let nw = (x1 - x0).abs().max(1.0);
-            let nh = (y1 - y0).abs().max(1.0);
-            (nx, ny, nw, nh)
-        } else {
-            (wx, wy, 1.0, 1.0)
-        };
+        // World-space bounds using all four transformed local corners.
+        let (bx, by, bw, bh) = world_aabb(node)
+            .map(|[x, y, width, height]| (x, y, width.max(1.0), height.max(1.0)))
+            .unwrap_or((wx, wy, 1.0, 1.0));
 
         // Expand canvas bounds
         if bx < min_x {
@@ -1069,14 +1062,11 @@ pub async fn fit_to_margins(state: &AppState, args: FitToMarginsArgs) -> ToolRes
 
     for nid in &target_ids {
         if let Some(node) = doc.nodes.get(nid) {
-            if let Some(lb) = node.local_bounds() {
-                let (x0, y0) = node.transform.apply(lb.x0, lb.y0);
-                let (x1, y1) = node.transform.apply(lb.x1, lb.y1);
-                let (nx0, ny0, nx1, ny1) = (x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
-                union_x0 = union_x0.min(nx0);
-                union_y0 = union_y0.min(ny0);
-                union_x1 = union_x1.max(nx1);
-                union_y1 = union_y1.max(ny1);
+            if let Some([x, y, width, height]) = world_aabb(node) {
+                union_x0 = union_x0.min(x);
+                union_y0 = union_y0.min(y);
+                union_x1 = union_x1.max(x + width);
+                union_y1 = union_y1.max(y + height);
                 valid_ids.push(*nid);
             }
         }
@@ -1125,8 +1115,10 @@ pub async fn fit_to_margins(state: &AppState, args: FitToMarginsArgs) -> ToolRes
             let mut new_node = node.clone();
             new_node.transform.matrix[4] = new_tx;
             new_node.transform.matrix[5] = new_ty;
-            // Scale the node (adjust the scale component of the transform matrix)
+            // Scale every linear term so rotation and shear are preserved.
             new_node.transform.matrix[0] *= scale_x;
+            new_node.transform.matrix[2] *= scale_x;
+            new_node.transform.matrix[1] *= scale_y;
             new_node.transform.matrix[3] *= scale_y;
             cmds.push(Command::UpdateNode {
                 old: node.clone(),
@@ -1267,5 +1259,158 @@ pub async fn remove_dimension(state: &AppState, args: RemoveDimensionArgs) -> To
         ToolResult::error(format!("Dimension '{}' not found.", args.id))
     } else {
         ToolResult::text(format!("Removed dimension '{}'.", args.id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::doc_analysis::{analyze_composition, detect_rhythms, measure_distances};
+    use crate::protocol::{
+        AnalyzeCompositionArgs, ContentItem, DetectRhythmsArgs, FitToMarginsArgs,
+        MeasureDistancesArgs,
+    };
+    use crate::server::McpServerConfig;
+    use photonic_core::{
+        node::{PathNode, SceneNode, SceneNodeKind},
+        path::PathData,
+        transform::Transform,
+        AuditLog, Document,
+    };
+    use std::sync::{Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
+
+    fn test_state(width: f64, height: f64) -> AppState {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        AppState {
+            document: Arc::new(Mutex::new(Document::new("spatial test", width, height))),
+            history: Arc::new(Mutex::new(photonic_core::history::CommandHistory::new(100))),
+            document_path: Arc::new(StdMutex::new(None)),
+            capture_tx: Arc::new(StdMutex::new(tx)),
+            config: McpServerConfig::default(),
+            audit_log: Arc::new(StdMutex::new(AuditLog::new())),
+            clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            ..AppState::headless_for_test()
+        }
+    }
+
+    async fn add_rect(state: &AppState, name: &str, transform: Transform) -> uuid::Uuid {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+        let node = SceneNode::new(
+            name,
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::rect(0.0, 0.0, 100.0, 50.0))),
+        )
+        .with_transform(transform);
+        doc.add_node(node, Some(layer_id))
+    }
+
+    fn rotated_rect(tx: f64, ty: f64) -> Transform {
+        let angle = std::f64::consts::FRAC_PI_4;
+        Transform::new(angle.cos(), angle.sin(), -angle.sin(), angle.cos(), tx, ty)
+    }
+
+    fn json_data(result: &ToolResult) -> serde_json::Value {
+        let Some(ContentItem::Text { text }) = result.content.last() else {
+            panic!("tool result did not contain JSON text: {result:?}");
+        };
+        serde_json::from_str(text).expect("tool result JSON")
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!((actual - expected).abs() < 1e-8, "{actual} != {expected}");
+    }
+
+    #[tokio::test]
+    async fn overview_and_composition_use_full_affine_bounds() {
+        let state = test_state(200.0, 200.0);
+        add_rect(&state, "rotated", rotated_rect(40.0, 30.0)).await;
+
+        let overview = get_canvas_overview(&state, GetCanvasOverviewArgs::default()).await;
+        assert!(overview.is_error.is_none(), "{overview:?}");
+        let overview_data = json_data(&overview);
+        let bounds = &overview_data["nodes"][0]["bounds"];
+        assert_close(bounds["x"].as_f64().unwrap(), 40.0 - 25.0 * 2.0_f64.sqrt());
+        assert_close(bounds["y"].as_f64().unwrap(), 30.0);
+        assert_close(bounds["w"].as_f64().unwrap(), 75.0 * 2.0_f64.sqrt());
+        assert_close(bounds["h"].as_f64().unwrap(), 75.0 * 2.0_f64.sqrt());
+
+        let analysis = analyze_composition(&state, AnalyzeCompositionArgs::default()).await;
+        assert!(analysis.is_error.is_none(), "{analysis:?}");
+        let analysis_data = json_data(&analysis);
+        assert_close(analysis_data["canvas_coverage_pct"].as_f64().unwrap(), 28.1);
+    }
+
+    #[tokio::test]
+    async fn rhythms_and_distances_use_full_affine_bounds() {
+        let state = test_state(600.0, 300.0);
+        let first = add_rect(&state, "first", rotated_rect(0.0, 0.0)).await;
+        let second = add_rect(&state, "second", rotated_rect(200.0, 0.0)).await;
+        add_rect(&state, "third", rotated_rect(400.0, 0.0)).await;
+
+        let rhythms = detect_rhythms(
+            &state,
+            DetectRhythmsArgs {
+                node_ids: Vec::new(),
+                min_count: Some(3),
+            },
+        )
+        .await;
+        assert!(rhythms.is_error.is_none(), "{rhythms:?}");
+        let rhythms_data = json_data(&rhythms);
+        let uniform_width = rhythms_data["patterns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pattern| pattern["type"] == "uniform_width")
+            .expect("uniform-width rhythm");
+        assert_close(uniform_width["width_px"].as_f64().unwrap(), 106.1);
+
+        let distances = measure_distances(
+            &state,
+            MeasureDistancesArgs {
+                node_ids: vec![first.to_string(), second.to_string()],
+            },
+        )
+        .await;
+        assert!(distances.is_error.is_none(), "{distances:?}");
+        let distances_data = json_data(&distances);
+        assert_close(
+            distances_data["measurements"][0]["horizontal_gap_px"]
+                .as_f64()
+                .unwrap(),
+            ((200.0 - 75.0 * 2.0_f64.sqrt()) * 10.0).round() / 10.0,
+        );
+    }
+
+    #[tokio::test]
+    async fn fit_to_margins_keeps_rotated_aabb_inside_safe_area() {
+        let state = test_state(200.0, 300.0);
+        let id = add_rect(&state, "rotated", rotated_rect(0.0, 0.0)).await;
+        {
+            let mut doc = state.document.lock().await;
+            doc.margin_left = 50.0;
+            doc.margin_right = 50.0;
+            doc.margin_top = 50.0;
+            doc.margin_bottom = 50.0;
+        }
+
+        let result = fit_to_margins(
+            &state,
+            FitToMarginsArgs {
+                node_ids: vec![id.to_string()],
+                uniform: true,
+                padding: 0.0,
+            },
+        )
+        .await;
+        assert!(result.is_error.is_none(), "{result:?}");
+
+        let doc = state.document.lock().await;
+        let bounds = world_aabb(doc.nodes.get(&id).unwrap()).unwrap();
+        for (actual, expected) in bounds.into_iter().zip([50.0, 100.0, 100.0, 100.0]) {
+            assert_close(actual, expected);
+        }
     }
 }

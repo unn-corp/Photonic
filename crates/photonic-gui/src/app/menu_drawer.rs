@@ -59,11 +59,11 @@ impl PhotonicApp {
                                             self.selected_drawer_option = None;
                                             if let Some(path) = run_file_dialog(|| {
                                                 rfd::FileDialog::new()
-                                                    .add_filter("Photonic", &["photon"])
+                                                    .add_filter("Photonic", &[PHOTON_FILE_EXTENSION])
                                                     .add_filter("SVG", &["svg"])
                                                     .add_filter("Images", &IMAGE_EXTENSIONS)
                                                     .add_filter("All supported", &{
-                                                        let mut all = vec!["photon", "svg"];
+                                                        let mut all = vec![PHOTON_FILE_EXTENSION, "svg"];
                                                         all.extend(IMAGE_EXTENSIONS);
                                                         all
                                                     })
@@ -135,19 +135,21 @@ impl PhotonicApp {
                                             let default_name = self.current_file.as_ref()
                                                 .and_then(|p| p.file_name())
                                                 .map(|n| n.to_string_lossy().into_owned())
-                                                .unwrap_or_else(|| format!("{}.photon", doc.name));
+                                                .unwrap_or_else(|| {
+                                                    format!("{}.{}", doc.name, PHOTON_FILE_EXTENSION)
+                                                });
                                             let start_dir = self.current_file.as_ref()
                                                 .and_then(|p| p.parent())
                                                 .map(|p| p.to_path_buf());
                                             let mut dialog = rfd::FileDialog::new()
-                                                .add_filter("Photonic", &["photon"])
+                                                .add_filter("Photonic", &[PHOTON_FILE_EXTENSION])
                                                 .set_file_name(&default_name);
                                             if let Some(dir) = start_dir {
                                                 dialog = dialog.set_directory(dir);
                                             }
                                             if let Some(path) = run_file_dialog(move || dialog.save_file()) {
                                                 let path = if path.extension().is_none() {
-                                                    path.with_extension("photon")
+                                                    path.with_extension(PHOTON_FILE_EXTENSION)
                                                 } else { path };
                                                 match write_photon_file(&path, doc, history) {
                                                     Ok(_) => {

@@ -6,7 +6,7 @@
 
 No installer exists for any platform. Windows users must extract a zip (no Start Menu
 shortcut, no Add/Remove Programs entry). macOS has no DMG. Linux has no `.deb`,
-AppImage, or Flatpak. File association (`.photonic` extension) is implemented in Rust for
+AppImage, or Flatpak. File association (`.photon` extension) is implemented in Rust for
 Windows (`crates/photonic-app/src/main.rs:581`, via `register_file_association()`) but
 has no equivalent for macOS or Linux, and requires the installer to set up the registry
 entry on Windows (the current runtime registration at line 92 requires elevation or
@@ -17,9 +17,9 @@ it adds installer packaging on top of the bare binary artifacts.
 
 **In**
 - **Windows**: WiX v4 MSI (preferred) or NSIS installer; Start Menu shortcut; Add/Remove
-  Programs entry; `.photonic` file association via registry; silent install mode.
+  Programs entry; `.photon` file association via registry; silent install mode.
 - **macOS**: signed/notarized `.app` bundle + `.dmg` with drag-to-Applications; `Info.plist`
-  document type and UTI for `.photonic`; Gatekeeper-compatible.
+  document type and UTI for `.photon`; Gatekeeper-compatible.
 - **Linux**: AppImage (widest compat) + `.deb` (Debian/Ubuntu); `.desktop` entry; MIME
   type registration via `shared-mime-info`; optional Flatpak manifest.
 - Hook each installer into the release pipeline from issue #56.
@@ -45,7 +45,7 @@ path-guid = "<generate-uuid>"
 
 Run `cargo wix init` to generate `wix/main.wxs`. Customise:
 - `<Shortcut>` in `ProgramMenuFolder`.
-- `<ProgId>` + `<Extension>` for `.photonic` association (replaces the runtime
+- `<ProgId>` + `<Extension>` for `.photon` association (replaces the runtime
   `register_file_association()` call at `main.rs:581`; the installer sets the registry
   keys as SYSTEM, removing the need for per-user runtime registration).
 - `<Icon>` pointing to `logo_improved.svg` converted to `.ico`.
@@ -135,7 +135,7 @@ maintainer-scripts = "packaging/deb-scripts/"
 ```
 
 The `photonic.xml` is a `shared-mime-info` XML file registering the `application/x-photonic`
-MIME type and `.photonic` extension. Post-install scripts call `update-mime-database` and
+MIME type and `.photon` extension. Post-install scripts call `update-mime-database` and
 `update-desktop-database`.
 
 **Flatpak** (optional, lower priority): write a `dev.photonic.app.yaml` manifest using
@@ -147,7 +147,7 @@ until AppImage/.deb are validated.
 
 | Platform | Mechanism | Current state |
 |----------|-----------|---------------|
-| Windows  | Registry `HKEY_CLASSES_ROOT\.photonic` | Runtime in `main.rs:581`; should move to installer |
+| Windows  | Registry `HKEY_CLASSES_ROOT\.photon` | Runtime in `main.rs:581`; should move to installer |
 | macOS    | `Info.plist` `CFBundleDocumentTypes` + UTI | Not yet; handled by `cargo-bundle` |
 | Linux    | `.desktop` + `shared-mime-info` XML | Not yet; handled by deb post-install |
 
@@ -190,9 +190,9 @@ plain extracted binary) to avoid privilege errors.
 ## Acceptance Criteria
 
 - [ ] Windows: running the MSI installs Photonic to Program Files, creates a Start Menu
-      shortcut, registers `.photonic` association, and appears in Add/Remove Programs.
+      shortcut, registers `.photon` association, and appears in Add/Remove Programs.
 - [ ] macOS: opening the DMG shows a drag-to-Applications window; the installed `.app`
-      is signed and Gatekeeper-accepted; double-clicking a `.photonic` file opens it.
+      is signed and Gatekeeper-accepted; double-clicking a `.photon` file opens it.
 - [ ] Linux: the AppImage runs without installation on Ubuntu 22.04+; the `.deb` installs
       cleanly and registers the MIME type and `.desktop` entry.
 - [ ] All installers are produced and attached by the release workflow (issue #56).

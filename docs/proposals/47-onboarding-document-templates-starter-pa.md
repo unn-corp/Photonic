@@ -18,7 +18,7 @@ and build colour schemes from scratch. The MCP `apply_document_template` tool
 - New Document dialog (preset artboard sizes: print A4/Letter, web 1920×1080,
   social 1080×1080, iOS/Android device frames), colour mode selector (RGB/CMYK).
 - Curated starter palettes surfaced in the welcome screen and the GUI colour panel.
-- A small library of sample `.photonic` template documents shipped as embedded assets.
+- A small library of sample `.photon` template documents shipped as embedded assets.
 - Wiring the existing `apply_document_template` MCP handler to a GUI action path.
 
 **Out**
@@ -42,7 +42,7 @@ and build colour schemes from scratch. The MCP `apply_document_template` tool
    `photonic-core`).
 
 3. **Template assets**  
-   Store 4–6 `.photonic` JSON files under `crates/photonic-gui/assets/templates/`.
+   Store 4–6 `.photon` JSON files under `crates/photonic-gui/assets/templates/`.
    Embed via `include_bytes!` or a build-script asset directory (check whether the
    project already has an assets embedding pattern). On selection, load with the same
    deserialization path as file-open.
@@ -62,7 +62,7 @@ and build colour schemes from scratch. The MCP `apply_document_template` tool
 
 - `crates/photonic-gui/src/welcome.rs` — primary change surface
 - `crates/photonic-gui/src/lib.rs` — re-export any new `palettes` module
-- `crates/photonic-gui/assets/templates/` — new directory (embedded `.photonic` files)
+- `crates/photonic-gui/assets/templates/` — new directory (embedded `.photon` files)
 - `crates/photonic-app/src/main.rs` — welcome action dispatch (lines ~286–310)
 - `crates/photonic-core/` — optional `Command::SetSwatches` if swatch state is tracked
   in the document model

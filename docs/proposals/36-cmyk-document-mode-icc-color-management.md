@@ -100,7 +100,7 @@ accurate CMYK entry in #35 (color picker).
 - **lcms2 C dependency**: `lcms2` is a C library; adds a `cc`-based build step and increases
   binary size. Evaluate `lcms2-rs` (safe wrapper) vs. writing a minimal pure-Rust sRGB↔CMYK
   formula for the MVP and adding full lcms2 in a follow-on.
-- **Serialization of ICC profiles**: storing the path in the `.photonic` file works for local
+- **Serialization of ICC profiles**: storing the path in the `.photon` file works for local
   files; embedded profiles (binary blob in the save file) is more portable but increases file
   size. Decide embed vs. path-reference policy.
 - **Rounding on mode switch**: converting a whole document's colors from RGB to CMYK is lossy.

@@ -1,5 +1,5 @@
 use crate::handlers::nodes::{generate_name, is_generic_name};
-use crate::handlers::shared::styling::*;
+use crate::handlers::shared::{spatial::world_aabb, styling::*};
 use crate::protocol::*;
 use crate::server::AppState;
 use kurbo;
@@ -334,24 +334,6 @@ pub async fn measure_nodes(
         return ToolResult::error("node_ids must not be empty");
     }
 
-    /// Transform a node's local AABB into world space by applying its affine
-    /// transform to all four corners and taking the bounding box of the result.
-    fn world_aabb(node: &SceneNode) -> Option<[f64; 4]> {
-        let local = node.local_bounds()?;
-        let affine = node.transform.to_kurbo();
-        let pts = [
-            affine * kurbo::Point::new(local.x0, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y1),
-            affine * kurbo::Point::new(local.x0, local.y1),
-        ];
-        let x0 = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-        let y0 = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-        let x1 = pts.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
-        let y1 = pts.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
-        Some([x0, y0, x1 - x0, y1 - y0])
-    }
-
     fn r2(v: f64) -> f64 {
         (v * 100.0).round() / 100.0
     }
@@ -485,23 +467,12 @@ pub async fn set_node_size(state: &AppState, args: crate::protocol::SetNodeSizeA
         let Some(node) = doc.get_node(&args.node_id) else {
             return ToolResult::error(format!("Node not found: {}", args.node_id));
         };
-        let Some(local) = node.local_bounds() else {
+        let Some(aabb) = world_aabb(node) else {
             return ToolResult::error(
                 "Cannot resize this node — it has no computable bounding box (e.g. empty group)",
             );
         };
-        let affine = node.transform.to_kurbo();
-        let pts = [
-            affine * kurbo::Point::new(local.x0, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y1),
-            affine * kurbo::Point::new(local.x0, local.y1),
-        ];
-        let x0 = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-        let y0 = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-        let x1 = pts.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
-        let y1 = pts.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
-        (node.clone(), [x0, y0, x1 - x0, y1 - y0])
+        (node.clone(), aabb)
     };
 
     let [ax, ay, cur_w, cur_h] = aabb;
@@ -599,22 +570,6 @@ pub async fn inspect_node(state: &AppState, args: InspectNodeArgs) -> ToolResult
 
     // ── shared helpers ────────────────────────────────────────────────────────
 
-    fn world_aabb_of(node: &SceneNode) -> Option<[f64; 4]> {
-        let local = node.local_bounds()?;
-        let affine = node.transform.to_kurbo();
-        let pts = [
-            affine * kurbo::Point::new(local.x0, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y1),
-            affine * kurbo::Point::new(local.x0, local.y1),
-        ];
-        let x0 = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-        let y0 = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-        let x1 = pts.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
-        let y1 = pts.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
-        Some([x0, y0, x1 - x0, y1 - y0])
-    }
-
     fn union_aabb(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
         let x0 = a[0].min(b[0]);
         let y0 = a[1].min(b[1]);
@@ -658,7 +613,7 @@ pub async fn inspect_node(state: &AppState, args: InspectNodeArgs) -> ToolResult
                 (0.0, 0.0)
             };
 
-            let world_bounds = world_aabb_of(&node).map(aabb_to_json);
+            let world_bounds = world_aabb(&node).map(aabb_to_json);
             let local_bounds = node.local_bounds().map(|r| {
                 serde_json::json!({
                     "x": r2(r.x0), "y": r2(r.y0),
@@ -728,7 +683,7 @@ pub async fn inspect_node(state: &AppState, args: InspectNodeArgs) -> ToolResult
                         if p.stroke.enabled {
                             stroke_colors.insert(p.stroke.color.to_hex());
                         }
-                        if let Some(aabb) = world_aabb_of(n) {
+                        if let Some(aabb) = world_aabb(n) {
                             world_bounds = Some(match world_bounds {
                                 None => aabb,
                                 Some(r) => union_aabb(r, aabb),
@@ -778,7 +733,7 @@ pub async fn inspect_node(state: &AppState, args: InspectNodeArgs) -> ToolResult
         SceneNodeKind::Text(text_node) => {
             let line_count = text_node.content.lines().count().max(1);
             let char_count = text_node.content.chars().count();
-            let world_bounds = world_aabb_of(&node).map(aabb_to_json);
+            let world_bounds = world_aabb(&node).map(aabb_to_json);
 
             let data = serde_json::json!({
                 "id": id_str,
@@ -803,7 +758,7 @@ pub async fn inspect_node(state: &AppState, args: InspectNodeArgs) -> ToolResult
 
         // raster: pixel layer — no vector geometry, fill, or stroke
         SceneNodeKind::Raster(_) => {
-            let world_bounds = world_aabb_of(&node).map(aabb_to_json);
+            let world_bounds = world_aabb(&node).map(aabb_to_json);
 
             let data = serde_json::json!({
                 "id": id_str,
@@ -1058,23 +1013,6 @@ pub async fn get_css_preview(state: &AppState, args: GetCssPreviewArgs) -> ToolR
             "transform: matrix({:.6}, {:.6}, {:.6}, {:.6}, {:.6}, {:.6});",
             m[0], m[1], m[2], m[3], m[4], m[5]
         ))
-    }
-
-    /// Compute the world-space AABB [x, y, w, h] of a node.
-    fn world_aabb(node: &SceneNode) -> Option<[f64; 4]> {
-        let local = node.local_bounds()?;
-        let affine = node.transform.to_kurbo();
-        let pts = [
-            affine * kurbo::Point::new(local.x0, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y0),
-            affine * kurbo::Point::new(local.x1, local.y1),
-            affine * kurbo::Point::new(local.x0, local.y1),
-        ];
-        let x0 = pts.iter().map(|p| p.x).fold(f64::INFINITY, f64::min);
-        let y0 = pts.iter().map(|p| p.y).fold(f64::INFINITY, f64::min);
-        let x1 = pts.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max);
-        let y1 = pts.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max);
-        Some([x0, y0, x1 - x0, y1 - y0])
     }
 
     // ── Resolve node ──────────────────────────────────────────────────────────

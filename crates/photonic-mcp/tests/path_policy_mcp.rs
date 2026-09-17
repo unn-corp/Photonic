@@ -7,6 +7,7 @@ use photonic_core::{AuditLog, Document, PathAccess, PathPolicy};
 use photonic_mcp::handlers;
 use photonic_mcp::protocol::ProtocolMode;
 use photonic_mcp::server::{build_router, AppState, McpServerConfig};
+use photonic_mcp::MCP_SECRET_HEADER;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::Mutex;
@@ -21,7 +22,7 @@ fn state_with_policy(pol: PathPolicy) -> AppState {
         capture_tx: Arc::new(StdMutex::new(tx)),
         config: McpServerConfig {
             port: 0,
-            secret: None,
+            secret: Some("test-secret".to_string()),
             protocol_mode: ProtocolMode::Dual,
         },
         path_policy: pol,
@@ -60,6 +61,7 @@ async fn save_document_outside_roots_denied() {
         .method("POST")
         .uri("/mcp")
         .header("content-type", "application/json")
+        .header(MCP_SECRET_HEADER, "test-secret")
         .body(Body::from(body.to_string()))
         .unwrap();
     let res = build_router(state_with_policy(pol))

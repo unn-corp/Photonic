@@ -21,7 +21,7 @@
 //!   documents. A malformed history payload is likewise dropped, never fatal.
 
 use serde::Serialize;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +34,9 @@ use crate::history::HistorySnapshot;
 /// `photon_history` payload is laid out.
 pub const PHOTON_FORMAT_VERSION: u32 = 1;
 
+/// Canonical extension for native Photonic documents.
+pub const PHOTON_FILE_EXTENSION: &str = "photon";
+
 static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write bytes to `path` without exposing a partially written destination.
@@ -42,22 +45,73 @@ static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// the sibling replaces the destination. A failed write or replacement leaves an
 /// existing destination untouched and removes the staging file.
 pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic_file_with_replacer(path, bytes, replace_destination)
+    write_atomic_file_with_replacer(path, bytes, None, replace_destination)
 }
 
-fn write_atomic_file_with_replacer<F>(path: &Path, bytes: &[u8], replace: F) -> io::Result<()>
+/// Write bytes atomically while applying a Unix permission mode to the staged
+/// file before it replaces the destination.
+///
+/// On non-Unix platforms, access is governed by the platform's ACLs and
+/// `mode` is ignored.
+pub fn write_atomic_file_with_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_file_with_replacer(path, bytes, Some(mode), replace_destination)
+}
+
+fn write_atomic_file_with_replacer<F>(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    replace: F,
+) -> io::Result<()>
 where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    write_atomic_file_with_hooks(
+        path,
+        bytes,
+        mode,
+        |file, bytes| file.write_all(bytes),
+        replace,
+    )
+}
+
+fn write_atomic_file_with_hooks<W, F>(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+    write: W,
+    replace: F,
+) -> io::Result<()>
+where
+    W: FnOnce(&mut File, &[u8]) -> io::Result<()>,
     F: FnOnce(&Path, &Path) -> io::Result<()>,
 {
     let staging = staging_path(path)?;
     let mut staging_created = false;
     let result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staging)?;
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            options.mode(mode);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+
+        let mut file = options.open(&staging)?;
         staging_created = true;
-        file.write_all(bytes)?;
+
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+
+        write(&mut file, bytes)?;
         file.flush()?;
         file.sync_all()?;
         replace(&staging, path)
@@ -418,16 +472,73 @@ mod tests {
         let original = b"old project bytes";
         fs::write(&path, original).unwrap();
 
-        let error = write_atomic_file_with_replacer(&path, b"new project bytes", |_staging, _| {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "injected replacement failure",
-            ))
-        })
+        let error = write_atomic_file_with_replacer(
+            &path,
+            b"new project bytes",
+            Some(0o600),
+            |_staging, _| {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected replacement failure",
+                ))
+            },
+        )
         .unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::Other);
         assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(staging_files(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn injected_write_failure_preserves_destination_and_cleans_staging() {
+        let dir = test_dir("write-failure");
+        let path = dir.join("project.photon");
+        let original = b"old project bytes";
+        fs::write(&path, original).unwrap();
+
+        let error = write_atomic_file_with_hooks(
+            &path,
+            b"new project bytes",
+            Some(0o600),
+            |_file, _bytes| {
+                Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "injected write failure",
+                ))
+            },
+            |_staging, _| panic!("replacement must not run after a write failure"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(staging_files(&dir).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_with_mode_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("private");
+        let path = dir.join("claude.json");
+
+        write_atomic_file_with_mode(&path, b"private settings", 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_atomic_file_with_mode(&path, b"updated private settings", 0o600).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"updated private settings");
         assert!(staging_files(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
     }

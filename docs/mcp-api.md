@@ -24,7 +24,7 @@ Insert a new anchor point at the midpoint of every segment in the selected path 
 
 Attach a non-printing text comment to a node or to the document as a whole.
 
-Annotations are stored in the `.photonic` file but are completely invisible in all export formats (SVG, PNG, ICO). They are not part of the undo/redo history.
+Annotations are stored in the `.photon` file but are completely invisible in all export formats (SVG, PNG, ICO). They are not part of the undo/redo history.
 
 Use cases:
 - AI agents recording *why* a design decision was made: "Chose this radius because the brief said 'approachable'."
@@ -1283,7 +1283,7 @@ Useful for comparing profiles (skills, stats, attributes) across multiple subjec
 
 ## `create_raster_layer`
 
-Create a blank raster (pixel) layer of a given size — a transparent canvas to paint on, or filled with a solid color. Edit with brush_stroke, gradient_fill, apply_filter, etc.
+Create a blank raster (pixel) layer of a given size — a transparent canvas to paint on, or filled with a solid color. Edit with brush_stroke, gradient_fill, apply_filter, etc. Dimensions are limited to 16384 pixels per side and 67108864 pixels total.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -2032,7 +2032,7 @@ Export one or more artboards to raster images — one image per artboard. Return
 
 ## `export_audit_log`
 
-Export the complete in-memory MCP audit log as a JSON array (oldest first). Includes every tool call recorded since the server started, up to 1000 entries.
+Export the retained in-memory MCP audit log as a JSON array (oldest first). Argument summaries are bounded, and the formatted response is capped at 256 KiB; when the retained buffer does not fit, only the oldest entries that fit are returned.
 
 _No parameters._
 
@@ -2095,15 +2095,15 @@ Export the current canvas as a raster image (PNG, JPEG, WebP, GIF, or TIFF). Ret
 
 PNG is lossless with optional transparency. JPEG is lossy with configurable quality (1–100) and always has a white background. WebP is lossy with transparency support and configurable quality. TIFF is lossless with full RGBA support, suitable for print workflows. Use this to obtain a file-ready raster export without the GUI file menu.
 
-Optionally specify width/height to resize the output. If omitted, the capture uses the current canvas dimensions.
+Optionally specify width/height to resize the output. Each supplied dimension is limited to 16384 pixels per side and a paired resize is limited to 67108864 pixels total. If omitted, the capture uses the current canvas dimensions.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `format` | enum (`png`, `jpeg`, `webp`, `gif`, `tiff`) | no | Output format (default: png) |
-| `height` | integer | no | Output height in pixels. Omit to use current canvas height. |
+| `height` | integer | no | Output height in pixels (maximum 16384; paired resize maximum 67108864 pixels). Omit to use current canvas height. |
 | `path` | string | no | Write the encoded image to this filesystem path (parent dirs created) and return a small result (path + width/height) instead of base64. Omit to return base64 inline. Use this for full-resolution PNGs, whose base64 is too large for the MCP socket. |
 | `quality` | integer | no | JPEG/WebP quality 1–100 (default: 90 for JPEG, 80 for WebP). Ignored for PNG. |
-| `width` | integer | no | Output width in pixels. Omit to use current canvas width. |
+| `width` | integer | no | Output width in pixels (maximum 16384; paired resize maximum 67108864 pixels). Omit to use current canvas width. |
 
 ## `export_selection_as_svg`
 
@@ -2918,9 +2918,9 @@ _No parameters._
 
 Return the most recent MCP tool calls recorded since the server started.
 
-Each entry includes: `id` (sequential), `timestamp` (ISO 8601), `tool_name`, `args` (full arguments), `result_summary` (first 200 chars of result text), `duration_ms`, and `is_error`.
+Each entry includes: `id` (sequential), `timestamp` (ISO 8601), `tool_name`, `args` (a bounded structural summary), `result_summary` (first 200 chars of result text), `duration_ms`, and `is_error`. Responses are capped at a fixed byte budget.
 
-Useful for multi-agent accountability: see exactly what was called, by whom (if the calling agent passes an `author` in its args), and with what parameters.
+Useful for multi-agent accountability: see what was called, by whom (if the calling agent passes an `author` in its args), and with which bounded parameters.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4453,7 +4453,7 @@ Create a live property constraint binding a node property to an arithmetic expre
 
 ## `set_document_bleed`
 
-Set the print bleed and/or slug margins for the document. Bleed is the extra artwork bled past the trim edge (typically 3 mm) to prevent white borders after cutting. Slug is the additional area outside bleed reserved for printer marks and file info. Values persist in the .photonic file. Provide only the fields you want to change.
+Set the print bleed and/or slug margins for the document. Bleed is the extra artwork bled past the trim edge (typically 3 mm) to prevent white borders after cutting. Slug is the additional area outside bleed reserved for printer marks and file info. Values persist in the .photon file. Provide only the fields you want to change.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4462,7 +4462,7 @@ Set the print bleed and/or slug margins for the document. Bleed is the extra art
 
 ## `set_document_color_mode`
 
-Set the document color mode to RGB or CMYK. CMYK is required for print-production PDF/X output. The mode persists in the .photonic file and is used as the default color space when exporting PDF without an explicit color_mode override.
+Set the document color mode to RGB or CMYK. CMYK is required for print-production PDF/X output. The mode persists in the .photon file and is used as the default color space when exporting PDF without an explicit color_mode override.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -4470,7 +4470,7 @@ Set the document color mode to RGB or CMYK. CMYK is required for print-productio
 
 ## `set_document_dpi`
 
-Set the document resolution (DPI) — the honored physical-size property on export: exported PDF/raster physical size = pixel size / dpi × 72 pt. A 1050×600 px document at 300 DPI exports at 252×144 pt (3.5×2 in); the same pixels at 72 DPI export at 1050×600 pt. Presets set this automatically (e.g. 300 for print). Default is 72 (px ≡ pt). Persists in the .photonic file.
+Set the document resolution (DPI) — the honored physical-size property on export: exported PDF/raster physical size = pixel size / dpi × 72 pt. A 1050×600 px document at 300 DPI exports at 252×144 pt (3.5×2 in); the same pixels at 72 DPI export at 1050×600 pt. Presets set this automatically (e.g. 300 for print). Default is 72 (px ≡ pt). Persists in the .photon file.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |

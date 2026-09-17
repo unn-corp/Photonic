@@ -24,8 +24,8 @@ pub struct Args {
     #[arg(long, default_value_t = 7842)]
     pub mcp_port: u16,
 
-    /// Optional shared secret for MCP authentication. Clients must send it in
-    /// the X-MCP-Secret header on every MCP request.
+    /// Shared secret for MCP authentication. Required when running the MCP
+    /// server; clients must send it in the X-MCP-Secret header on every request.
     #[arg(long)]
     pub mcp_secret: Option<String>,
 

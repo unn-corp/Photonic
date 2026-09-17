@@ -61,7 +61,7 @@ exposes them via GUI lock indicators and MCP tools.
   (not user-editable until constraint removed).
 - Cycle detection: report a named error, leave affected properties at their last valid
   values, do not crash.
-- Constraints persisted in `.photonic` under a new `constraints` field on `Document`.
+- Constraints persisted in `.photon` under a new `constraints` field on `Document`.
 - MCP tools: `set_constraint`, `list_constraints`, `remove_constraint`.
 - GUI: lock icon on constrained property fields in the Properties panel; formula tooltip.
 
@@ -138,7 +138,7 @@ exposes them via GUI lock indicators and MCP tools.
       rect_a is resized.
 - [ ] A cycle between two constraints is detected and reported with both node/property
       names; the document remains editable.
-- [ ] Constraints round-trip through `.photonic` save/load.
+- [ ] Constraints round-trip through `.photon` save/load.
 - [ ] `set_constraint`, `list_constraints`, `remove_constraint` MCP tools work.
 - [ ] Constrained properties show a lock indicator in the Properties panel.
 

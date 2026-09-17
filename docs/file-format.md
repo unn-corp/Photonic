@@ -1,6 +1,6 @@
-# .photonic File Format
+# .photon File Format
 
-`.photonic` files are plain JSON, human-readable and version-control friendly. This document describes the schema.
+`.photon` files are plain JSON, human-readable and version-control friendly. This document describes the schema.
 
 ---
 

@@ -1,3 +1,4 @@
+use crate::handlers::shared::{wait_for_capture, CaptureWaitError};
 use crate::protocol::{
     AddExportProfileArgs, DeleteLayerArgs, DuplicateLayerArgs, ExportArtboardsArgs,
     ExportDesignTokensArgs, ExportIconSetArgs, ExportPdfArgs, ExportRasterArgs,
@@ -7,6 +8,7 @@ use crate::protocol::{
 };
 use crate::server::AppState;
 use photonic_core::node::SceneNodeKind;
+use photonic_core::raster::validate_raster_dimensions;
 use photonic_core::style::{Fill, FillKind};
 use std::collections::BTreeSet;
 
@@ -489,6 +491,15 @@ fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+fn validate_export_dimensions(width: Option<u32>, height: Option<u32>) -> Result<(), String> {
+    match (width, height) {
+        (Some(width), Some(height)) => validate_raster_dimensions(width, height),
+        (Some(width), None) => validate_raster_dimensions(width, 1),
+        (None, Some(height)) => validate_raster_dimensions(1, height),
+        (None, None) => Ok(()),
+    }
+}
+
 pub async fn export_raster(state: &AppState, args: ExportRasterArgs) -> ToolResult {
     tracing::debug!("tool: export_raster");
 
@@ -506,6 +517,10 @@ pub async fn export_raster(state: &AppState, args: ExportRasterArgs) -> ToolResu
         ));
     }
 
+    if let Err(error) = validate_export_dimensions(args.width, args.height) {
+        return ToolResult::error(format!("Invalid output dimensions: {error}"));
+    }
+
     // Capture a screenshot from the render thread (PNG bytes).
     let (tx, rx) = tokio::sync::oneshot::channel::<Vec<u8>>();
     let sent = state
@@ -515,17 +530,32 @@ pub async fn export_raster(state: &AppState, args: ExportRasterArgs) -> ToolResu
         .unwrap_or(false);
 
     if !sent {
-        return ToolResult::error("Export unavailable — render thread not running");
+        return ToolResult::error("Export unavailable — render request channel is closed");
     }
 
-    let png_bytes = match rx.await {
-        Ok(b) if !b.is_empty() => b,
-        _ => return ToolResult::error("Render thread did not return image data"),
+    let png_bytes = match wait_for_capture(rx).await {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return ToolResult::error("Render thread returned empty image data"),
+        Err(CaptureWaitError::Timeout) => {
+            tracing::warn!("tool: export_raster — render thread response timed out");
+            return ToolResult::error(
+                "Raster export timed out waiting for the render thread to return image data",
+            );
+        }
+        Err(CaptureWaitError::Disconnected) => {
+            tracing::warn!("tool: export_raster — render thread closed the response channel");
+            return ToolResult::error(
+                "Render thread closed the raster export response channel before returning image data",
+            );
+        }
     };
 
     // Optionally resize.
     let png_bytes = match (args.width, args.height) {
-        (Some(w), Some(h)) => resize_png(&png_bytes, w, h).unwrap_or(png_bytes),
+        (Some(w), Some(h)) => match resize_png(&png_bytes, w, h) {
+            Ok(resized) => resized,
+            Err(error) => return ToolResult::error(format!("Failed to resize export: {error}")),
+        },
         _ => png_bytes,
     };
 
@@ -605,6 +635,109 @@ pub async fn export_raster(state: &AppState, args: ExportRasterArgs) -> ToolResu
             "data_base64": b64,
         }),
     )
+}
+
+#[cfg(test)]
+mod export_raster_capture_tests {
+    use super::export_raster;
+    use crate::handlers::shared::CAPTURE_RESPONSE_TIMEOUT;
+    use crate::protocol::{ContentItem, ExportRasterArgs, ToolResult};
+    use crate::server::{AppState, McpServerConfig};
+    use photonic_core::{history::CommandHistory, AuditLog, Document};
+    use std::sync::{mpsc, Arc, Mutex as StdMutex};
+    use tokio::sync::{oneshot, Mutex};
+
+    fn state_with_capture_tx(capture_tx: mpsc::Sender<oneshot::Sender<Vec<u8>>>) -> AppState {
+        AppState {
+            document: Arc::new(Mutex::new(Document::new("capture test", 200.0, 100.0))),
+            history: Arc::new(Mutex::new(CommandHistory::new(100))),
+            document_path: Arc::new(StdMutex::new(None)),
+            capture_tx: Arc::new(StdMutex::new(capture_tx)),
+            config: McpServerConfig::default(),
+            audit_log: Arc::new(StdMutex::new(AuditLog::new())),
+            clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            ..AppState::headless_for_test()
+        }
+    }
+
+    fn result_text(result: &ToolResult) -> &str {
+        match result.content.first() {
+            Some(ContentItem::Text { text }) => text,
+            other => panic!("expected a text result, got {other:?}"),
+        }
+    }
+
+    fn test_png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn export_raster_times_out_when_render_loop_does_not_service_request() {
+        let (capture_tx, _capture_rx) = mpsc::channel();
+        let state = state_with_capture_tx(capture_tx);
+        let task =
+            tokio::spawn(async move { export_raster(&state, ExportRasterArgs::default()).await });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(CAPTURE_RESPONSE_TIMEOUT).await;
+        let result = task.await.unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn export_raster_reports_request_channel_closure() {
+        let (capture_tx, capture_rx) = mpsc::channel();
+        drop(capture_rx);
+        let state = state_with_capture_tx(capture_tx);
+
+        let result = export_raster(&state, ExportRasterArgs::default()).await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("request channel is closed"));
+    }
+
+    #[tokio::test]
+    async fn export_raster_reports_response_channel_closure() {
+        let (capture_tx, capture_rx) = mpsc::channel();
+        let state = state_with_capture_tx(capture_tx);
+        let service = std::thread::spawn(move || {
+            let reply_tx = capture_rx.recv().unwrap();
+            drop(reply_tx);
+        });
+
+        let result = export_raster(&state, ExportRasterArgs::default()).await;
+        service.join().unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(result_text(&result).contains("response channel"));
+    }
+
+    #[tokio::test]
+    async fn export_raster_returns_serviced_capture() {
+        let (capture_tx, capture_rx) = mpsc::channel();
+        let state = state_with_capture_tx(capture_tx);
+        let service = std::thread::spawn(move || {
+            let reply_tx = capture_rx.recv().unwrap();
+            reply_tx.send(test_png()).unwrap();
+        });
+
+        let result = export_raster(&state, ExportRasterArgs::default()).await;
+        service.join().unwrap();
+
+        assert_eq!(result.is_error, None);
+        assert!(result_text(&result).contains("PNG export"));
+        assert!(result.content.len() >= 2);
+    }
 }
 
 /// Resolve which artboards `export_artboards` should render, applying the
@@ -1203,15 +1336,17 @@ pub async fn preview_selection(state: &AppState, args: PreviewSelectionArgs) -> 
     }))
 }
 
-fn resize_png(png_bytes: &[u8], w: u32, h: u32) -> Option<Vec<u8>> {
+fn resize_png(png_bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>, String> {
     use image::{imageops::FilterType, ImageFormat};
-    let img = image::load_from_memory_with_format(png_bytes, ImageFormat::Png).ok()?;
-    let resized = img.resize_exact(w.max(1), h.max(1), FilterType::Triangle);
+    validate_raster_dimensions(w, h)?;
+    let img = image::load_from_memory_with_format(png_bytes, ImageFormat::Png)
+        .map_err(|error| format!("could not decode PNG: {error}"))?;
+    let resized = img.resize_exact(w, h, FilterType::Triangle);
     let mut out = Vec::new();
     resized
         .write_to(&mut std::io::Cursor::new(&mut out), ImageFormat::Png)
-        .ok()?;
-    Some(out)
+        .map_err(|error| format!("could not encode PNG: {error}"))?;
+    Ok(out)
 }
 
 fn png_to_jpeg(png_bytes: &[u8], quality: u8) -> Option<Vec<u8>> {
@@ -2450,5 +2585,70 @@ mod export_blocking_tests {
         } else {
             eprintln!("no GPU adapter — export returned an error, but did not panic (ok)");
         }
+    }
+}
+
+#[cfg(test)]
+mod raster_export_tests {
+    use super::{export_raster, validate_export_dimensions};
+    use crate::handlers::clipboard::new_clipboard_ring;
+    use crate::protocol::{ExportRasterArgs, ToolResult};
+    use crate::server::{AppState, McpServerConfig};
+    use photonic_core::{history::CommandHistory, AuditLog, Document};
+    use std::sync::{mpsc, Arc, Mutex as StdMutex};
+    use tokio::sync::Mutex;
+
+    fn state_with_capture_receiver() -> (
+        AppState,
+        mpsc::Receiver<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    ) {
+        let (capture_tx, capture_rx) = mpsc::channel();
+        let state = AppState {
+            document: Arc::new(Mutex::new(Document::new("raster export test", 64.0, 48.0))),
+            history: Arc::new(Mutex::new(CommandHistory::new(100))),
+            document_path: Arc::new(StdMutex::new(None)),
+            capture_tx: Arc::new(StdMutex::new(capture_tx)),
+            config: McpServerConfig::default(),
+            audit_log: Arc::new(StdMutex::new(AuditLog::new())),
+            clipboard_ring: Arc::new(new_clipboard_ring()),
+            ..AppState::headless_for_test()
+        };
+        (state, capture_rx)
+    }
+
+    fn first_text(result: &ToolResult) -> &str {
+        match result.content.first() {
+            Some(crate::protocol::ContentItem::Text { text }) => text,
+            _ => panic!("expected a text tool result"),
+        }
+    }
+
+    #[test]
+    fn export_dimension_validator_rejects_invalid_optional_dimensions() {
+        assert!(validate_export_dimensions(Some(0), Some(1)).is_err());
+        assert!(validate_export_dimensions(Some(100_000), None).is_err());
+        assert!(validate_export_dimensions(Some(8193), Some(8192)).is_err());
+        assert!(validate_export_dimensions(None, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn export_raster_rejects_oversized_resize_before_capture() {
+        let (state, capture_rx) = state_with_capture_receiver();
+        let result = export_raster(
+            &state,
+            ExportRasterArgs {
+                width: Some(100_000),
+                height: Some(100_000),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert_eq!(result.is_error, Some(true));
+        assert!(first_text(&result).contains("Invalid output dimensions"));
+        assert!(
+            capture_rx.try_recv().is_err(),
+            "rejected resize must not capture"
+        );
     }
 }

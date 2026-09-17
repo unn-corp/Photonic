@@ -10,12 +10,16 @@
 //! This is the attach path for MCPB / Claude Desktop: host spawns this proxy
 //! (or `photonic mcp-proxy`) which talks to the already-running GUI.
 
-use anyhow::{Context, Result};
-use photonic_mcp::stdio::{read_message, write_json_value};
+use anyhow::{bail, Context, Result};
+use photonic_mcp::{
+    stdio::{read_message, write_json_value},
+    MCP_SECRET_HEADER,
+};
 use serde_json::Value;
 use std::io::{BufReader, Write};
 
-pub fn run(host_port: &str) -> Result<()> {
+pub fn run(host_port: &str, secret: Option<&str>) -> Result<()> {
+    let secret = require_secret(secret)?;
     let url = format!("http://{host_port}/mcp");
     let token = std::env::var("PHOTONIC_MCP_TOKEN")
         .ok()
@@ -67,6 +71,7 @@ pub fn run(host_port: &str) -> Result<()> {
         let mut req = client
             .post(&url)
             .header("content-type", "application/json")
+            .header(MCP_SECRET_HEADER, secret)
             .header("Mcp-Method", method);
         if let Some(name) = tool_name {
             req = req.header("Mcp-Name", name);
@@ -121,4 +126,14 @@ pub fn run(host_port: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn require_secret(secret: Option<&str>) -> Result<&str> {
+    let Some(secret) = secret.filter(|secret| !secret.trim().is_empty()) else {
+        bail!("MCP authentication requires --mcp-secret or PHOTONIC_MCP_SECRET");
+    };
+    if secret.bytes().any(|byte| matches!(byte, b'\r' | b'\n')) {
+        bail!("MCP secret cannot contain CR or LF characters");
+    }
+    Ok(secret)
 }

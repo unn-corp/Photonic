@@ -307,7 +307,7 @@ Currently have: Union, Subtract, Intersect, Exclude, Crop, Minus Back, Minus Fro
 ### Missing Document Features
 - **CMYK color mode** — full CMYK document mode with proper color management
 - **Color Management / ICC profiles** — assign, convert, and proof using ICC color profiles
-- ~~**Bleed and slug settings**~~ — *(implemented: `set_document_bleed { bleed_mm, slug_mm }` + `get_document_bleed` MCP tools + GUI "Print Settings" collapsing panel — stores bleed and slug values in mm on the document model, persisted in .photonic files)*
+- ~~**Bleed and slug settings**~~ — *(implemented: `set_document_bleed { bleed_mm, slug_mm }` + `get_document_bleed` MCP tools + GUI "Print Settings" collapsing panel — stores bleed and slug values in mm on the document model, persisted in .photon files)*
 - **Print dialog** — media size, orientation, crop marks/bleed, color management, separations output
 
 ### Missing File Format Support
@@ -464,7 +464,7 @@ An opt-in layout mode for groups that behaves like CSS Flexbox/Grid — but for 
 Photonic has a built-in AI loop that no other vector tool has. These features exploit it fully.
 
 ### ~~B1. Prompt History on Objects~~
-*(implemented: `set_node_prompt` MCP tool (append/prepend/replace modes) + `get_node_prompts` MCP tool. `prompt_history: Vec<String>` stored on every `SceneNode`, persisted in `.photonic` files, skipped on export. GUI: "Origin (Prompt History)" collapsing section in Properties panel shows entries when history is non-empty.)*
+*(implemented: `set_node_prompt` MCP tool (append/prepend/replace modes) + `get_node_prompts` MCP tool. `prompt_history: Vec<String>` stored on every `SceneNode`, persisted in `.photon` files, skipped on export. GUI: "Origin (Prompt History)" collapsing section in Properties panel shows entries when history is non-empty.)*
 
 - Remaining: re-run-with-edits UI (requires generative integration)
 
@@ -513,7 +513,7 @@ The community's #2 pain point with Illustrator: it destroys SVG quality. Photoni
 ### ~~C5. Multi-Target Export Profiles~~
 ~~Define named export profiles, each with its own format, scale, color space, and overrides.~~
 
-*(implemented: `add_export_profile`, `list_export_profiles`, `remove_export_profile`, `run_export_profile` MCP tools — named export configurations stored in `.photonic` file; supports SVG, PNG, JPEG, WebP formats with per-profile width/height/precision/semantic_ids settings; GUI: Export Profiles panel shows stored profiles with Remove buttons)*
+*(implemented: `add_export_profile`, `list_export_profiles`, `remove_export_profile`, `run_export_profile` MCP tools — named export configurations stored in `.photon` file; supports SVG, PNG, JPEG, WebP formats with per-profile width/height/precision/semantic_ids settings; GUI: Export Profiles panel shows stored profiles with Remove buttons)*
 
 ---
 

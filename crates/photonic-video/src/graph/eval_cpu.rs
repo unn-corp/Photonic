@@ -574,7 +574,7 @@ mod tests {
             kind: EffectKind::Deflicker,
             params,
         };
-        let out = eval_op(&op, &[&img], 2, 2, &mut EmptyProvider);
+        let out = eval_op(&op, &[&img], 2, 2, &mut EmptyProvider, false);
         let got = crate::graph::ops::linear_to_srgb(out.pixels[0][0]);
         assert!(
             (got - 0.5).abs() < 1e-3,
@@ -587,7 +587,7 @@ mod tests {
             kind: EffectKind::Deflicker,
             params: ResolvedParams::default(),
         };
-        let passthrough = eval_op(&inert, &[&img], 2, 2, &mut EmptyProvider);
+        let passthrough = eval_op(&inert, &[&img], 2, 2, &mut EmptyProvider, false);
         assert_eq!(passthrough.pixels, img.pixels);
     }
 

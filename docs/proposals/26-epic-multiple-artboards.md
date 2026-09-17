@@ -16,7 +16,7 @@ single canvas to a default artboard, and extends render, export, and MCP accordi
 - `Artboard` struct: `id`, `name`, `x`, `y`, `width`, `height`, optional `margin_*`,
   `bleed_mm`, `slug_mm` (move current doc-level fields here).
 - `Document.artboards: Vec<Artboard>` and `Document.active_artboard_id: Option<Uuid>`.
-- Migration: on load of a pre-artboard `.photonic`, synthesise one default artboard from
+- Migration: on load of a pre-artboard `.photon`, synthesise one default artboard from
   the existing `doc.width`/`doc.height` (format_version bump).
 - Global coordinate system: nodes live in document-global space; artboard is a named
   viewport rect (no per-artboard origin transform).
@@ -89,7 +89,7 @@ single canvas to a default artboard, and extends render, export, and MCP accordi
 ## Acceptance criteria
 
 - [ ] A document can hold multiple named artboards of different sizes at arbitrary positions.
-- [ ] Loading an old single-canvas `.photonic` file produces one default artboard matching
+- [ ] Loading an old single-canvas `.photon` file produces one default artboard matching
       the original canvas size (no visible change to existing docs).
 - [ ] Headless export scoped to one artboard renders only nodes within that rect.
 - [ ] MCP `create_artboard` / `list_artboards` / `export_artboard` tools work.

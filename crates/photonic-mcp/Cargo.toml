@@ -36,3 +36,4 @@ kurbo = { workspace = true }
 # behind `util`; the workspace `tower` dep is featureless.
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+tokio = { workspace = true, features = ["test-util"] }

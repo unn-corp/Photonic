@@ -1,3 +1,4 @@
+use crate::handlers::shared::spatial::world_aabb;
 use crate::protocol::{
     AnalyzeCompositionArgs, DetectRhythmsArgs, MeasureDistancesArgs, ToolResult,
 };
@@ -54,17 +55,9 @@ pub async fn analyze_composition(state: &AppState, args: AnalyzeCompositionArgs)
             }
         }
         let (wx, wy) = node.transform.apply(0.0, 0.0);
-        let (bx, by, bw, bh) = if let Some(lb) = node.local_bounds() {
-            let (x0, y0) = node.transform.apply(lb.x0, lb.y0);
-            let (x1, y1) = node.transform.apply(lb.x1, lb.y1);
-            let nx = x0.min(x1);
-            let ny = y0.min(y1);
-            let nw = (x1 - x0).abs().max(1.0);
-            let nh = (y1 - y0).abs().max(1.0);
-            (nx, ny, nw, nh)
-        } else {
-            (wx, wy, 1.0, 1.0)
-        };
+        let (bx, by, bw, bh) = world_aabb(node)
+            .map(|[x, y, width, height]| (x, y, width.max(1.0), height.max(1.0)))
+            .unwrap_or((wx, wy, 1.0, 1.0));
         let (fill_r, fill_g, fill_b, has_solid) = match &node.kind {
             SceneNodeKind::Path(pn) => match &pn.fill.kind {
                 FillKind::Solid(c) => (c.r, c.g, c.b, true),
@@ -350,18 +343,12 @@ pub async fn detect_rhythms(state: &AppState, args: DetectRhythmsArgs) -> ToolRe
             continue;
         }
 
-        let (bx, by, bw, bh) = if let Some(lb) = node.local_bounds() {
-            let (x0, y0) = node.transform.apply(lb.x0, lb.y0);
-            let (x1, y1) = node.transform.apply(lb.x1, lb.y1);
-            let nx = x0.min(x1);
-            let ny = y0.min(y1);
-            let nw = (x1 - x0).abs().max(0.001);
-            let nh = (y1 - y0).abs().max(0.001);
-            (nx, ny, nw, nh)
-        } else {
-            let (wx, wy) = node.transform.apply(0.0, 0.0);
-            (wx, wy, 1.0, 1.0)
-        };
+        let (bx, by, bw, bh) = world_aabb(node)
+            .map(|[x, y, width, height]| (x, y, width.max(0.001), height.max(0.001)))
+            .unwrap_or_else(|| {
+                let (wx, wy) = node.transform.apply(0.0, 0.0);
+                (wx, wy, 1.0, 1.0)
+            });
 
         // Extract rotation from affine matrix [a, b, c, d, tx, ty]: angle = atan2(b, a)
         let rotation_deg = {
@@ -635,14 +622,8 @@ pub async fn measure_distances(state: &AppState, args: MeasureDistancesArgs) -> 
             .or_else(|| doc.find_node_by_name(id_str).map(|n| n.id));
         let node = uid.and_then(|uid| doc.nodes.get(&uid));
         if let Some(node) = node {
-            let (bx, by, bw, bh) = if let Some(lb) = node.local_bounds() {
-                let (x0, y0) = node.transform.apply(lb.x0, lb.y0);
-                let (x1, y1) = node.transform.apply(lb.x1, lb.y1);
-                let nx: f64 = x0.min(x1);
-                let ny: f64 = y0.min(y1);
-                let nw = (x1 - x0).abs().max(0.0);
-                let nh = (y1 - y0).abs().max(0.0);
-                (nx, ny, nw, nh)
+            let (bx, by, bw, bh) = if let Some([x, y, width, height]) = world_aabb(node) {
+                (x, y, width, height)
             } else {
                 let (wx, wy) = node.transform.apply(0.0, 0.0);
                 (wx, wy, 0.0_f64, 0.0_f64)

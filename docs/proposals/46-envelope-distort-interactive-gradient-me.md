@@ -85,7 +85,7 @@ This issue makes both features interactive and non-destructive.
   coordinates. If the parent object is transformed, positions need to be in local space.
   Clarify coordinate space contract before implementing.
 - Envelope non-destructive mode adds a new node kind; confirm serialization format
-  is versioned in the `.photonic` format before merging.
+  is versioned in the `.photon` format before merging.
 
 ## Acceptance Criteria
 

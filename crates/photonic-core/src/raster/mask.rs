@@ -5,8 +5,12 @@
 //! give partial coverage (feathered edges, anti-aliasing), exactly like a
 //! Photoshop selection or layer mask.
 
-use super::image::{luma, RasterImage};
-use serde::{Deserialize, Deserializer, Serialize};
+use super::image::{checked_raster_pixel_count, luma, RasterImage, MAX_PERSISTED_RASTER_PIXELS};
+use serde::{
+    de::{self, SeqAccess, Visitor},
+    Deserialize, Deserializer, Serialize,
+};
+use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Mask {
@@ -20,18 +24,59 @@ pub struct Mask {
 struct MaskRepr {
     width: u32,
     height: u32,
+    #[serde(deserialize_with = "deserialize_bounded_data")]
     data: Vec<u8>,
+}
+
+fn deserialize_bounded_data<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedMaskData;
+
+    impl<'de> Visitor<'de> for BoundedMaskData {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a mask coverage byte array")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let size_hint = seq.size_hint().unwrap_or(0);
+            if size_hint > MAX_PERSISTED_RASTER_PIXELS {
+                return Err(de::Error::custom(format!(
+                    "mask data exceeds maximum of {} pixels",
+                    MAX_PERSISTED_RASTER_PIXELS
+                )));
+            }
+            let mut data = Vec::with_capacity(size_hint);
+            while let Some(value) = seq.next_element::<u8>()? {
+                if data.len() >= MAX_PERSISTED_RASTER_PIXELS {
+                    return Err(de::Error::custom(format!(
+                        "mask data exceeds maximum of {} pixels",
+                        MAX_PERSISTED_RASTER_PIXELS
+                    )));
+                }
+                data.push(value);
+            }
+            Ok(data)
+        }
+    }
+
+    d.deserialize_seq(BoundedMaskData)
 }
 
 impl<'de> Deserialize<'de> for Mask {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let repr = MaskRepr::deserialize(d)?;
-        let expected = (repr.width as usize)
-            .checked_mul(repr.height as usize)
-            .ok_or_else(|| serde::de::Error::custom("mask dimensions overflow data length"))?;
         if repr.width == 0 || repr.height == 0 {
             return Err(serde::de::Error::custom("mask dimensions must be non-zero"));
         }
+        let expected = checked_raster_pixel_count(repr.width, repr.height)
+            .map_err(serde::de::Error::custom)?;
         if repr.data.len() != expected {
             return Err(serde::de::Error::custom(format!(
                 "mask data length {} does not match {}x{} = {}",
@@ -533,6 +578,18 @@ mod tests {
                 "malformed mask should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn serde_rejects_oversized_pixel_count() {
+        let value = serde_json::json!({
+            "width": (MAX_PERSISTED_RASTER_PIXELS + 1) as u64,
+            "height": 1,
+            "data": []
+        });
+
+        let err = serde_json::from_value::<Mask>(value).unwrap_err();
+        assert!(err.to_string().contains("exceed maximum"));
     }
 
     #[test]

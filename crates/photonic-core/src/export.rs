@@ -595,7 +595,7 @@ fn emit_node_inner(
             // Non-destructive adjustment layers carry no pixels of their own —
             // they recolor the composite beneath them, which a flat SVG cannot
             // represent. Skip them rather than emit a bogus 1×1 placeholder
-            // (the .photonic format preserves them; PNG/JPEG bake them in).
+            // (the .photon format preserves them; PNG/JPEG bake them in).
             if r.is_adjustment_layer() {
                 return;
             }

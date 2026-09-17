@@ -6,7 +6,7 @@ pub type AnnotationId = Uuid;
 
 /// A non-printing comment or design note attached to a node or the document.
 ///
-/// Annotations are stored in the `.photonic` file but stripped from all
+/// Annotations are stored in the `.photon` file but stripped from all
 /// export formats (SVG, PNG, ICO). They are not part of the undo history —
 /// they represent meta-commentary on the design, not visual artwork changes.
 ///
