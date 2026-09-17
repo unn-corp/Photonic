@@ -4187,6 +4187,11 @@ pub async fn relink_media_batch(state: &AppState, args: RelinkMediaBatchArgs) ->
             format!("search_dir is not a directory: {}", args.search_dir),
         );
     }
+    // Keep batch relinks consistent with `import_media`/the path guard. On
+    // macOS the temporary directory is exposed through `/var` but resolves to
+    // `/private/var`; storing whichever spelling the caller happened to use
+    // makes the same file acquire two different project identities.
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
     let recursive = args.recursive.unwrap_or(true);
     let (candidates, truncated) = scan_relink_candidates(&root, recursive, true);
     let hashed_scan = candidates.iter().any(|c| c.content_hash.is_some());
