@@ -36,6 +36,12 @@ jobs:
     # video-nightly job below; this job already runs on every push/PR.
     if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
+    # Several integration tests launch real FFmpeg and GPU workers. Running
+    # them concurrently can exhaust process/device resources on hosted runners
+    # and turn successful decodes into empty output. Keep the cross-platform
+    # correctness matrix deterministic, matching the strict video job below.
+    env:
+      RUST_TEST_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -73,6 +79,10 @@ jobs:
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
+          # Hosted images include Chrome's third-party apt source even though
+          # this job does not use Chrome. A repository mirror sync there must
+          # not prevent installation of Photonic's Ubuntu dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev libgtk-3-dev \
