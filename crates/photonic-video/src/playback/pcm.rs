@@ -190,14 +190,23 @@ pub fn pcm_ffmpeg_argv(
     sample_rate: u32,
     stream: Option<u32>,
 ) -> Vec<String> {
+    // Input seeking alone may snap compressed audio to the next packet on
+    // some FFmpeg builds (notably IMA ADPCM on Ubuntu), skipping a short sound
+    // immediately after the requested mark. Seek at most one second early for
+    // speed, then use an output seek to discard the exact residual interval.
+    let lookback = Tick::from_seconds(1);
+    let coarse = Tick((start.0 - lookback.0).max(0));
+    let residual = Tick(start.0 - coarse.0);
     let mut args = vec![
         "-v".into(),
         "error".into(),
         "-accurate_seek".into(),
         "-ss".into(),
-        format!("{:.6}", start.as_seconds_f64().max(0.0)),
+        format!("{:.6}", coarse.as_seconds_f64()),
         "-i".into(),
         input.display().to_string(),
+        "-ss".into(),
+        format!("{:.6}", residual.as_seconds_f64()),
     ];
     // K-D3: pick a specific demuxed audio stream when the clip asks for one.
     if let Some(n) = stream {

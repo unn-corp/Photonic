@@ -36,12 +36,6 @@ jobs:
     # video-nightly job below; this job already runs on every push/PR.
     if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
-    # Several integration tests launch real FFmpeg and GPU workers. Running
-    # them concurrently can exhaust process/device resources on hosted runners
-    # and turn successful decodes into empty output. Keep the cross-platform
-    # correctness matrix deterministic, matching the strict video job below.
-    env:
-      RUST_TEST_THREADS: "1"
     strategy:
       fail-fast: false
       matrix:
