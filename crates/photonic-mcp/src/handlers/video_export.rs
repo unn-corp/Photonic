@@ -257,28 +257,28 @@ fn start(
                 }
             },
         );
-        let status = if cancel.load(Ordering::Relaxed) {
-            JobStatus::Cancelled
-        } else {
-            match result {
-                Ok(()) => JobStatus::Done {
-                    result: if batch {
-                        json!({"revision":revision,"outputs":outputs})
-                    } else {
-                        let mut output = outputs[0].clone();
-                        output["revision"] = json!(revision);
-                        output
-                    },
-                },
-                Err(ExportError::RenderTimeout(message)) => JobStatus::Failed {
-                    error_code: "RenderTimeout".into(),
-                    message,
-                },
-                Err(error) => JobStatus::Failed {
-                    error_code: "ExportFailed".into(),
-                    message: error.to_string(),
-                },
+        let status = match result {
+            Err(ExportError::Encode(photonic_video::export::encoder::EncodeError::Cancelled)) => {
+                JobStatus::Cancelled
             }
+            Err(ExportError::RenderTimeout(message)) => JobStatus::Failed {
+                error_code: "RenderTimeout".into(),
+                message,
+            },
+            Err(error) => JobStatus::Failed {
+                error_code: "ExportFailed".into(),
+                message: error.to_string(),
+            },
+            Ok(()) if cancel.load(Ordering::Relaxed) => JobStatus::Cancelled,
+            Ok(()) => JobStatus::Done {
+                result: if batch {
+                    json!({"revision":revision,"outputs":outputs})
+                } else {
+                    let mut output = outputs[0].clone();
+                    output["revision"] = json!(revision);
+                    output
+                },
+            },
         };
         set_job_status(&jobs, id, status);
     });

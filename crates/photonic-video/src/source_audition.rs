@@ -227,6 +227,13 @@ impl Drop for SourceAudition {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ffmpeg_audio_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
     use photonic_core::timeline::MediaProbe;
 
     #[test]
@@ -248,6 +255,7 @@ mod tests {
 
     #[test]
     fn source_audition_audio_uses_marked_offset_and_stops_at_out() {
+        let _ffmpeg_guard = ffmpeg_audio_test_lock();
         use crate::audio::{
             mixer::{ClipVoice, Mixer, TrackVoice},
             BLOCK_FRAMES, CHANNELS,
@@ -322,6 +330,7 @@ mod tests {
 
     #[test]
     fn source_feeder_prefills_real_pcm_and_cuts_beep_at_out_without_device() {
+        let _ffmpeg_guard = ffmpeg_audio_test_lock();
         let Some(tools) = crate::media::ffmpeg_locate::locate_for_test() else {
             eprintln!("FFmpeg unavailable; source feeder fixture skipped");
             return;

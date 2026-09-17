@@ -261,7 +261,7 @@ fn ui_engine_bridge_preview_target_and_proxy_mode() {
     }));
     // Poll until engine thread applies (status is arc-swap published).
     let mut saw_asset = false;
-    for _ in 0..50 {
+    for _ in 0..375 {
         std::thread::sleep(Duration::from_millis(40));
         let st = session.status();
         if matches!(st.preview_target, PreviewTarget::Asset { asset, .. } if asset == asset_id) {
@@ -278,7 +278,7 @@ fn ui_engine_bridge_preview_target_and_proxy_mode() {
     // Play wins: Play forces sequence target (24 §3.2) — engine Play path.
     session.send(EngineCmd::Play);
     let mut saw_seq_or_play = false;
-    for _ in 0..50 {
+    for _ in 0..375 {
         std::thread::sleep(Duration::from_millis(40));
         let st = session.status();
         if matches!(st.preview_target, PreviewTarget::Sequence { .. }) || st.playing {

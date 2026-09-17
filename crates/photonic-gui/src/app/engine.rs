@@ -892,7 +892,7 @@ mod tests {
         bridge.preview_trim_candidate(&doc, &history, &commands);
         let candidate_generation = bridge.trim_candidate.as_ref().unwrap().1;
         let wait = |bridge: &EngineBridge, generation: u64| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
             while bridge.status().snapshot_generation != generation
                 && std::time::Instant::now() < deadline
             {

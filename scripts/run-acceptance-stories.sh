@@ -143,12 +143,15 @@ wait_for_server() {
   while [ "$SECONDS" -lt "$deadline" ]; do
     if ! kill -0 "$pid" 2>/dev/null; then return 1; fi
     if python3 - "$port" <<'PY' >/dev/null 2>&1
-import json, sys, urllib.request
+import json, os, sys, urllib.request
 url = f"http://127.0.0.1:{sys.argv[1]}/mcp"
 body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                    "params": {"protocolVersion": "2024-11-05", "capabilities": {},
                               "clientInfo": {"name": "run-acceptance-stories.sh", "version": "1"}}}).encode()
-req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+req = urllib.request.Request(url, data=body, headers={
+    "Content-Type": "application/json",
+    "x-mcp-secret": os.environ["PHOTONIC_MCP_SECRET"],
+}, method="POST")
 with urllib.request.urlopen(req, timeout=5) as r:
     assert json.loads(r.read())["result"]["serverInfo"]["name"] == "photonic"
 PY
@@ -175,6 +178,11 @@ for story in "${STORIES[@]}"; do
 
   port="$(free_port)"
   server_log="${LOG_DIR}/${story}-server.log"
+  PHOTONIC_MCP_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+  export PHOTONIC_MCP_SECRET
+  TMPDIR="${REPO_ROOT}/target/acceptance-tmp/${story}"
+  mkdir -p "$TMPDIR"
+  export TMPDIR
 
   echo "── ${story}: ${STORY_TITLE[$story]} (port ${port}) ────────────────"
   # Each story gets a pristine server: the MCP surface mutates one in-process

@@ -261,7 +261,7 @@ fn main() -> Result<()> {
         args.file.as_deref().and_then(native_project_path),
     ));
 
-    let secret = args.mcp_secret.clone().or_else(|| {
+    let secret = cli_secret.or_else(|| {
         // Generate a session token when not pinned (28 §4 / MCP local profile).
         let tok = photonic_mcp::auth::generate_token();
         match photonic_mcp::auth::write_token(&tok) {

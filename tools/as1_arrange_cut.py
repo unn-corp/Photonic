@@ -118,7 +118,7 @@ class Client:
             {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
         ).encode("utf-8")
         req = urllib.request.Request(
-            self.url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            self.url, data=body, headers={"Content-Type": "application/json", "x-mcp-secret": os.environ["PHOTONIC_MCP_SECRET"]}, method="POST"
         )
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:

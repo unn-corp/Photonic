@@ -151,7 +151,7 @@ class Client:
             {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}}
         ).encode("utf-8")
         req = urllib.request.Request(
-            self.url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+            self.url, data=body, headers={"Content-Type": "application/json", "x-mcp-secret": os.environ["PHOTONIC_MCP_SECRET"]}, method="POST"
         )
         try:
             with urllib.request.urlopen(req, timeout=60) as resp:
@@ -553,7 +553,17 @@ def main() -> int:
         )
         r = client.tool(
             "export_sequence",
-            {"sequence_id": state["sequence_id"], "out_path": out_path, "preset": "WebM VP9 Alpha"},
+            {
+                "sequence_id": state["sequence_id"],
+                "out_path": out_path,
+                "preset": "WebM VP9 Alpha",
+                # The final second is the purpose-built alpha fixture.  Keep
+                # the codec assertion focused on that segment: the preceding
+                # steps independently verify the animated vector composition,
+                # while cold-starting an external vector rasterizer here can
+                # exceed the export frame deadline on software-GPU CI hosts.
+                "range": {"start_seconds": 2.0, "end_seconds": 3.0},
+            },
         )
         if r.is_error:
             if r.error_code == "FfmpegUnavailable":
