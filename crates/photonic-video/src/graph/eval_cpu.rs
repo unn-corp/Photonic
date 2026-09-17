@@ -86,6 +86,8 @@ pub fn evaluate_at(
     node: Option<crate::graph::ir::IrNodeId>,
 ) -> Image {
     let (cw, ch) = (canvas.0.max(1), canvas.1.max(1));
+    let canvas_scale = graph.canvas_scale((cw, ch));
+    let native = graph.native_video_sources();
     let mut results: Vec<Option<Image>> = (0..graph.nodes.len()).map(|_| None).collect();
 
     for (i, node) in graph.nodes.iter().enumerate() {
@@ -99,7 +101,14 @@ pub fn evaluate_at(
                         .expect("input evaluated before consumer (topo order)")
                 })
                 .collect();
-            eval_op(&node.op, &inputs, cw, ch, provider)
+            eval_op(
+                &node.op.at_canvas_scale(canvas_scale),
+                &inputs,
+                cw,
+                ch,
+                provider,
+                native[i],
+            )
         };
         results[i] = Some(img);
     }
@@ -108,6 +117,13 @@ pub fn evaluate_at(
         Some(out) => results
             .get_mut(out.0 as usize)
             .and_then(|slot| slot.take())
+            .map(|image| {
+                if native[out.0 as usize] {
+                    normalize_source(image, cw, ch)
+                } else {
+                    image
+                }
+            })
             .unwrap_or_else(|| Image::new(cw, ch)),
         None => Image::new(cw, ch),
     }
@@ -119,6 +135,7 @@ fn eval_op(
     cw: u32,
     ch: u32,
     provider: &mut dyn FrameProvider,
+    native_video: bool,
 ) -> Image {
     // Missing-input safety: the compiler always wires unary/binary ops, but be
     // defensive so a malformed graph degrades to transparent, never panics.
@@ -134,11 +151,14 @@ fn eval_op(
             asset,
             src_time,
             proxy,
-        } => normalize_source(
-            provider.decode_video(*asset, *src_time, *proxy, cw, ch),
-            cw,
-            ch,
-        ),
+        } => {
+            let image = provider.decode_video(*asset, *src_time, *proxy, cw, ch);
+            if native_video {
+                image
+            } else {
+                normalize_source(image, cw, ch)
+            }
+        }
         IrOp::DecodeStill { asset } => {
             normalize_source(provider.decode_still(*asset, cw, ch), cw, ch)
         }
@@ -150,7 +170,7 @@ fn eval_op(
         } => normalize_source(provider.raster_vector(*vref, *doc_state, *w, *h), cw, ch),
         IrOp::SolidColor { color } => ops::solid(cw, ch, *color),
         IrOp::Transform2D { mat, sampling } => match inputs.first() {
-            Some(input) => ops::transform2d(input, *mat, *sampling),
+            Some(input) => ops::transform2d_to_canvas(input, *mat, *sampling, cw, ch),
             None => Image::new(cw, ch),
         },
         IrOp::StabilizeWarp { warp, sampling } => match inputs.first() {

@@ -421,6 +421,73 @@ pub struct FrameGraph {
     pub output: Option<IrNodeId>,
 }
 
+impl FrameGraph {
+    /// Keep decoded detail until a direct transform samples the portrait crop.
+    /// Other consumers retain the canvas-sized source contract.
+    pub(crate) fn native_video_sources(&self) -> Vec<bool> {
+        let mut native: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|n| matches!(n.op, IrOp::DecodeVideo { .. }))
+            .collect();
+        for node in &self.nodes {
+            if !matches!(node.op, IrOp::Transform2D { .. }) {
+                for (id, _) in &node.inputs {
+                    native[id.0 as usize] = false;
+                }
+            }
+        }
+        if let Some(id) = self.output {
+            native[id.0 as usize] = false;
+        }
+        native
+    }
+
+    /// Convert authored output pixels to the processing canvas used by Draft.
+    pub(crate) fn canvas_scale(&self, canvas: (u32, u32)) -> glam::Vec2 {
+        match self.output.and_then(|id| self.nodes.get(id.0 as usize)) {
+            Some(IrNode {
+                op: IrOp::Output { w, h },
+                ..
+            }) if *w > 0 && *h > 0 => {
+                glam::Vec2::new(canvas.0 as f32 / *w as f32, canvas.1 as f32 / *h as f32)
+            }
+            _ => glam::Vec2::ONE,
+        }
+    }
+}
+
+impl IrOp {
+    /// Affine coordinates are authored in output pixels, including the pivot.
+    /// Conjugation preserves scale/rotation while adapting translation to Draft.
+    pub(crate) fn at_canvas_scale(&self, scale: glam::Vec2) -> std::borrow::Cow<'_, Self> {
+        match self {
+            Self::Transform2D { mat, sampling } if scale != glam::Vec2::ONE => {
+                let basis = Mat3::from_scale(scale);
+                std::borrow::Cow::Owned(Self::Transform2D {
+                    mat: basis * *mat * basis.inverse(),
+                    sampling: *sampling,
+                })
+            }
+            Self::TextGen { block } if scale != glam::Vec2::ONE => {
+                let mut block = block.clone();
+                if let Some(cue) = &mut block.cue {
+                    cue.font_size *= scale.y;
+                }
+                std::borrow::Cow::Owned(Self::TextGen { block })
+            }
+            Self::CaptionOverlay { cue_batch } if scale != glam::Vec2::ONE => {
+                let mut cue_batch = cue_batch.clone();
+                for cue in &mut cue_batch.cues {
+                    cue.font_size *= scale.y;
+                }
+                std::borrow::Cow::Owned(Self::CaptionOverlay { cue_batch })
+            }
+            _ => std::borrow::Cow::Borrowed(self),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

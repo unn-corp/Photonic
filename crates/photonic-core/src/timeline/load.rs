@@ -1053,6 +1053,21 @@ mod load_repair_tests {
     // ── Task 1: orphan flagging reaches the new scopes (35 §2) ────────────
 
     #[test]
+    fn catalog_effect_animation_remains_live_after_load() {
+        let kind = super::super::effect_kind::EffectKind::Unknown(
+            super::super::unknown::UnknownTag::intern("blur.motion"),
+        );
+        let mut tracks = vec![PropertyTrack::new(super::super::anim::PropPath::new(
+            "params.distance",
+        ))];
+        flag_tracks(&mut tracks, PropTargetKind::Effect(kind));
+        assert!(
+            !tracks[0].orphaned,
+            "known catalog animation must survive loading"
+        );
+    }
+
+    #[test]
     fn orphaned_paths_are_flagged_at_track_master_and_asset_scope() {
         let mut project = TimelineProject::new();
         let (mut seq, _) = seq_with_one_clip();

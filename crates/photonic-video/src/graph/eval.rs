@@ -508,6 +508,7 @@ pub struct Evaluator {
     /// the scopes are still measuring.
     pinned_tap: Option<crate::graph::ir::ContentHash>,
     source_namespace: u64,
+    canvas_scale: glam::Vec2,
 }
 
 impl Evaluator {
@@ -531,6 +532,7 @@ impl Evaluator {
             pinned_output: None,
             pinned_tap: None,
             source_namespace: 0,
+            canvas_scale: glam::Vec2::ONE,
         }
     }
 
@@ -553,6 +555,13 @@ impl Evaluator {
         h: u32,
     ) -> crate::graph::ir::ContentHash {
         let mut hash = evaluation_hash(hash, w, h);
+        // The same authored affine can occur under different output formats.
+        // Include its coordinate basis so those previews cannot share pixels.
+        hash = evaluation_hash(
+            hash,
+            self.canvas_scale.x.to_bits(),
+            self.canvas_scale.y.to_bits(),
+        );
         if self.source_namespace != 0 {
             // Exact evaluation keeps its stable namespace; approximations must
             // never satisfy a later paused/export lookup for the same tick.
@@ -616,6 +625,9 @@ impl Evaluator {
     ) -> (Option<GpuFrame>, Option<GpuFrame>) {
         self.source_namespace = source.cache_namespace();
         let (cw, ch) = (canvas.0.max(1), canvas.1.max(1));
+        let canvas_scale = graph.canvas_scale((cw, ch));
+        self.canvas_scale = canvas_scale;
+        let native = graph.native_video_sources();
         let mut results: Vec<Option<GpuFrame>> = (0..graph.nodes.len()).map(|_| None).collect();
 
         for (i, node) in graph.nodes.iter().enumerate() {
@@ -631,9 +643,11 @@ impl Evaluator {
                     src_time,
                     proxy,
                 } => match source.video_texture(&self.gpu, *asset, *src_time, *proxy) {
-                    Some(frame) => {
-                        Some(self.normalize_source_cached(node.content_hash, frame, cw, ch))
-                    }
+                    Some(frame) => Some(if native[i] {
+                        frame
+                    } else {
+                        self.normalize_source_cached(node.content_hash, frame, cw, ch)
+                    }),
                     None => None,
                 },
                 // K-C8: the still is requested at the LOGICAL canvas size
@@ -659,7 +673,7 @@ impl Evaluator {
                     None => None,
                 },
                 _ if inputs.len() == node.inputs.len() => {
-                    Some(self.render_cached(node, &inputs, cw, ch))
+                    Some(self.render_cached(node, &inputs, cw, ch, canvas_scale))
                 }
                 _ => None,
             };
@@ -684,7 +698,12 @@ impl Evaluator {
                 results[id.0 as usize].clone().map(|frame| {
                     (
                         self.evaluation_hash(graph.nodes[id.0 as usize].content_hash, cw, ch),
-                        frame,
+                        self.normalize_source_cached(
+                            graph.nodes[id.0 as usize].content_hash,
+                            frame,
+                            cw,
+                            ch,
+                        ),
                     )
                 })
             });
@@ -728,6 +747,7 @@ impl Evaluator {
         inputs: &[GpuFrame],
         cw: u32,
         ch: u32,
+        canvas_scale: glam::Vec2,
     ) -> GpuFrame {
         let (w, h) = op_size(&node.op, cw, ch);
         let desc = TextureDesc {
@@ -739,7 +759,13 @@ impl Evaluator {
         if valid {
             return GpuFrame::new(target, w, h);
         }
-        self.render_op(&node.op, inputs, &target, w, h);
+        self.render_op(
+            &node.op.at_canvas_scale(canvas_scale),
+            inputs,
+            &target,
+            w,
+            h,
+        );
         self.cache.mark_rendered(hash);
         GpuFrame::new(target, w, h)
     }
@@ -895,8 +921,8 @@ impl Evaluator {
                         self.gpu.queue(),
                         target,
                         std::slice::from_ref(cue),
-                        target.width(),
-                        target.height(),
+                        logical_w,
+                        logical_h,
                     );
                 }
             }
@@ -915,8 +941,8 @@ impl Evaluator {
                         self.gpu.queue(),
                         target,
                         &cue_batch.cues,
-                        target.width(),
-                        target.height(),
+                        logical_w,
+                        logical_h,
                     );
                 }
             }

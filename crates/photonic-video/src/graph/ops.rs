@@ -122,18 +122,33 @@ pub fn solid(width: u32, height: u32, color: LinearColor) -> Image {
 /// `Transform2D`: resample `input` under the affine `mat` (dest ← src via the
 /// inverse), producing a same-sized image. Identity is an exact passthrough.
 pub fn transform2d(input: &Image, mat: Mat3, sampling: Sampling) -> Image {
+    transform2d_to_canvas(input, mat, sampling, input.width, input.height)
+}
+
+/// Resample directly from native pixels using the authored canvas coordinates.
+pub(crate) fn transform2d_to_canvas(
+    input: &Image,
+    mat: Mat3,
+    sampling: Sampling,
+    width: u32,
+    height: u32,
+) -> Image {
     if !transform_matrix_is_valid(mat) {
-        return Image::new(input.width, input.height);
+        return Image::new(width, height);
     }
-    if mat == Mat3::IDENTITY {
+    if mat == Mat3::IDENTITY && input.width == width && input.height == height {
         return input.clone();
     }
     let inv = mat.inverse();
-    let mut out = Image::new(input.width, input.height);
+    let mut out = Image::new(width, height);
+    let source_scale = Vec2::new(
+        input.width as f32 / out.width as f32,
+        input.height as f32 / out.height as f32,
+    );
     for y in 0..out.height {
         for x in 0..out.width {
             let dst = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
-            let src = inv.transform_point2(dst);
+            let src = inv.transform_point2(dst) * source_scale;
             let v = match sampling {
                 Sampling::Bilinear => input.sample_bilinear(src.x, src.y),
                 Sampling::Nearest => {

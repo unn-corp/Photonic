@@ -217,10 +217,8 @@ pub fn entries(kind: PropTargetKind) -> &'static [PropEntry] {
             EffectKind::Invert => EFFECT_INVERT,
             EffectKind::MaskShapeGen => EFFECT_MASKSHAPE,
             EffectKind::Deflicker => EFFECT_DEFLICKER,
-            // Forward-compat (39 §2.2): an unknown kind has zero registered
-            // paths, so every PropertyTrack targeting it is flagged orphaned by
-            // `flag_orphaned_property_tracks` — retained, not dropped, eval
-            // falls back to base. Never guess a similar known kind's paths.
+            // Catalog ids are resolved from their manifest in `resolve`.
+            // Truly unknown ids retain orphaned tracks without guessing paths.
             EffectKind::Unknown(_) => &[],
         },
         PropTargetKind::GradeOp(g) => match g {
@@ -263,7 +261,22 @@ pub fn resolve(kind: PropTargetKind, path: &str) -> Option<PropEntry> {
             range: None,
         });
     }
-    entries(kind).iter().copied().find(|e| e.path == path)
+    entries(kind)
+        .iter()
+        .copied()
+        .find(|e| e.path == path)
+        .or_else(|| {
+            // Catalog effects use stable ids carried by Unknown; their manifest is
+            // authoritative even when the legacy static registry has no block.
+            let PropTargetKind::Effect(effect) = kind else {
+                return None;
+            };
+            super::effect_manifest::manifest(effect.effect_id())?
+                .params
+                .iter()
+                .find(|spec| spec.path == path)
+                .map(super::effect_manifest::project)
+        })
 }
 
 /// Whether a path is registered for a target kind (i.e. not orphaned on load).

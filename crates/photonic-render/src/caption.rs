@@ -230,6 +230,9 @@ impl CaptionCompositor {
                     occlusion_query_set: None,
                 })
                 .forget_lifetime();
+            // Video textures are bucket-padded; layout and rasterization must
+            // both target the logical frame, leaving the padding untouched.
+            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
             if let Err(e) = st.renderer.render(&st.atlas, &st.viewport, &mut pass) {
                 tracing::warn!("caption glyphon render failed: {:?}", e);
             }

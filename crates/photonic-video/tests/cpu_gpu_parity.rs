@@ -295,7 +295,14 @@ fn upload_pattern(gpu: &GpuContext, image: &Image) -> std::sync::Arc<wgpu::Textu
     let mut half = Vec::with_capacity(image.pixels.len() * 4);
     for pixel in &image.pixels {
         for channel in pixel {
-            half.push(if *channel == 0.0 { 0u16 } else { 0x3c00u16 });
+            // Fixtures contain zero or positive normal half-float values.
+            let bits = channel.to_bits();
+            let exponent = ((bits >> 23) & 0xff) as i32 - 112;
+            half.push(if exponent <= 0 {
+                0
+            } else {
+                ((exponent as u16) << 10) | ((bits & 0x7fffff) >> 13) as u16
+            });
         }
     }
     gpu.queue().write_texture(
@@ -1006,5 +1013,203 @@ fn transition_kind_cpu_gpu_parity() {
             &compiled.graph,
             1e-3,
         );
+    }
+}
+
+// Portrait reframing must use the same center in Draft and Full previews.
+#[test]
+fn centered_reframe_matches_full_when_preview_canvas_is_smaller() {
+    let full = (108, 192);
+    let draft = (54, 96);
+    let mut image = Image::new(full.0, full.1);
+    for y in 0..full.1 {
+        for x in 0..full.0 {
+            image.pixels[(y * full.0 + x) as usize] = [
+                (x as f32 + 0.5) / full.0 as f32,
+                (y as f32 + 0.5) / full.1 as f32,
+                0.0,
+                1.0,
+            ];
+        }
+    }
+    let center = glam::Vec2::new(54.0, 96.0);
+    let mat = glam::Mat3::from_translation(center + glam::Vec2::new(5.0, -8.0))
+        * glam::Mat3::from_scale(glam::Vec2::new(3.16, 1.2))
+        * glam::Mat3::from_translation(-center);
+    let graph = FrameGraph {
+        nodes: vec![
+            IrNode {
+                op: IrOp::DecodeStill {
+                    asset: AssetId::new(),
+                },
+                inputs: vec![],
+                content_hash: ContentHash(810),
+            },
+            IrNode {
+                op: IrOp::Transform2D {
+                    mat,
+                    sampling: Sampling::Bilinear,
+                },
+                inputs: vec![(IrNodeId(0), OutPort::default())],
+                content_hash: ContentHash(811),
+            },
+            IrNode {
+                op: IrOp::Output {
+                    w: full.0,
+                    h: full.1,
+                },
+                inputs: vec![(IrNodeId(1), OutPort::default())],
+                content_hash: ContentHash(812),
+            },
+        ],
+        output: Some(IrNodeId(2)),
+    };
+    let expected = eval_cpu::evaluate(
+        &graph,
+        full,
+        &mut PatternCpuSource {
+            image: image.clone(),
+        },
+    );
+    let actual = eval_cpu::evaluate(
+        &graph,
+        draft,
+        &mut PatternCpuSource {
+            image: image.clone(),
+        },
+    );
+    assert_pixels_within("CPU draft reframe", &expected, &actual, 0.015);
+    if let Some(gpu) = gpu_or_skip("Draft reframe") {
+        let mut source = PatternGpuSource {
+            frame: GpuFrame::new(upload_pattern(&gpu, &image), full.0, full.1),
+        };
+        let mut eval = Evaluator::new(gpu.clone());
+        let tex = eval
+            .evaluate(&graph, draft, &mut source)
+            .expect("draft output");
+        let actual = Image {
+            width: full.0,
+            height: full.1,
+            pixels: read_texture_rgba16f(&gpu, &tex, full.0, full.1),
+        };
+        assert_pixels_within("GPU draft reframe", &expected, &actual, 0.015);
+    }
+}
+
+#[test]
+fn title_bounds_match_between_draft_and_full_on_padded_canvas() {
+    let Some(gpu) = gpu_or_skip("title preview size") else {
+        return;
+    };
+    let full = (216, 384);
+    let cue = photonic_render::caption::CaptionCueRun {
+        words: vec![photonic_render::caption::CaptionWordRun {
+            text: "Hello".into(),
+            font_family: "Inter".into(),
+            font_weight: 700,
+            color: [255; 4],
+        }],
+        font_size: 32.0,
+        line_height_mul: 1.2,
+        anchor: [0.5, 0.2],
+        max_width: 0.8,
+    };
+    let graph = FrameGraph {
+        nodes: vec![
+            IrNode {
+                op: IrOp::TextGen {
+                    block: photonic_video::contract::ResolvedTextBlock { cue: Some(cue) },
+                },
+                inputs: vec![],
+                content_hash: ContentHash(900),
+            },
+            IrNode {
+                op: IrOp::Output {
+                    w: full.0,
+                    h: full.1,
+                },
+                inputs: vec![(IrNodeId(0), OutPort::default())],
+                content_hash: ContentHash(901),
+            },
+        ],
+        output: Some(IrNodeId(1)),
+    };
+    let bounds = |canvas| {
+        let mut eval = Evaluator::new(gpu.clone());
+        let tex = eval.evaluate(&graph, canvas, &mut NullFrameSource).unwrap();
+        let pixels = read_texture_rgba16f(&gpu, &tex, full.0, full.1);
+        let mut b = [full.0 as i32, full.1 as i32, 0, 0];
+        for (i, p) in pixels.iter().enumerate().filter(|(_, p)| p[3] > 0.2) {
+            let (x, y) = ((i as u32 % full.0) as i32, (i as u32 / full.0) as i32);
+            let _ = p;
+            b = [b[0].min(x), b[1].min(y), b[2].max(x), b[3].max(y)];
+        }
+        b
+    };
+    let a = bounds(full);
+    let b = bounds((108, 192));
+    assert!(
+        a.iter().zip(b).all(|(x, y)| (*x - y).abs() <= 3),
+        "Full {a:?}, Draft {b:?}"
+    );
+    assert!(
+        (a[0] + a[2] - 216).abs() <= 5,
+        "title must center on logical canvas: {a:?}"
+    );
+}
+
+#[test]
+fn portrait_crop_preserves_native_video_detail() {
+    let canvas = (8, 16);
+    let mut image = Image::new(32, 16);
+    for y in 0..16 {
+        for x in 0..32 {
+            let v = (x % 2) as f32;
+            image.pixels[(y * 32 + x) as usize] = [v, v, v, 1.0];
+        }
+    }
+    let graph = FrameGraph {
+        nodes: vec![
+            IrNode {
+                op: IrOp::DecodeVideo {
+                    asset: AssetId::new(),
+                    src_time: Tick(0),
+                    proxy: false,
+                },
+                inputs: vec![],
+                content_hash: ContentHash(9001),
+            },
+            IrNode {
+                op: IrOp::Transform2D {
+                    mat: glam::Mat3::from_translation(glam::Vec2::new(-12.0, 0.0))
+                        * glam::Mat3::from_scale(glam::Vec2::new(4.0, 1.0)),
+                    sampling: Sampling::Bilinear,
+                },
+                inputs: vec![(IrNodeId(0), OutPort::default())],
+                content_hash: ContentHash(9002),
+            },
+        ],
+        output: Some(IrNodeId(1)),
+    };
+    let mut expected = Image::new(8, 16);
+    for y in 0..16 {
+        for x in 0..8 {
+            expected.pixels[(y * 8 + x) as usize] = image.pixel(x + 12, y);
+        }
+    }
+    let cpu = eval_cpu::evaluate(
+        &graph,
+        canvas,
+        &mut PatternCpuSource {
+            image: image.clone(),
+        },
+    );
+    assert_pixels_within("native crop CPU", &expected, &cpu, 0.001);
+    if let Some(gpu) = gpu_or_skip("native crop") {
+        let mut source = PatternGpuSource {
+            frame: GpuFrame::new(upload_pattern(&gpu, &image), 32, 16),
+        };
+        let actual = eval_gpu_at(&gpu, &graph, &mut source, canvas);
+        assert_pixels_within("native crop GPU", &expected, &actual, 0.001);
     }
 }

@@ -1001,6 +1001,21 @@ fn draw_speed_ramp_editor(
 
 // ── Reframe (05 §4.2, CAP-012) ───────────────────────────────────────────────
 
+/// Scale the renderer's normalized source back to its display aspect, covering
+/// the output. Store ordinary transforms so UI and MCP retain identical edits.
+fn cover_scales(sw: u32, sh: u32, pixel_aspect: f64, fw: u32, fh: u32) -> Option<(f64, f64)> {
+    if sw == 0 || sh == 0 || fw == 0 || fh == 0 || !pixel_aspect.is_finite() || pixel_aspect <= 0.0
+    {
+        return None;
+    }
+    let ratio = (sw as f64 * pixel_aspect / sh as f64) / (fw as f64 / fh as f64);
+    Some(if ratio >= 1.0 {
+        (ratio, 1.0)
+    } else {
+        (1.0, 1.0 / ratio)
+    })
+}
+
 fn draw_reframe_section(
     ui: &mut Ui,
     project: &TimelineProject,
@@ -1018,7 +1033,7 @@ fn draw_reframe_section(
         .map(|s| s.formats.len())
         .unwrap_or(1);
     egui::CollapsingHeader::new("Reframe")
-        .default_open(false)
+        .default_open(true)
         .id_salt("clip_inspector_reframe")
         .show(ui, |ui| {
             // Per-format override dot row (13 §5.1: "small format-index chip
@@ -1045,6 +1060,32 @@ fn draw_reframe_section(
                 .unwrap_or(clip.transform.base);
             let mut new_t = base;
             let mut changed = false;
+            let format = project.sequences.get(&seq).and_then(|s| s.formats.get(active_format));
+            if let Some(format) = format {
+                ui.label(format!("{} · {} × {}", format.name, format.width, format.height));
+                let source = clip.source.asset()
+                    .and_then(|id| project.media.assets.get(&id))
+                    .and_then(|asset| asset.probe.as_ref())
+                    .and_then(|probe| probe.video.as_ref());
+                let scales = source.and_then(|v| cover_scales(
+                    v.width, v.height, v.pixel_aspect as f64, format.width, format.height,
+                ));
+                if ui.add_enabled(scales.is_some(), egui::Button::new("Fill frame"))
+                    .on_hover_text("Center and crop to fill this format without stretching. Resets position and rotation for this format.")
+                    .clicked()
+                {
+                    if let Some((scale_x, scale_y)) = scales {
+                        let mut new_clip = clip.clone();
+                        new_clip.reframe.insert(active_format, photonic_core::timeline::ClipTransform {
+                            scale_x, scale_y, opacity: base.opacity, ..Default::default()
+                        });
+                        set_clip_discrete(project, seq, track, new_clip, action);
+                    }
+                }
+                if scales.is_none() {
+                    ui.label(RichText::new("Probe source media to enable Fill frame.").small().color(MUTED));
+                }
+            }
             egui::Grid::new("clip_reframe_grid")
                 .num_columns(2)
                 .spacing([4.0, 2.0])
@@ -1896,12 +1937,13 @@ fn draw_keyframes_section(
 
 // ── Transitions (13 §5.1, 08 §2.0b) ─────────────────────────────────────────
 
-const TRANSITION_KINDS: [TransitionKind; 5] = [
+const TRANSITION_KINDS: [TransitionKind; 6] = [
     TransitionKind::CrossDissolve,
     TransitionKind::DipToBlack,
     TransitionKind::DipToColor,
     TransitionKind::Wipe,
     TransitionKind::Push,
+    TransitionKind::LumaWipe,
 ];
 
 fn transition_label(kind: TransitionKind) -> &'static str {
@@ -1911,6 +1953,7 @@ fn transition_label(kind: TransitionKind) -> &'static str {
         TransitionKind::DipToColor => "Dip to Color",
         TransitionKind::Wipe => "Wipe",
         TransitionKind::Push => "Push",
+        TransitionKind::LumaWipe => "Masked Wipe",
         // Forward-compat (39 §2.2): show the preserved tag; renders as a cut.
         TransitionKind::Unknown(t) => t.as_str(),
         // `#[non_exhaustive]`: a kind a newer build adds shows a placeholder.
@@ -1952,7 +1995,11 @@ fn draw_one_transition(
         &clip.transition_out
     };
     ui.horizontal(|ui| {
-        ui.label(label);
+        ui.label(label).on_hover_text(if is_in {
+            "Blends from the preceding clip at the cut using its available source handles"
+        } else {
+            "Fades at the end of a clip before a gap or sequence end"
+        });
         match current {
             None => {
                 if ui.small_button("Add Transition").clicked() {
@@ -2017,11 +2064,296 @@ fn draw_one_transition(
             }
         }
     });
+    if let Some(t) = current {
+        let mut params = t.params;
+        ui.push_id(("transition_parameters", clip.id, is_in), |ui| {
+            draw_transition_parameters(ui, t.kind, &mut params);
+        });
+        if params != t.params {
+            let mut new_clip = clip.clone();
+            let updated = Transition { params, ..*t };
+            if is_in {
+                new_clip.transition_in = Some(updated);
+            } else {
+                new_clip.transition_out = Some(updated);
+            }
+            set_clip_coalesced(project, seq, track, new_clip, action);
+        }
+    }
+}
+
+fn draw_transition_parameters(ui: &mut Ui, kind: TransitionKind, params: &mut TransitionParams) {
+    use photonic_core::timeline::{EaseCurve, LumaWipeMap, WipeDirection};
+    egui::ComboBox::from_label("Easing")
+        .selected_text(match params.curve {
+            EaseCurve::Linear => "Linear",
+            EaseCurve::EaseIn => "Ease in",
+            EaseCurve::EaseOut => "Ease out",
+            EaseCurve::EaseInOut => "Ease in and out",
+        })
+        .show_ui(ui, |ui| {
+            for (value, label) in [
+                (EaseCurve::Linear, "Linear"),
+                (EaseCurve::EaseIn, "Ease in"),
+                (EaseCurve::EaseOut, "Ease out"),
+                (EaseCurve::EaseInOut, "Ease in and out"),
+            ] {
+                ui.selectable_value(&mut params.curve, value, label);
+            }
+        });
+    if matches!(kind, TransitionKind::Wipe | TransitionKind::Push) {
+        egui::ComboBox::from_label("Direction")
+            .selected_text(format!("{:?}", params.direction))
+            .show_ui(ui, |ui| {
+                for value in [
+                    WipeDirection::Left,
+                    WipeDirection::Right,
+                    WipeDirection::Up,
+                    WipeDirection::Down,
+                ] {
+                    ui.selectable_value(&mut params.direction, value, format!("{value:?}"));
+                }
+            });
+    }
+    if kind == TransitionKind::LumaWipe {
+        let maps = [
+            (LumaWipeMap::LinearH, "Horizontal"),
+            (LumaWipeMap::LinearV, "Vertical"),
+            (LumaWipeMap::Radial, "Iris"),
+            (LumaWipeMap::BarnDoorH, "Barn doors"),
+            (LumaWipeMap::Clock, "Clock"),
+        ];
+        let selected = maps
+            .iter()
+            .find(|(value, _)| *value == params.luma_map)
+            .map_or("Mask", |(_, label)| *label);
+        egui::ComboBox::from_label("Mask shape")
+            .selected_text(selected)
+            .show_ui(ui, |ui| {
+                for (value, label) in maps {
+                    ui.selectable_value(&mut params.luma_map, value, label);
+                }
+            });
+        ui.checkbox(&mut params.invert, "Reverse mask");
+    }
+    if matches!(kind, TransitionKind::Wipe | TransitionKind::LumaWipe) {
+        ui.add(egui::Slider::new(&mut params.softness, 0.0..=0.5).text("Edge softness"));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn masked_wipe_reverse_control_is_undoable() {
+        use photonic_core::history::{Command, CommandHistory};
+        use photonic_core::timeline::media::{ProbedColor, ScanType, VideoStreamInfo};
+        use photonic_core::timeline::{
+            AssetKind, AssetSource, ClipSource, FrameRate, MediaAsset, MediaProbe, Sequence, Track,
+        };
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::new(
+            AssetKind::Video,
+            AssetSource::File {
+                path: "fixture.mov".into(),
+                rel_path: None,
+            },
+        );
+        let mut probe = MediaProbe::basic(Tick(1000), "mov", "h264");
+        probe.video = Some(VideoStreamInfo {
+            width: 3840,
+            height: 2160,
+            frame_rate: FrameRate::FPS_30,
+            pixel_aspect: 1.0,
+            color: ProbedColor::default(),
+            keyframe_index_cached: false,
+            scan: ScanType::Progressive,
+        });
+        asset.probe = Some(probe);
+        let asset_id = project.media.insert(asset);
+        let mut seq = Sequence::new("Portrait", FrameRate::FPS_30, 1080, 1920);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(ClipSource::Asset { asset: asset_id }, Tick(0), Tick(1000));
+        clip.transition_in = Some(Transition::new(
+            TransitionKind::LumaWipe,
+            Tick(TICKS_PER_SECOND / 2),
+        ));
+        let (sid, tid, cid) = (seq.id, track.id, clip.id);
+        track.clips.push(clip.clone());
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut action = None;
+        let mut run = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_one_transition(ui, &project, sid, tid, &clip, true, &mut action)
+                    });
+                },
+            )
+        };
+        let output = run(vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Reverse mask" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("Masked wipe parameters are visible");
+        let _ = run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let Some(PanelAction::ClipEditCoalesced(cmd)) = action else {
+            panic!("click must produce one discrete edit");
+        };
+        let mut doc = photonic_core::Document::new("test", 1080.0, 1920.0);
+        doc.timeline = Some(project);
+        let before = doc.timeline.clone();
+        let mut history = CommandHistory::new(10);
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        let after = doc.timeline.clone();
+        let (_, _, edited) = locate_clip(doc.timeline.as_ref().unwrap(), cid).unwrap();
+        assert!(edited.transition_in.as_ref().unwrap().params.invert);
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.timeline, before);
+        assert!(history.redo(&mut doc));
+        assert_eq!(doc.timeline, after);
+    }
+
+    #[test]
+    fn fill_frame_button_emits_one_undoable_edit() {
+        use photonic_core::history::{Command, CommandHistory};
+        use photonic_core::timeline::media::{ProbedColor, ScanType, VideoStreamInfo};
+        use photonic_core::timeline::{
+            AssetKind, AssetSource, ClipSource, FrameRate, MediaAsset, MediaProbe, Sequence, Track,
+        };
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::new(
+            AssetKind::Video,
+            AssetSource::File {
+                path: "fixture.mov".into(),
+                rel_path: None,
+            },
+        );
+        let mut probe = MediaProbe::basic(Tick(1000), "mov", "h264");
+        probe.video = Some(VideoStreamInfo {
+            width: 3840,
+            height: 2160,
+            frame_rate: FrameRate::FPS_30,
+            pixel_aspect: 1.0,
+            color: ProbedColor::default(),
+            keyframe_index_cached: false,
+            scan: ScanType::Progressive,
+        });
+        asset.probe = Some(probe);
+        let asset_id = project.media.insert(asset);
+        let mut seq = Sequence::new("Portrait", FrameRate::FPS_30, 1080, 1920);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let clip = Clip::new(ClipSource::Asset { asset: asset_id }, Tick(0), Tick(1000));
+        let (sid, tid, cid) = (seq.id, track.id, clip.id);
+        track.clips.push(clip.clone());
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut action = None;
+        let mut run = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(400.0, 800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_reframe_section(ui, &project, sid, tid, &clip, 0, &mut action)
+                    });
+                },
+            )
+        };
+        let output = run(vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Fill frame" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("Fill frame is visible in the inspector without opening another panel");
+        let _ = run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let Some(PanelAction::ClipEditDiscrete(cmd)) = action else {
+            panic!("click must produce one discrete edit");
+        };
+        let mut doc = photonic_core::Document::new("test", 1080.0, 1920.0);
+        doc.timeline = Some(project);
+        let before = doc.timeline.clone();
+        let mut history = CommandHistory::new(10);
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        let after = doc.timeline.clone();
+        let (_, _, edited) = locate_clip(doc.timeline.as_ref().unwrap(), cid).unwrap();
+        assert!((edited.reframe[&0].scale_x - 256.0 / 81.0).abs() < 1e-10);
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.timeline, before);
+        assert!(history.redo(&mut doc));
+        assert_eq!(doc.timeline, after);
+    }
+
+    #[test]
+    fn fill_frame_preserves_source_aspect_for_portrait_and_landscape() {
+        let (x, y) = cover_scales(3840, 2160, 1.0, 1080, 1920).unwrap();
+        assert!((x - 256.0 / 81.0).abs() < 1e-10);
+        assert_eq!(y, 1.0);
+        let (x, y) = cover_scales(1080, 1920, 1.0, 1920, 1080).unwrap();
+        assert_eq!(x, 1.0);
+        assert!((y - 256.0 / 81.0).abs() < 1e-10);
+        assert!(cover_scales(0, 2160, 1.0, 1080, 1920).is_none());
+        assert!(cover_scales(3840, 2160, f64::NAN, 1080, 1920).is_none());
+    }
 
     #[test]
     fn swapped_order_swaps_only_the_two_indices() {
