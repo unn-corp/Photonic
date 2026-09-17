@@ -11774,7 +11774,7 @@ mod tests {
         assert_ne!(r.is_error, Some(true), "relink_media_batch: {r:?}");
         assert_eq!(
             asset_path(&state, &ids[0]).await,
-            new.join("a.mp4").to_string_lossy()
+            canonical_new.join("a.mp4").to_string_lossy()
         );
         let r = call(&state, "list_media", json!({})).await;
         let row = data(&r)["assets"]
