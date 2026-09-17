@@ -143,6 +143,7 @@ mod tests {
         f.write_all(&[0u8; 1000]).unwrap();
         let mut f = std::fs::File::create(cache.join("abc.poster.png")).unwrap();
         f.write_all(&[0u8; 200]).unwrap();
+        drop(f);
 
         let report = summarize_cache(Some(&project));
         assert!(report.total_bytes >= 1200);

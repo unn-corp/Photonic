@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, TryLockError};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use photonic_core::timeline::{SequenceId, Tick};
 use serde::{Deserialize, Serialize};
@@ -515,7 +515,7 @@ impl PreviewCache {
                 "unindexed preview destination already exists".into(),
             ));
         }
-        std::fs::rename(&staging.directory, &destination)?;
+        rename_directory_for_publication(&staging.directory, &destination)?;
         let path = destination.join(
             staging
                 .path
@@ -550,6 +550,28 @@ impl PreviewCache {
         );
         Ok(chunk)
     }
+}
+
+/// Windows can briefly keep a newly synced media file open (for example while
+/// Defender inspects it), causing an otherwise valid directory rename to
+/// return `PermissionDenied`. Retry that transient condition without changing
+/// the immutable, atomic publication model.
+fn rename_directory_for_publication(source: &Path, destination: &Path) -> std::io::Result<()> {
+    const ATTEMPTS: u32 = 10;
+    for attempt in 0..ATTEMPTS {
+        match std::fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt + 1 < ATTEMPTS =>
+            {
+                std::thread::sleep(Duration::from_millis(20 * u64::from(attempt + 1)));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("rename retry loop always returns")
 }
 
 pub(crate) struct ChunkStaging {

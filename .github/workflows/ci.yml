@@ -110,7 +110,10 @@ jobs:
         # silently excluded from CI. The `video-p1-contract` feature stranded
         # 8 passing contract tests this way; see 29-qa-spec.md and
         # 40-spec-verification.md §3.6.
-        run: cargo test --workspace --locked --all-features
+        # Windows' software/GPU and FFmpeg tests share process-global native
+        # resources. Serial execution avoids backend contention and matches the
+        # strict video-outcomes job's one-workflow-at-a-time contract.
+        run: cargo test --workspace --locked --all-features ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
 
   lint:
     name: Lint (fmt + clippy)

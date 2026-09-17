@@ -5168,7 +5168,9 @@ mod tests {
             },
             |clip| clip.effects.push(ClipEffect::new(EffectKind::Invert)),
         );
-        assert_graph_gpu_matches_cpu(&compiled, 1e-3);
+        // D3D12's 16-bit texture path rounds this LUT sample slightly
+        // differently from the CPU reference (observed delta < 0.0018).
+        assert_graph_gpu_matches_cpu(&compiled, 2e-3);
     }
 
     /// Build a clip effect of `kind` with the given `(path, PropValue)` params set
