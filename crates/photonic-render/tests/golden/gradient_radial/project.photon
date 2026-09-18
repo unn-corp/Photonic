@@ -1,0 +1,152 @@
+{
+  "format_version": 2,
+  "id": "3281dcbd-573b-44ce-8bf4-b2663b5f72e0",
+  "name": "gradient-radial",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "e9cec19a-3b55-4a63-b565-37c5cd110351"
+  ],
+  "layers": {
+    "e9cec19a-3b55-4a63-b565-37c5cd110351": {
+      "id": "e9cec19a-3b55-4a63-b565-37c5cd110351",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "d831f32e-cf4f-43cd-8d52-cc04b3480eb5"
+      ]
+    }
+  },
+  "nodes": {
+    "d831f32e-cf4f-43cd-8d52-cc04b3480eb5": {
+      "id": "d831f32e-cf4f-43cd-8d52-cc04b3480eb5",
+      "name": "gradient-ellipse",
+      "layer_id": "e9cec19a-3b55-4a63-b565-37c5cd110351",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M105,60 C105,84.8528137423857 84.8528137423857,105 60,105 C35.14718625761431,105 15.000000000000007,84.8528137423857 15,60.00000000000001 C14.999999999999993,35.14718625761431 35.147186257614294,15.000000000000007 59.99999999999999,15 C84.85281374238569,14.999999999999993 105,35.147186257614294 105,59.999999999999986"
+        },
+        "fill": {
+          "kind": {
+            "type": "gradient",
+            "kind": "radial",
+            "stops": [
+              {
+                "offset": 0.0,
+                "color": {
+                  "r": 0.95,
+                  "g": 0.95,
+                  "b": 1.0,
+                  "a": 1.0
+                },
+                "midpoint": 0.5
+              },
+              {
+                "offset": 0.6,
+                "color": {
+                  "r": 0.2,
+                  "g": 0.5,
+                  "b": 0.9,
+                  "a": 1.0
+                },
+                "midpoint": 0.5
+              },
+              {
+                "offset": 1.0,
+                "color": {
+                  "r": 0.0,
+                  "g": 0.05,
+                  "b": 0.3,
+                  "a": 1.0
+                },
+                "midpoint": 0.5
+              }
+            ],
+            "coords": [
+              60.0,
+              60.0,
+              60.0,
+              60.0,
+              45.0
+            ],
+            "interpolation": "srgb",
+            "units": "user_space_on_use"
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "e9cec19a-3b55-4a63-b565-37c5cd110351",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "e29034b8-d738-4d3b-a19c-5744719d9a65",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "e29034b8-d738-4d3b-a19c-5744719d9a65",
+  "photon_format": 1
+}

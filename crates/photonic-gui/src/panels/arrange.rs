@@ -17,7 +17,7 @@ pub(crate) fn draw_arrange_align(ui: &mut Ui, ctx: &mut PropPanelCtx) {
         ui.label(
             RichText::new("Arrange & Align")
                 .small()
-                .color(Color32::from_rgb(80, 80, 110)),
+                .color(crate::theme::section_header_color(ui)),
         );
         ui.add_space(2.0);
     }

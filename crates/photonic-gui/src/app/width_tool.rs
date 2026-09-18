@@ -234,7 +234,7 @@ impl PhotonicApp {
             for (idx, top, bottom) in self.width_handle_positions(doc, view, node) {
                 for (pos, is_right) in [(top, false), (bottom, true)] {
                     let d = pos.distance(screen);
-                    if d <= HANDLE_GRAB_PX && best.map_or(true, |b| d < b.0) {
+                    if d <= HANDLE_GRAB_PX && best.is_none_or(|b| d < b.0) {
                         best = Some((d, node.id, idx, is_right));
                     }
                 }

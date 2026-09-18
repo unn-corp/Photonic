@@ -8,6 +8,7 @@ license.workspace = true
 photonic-core = { path = "../photonic-core" }
 kurbo = { workspace = true }
 photonic-render = { path = "../photonic-render" }
+photonic-video = { path = "../photonic-video" }
 photonic-embed = { path = "../photonic-embed" }
 photonic-matte = { path = "../photonic-matte" }
 photonic-mcp = { path = "../photonic-mcp" }
@@ -27,6 +28,14 @@ tracing = { workspace = true }
 rfd = "0.15"
 regex = "1"
 pollster = { workspace = true }
+# `photonic_video::captions::provider::ProgressSink` is a
+# `crossbeam_channel::Sender<ProviderProgress>` (06 §2.1) — the caption-editor
+# panel (06 §3/§6) calls the committed `TranscriptionProvider`/`TtsProvider`
+# trait directly (mock provider, same as MCP's `auto_caption`/
+# `generate_voiceover` "mock" path) on a background thread, so it needs a
+# channel of that exact type. Already resolved elsewhere in the workspace
+# (photonic-video) at 0.5.15; MIT/Apache-2.0, zero-cost MPMC/SPSC channel.
+crossbeam-channel = "0.5"
 self_update = { version = "0.42", default-features = false, features = [
     "rustls",
     "archive-tar",

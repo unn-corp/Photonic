@@ -54,6 +54,12 @@ impl PhotonicRenderer {
     pub(crate) fn capture_rgba(&mut self, vertices: &[Vertex], indices: &[u32]) -> Vec<u8> {
         let w = self.width;
         let h = self.height;
+        // Offscreen capture reuses the persistent document buffers; ensure they
+        // fit these vertices/indices before `record_document_pass` writes them.
+        self.ensure_doc_buffers(
+            std::mem::size_of_val(vertices) as u64,
+            std::mem::size_of_val(indices) as u64,
+        );
 
         // Offscreen resolve target (single-sample, read back as PNG)
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -66,7 +72,12 @@ impl PhotonicRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: self.surface_format,
+            // Offscreen capture shares the document-pass pipelines, which target
+            // the sRGB `scene_format` (03 §4.5.4); the capture + MSAA targets and
+            // the text pass therefore MUST be `scene_format` too, or wgpu panics on
+            // a colour-target format mismatch. Reading back this sRGB texture yields
+            // the same encoded bytes the headless export path produces.
+            format: self.scene_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
@@ -74,7 +85,7 @@ impl PhotonicRenderer {
 
         // MSAA render target for the capture (resolved into tex_view)
         let (capture_msaa_tex, capture_msaa_view) =
-            create_msaa_texture(&self.device, self.surface_format, w, h);
+            create_msaa_texture(&self.device, self.scene_format, w, h);
 
         // Draw geometry into the offscreen texture via MSAA (with effects layer).
         let mut enc = self.device.create_command_encoder(&Default::default());
@@ -237,8 +248,10 @@ impl PhotonicRenderer {
 
         let raw = slice.get_mapped_range();
 
+        // Capture now reads back the sRGB `scene_format` (03 §4.5.4), which is a
+        // fixed `Rgba8UnormSrgb` — never a BGRA order — so there is no channel swap.
         let is_bgra = matches!(
-            self.surface_format,
+            self.scene_format,
             wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
         );
 
@@ -521,7 +534,7 @@ mod offscreen_tests {
         const H: u32 = 48;
         let mut doc = Document::new("raster parity", W as f64, H as f64);
         let layer_id = doc.active_layer_id.unwrap();
-        let image = RasterImage::from_rgba(24, 20, vec![255, 0, 0, 255].repeat(24 * 20))
+        let image = RasterImage::from_rgba(24, 20, [255, 0, 0, 255].repeat(24 * 20))
             .expect("valid raster image");
         let mut raster = RasterNode::new(image);
         raster.mask = Some(Mask::rect(24, 20, 0, 0, 12, 20));
@@ -650,6 +663,30 @@ mod offscreen_tests {
             "live renderer broke after shared export: center={lc:?}"
         );
     }
+
+    /// A-1 invariant (03 §4.5.4): the offscreen document target — the format the
+    /// fill/blend/composite pass renders and reads back in — is the sRGB
+    /// `SCENE_FORMAT`, never the non-sRGB presentation surface. This is what makes
+    /// on-canvas blending run in linear light and match the headless export path;
+    /// a real assertion on the wired-up renderer, not a stdlib property check.
+    #[test]
+    fn document_target_is_srgb() {
+        let doc = Document::new("srgb_target", 8.0, 8.0);
+        let Some(r) = offscreen(doc, 8, 8) else {
+            eprintln!("no GPU adapter — skipping document_target_is_srgb");
+            return;
+        };
+        assert_eq!(
+            r.scene_format(),
+            crate::pipeline::SCENE_FORMAT,
+            "document pass must target the sRGB SCENE_FORMAT",
+        );
+        assert!(
+            r.scene_format().is_srgb(),
+            "scene_format must be sRGB so document blending runs in linear light",
+        );
+    }
+
     /// Stage 0 smoke test: the windowless renderer drives the real GPU pipeline
     /// and reads pixels back. A red rect filling a 20×20 doc → red at the centre.
     #[test]
@@ -769,8 +806,16 @@ mod offscreen_tests {
     /// Stage 1 (#226): a layer at 50% opacity composites as an **isolated unit**.
     /// Two overlapping opaque rects (red under, blue over) live in one 50%-opacity
     /// layer over a white artboard. Correct per-layer isolation makes the overlap
-    /// = blue@50% over white ≈ (128,128,255); the *old per-node fold* would double
-    /// the layer opacity there and give ≈ (128,64,191). This pins the fix.
+    /// = blue@50% over white; the *old per-node fold* would double the layer
+    /// opacity there. This pins the isolation fix.
+    ///
+    /// A-1 (03 §4.5.4): the document pass now composites in the sRGB
+    /// `scene_format`, so the 50% source-over runs in **linear light** — the
+    /// composite shader samples the sRGB layer/backdrop as linear, mixes 50/50 in
+    /// linear, and the sRGB store re-encodes: blue@50% over white is
+    /// `srgb_oetf(0.5)` ≈ **188** (not the pre-fix gamma-space 128). The isolation
+    /// invariant (overlap == blue-only, red kept separate) is unchanged; only the
+    /// blend space moved to linear per spec.
     #[test]
     fn half_opacity_layer_composites_as_isolated_unit() {
         let mut doc = Document::new("iso", 20.0, 20.0);
@@ -810,17 +855,18 @@ mod offscreen_tests {
         let overlap = img.get_pixel(10, 10).0; // blue over red → blue on top
         let red_only = img.get_pixel(3, 3).0;
         let blue_only = img.get_pixel(17, 17).0;
+        // Linear-light 50/50 over white → srgb_oetf(0.5) ≈ 188 (A-1, §4.5.4).
         assert!(
-            near(overlap, [128, 128, 255]),
-            "overlap must be blue@50% over white (isolated), got {overlap:?}"
+            near(overlap, [188, 188, 255]),
+            "overlap must be blue@50% over white in linear light (isolated), got {overlap:?}"
         );
         assert!(
-            near(red_only, [255, 128, 128]),
-            "red-only region must be red@50% over white, got {red_only:?}"
+            near(red_only, [255, 188, 188]),
+            "red-only region must be red@50% over white in linear light, got {red_only:?}"
         );
         assert!(
-            near(blue_only, [128, 128, 255]),
-            "blue-only region must be blue@50% over white, got {blue_only:?}"
+            near(blue_only, [188, 188, 255]),
+            "blue-only region must be blue@50% over white in linear light, got {blue_only:?}"
         );
     }
 
@@ -829,7 +875,8 @@ mod offscreen_tests {
     /// but the blue rect has a drop shadow. Under Stage 1 this doc fell back to the
     /// flat effects path (no layer isolation) and the overlap would be opaque blue;
     /// with Stage 2 the layer (shadow + shapes) composites at 50%, so the overlap
-    /// is still blue@50% over white ≈ (128,128,255).
+    /// is still blue@50% over white — in linear light ≈ (188,188,255) post-A-1
+    /// (03 §4.5.4, was gamma-space 128 before the sRGB document target).
     #[test]
     fn nontrivial_layer_with_drop_shadow_stays_isolated() {
         use photonic_core::node::DropShadow;
@@ -871,12 +918,13 @@ mod offscreen_tests {
             .expect("png")
             .to_rgba8();
         let overlap = img.get_pixel(10, 10).0; // opaque blue over its own shadow
+                                               // Linear-light 50% over white → srgb_oetf(0.5) ≈ 188 (A-1, §4.5.4).
         assert!(
-            (overlap[0] as i32 - 128).abs() < 16
-                && (overlap[1] as i32 - 128).abs() < 16
+            (overlap[0] as i32 - 188).abs() < 16
+                && (overlap[1] as i32 - 188).abs() < 16
                 && (overlap[2] as i32 - 255).abs() < 16,
-            "layer with a drop shadow must still composite at 50% (isolated), \
-             got {overlap:?}"
+            "layer with a drop shadow must still composite at 50% in linear light \
+             (isolated), got {overlap:?}"
         );
     }
 }

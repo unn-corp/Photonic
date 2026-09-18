@@ -877,7 +877,7 @@ pub async fn divide_objects_below(state: &AppState, args: DivideObjectsBelowArgs
         None => return ToolResult::error("cutter layer not found"),
     };
 
-    let below_ids: Vec<uuid::Uuid> = layer.node_ids[..cutter_z].iter().copied().collect();
+    let below_ids: Vec<uuid::Uuid> = layer.node_ids[..cutter_z].to_vec();
 
     let mut commands: Vec<Command> = Vec::new();
     let mut split_count = 0usize;

@@ -306,7 +306,7 @@ pub(crate) fn apply_round_corners(bez: &kurbo::BezPath, radius: f64) -> kurbo::B
         }
 
         let n = pts.len();
-        let effective_n = if closed { n } else { n };
+        let effective_n = n;
 
         for i in 0..effective_n {
             let prev = if i == 0 {
@@ -385,9 +385,7 @@ pub(crate) fn apply_round_corners(bez: &kurbo::BezPath, radius: f64) -> kurbo::B
                     curr.y + (dy_out / len_out) * r,
                 );
 
-                if i == 0 && closed {
-                    result.move_to(fillet_start);
-                } else if i == 0 {
+                if i == 0 {
                     result.move_to(fillet_start);
                 } else {
                     result.line_to(fillet_start);

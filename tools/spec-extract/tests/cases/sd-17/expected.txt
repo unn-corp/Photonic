@@ -1,0 +1,3 @@
+doc.md:1
+  spec-assert: ci-step-contains gen-mcp-docs.py
+  actual:      not found in .github/workflows/*

@@ -408,7 +408,7 @@ impl PathData {
     pub fn subdivide(&self, passes: u32) -> PathData {
         use kurbo::PathEl;
 
-        let passes = passes.min(8).max(1);
+        let passes = passes.clamp(1, 8);
         let mut path = self.to_bez_path();
 
         for _ in 0..passes {

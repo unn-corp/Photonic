@@ -54,7 +54,7 @@ pub fn round_corners(bez: &kurbo::BezPath, radius: f64) -> kurbo::BezPath {
         return bez.clone();
     }
 
-    let els: Vec<kurbo::PathEl> = bez.elements().iter().copied().collect();
+    let els: Vec<kurbo::PathEl> = bez.elements().to_vec();
     if els.is_empty() {
         return bez.clone();
     }

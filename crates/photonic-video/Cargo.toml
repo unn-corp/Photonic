@@ -1,0 +1,102 @@
+[package]
+name = "photonic-video"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+description = "Video engine for Photonic: frame-graph IR, decode, playback, audio, export (docs/specs/video-editor/02-engine.md)"
+
+[dependencies]
+photonic-core = { path = "../photonic-core" }
+# Decode delivers YUV planes to the render crate's consumer type
+# (photonic_render::video::YuvPlanes) — allowed dep direction per 00 §3.
+photonic-render = { path = "../photonic-render" }
+uuid = { workspace = true }
+glam = { workspace = true }
+wgpu = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Content-hash (relink identity, 01 §3). xxh3 is the spec's first choice:
+# 64-bit output (far lower collision probability than the crc32fast already in
+# the tree) and deterministic across platforms/toolchain versions — unlike
+# std's DefaultHasher (SipHash), whose output Rust explicitly does not
+# guarantee stable, which a persisted relink hash requires. Single MIT crate,
+# zero transitive deps → cargo-deny clean.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+# Audio device I/O (09 §3's stack decision: cpal over rodio — raw callback
+# access the mixer worker's real-time drain needs). Apache-2.0.
+cpal = "0.18"
+# Lock-free SPSC ring buffer for the mixer-worker -> cpal-callback handoff
+# (09 §5). Purpose-built for exactly this real-time-audio producer/consumer
+# shape (chunked, wait-free read/write, no allocation on the hot path) rather
+# than hand-rolling atomics. Dual MIT/Apache-2.0.
+rtrb = "0.3"
+# Provider job progress/cancellation channel (06 §2.1: `ProgressSink =
+# crossbeam_channel::Sender<ProviderProgress>`). Already resolved elsewhere in
+# the workspace (transitively) at 0.5.15; MIT/Apache-2.0, zero-cost MPMC/SPSC
+# channel, matches the thread-based (not async) job model the whole engine uses.
+crossbeam-channel = "0.5"
+# Lock-free single-value publish/read for the engine→GUI frame + status
+# handoff (02 §1: "publishes EngineFrame + EngineStatus via triple_buffer/watch
+# — GUI never blocks on engine"). arc-swap is the minimal fit: an atomic
+# `Arc` cell the engine stores into and the GUI loads from, wait-free on both
+# sides, no Mutex on the present path. MIT/Apache-2.0, zero transitive deps →
+# cargo-deny clean.
+arc-swap = "1"
+# Blocking HTTP client for the hosted AI provider adapter (06 §2.4
+# `hosted.rs`). Matches 06 §2.1's "blocking trait method on a provider worker"
+# model — no second (async) concurrency model introduced. Already a resolved,
+# vetted dependency of `photonic-matte` in this workspace (same "2.12" line),
+# so reusing it here adds no new dependency footprint. MIT/Apache-2.0. The
+# `json` feature (send_json/into_json) is required explicitly here because
+# per-package feature unification is scoped to this crate's own build graph
+# when building `-p photonic-video` alone.
+ureq = { version = "2.12", features = ["json"] }
+# The hosted adapter's generic-JSON contract carries WAV bytes as base64
+# (06 §2.4 `hosted.rs`); already a workspace dependency (screenshot encoding),
+# reused rather than hand-rolled.
+base64 = { workspace = true }
+# Block-on for the headless `GpuContext::request_blocking` (CLI/headless/MCP
+# entry that requests its own adapter, 02 §1) and export readback. Already a
+# workspace dependency; MIT/Apache-2.0.
+pollster = { workspace = true }
+# Uniform-buffer packing for the evaluator's fill/merge passes (graph/eval.rs).
+# Already the render crate's uniform-packing crate; MIT/Apache/Zlib.
+bytemuck = { workspace = true }
+# PNG encode/decode + `RgbaImage` for the always-compiled `testing::frame_compare`
+# module (29 §3 / CAP-019): the acceptance-story harness in another crate needs
+# the 11 §1.2 two-layer metric and its diff-heatmap output, so the comparator can
+# no longer live only in this crate's test binary. Promoted from a dev-dependency
+# to a normal one for exactly that reason; already a vetted workspace dependency.
+image = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Named pipe (FIFO) for the export encoder's second (audio) piped ffmpeg
+# input (export/encoder.rs) — a direct `libc::mkfifo` call rather than
+# shelling out to the `mkfifo` binary. Already resolved elsewhere in the
+# workspace transitively (cpal → libc) at a compatible version; MIT/Apache-2.0,
+# cargo-deny clean.
+libc = "0.2"
+
+[dev-dependencies]
+pollster = { workspace = true }
+# Local loopback HTTP stub for hosted-adapter request-shape tests (06 §2.4,
+# §8): asserts the exact request the adapter sends for both endpoint shapes
+# without any live network dependency. Dev-only, dual MIT/Apache-2.0, minimal
+# transitive footprint (ascii, chunked_transfer, httpdate, log).
+tiny_http = "0.12"
+# Perf-budget benches (02 §8, gated by 11 §6 P3: `benches/engine.rs`). Dual
+# MIT/Apache-2.0, cargo-deny clean. `default-features = false` drops the
+# `plotters`/`rayon` defaults (HTML report generation, parallel sampling) —
+# not needed for the console pass/fail this crate's benches print; only
+# `cargo_bench_support` is required for the standard `cargo bench` harness.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Golden-case `meta.toml` parsing (11 §1.1: ticks/format/notes per case). The
+# generator writes the TOML text directly; only the harness deserializes it.
+# Already resolved in the workspace lock; MIT/Apache-2.0, cargo-deny clean.
+toml = "1"
+
+[[bench]]
+name = "engine"
+harness = false

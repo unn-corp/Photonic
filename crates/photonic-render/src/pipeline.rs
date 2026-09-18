@@ -520,12 +520,27 @@ pub fn create_blur_pipeline_with_blend(
 
 // ─── Layer composite (offscreen isolation, all blend modes) ─────────────────────
 
+/// True when `mode` cannot be expressed as fixed-function GPU blending and so
+/// needs the offscreen COMPOSITE_SHADER isolation pass (03 §2.4): every mode
+/// except `Normal` and the four [`SEPARABLE_BLEND_MODES`]. This is the 22 modes
+/// (backdrop-read separable + HSL non-separable) that previously fell back to a
+/// normal-alpha on-canvas approximation (issue #17).
+pub(crate) fn mode_needs_isolation(mode: BlendMode) -> bool {
+    mode != BlendMode::Normal && !SEPARABLE_BLEND_MODES.contains(&mode)
+}
+
+/// True when any draw segment uses a blend mode that needs the isolation pass.
+/// The isolation compositing path is entered only in this case, so documents
+/// that are entirely `Normal`/separable keep the untouched fixed-function draw
+/// (and thus remain byte-identical — the golden-corpus contract, 03 §2.6).
+pub(crate) fn segments_need_isolation(segments: &[DrawSegment]) -> bool {
+    segments.iter().any(|s| mode_needs_isolation(s.mode))
+}
+
 /// Stable numeric id for a blend mode, passed to the composite shader. Matches
 /// the `BlendMode` declaration order; indices `>= 12` are the non-separable HSL
 /// modes. Explicit (not `as u32`) so the mapping can't drift if the enum is
 /// reordered.
-// Wired into the per-layer composite passes in the next increment.
-#[allow(dead_code)]
 pub(crate) fn blend_mode_index(mode: BlendMode) -> u32 {
     match mode {
         BlendMode::Normal => 0,
@@ -802,6 +817,244 @@ pub fn create_composite_pipeline(
     })
 }
 
+// ─── Scene → surface present (blit) pass (03 §4.5.4, audit A-1) ─────────────────
+
+/// Full-screen present shader for the A-1 blit (03 §4.5.4): samples the sRGB
+/// offscreen scene target (the sampler hardware-decodes it to linear) and writes
+/// the sRGB-encoded pixel into a **non-sRGB** presentation surface — so the
+/// gamma encode is applied *explicitly* here (`srgb_oetf`), because the target
+/// view is not `*Srgb` and gives no free hardware encode. The `srgb_oetf`
+/// function mirrors `crate::color::srgb_oetf` byte-for-byte (breakpoint 0.0031308,
+/// slope 12.92, α 1.055, β 0.055, 1/γ = 1/2.4). Alpha is passed through: the
+/// document scene is opaque-over-BG and premultiplied source-over, so no
+/// unpremultiply is needed on this path.
+pub const BLIT_SHADER: &str = r#"
+@group(0) @binding(0) var t_scene: texture_2d<f32>;
+@group(0) @binding(1) var samp:    sampler;
+
+struct VOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0)       uv:       vec2<f32>,
+}
+
+@vertex
+fn vs_quad(@builtin(vertex_index) vi: u32) -> VOut {
+    var pos = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0,  1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0,  1.0), vec2<f32>(-1.0, 1.0)
+    );
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+    );
+    var out: VOut;
+    out.clip_pos = vec4<f32>(pos[vi], 0.0, 1.0);
+    out.uv       = uvs[vi];
+    return out;
+}
+
+fn srgb_oetf(c: f32) -> f32 {
+    if (c <= 0.0031308) { return 12.92 * c; }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+@fragment
+fn fs_blit(in: VOut) -> @location(0) vec4<f32> {
+    // Hardware sRGB-decode on sample → linear scene colour.
+    let lin = textureSample(t_scene, samp, in.uv);
+    return vec4<f32>(srgb_oetf(lin.r), srgb_oetf(lin.g), srgb_oetf(lin.b), lin.a);
+}
+"#;
+
+/// Bind group layout for the blit pass: scene texture + sampler.
+pub fn create_blit_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("blit_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The present (blit) pipeline. `output_format` is the non-sRGB presentation
+/// surface format; the shader writes the finished pixel, so no fixed-function
+/// blend and a single sample.
+pub fn create_blit_pipeline(
+    device: &wgpu::Device,
+    output_format: wgpu::TextureFormat,
+    blit_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("blit_shader"),
+        source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("blit_layout"),
+        bind_group_layouts: &[blit_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("blit_pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_quad",
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_blit",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: output_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
+// ─── Asset → working-texture conversion (03 §2.5 Tier B / §4.2) ─────────────────
+
+/// The working-graph texture format: linear-light, premultiplied `Rgba16Float`
+/// (D-09). Every `IrOp` output and the Tier B vector-to-working conversion
+/// target this format.
+pub const WORKING_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
+/// Convert an sRGB-gamma, straight-alpha RGBA8 layer into linear-light,
+/// premultiplied `Rgba16Float` — the "asset → working" boundary (§4.2 rows 2-3).
+/// The source is sampled as **raw** bytes (a non-sRGB view / an `Rgba8Unorm`
+/// upload), so the sRGB EOTF is applied explicitly here rather than by the
+/// hardware; this keeps Tier A (CPU-readback upload) and Tier B (GPU-to-GPU)
+/// numerically identical — they run the same math on the same bytes. Uses the
+/// exact sRGB EOTF from `raster/adjust.rs:72` (threshold 0.04045).
+pub const CONVERT_SHADER: &str = r#"
+@group(0) @binding(0) var t_src: texture_2d<f32>;
+@group(0) @binding(1) var samp:  sampler;
+
+struct VOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0)       uv:       vec2<f32>,
+}
+
+@vertex
+fn vs_quad(@builtin(vertex_index) vi: u32) -> VOut {
+    var pos = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0,  1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>(1.0,  1.0), vec2<f32>(-1.0, 1.0)
+    );
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 0.0)
+    );
+    var out: VOut;
+    out.clip_pos = vec4<f32>(pos[vi], 0.0, 1.0);
+    out.uv       = uvs[vi];
+    return out;
+}
+
+fn srgb_eotf(c: f32) -> f32 {
+    if (c <= 0.04045) { return c / 12.92; }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fs_convert(in: VOut) -> @location(0) vec4<f32> {
+    let raw = textureSample(t_src, samp, in.uv);
+    let lin = vec3<f32>(srgb_eotf(raw.r), srgb_eotf(raw.g), srgb_eotf(raw.b));
+    let a = raw.a;
+    return vec4<f32>(lin * a, a); // premultiplied, linear
+}
+"#;
+
+/// Bind group layout for the conversion pass: source texture + sampler.
+pub fn create_convert_bgl(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("convert_bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    })
+}
+
+/// The asset→working conversion pipeline. Output is [`WORKING_FORMAT`]; the
+/// shader writes the finished premultiplied pixel, so no fixed-function blend.
+pub fn create_convert_pipeline(
+    device: &wgpu::Device,
+    convert_bgl: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("convert_shader"),
+        source: wgpu::ShaderSource::Wgsl(CONVERT_SHADER.into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("convert_layout"),
+        bind_group_layouts: &[convert_bgl],
+        push_constant_ranges: &[],
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("convert_pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_quad",
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_convert",
+            targets: &[Some(wgpu::ColorTargetState {
+                format: WORKING_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -928,10 +1181,28 @@ mod tests {
     /// compile of the composite/blend math with no GPU device required.
     #[test]
     fn wgsl_shaders_parse_and_validate() {
+        // Grade + scope shaders splice a shared prelude at build time, so
+        // validate the expanded form the pipeline actually compiles.
+        let grade_math = crate::grade_gpu::expanded_math_shader();
+        let grade_curves = crate::grade_gpu::expanded_curves_shader();
+        let grade_lut3d = crate::grade_gpu::expanded_lut3d_shader();
+        let scope_hist = crate::scopes::expanded_histogram_shader();
+        let scope_wave = crate::scopes::expanded_waveform_shader();
+        let scope_vector = crate::scopes::expanded_vectorscope_shader();
         for (name, src) in [
             ("fill", FILL_SHADER),
             ("blur", BLUR_SHADER),
             ("composite", COMPOSITE_SHADER),
+            ("blit", BLIT_SHADER),
+            ("convert", CONVERT_SHADER),
+            ("yuv_convert", crate::video::YUV_CONVERT_SHADER),
+            ("present", crate::video::PRESENT_SHADER),
+            ("grade_math", grade_math.as_str()),
+            ("grade_curves", grade_curves.as_str()),
+            ("grade_lut3d", grade_lut3d.as_str()),
+            ("scope_histogram", scope_hist.as_str()),
+            ("scope_waveform", scope_wave.as_str()),
+            ("scope_vectorscope", scope_vector.as_str()),
         ] {
             let module = naga::front::wgsl::parse_str(src)
                 .unwrap_or_else(|e| panic!("{name} shader failed to parse: {e:?}"));

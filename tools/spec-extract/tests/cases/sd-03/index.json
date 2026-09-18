@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "items": [
+    {
+      "file": "crates/photonic-core/src/document.rs",
+      "line": 110,
+      "krate": "photonic-core",
+      "module_path": "photonic_core::document",
+      "name": "CURRENT_FORMAT_VERSION",
+      "kind": "Const",
+      "visibility": "pub",
+      "fields": [],
+      "variants": [],
+      "value": "4",
+      "signature": null,
+      "cfg": []
+    }
+  ]
+}

@@ -8,3 +8,15 @@
 
 # Release signing private key — never commit; store as a GitHub Actions secret
 release/*.priv
+artifacts/
+_arcwright-output/
+
+# Diff heatmaps the golden-image harness writes beside a reference when a case
+# fails (crates/photonic-render/tests/golden_vector_equivalence.rs). Debugging
+# output, not fixtures — never commit them alongside the blessed references.
+last_failure_diff.png
+
+# Workspace API index emitted by `tools/spec-extract` for the CI spec-drift gate
+# (40-spec-verification.md §3). Built fresh in the `lint` job, never committed.
+spec-index.json
+packaging/mcpb/dist/

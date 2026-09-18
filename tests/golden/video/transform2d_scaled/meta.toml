@@ -1,0 +1,11 @@
+# Golden case: transform2d_scaled
+# Authored by tests/gen_video_golden.rs (11 §1.1). Bless PNGs with
+# PHOTONIC_BLESS_GOLDEN=1 cargo test -p photonic-video --test golden_frames.
+notes = "quadrant pattern scaled 0.6 + rotated ~17° about centre"
+format_index = 0
+doc_generation = 1
+
+[[frames]]
+n = 0
+name = "scaled-rotated"
+

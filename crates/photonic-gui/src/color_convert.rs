@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(parse_hex("00ff00"), Some([0.0, 1.0, 0.0, 1.0]));
         assert_eq!(parse_hex("#fff"), Some([1.0, 1.0, 1.0, 1.0]));
         assert_eq!(
-            parse_hex("#12345678").map(|c| rgba_to_bytes(c)),
+            parse_hex("#12345678").map(rgba_to_bytes),
             Some([0x12, 0x34, 0x56, 0x78])
         );
         assert_eq!(parse_hex("nope"), None);

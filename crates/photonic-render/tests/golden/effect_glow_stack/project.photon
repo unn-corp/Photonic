@@ -1,0 +1,149 @@
+{
+  "format_version": 2,
+  "id": "ddd415ad-f997-4959-8265-ff93274a4280",
+  "name": "effect-glow-stack",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "306e5307-5c10-4c33-9463-bcd5b6a9a3b4"
+  ],
+  "layers": {
+    "306e5307-5c10-4c33-9463-bcd5b6a9a3b4": {
+      "id": "306e5307-5c10-4c33-9463-bcd5b6a9a3b4",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "a5eddd9e-c04d-4b7f-b8d9-e9450f775113"
+      ]
+    }
+  },
+  "nodes": {
+    "a5eddd9e-c04d-4b7f-b8d9-e9450f775113": {
+      "id": "a5eddd9e-c04d-4b7f-b8d9-e9450f775113",
+      "name": "glowing-shape",
+      "layer_id": "306e5307-5c10-4c33-9463-bcd5b6a9a3b4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M85,60 C85,73.80711874576983 73.80711874576984,85 60,85 C46.192881254230166,85 35,73.80711874576984 35,60 C35,46.19288125423017 46.19288125423016,35 59.99999999999999,35 C73.80711874576983,35 85,46.19288125423016 85,59.99999999999999"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.15,
+            "g": 0.2,
+            "b": 0.3,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      },
+      "outer_glow": {
+        "color": {
+          "r": 0.3,
+          "g": 0.7,
+          "b": 1.0,
+          "a": 1.0
+        },
+        "opacity": 0.75,
+        "size": 14.0,
+        "enabled": true,
+        "join": "miter"
+      },
+      "inner_glow": {
+        "color": {
+          "r": 1.0,
+          "g": 1.0,
+          "b": 1.0,
+          "a": 1.0
+        },
+        "opacity": 0.75,
+        "size": 6.0,
+        "enabled": true,
+        "join": "miter"
+      },
+      "gaussian_glow": {
+        "color": {
+          "r": 1.0,
+          "g": 0.4,
+          "b": 0.8,
+          "a": 1.0
+        },
+        "opacity": 0.75,
+        "radius": 10.0,
+        "enabled": true
+      }
+    }
+  },
+  "active_layer_id": "306e5307-5c10-4c33-9463-bcd5b6a9a3b4",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "9d10dc6a-abf5-4e5e-bb96-c2219864aca2",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "9d10dc6a-abf5-4e5e-bb96-c2219864aca2",
+  "photon_format": 1
+}

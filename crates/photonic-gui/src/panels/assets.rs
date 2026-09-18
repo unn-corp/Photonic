@@ -525,9 +525,9 @@ pub(crate) fn draw_symbols_panel(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                     ui.separator();
                     // Symbol Sprayer controls
                     thread_local! {
-                        static SPRAY_COUNT: std::cell::RefCell<usize> = std::cell::RefCell::new(10);
-                        static SPRAY_SPREAD: std::cell::RefCell<f64> = std::cell::RefCell::new(100.0);
-                        static SPRAY_SYM: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+                        static SPRAY_COUNT: std::cell::RefCell<usize> = const { std::cell::RefCell::new(10) };
+                        static SPRAY_SPREAD: std::cell::RefCell<f64> = const { std::cell::RefCell::new(100.0) };
+                        static SPRAY_SYM: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
                     }
                     egui::CollapsingHeader::new("Symbol Sprayer")
                         .default_open(false)
@@ -649,7 +649,7 @@ pub(crate) fn draw_libraries_export(ui: &mut Ui, ctx: &mut PropPanelCtx) {
         ui.label(
             RichText::new("Libraries & Export")
                 .small()
-                .color(Color32::from_rgb(80, 80, 110)),
+                .color(crate::theme::section_header_color(ui)),
         );
         ui.add_space(2.0);
     }

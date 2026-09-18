@@ -257,7 +257,7 @@ pub async fn create_flare(state: &AppState, args: CreateFlareArgs) -> ToolResult
         };
         pn.stroke = Stroke::none();
         let mut node = SceneNode::new(
-            &format!("Flare Ray {}", i + 1),
+            format!("Flare Ray {}", i + 1),
             actual_layer,
             SceneNodeKind::Path(pn),
         );
@@ -286,7 +286,7 @@ pub async fn create_flare(state: &AppState, args: CreateFlareArgs) -> ToolResult
             ..Default::default()
         };
         let node = SceneNode::new(
-            &format!("Flare Ring {}", i + 1),
+            format!("Flare Ring {}", i + 1),
             actual_layer,
             SceneNodeKind::Path(pn),
         );
@@ -518,7 +518,7 @@ pub async fn add_anchor_points(state: &AppState, args: AddAnchorPointsArgs) -> T
         return ToolResult::error("node_ids must not be empty");
     }
 
-    let passes = args.passes.unwrap_or(1).min(8).max(1);
+    let passes = args.passes.unwrap_or(1).clamp(1, 8);
 
     let mut doc = state.document.lock().await;
     let mut history = state.history.lock().await;
@@ -1108,7 +1108,7 @@ pub async fn create_parametric_shape(
     let cx = args.cx;
     let cy = args.cy;
     let radius = args.radius.unwrap_or(80.0);
-    let n_pts = args.points.unwrap_or(360).max(3).min(4096);
+    let n_pts = args.points.unwrap_or(360).clamp(3, 4096);
     let rx = radius * args.ratio_x.unwrap_or(1.0);
     let ry = radius * args.ratio_y.unwrap_or(1.0);
 
@@ -1256,7 +1256,7 @@ pub async fn create_truchet_tiling(state: &AppState, args: CreateTruchetTilingAr
     let tile_color = args
         .color
         .as_deref()
-        .and_then(|s| photonic_core::Color::from_hex(s))
+        .and_then(photonic_core::Color::from_hex)
         .unwrap_or(photonic_core::Color::new(0.10, 0.10, 0.18, 1.0));
 
     let cols = (width / ts).ceil() as usize;
@@ -3011,7 +3011,7 @@ pub async fn outline_stroke(state: &AppState, args: OutlineStrokeArgs) -> ToolRe
         outline_pn.stroke = Stroke::none();
 
         let outline_node = SceneNode::new(
-            &format!("{} outline", node.name),
+            format!("{} outline", node.name),
             layer_id,
             SceneNodeKind::Path(outline_pn),
         );
@@ -3121,7 +3121,7 @@ pub async fn offset_path(state: &AppState, args: OffsetPathArgs) -> ToolResult {
             let mut new_pn = pn.clone();
             new_pn.path_data = offset_data;
             let new_node = SceneNode::new(
-                &format!("{} offset", node.name),
+                format!("{} offset", node.name),
                 layer_id,
                 SceneNodeKind::Path(new_pn),
             );
@@ -3307,7 +3307,7 @@ pub async fn scissors_cut(state: &AppState, args: ScissorsCutArgs) -> ToolResult
             ..pn.clone()
         }),
     );
-    node_before.transform = node.transform.clone();
+    node_before.transform = node.transform;
     node_before.opacity = node.opacity;
     node_before.blend_mode = node.blend_mode;
 
@@ -3319,7 +3319,7 @@ pub async fn scissors_cut(state: &AppState, args: ScissorsCutArgs) -> ToolResult
             ..pn.clone()
         }),
     );
-    node_after.transform = node.transform.clone();
+    node_after.transform = node.transform;
     node_after.opacity = node.opacity;
     node_after.blend_mode = node.blend_mode;
 
@@ -3344,7 +3344,7 @@ pub async fn scissors_cut(state: &AppState, args: ScissorsCutArgs) -> ToolResult
         &mut doc,
     );
 
-    ToolResult::text(format!("Cut path into 2 open paths")).with_data(serde_json::json!({
+    ToolResult::text("Cut path into 2 open paths".to_string()).with_data(serde_json::json!({
         "node_before_id": id_before,
         "node_after_id": id_after,
     }))

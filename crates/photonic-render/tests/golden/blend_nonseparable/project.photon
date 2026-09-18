@@ -1,0 +1,302 @@
+{
+  "format_version": 2,
+  "id": "92d0383d-27c8-4bfe-9758-c78aab5a4352",
+  "name": "blend-nonseparable",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4"
+  ],
+  "layers": {
+    "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4": {
+      "id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "ed0fb0e4-cda8-429c-a2fe-1e4a0ed818ef",
+        "3514142d-9000-429d-8d40-d0e90d5fa074",
+        "10aa62b9-7f52-42f9-bedf-a1eeb889dde7",
+        "61a334b5-ac11-4879-a8d2-864b7b7edd0b",
+        "19164167-ffcc-4b88-bfcb-2de81d366108"
+      ]
+    }
+  },
+  "nodes": {
+    "19164167-ffcc-4b88-bfcb-2de81d366108": {
+      "id": "19164167-ffcc-4b88-bfcb-2de81d366108",
+      "name": "swatch-3",
+      "layer_id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M65,65 L110,65 L110,110 L65,110 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.3,
+            "g": 0.6,
+            "b": 0.9,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      },
+      "blend_mode": "luminosity"
+    },
+    "61a334b5-ac11-4879-a8d2-864b7b7edd0b": {
+      "id": "61a334b5-ac11-4879-a8d2-864b7b7edd0b",
+      "name": "swatch-2",
+      "layer_id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,65 L55,65 L55,110 L10,110 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.3,
+            "g": 0.6,
+            "b": 0.9,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      },
+      "blend_mode": "color"
+    },
+    "3514142d-9000-429d-8d40-d0e90d5fa074": {
+      "id": "3514142d-9000-429d-8d40-d0e90d5fa074",
+      "name": "swatch-0",
+      "layer_id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,10 L55,10 L55,55 L10,55 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.3,
+            "g": 0.6,
+            "b": 0.9,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      },
+      "blend_mode": "hue"
+    },
+    "ed0fb0e4-cda8-429c-a2fe-1e4a0ed818ef": {
+      "id": "ed0fb0e4-cda8-429c-a2fe-1e4a0ed818ef",
+      "name": "backdrop",
+      "layer_id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M0,0 L120,0 L120,120 L0,120 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.8,
+            "g": 0.4,
+            "b": 0.2,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    },
+    "10aa62b9-7f52-42f9-bedf-a1eeb889dde7": {
+      "id": "10aa62b9-7f52-42f9-bedf-a1eeb889dde7",
+      "name": "swatch-1",
+      "layer_id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M65,10 L110,10 L110,55 L65,55 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.3,
+            "g": 0.6,
+            "b": 0.9,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      },
+      "blend_mode": "saturation"
+    }
+  },
+  "active_layer_id": "e2abab91-b642-4bf6-b4e8-4c7bbfaf47e4",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "b43e0c99-8f4e-4926-b745-6560c6f41b2d",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "b43e0c99-8f4e-4926-b745-6560c6f41b2d",
+  "photon_format": 1
+}

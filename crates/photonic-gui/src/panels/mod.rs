@@ -9,6 +9,7 @@ use photonic_core::{
 };
 use uuid::Uuid;
 
+use crate::app::AppMode;
 use crate::color_popup::ColorPopup;
 use crate::radial_wheel::WheelAction;
 use crate::tools::Tool;
@@ -20,11 +21,16 @@ mod editors;
 mod history;
 mod inspector;
 mod layers_panel;
+/// Media pool panel + import ladder. `pub` for UI-path integration tests.
+pub mod media_pool;
 mod modify;
 mod navigator;
 mod toolbar;
 mod tools_panel;
 mod vertex_panel;
+pub(crate) mod video;
+
+pub(crate) use video::{ColorPageTab, ScopeKind, VideoPanelUi};
 
 use arrange::*;
 use assets::*;
@@ -105,6 +111,17 @@ pub enum EyedropperTarget {
     RecolorSwatch {
         ids: Vec<NodeId>,
         from: [f32; 4],
+    },
+    /// Seed a clip grade's HSL qualifier from a pixel sampled off the program
+    /// monitor (07 §5 / 13 §9.3). Extends the one eyedropper idiom into the video
+    /// color page rather than a parallel picker; the app handler samples the
+    /// engine frame and applies the sampled colour's HSL to the clip's
+    /// `HslQualifier` op via `SetGrade`.
+    GradeQualifier {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        op: photonic_core::timeline::GradeOpId,
     },
 }
 
@@ -322,6 +339,30 @@ pub enum PanelAction {
     OpenExportDialog,
     /// Open the Export dialog in batch mode: one file per artboard over a range.
     OpenArtboardExportDialog,
+    /// Open the K-A6 Edit Duration dialog for a timeline clip.
+    OpenEditDuration {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+    },
+    /// K-B14: freeze a clip at clip-relative `at` (zero-rate SpeedMap).
+    FreezeFrame {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        at: photonic_core::timeline::Tick,
+    },
+    /// D-12: bind a gyro/IMU sidecar to a clip (22 §6.5).
+    ImportMotionMetadata {
+        clip: photonic_core::timeline::ClipId,
+    },
+    /// D-12: run (or re-run) stabilization analysis for a clip (22 §6.5).
+    ///
+    /// Analysis is *generation, not history* — it produces a cache entry, not
+    /// an undo step, so re-running it never appears in the edit history.
+    AnalyzeStabilization {
+        clip: photonic_core::timeline::ClipId,
+    },
     /// Set the color tag of a layer (None = clear).
     SetLayerColor {
         layer_id: LayerId,
@@ -825,6 +866,116 @@ pub enum PanelAction {
     DeleteWorkspace { name: String },
     /// Recenter the canvas viewport on a canvas-space point (Navigator click).
     CenterViewOn { canvas_x: f64, canvas_y: f64 },
+
+    // ── Media pool (video mode, 05 §2) ────────────────────────────────────────
+    /// Open the OS multi-file picker and enqueue the chosen files for
+    /// background import (probe + hash) into `bin`.
+    MediaImportDialog {
+        bin: Option<photonic_core::timeline::BinId>,
+    },
+    /// Create a media bin (folder).
+    MediaCreateBin {
+        name: String,
+        parent: Option<photonic_core::timeline::BinId>,
+    },
+    /// Remove a media bin (assets fall back to the root).
+    MediaRemoveBin { bin: photonic_core::timeline::BinId },
+    /// Remove an asset from the pool.
+    MediaRemoveAsset {
+        asset: photonic_core::timeline::AssetId,
+    },
+    /// K-C5: remove every asset with zero timeline references (one undo batch).
+    MediaRemoveUnused,
+    /// K-C2: set or clear star rating (1–5 / None).
+    MediaSetRating {
+        asset: photonic_core::timeline::AssetId,
+        rating: Option<u8>,
+    },
+    /// K-C2: replace free-form tags (resolved into the project TagId registry).
+    MediaSetTags {
+        asset: photonic_core::timeline::AssetId,
+        tags: Vec<String>,
+    },
+    /// K-A8: create a subclip of `asset` over source range `[in_ticks, out_ticks)`.
+    MediaCreateSubclip {
+        asset: photonic_core::timeline::AssetId,
+        in_ticks: i64,
+        out_ticks: i64,
+        name: Option<String>,
+    },
+    /// Move an asset to `bin` (`None` = pool root).
+    MediaAssignBin {
+        asset: photonic_core::timeline::AssetId,
+        bin: Option<photonic_core::timeline::BinId>,
+    },
+    /// Open the OS file picker and relink an offline asset to the chosen file.
+    MediaRelink {
+        asset: photonic_core::timeline::AssetId,
+    },
+    /// Engine-wide proxy playback mode (05 §4; `EngineCmd::SetProxyMode`).
+    MediaSetProxyMode { mode: photonic_video::ProxyMode },
+    /// Build reusable editing proxies for every file-backed video in the pool.
+    MediaGenerateProxies,
+    /// Project policy: auto-queue L7 proxy generation after import (G-15C).
+    MediaSetGenerateProxiesOnImport { enabled: bool },
+    /// Attach a user-supplied proxy file to a video asset (G-15A).
+    MediaAttachProxy {
+        asset: photonic_core::timeline::AssetId,
+    },
+    /// Clear the asset's proxy ref without deleting user-owned attached files.
+    MediaDetachProxy {
+        asset: photonic_core::timeline::AssetId,
+    },
+    /// Insert the asset as a clip at the playhead on the first compatible
+    /// track (double-click / context menu; drag-to-timeline is the primary
+    /// path and is handled in the timeline panel itself).
+    MediaInsertAtPlayhead {
+        asset: photonic_core::timeline::AssetId,
+    },
+
+    // ── Captions (video mode, 04 §4.1 / 06) ──────────────────────────────────
+    // The caption-editor drawer is `PropPanelCtx`-based (carries `doc: &
+    // Document` for reads, no `&mut CommandHistory`) — same shape as `Media*`
+    // above. It builds already-validated `TimelineCmd`s itself (via
+    // `photonic_core::timeline::ops`/`CaptionCmd`, reading `ctx.doc`) and
+    // hands them up here as one undo step.
+    /// Several `TimelineCmd`s committed as ONE undo step (`Command::Batch`,
+    /// via `CommandHistory::execute_discrete`) — every caption/TTS mutation
+    /// (cue text/timing, split/merge, style cascade, auto-caption, voiceover
+    /// placement), including transcript plans that cut synchronized media and
+    /// captions together, routes through this single carrier.
+    CaptionEditBatch(Vec<photonic_core::timeline::TimelineCmd>),
+
+    // ── Clip inspector / effects browser (video mode, 04 §4.1) ───────────────
+    // These video panels are `PropPanelCtx`-based (like every left-rail
+    // drawer) so they carry `doc: &Document` for reads but no `&mut
+    // CommandHistory` — mirrors why `Media*` above exists. Rather than one
+    // named variant per field (transform/speed/reframe/effect-param/
+    // transition — all just sub-fields of `Clip`), the panel builds the
+    // already-validated `TimelineCmd` itself (via `photonic_core::timeline::
+    // ops::*`, reading `ctx.doc`) and hands it up here as one of two generic
+    // carriers, matching `ops_bridge.rs`'s "pure op → history" rule at the
+    // `PropPanelCtx` boundary instead of inside a drawer fn.
+    /// Move the session playhead to a tick — **not** a document mutation and
+    /// therefore **not** an undo step (26 K-A2 marker navigation; the same rule
+    /// K-G5's history browser follows). A panel only receives a *copy* of the
+    /// playhead through [`video::VideoPanelUi`], and the engine seek is driven
+    /// off `PhotonicApp::playhead` in `app/monitor.rs`, so a panel cannot seek
+    /// directly — it queues this and the main loop assigns the field.
+    SeekPlayhead { at: photonic_core::timeline::Tick },
+    /// Committed as ONE non-folding undo step (button/toggle actions: add/
+    /// remove/reorder effect, enable toggle, "Reset reframe", etc.).
+    ClipEditDiscrete(photonic_core::timeline::TimelineCmd),
+    /// Committed via the coalescing `history.execute` path (drag-scrub
+    /// numeric fields — transform/speed/reframe/transition values), so a
+    /// streamed drag folds into one undo step like every vector property
+    /// drag (the coalesce anchor is driven globally by pointer-down/up,
+    /// per `app/mod.rs`'s `begin_coalescing`/`end_coalescing`).
+    ClipEditCoalesced(photonic_core::timeline::TimelineCmd),
+    /// Several commands committed as ONE undo step (`Command::Batch`) — e.g.
+    /// the Effects Browser's double-click-to-apply fallback (13 §6.3)
+    /// applying one effect to every selected clip at once.
+    ClipEditBatch(Vec<photonic_core::timeline::TimelineCmd>),
 }
 
 /// Discriminant for which shape the radial wheel should create.
@@ -1064,6 +1215,18 @@ pub(crate) struct PropPanelCtx<'a> {
     pub(crate) event_trigger_event: &'a mut String,
     pub(crate) event_trigger_action: &'a mut String,
     pub(crate) workspace_name_input: &'a mut String,
+    /// Media pool drawer state (video mode, 05 §2).
+    pub(crate) media_ui: &'a mut media_pool::MediaPoolUi,
+    /// Whether a `VideoEngine` session is attached (proxy toggle hint).
+    pub(crate) engine_online: bool,
+    /// Current engine proxy-mode intent (05 §4).
+    pub(crate) proxy_mode: photonic_video::ProxyMode,
+    /// Video-editor session state the video-mode drawers read/mutate (04 §4.1).
+    /// The left-rail video drawers (`ClipInspector`/`Effects`/`Captions`/
+    /// `NodeEditor`) reach their per-panel state through here so panel builders
+    /// never touch `PhotonicApp` or `draw_drawer`.
+    #[allow(dead_code)] // read as each left-rail video panel story is filled in.
+    pub(crate) video: VideoPanelUi<'a>,
     pub(crate) action: Option<PanelAction>,
     pub(crate) q: String,
     pub(crate) forced_open: Option<bool>,
@@ -1097,13 +1260,74 @@ pub enum DrawerGroup {
     Document,
     /// Edit history and branches.
     History,
+    /// Video mode (04 §4.1): import, bins, asset list, probe metadata, proxy
+    /// status/toggle. Interior owned by 05-import-export.md.
+    MediaPool,
+    /// Video mode (04 §4.1): selected clip's transform/speed/effects-stack/
+    /// transition params — the `Clip`/`ClipEffect` analogue of `Inspector`.
+    /// This doc owns the panel shell; widgets source from `prop_registry`.
+    ClipInspector,
+    /// Video mode (04 §4.1): effect browser/catalog, drag-to-apply onto the
+    /// selected clip. Interior owned by 08-fusion-node-flows.md.
+    Effects,
+    /// Video mode (04 §4.1): caption track list, cue text/timing editor, style
+    /// panel. Interior owned by 06-captions-ai.md.
+    Captions,
+    /// Video mode (04 §4.1): node palette + node inspector — NOT the graph
+    /// canvas itself (that lives in the central panel's node-canvas content
+    /// state, 08 §6.1). Interior owned by 08-fusion-node-flows.md.
+    NodeEditor,
+    /// Video mode (04 §4.1): starter title/lower-third/caption-card presets
+    /// that insert a `ClipSource::Text` clip at the playhead, plus a basic
+    /// text/size/color/position editor for the selected Text clip (05 §4b /
+    /// 17 G-12 minimal — not the full VectorDoc title-template system).
+    /// Interior owned by `panels/video/titles.rs`.
+    Titles,
+    /// Video mode (26 K-A2): the markers workflow — a searchable, filterable,
+    /// sortable list of every marker on the active sequence in both scopes,
+    /// click-to-navigate (zero undo units), name/note/category/position/
+    /// **duration** editing (a duration > 0 is what makes a marker *ranged*,
+    /// the unit K-F2's per-marker export fans out over), and the project's
+    /// `MarkerCategory` registry with reassign-on-delete.
+    /// Interior owned by `panels/video/markers.rs`.
+    Markers,
+    /// Video mode (04 §4.1): second preview surface for the raw armed
+    /// source asset, its own scrub bar, and true source in/out marks
+    /// (17-nle-parity-round2.md §G-10 — Larger, needs its own mini-spec).
+    /// Interior owned by `panels/video/source_monitor.rs`; the real
+    /// dual-monitor surface is mostly `app/monitor.rs` (out of this crate
+    /// module's territory).
+    SourceMonitor,
+    /// Video mode (04 §4.1): multicam angle picker + sync controls (17 G-20
+    /// — Larger). Interior owned by `panels/video/multicam.rs`; the real
+    /// multi-camera source sequence + live angle cutting is
+    /// `photonic-video-engine` + `app/monitor.rs` territory.
+    Multicam,
+    /// Video mode (04 §4.1): text-based (transcript) editing — select a
+    /// word range, ripple the matching timeline clip range (17 G-18 —
+    /// Larger, nice-to-have). Interior owned by `panels/video/transcript.rs`.
+    Transcript,
+    /// A group written by a newer build. Never offered by [`all_for_mode`], and
+    /// normalized to the default in [`crate::preferences::AppPreferences::load`]
+    /// so one unknown token cannot discard the whole preferences file.
+    ///
+    /// Without this arm, serde's `#[serde(default = …)]` does not help: it
+    /// covers a *missing* field, not one that fails to deserialize, so a single
+    /// unrecognised drawer token fails the whole struct and `load`'s
+    /// `unwrap_or_default()` throws away every other preference the user set —
+    /// keymap, hotbar usage, drawer widths, snap toggles. Same forward-compat
+    /// rule as `MarkerAnchor`/`GroupKind` (39 §2.2).
+    ///
+    /// [`all_for_mode`]: DrawerGroup::all_for_mode
+    #[serde(other)]
+    Unknown,
 }
 
 impl DrawerGroup {
-    /// All groups shown on the left rail, in order (top to bottom). History is
-    /// intentionally absent — it now lives on the right rail (see
-    /// [`RightDrawerGroup`]) — but the `History` variant is retained so
-    /// `draw_drawer` can still render it there.
+    /// All groups shown on the left rail in Vector mode, in order (top to
+    /// bottom). History is intentionally absent — it now lives on the right
+    /// rail (see [`RightDrawerGroup`]) — but the `History` variant is retained
+    /// so `draw_drawer` can still render it there.
     pub const ALL: [DrawerGroup; 6] = [
         DrawerGroup::Tools,
         DrawerGroup::Inspector,
@@ -1112,6 +1336,32 @@ impl DrawerGroup {
         DrawerGroup::Assets,
         DrawerGroup::Document,
     ];
+
+    /// Left-rail groups in Video mode (04 §4.1) — Media Pool first, matching
+    /// every reference NLE's left-most-panel convention. The three round-2
+    /// (17-nle-parity-round2.md) choke-point additions — SourceMonitor,
+    /// Multicam, Transcript — trail the P1 set; each is a compile-clean stub
+    /// until its named story fills it in.
+    pub const VIDEO_ALL: [DrawerGroup; 10] = [
+        DrawerGroup::MediaPool,
+        DrawerGroup::ClipInspector,
+        DrawerGroup::Effects,
+        DrawerGroup::Markers,
+        DrawerGroup::Captions,
+        DrawerGroup::NodeEditor,
+        DrawerGroup::Titles,
+        DrawerGroup::SourceMonitor,
+        DrawerGroup::Multicam,
+        DrawerGroup::Transcript,
+    ];
+
+    /// Which group set the left rail offers for `mode` (04 §4).
+    pub fn all_for_mode(mode: AppMode) -> &'static [DrawerGroup] {
+        match mode {
+            AppMode::Vector => &Self::ALL,
+            AppMode::Video => &Self::VIDEO_ALL,
+        }
+    }
 
     /// Phosphor glyph shown on the rail button.
     pub fn icon(self) -> &'static str {
@@ -1123,6 +1373,17 @@ impl DrawerGroup {
             DrawerGroup::Assets => ph::SWATCHES,
             DrawerGroup::Document => ph::FILE_TEXT,
             DrawerGroup::History => ph::CLOCK_COUNTER_CLOCKWISE,
+            DrawerGroup::MediaPool => ph::FILM_STRIP,
+            DrawerGroup::ClipInspector => ph::FRAME_CORNERS,
+            DrawerGroup::Effects => ph::SPARKLE,
+            DrawerGroup::Captions => ph::CLOSED_CAPTIONING,
+            DrawerGroup::NodeEditor => ph::FLOW_ARROW,
+            DrawerGroup::Titles => ph::TEXT_T,
+            DrawerGroup::Markers => ph::MAP_PIN,
+            DrawerGroup::SourceMonitor => ph::MONITOR_PLAY,
+            DrawerGroup::Multicam => ph::SQUARES_FOUR,
+            DrawerGroup::Transcript => ph::ARTICLE,
+            DrawerGroup::Unknown => ph::QUESTION,
         }
     }
 
@@ -1136,6 +1397,17 @@ impl DrawerGroup {
             DrawerGroup::Assets => "Assets",
             DrawerGroup::Document => "Document",
             DrawerGroup::History => "History",
+            DrawerGroup::MediaPool => "Media Pool",
+            DrawerGroup::ClipInspector => "Clip Inspector",
+            DrawerGroup::Effects => "Effects",
+            DrawerGroup::Captions => "Captions",
+            DrawerGroup::NodeEditor => "Node Editor",
+            DrawerGroup::Titles => "Titles",
+            DrawerGroup::Markers => "Markers",
+            DrawerGroup::SourceMonitor => "Source Monitor",
+            DrawerGroup::Multicam => "Multicam",
+            DrawerGroup::Transcript => "Transcript",
+            DrawerGroup::Unknown => "Unknown",
         }
     }
 
@@ -1144,14 +1416,46 @@ impl DrawerGroup {
     /// that loses its content auto-collapses. Tools, Inspector (navigator + tool
     /// options), and the always-on library/document/history groups are always
     /// available; the operation drawers (Modify/Arrange) need a selection.
-    pub fn has_content(self, selection_count: usize) -> bool {
+    ///
+    /// Video-mode groups (04 §4.1): Media Pool/Effects/Captions/Node Editor are
+    /// always available; Clip Inspector needs a **timeline clip** selection
+    /// (`clip_selection_count`). Modify/Arrange need a **vector node** selection
+    /// (`node_selection_count`). Passing the node count for Clip Inspector was
+    /// a stub that left the rail icon permanently disabled in video mode —
+    /// speed ramp / transform / freeze all live in that drawer and were
+    /// unreachable without this split.
+    pub fn has_content(self, node_selection_count: usize, clip_selection_count: usize) -> bool {
         match self {
             DrawerGroup::Tools
             | DrawerGroup::Inspector
             | DrawerGroup::Assets
             | DrawerGroup::Document
-            | DrawerGroup::History => true,
-            DrawerGroup::Modify | DrawerGroup::Arrange => selection_count >= 1,
+            | DrawerGroup::History
+            | DrawerGroup::MediaPool
+            | DrawerGroup::Effects
+            | DrawerGroup::Captions
+            | DrawerGroup::NodeEditor
+            | DrawerGroup::Titles
+            // Markers is always reachable: its category editor and
+            // "add at playhead" are useful before a single marker exists.
+            | DrawerGroup::Markers
+            // Round-2 (17) additions are always reachable, like the P1 video
+            // groups above — none of them gate on the vector node-selection
+            // count (SourceMonitor/Multicam gate on an armed source/multicam
+            // clip once their stories land; Transcript gates on the sequence
+            // having captions; both are stub-empty until then).
+            | DrawerGroup::SourceMonitor
+            | DrawerGroup::Multicam
+            | DrawerGroup::Transcript => true,
+            DrawerGroup::Modify | DrawerGroup::Arrange => node_selection_count >= 1,
+            // Timeline clip selection, not vector nodes.
+            DrawerGroup::ClipInspector => clip_selection_count >= 1,
+            // A group this build does not know has no sections to render, so it
+            // never has content: the rail icon stays disabled and an `Unknown`
+            // that survives to the UI auto-collapses instead of drawing an empty
+            // drawer. `AppPreferences::load` normalizes it away first; this is
+            // the second line of defence.
+            DrawerGroup::Unknown => false,
         }
     }
 }
@@ -1167,15 +1471,49 @@ pub enum RightDrawerGroup {
     Chat,
     /// Edit history and branches (moved here from the left rail).
     History,
+    /// Video mode (04 §4.1): wheels/curves/HSL qualifier/LUT browser for the
+    /// selected clip's grade. Interior owned by 07-color-grading.md.
+    ColorControls,
+    /// Video mode (04 §4.1): track fader strips, master bus meters, per-track
+    /// EQ/comp/automation entry points. Interior owned by 09-audio-mixer.md.
+    AudioMixer,
+    /// A group written by a newer build. Never offered by [`all_for_mode`], and
+    /// normalized to the default in [`crate::preferences::AppPreferences::load`]
+    /// so one unknown token cannot discard the whole preferences file. Same
+    /// forward-compat rule as [`DrawerGroup::Unknown`] — this enum has the
+    /// identical bug, and fixing one of the two would only look done.
+    ///
+    /// [`all_for_mode`]: RightDrawerGroup::all_for_mode
+    #[serde(other)]
+    Unknown,
 }
 
 impl RightDrawerGroup {
-    /// All groups in rail order (top to bottom).
+    /// All groups in rail order (top to bottom), Vector mode.
     pub const ALL: [RightDrawerGroup; 3] = [
         RightDrawerGroup::Layers,
         RightDrawerGroup::Chat,
         RightDrawerGroup::History,
     ];
+
+    /// Right-rail groups in Video mode (04 §4.1). `Layers` stays (a flattened
+    /// clip list still helps keyboard-driven selection); `Chat`/`History` are
+    /// mode-agnostic already.
+    pub const VIDEO_ALL: [RightDrawerGroup; 5] = [
+        RightDrawerGroup::Layers,
+        RightDrawerGroup::ColorControls,
+        RightDrawerGroup::AudioMixer,
+        RightDrawerGroup::Chat,
+        RightDrawerGroup::History,
+    ];
+
+    /// Which group set the right rail offers for `mode` (04 §4).
+    pub fn all_for_mode(mode: AppMode) -> &'static [RightDrawerGroup] {
+        match mode {
+            AppMode::Vector => &Self::ALL,
+            AppMode::Video => &Self::VIDEO_ALL,
+        }
+    }
 
     /// Phosphor glyph shown on the rail button.
     pub fn icon(self) -> &'static str {
@@ -1183,6 +1521,9 @@ impl RightDrawerGroup {
             RightDrawerGroup::Layers => ph::STACK,
             RightDrawerGroup::Chat => ph::CHAT_CIRCLE_DOTS,
             RightDrawerGroup::History => ph::CLOCK_COUNTER_CLOCKWISE,
+            RightDrawerGroup::ColorControls => ph::PALETTE,
+            RightDrawerGroup::AudioMixer => ph::SLIDERS,
+            RightDrawerGroup::Unknown => ph::QUESTION,
         }
     }
 
@@ -1192,6 +1533,9 @@ impl RightDrawerGroup {
             RightDrawerGroup::Layers => "Layers",
             RightDrawerGroup::Chat => "AI Chat",
             RightDrawerGroup::History => "History",
+            RightDrawerGroup::ColorControls => "Color Controls",
+            RightDrawerGroup::AudioMixer => "Audio Mixer",
+            RightDrawerGroup::Unknown => "Unknown",
         }
     }
 }
@@ -1210,7 +1554,7 @@ pub(crate) fn draw_drawer(
     ui.label(
         RichText::new(group.title().to_uppercase())
             .small()
-            .color(Color32::from_rgb(80, 80, 110)),
+            .color(crate::theme::section_header_color(ui)),
     );
     ui.add_space(2.0);
 
@@ -1224,22 +1568,24 @@ pub(crate) fn draw_drawer(
     } else {
         "Search properties…"
     };
-    ui.horizontal(|ui| {
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut *ctx.prop_search)
-                .hint_text(search_hint)
-                .desired_width(ui.available_width() - 24.0),
-        );
-        if !ctx.prop_search.is_empty()
-            && ui
-                .small_button(ph::X)
-                .on_hover_text("Clear search")
-                .clicked()
-        {
-            ctx.prop_search.clear();
-            response.surrender_focus();
-        }
-    });
+    if group != DrawerGroup::Transcript {
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut *ctx.prop_search)
+                    .hint_text(search_hint)
+                    .desired_width(ui.available_width() - 24.0),
+            );
+            if !ctx.prop_search.is_empty()
+                && ui
+                    .small_button(ph::X)
+                    .on_hover_text("Clear search")
+                    .clicked()
+            {
+                ctx.prop_search.clear();
+                response.surrender_focus();
+            }
+        });
+    }
     ui.add_space(4.0);
 
     // An empty query matches everything; a non-empty query forces matching
@@ -1317,9 +1663,24 @@ pub(crate) fn draw_drawer(
             // separate "Branches" accordion has been retired.
             draw_edit_history(ui, ctx);
         }
+        DrawerGroup::MediaPool => media_pool::draw_media_pool(ui, ctx),
+        DrawerGroup::ClipInspector => video::clip_inspector::draw_clip_inspector(ui, ctx),
+        DrawerGroup::Effects => video::effects_browser::draw_effects_browser(ui, ctx),
+        DrawerGroup::Captions => video::caption_editor::draw_caption_editor(ui, ctx),
+        DrawerGroup::NodeEditor => video::node_editor::draw_node_editor_palette(ui, ctx),
+        DrawerGroup::Titles => video::titles::draw_titles(ui, ctx),
+        DrawerGroup::Markers => video::markers::draw_markers(ui, ctx),
+        DrawerGroup::SourceMonitor => video::source_monitor::draw_source_monitor(ui, ctx),
+        DrawerGroup::Multicam => video::multicam::draw_multicam(ui, ctx),
+        DrawerGroup::Transcript => video::transcript::draw_transcript(ui, ctx),
         // Tools is rendered by the app layer (it needs tool state, not the
         // property ctx), so it is never routed through draw_drawer.
         DrawerGroup::Tools => {}
+        // A group written by a newer build has no sections here to render.
+        // `AppPreferences::load` normalizes it to the default and `has_content`
+        // reports false, so this arm is unreachable in practice — it exists so
+        // the catch-all can never draw a half-populated drawer.
+        DrawerGroup::Unknown => {}
     }
 
     ctx.action.take()

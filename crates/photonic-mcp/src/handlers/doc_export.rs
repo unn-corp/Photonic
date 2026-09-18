@@ -656,6 +656,7 @@ mod export_raster_capture_tests {
             config: McpServerConfig::default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            ..AppState::headless_for_test()
         }
     }
 
@@ -2081,8 +2082,13 @@ mod reorder_layers_tests {
             document_path: Arc::new(StdMutex::new(None)),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
+            path_policy: photonic_core::PathPolicy::test_default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            video_engine: Arc::new(crate::handlers::video_jobs::VideoEngineHandle::new()),
+            video_jobs: Arc::new(StdMutex::new(
+                crate::handlers::video_jobs::JobRegistry::new(),
+            )),
         }
     }
 
@@ -2369,8 +2375,13 @@ mod export_pdf_real_path_tests {
             document_path: Arc::new(StdMutex::new(None)),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
+            path_policy: photonic_core::PathPolicy::test_default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            video_engine: Arc::new(crate::handlers::video_jobs::VideoEngineHandle::new()),
+            video_jobs: Arc::new(StdMutex::new(
+                crate::handlers::video_jobs::JobRegistry::new(),
+            )),
         }
     }
 
@@ -2518,8 +2529,13 @@ mod export_blocking_tests {
             document_path: Arc::new(StdMutex::new(None)),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
+            path_policy: photonic_core::PathPolicy::test_default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            video_engine: Arc::new(crate::handlers::video_jobs::VideoEngineHandle::new()),
+            video_jobs: Arc::new(StdMutex::new(
+                crate::handlers::video_jobs::JobRegistry::new(),
+            )),
         }
     }
 
@@ -2595,6 +2611,7 @@ mod raster_export_tests {
             config: McpServerConfig::default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(new_clipboard_ring()),
+            ..AppState::headless_for_test()
         };
         (state, capture_rx)
     }

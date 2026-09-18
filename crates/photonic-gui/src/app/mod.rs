@@ -9,29 +9,50 @@ mod demos;
 use demos::*;
 mod hit_test;
 use hit_test::*;
-pub(crate) mod autosave;
+mod editing_workflows;
+/// G-10 source marks (session-only). `pub` so UI-path integration tests can
+/// drive the same types the transport and command palette use.
+pub mod source_marks;
+// `pub` (not `pub(crate)`): CAP-022's crash-recovery integration test
+// (crates/photonic-gui/tests/timeline_recovery.rs) drives the real write/load
+// path via test-only hooks in `autosave.rs`, and external integration test
+// crates can only reach items through a fully `pub` module chain. See the
+// hooks' doc comments in `autosave.rs` for the full rationale.
+pub mod autosave;
 mod clipboard;
 mod close_guard;
 mod command_center;
 mod direct_select;
+pub mod engine;
 mod erase_tools;
 pub(crate) mod gradient_handles;
 pub(crate) mod layer_ops;
 mod menu_drawer;
+pub(crate) mod mode;
+pub(crate) mod monitor;
 mod proportional_move;
 mod recovery;
+// `pub` (29 §3 / CAP-019): the acceptance-story harness's GUI arm calls
+// `reframe::fit_clips_to_active_format` directly, the same entry the reframe
+// widget uses.
+pub mod reframe;
 mod rulers;
 mod tabs;
+/// Timeline panel + edit interact helpers. `pub` so UI-path integration tests
+/// can construct `PendingSource` the same way Insert/Overwrite does.
+pub mod timeline;
 mod tool_handlers;
 mod width_tool;
 use egui::{Color32, RichText};
 use egui_phosphor::regular as ph;
 use kurbo::{BezPath, PathEl, Point};
+pub use mode::AppMode;
 use photonic_core::{
     history::{Command, CommandHistory, HistoryGraphNode},
     layer::LayerId,
     node::{GroupNode, NodeId, PathNode},
     ops::artboard_ops,
+    timeline::{ClipId, CueId, GradeOpId, GraphId, GraphNodeId, SequenceId, Tick, TrackId},
     Color, Document, Fill, Layer, PathData, SceneNode, SceneNodeKind, Selection, Stroke,
     PHOTON_FILE_EXTENSION,
 };
@@ -39,12 +60,13 @@ use photonic_render::{CanvasView, ExportBackground, ExportOptions, PhotonicRende
 pub(crate) use rulers::GuideEditPopup;
 use std::path::Path;
 use std::sync::Arc;
+use timeline::TimelineView;
 
 use crate::{
     hotbar::{self, HotbarAction, HotbarBucket, HotbarEffect, HotbarItem, HotbarMode},
     panels::{
-        self, DrawerGroup, EyedropperTarget, PanelAction, RightDrawerGroup, SelectSameAttr,
-        ShapeKind, ZOrderOp,
+        self, ColorPageTab, DrawerGroup, EyedropperTarget, PanelAction, RightDrawerGroup,
+        ScopeKind, SelectSameAttr, ShapeKind, VideoPanelUi, ZOrderOp,
     },
     preferences::AppPreferences,
     radial_wheel::{WheelContext, WheelNodeKind, WheelState},
@@ -659,20 +681,12 @@ pub struct ClaudeChatState {
 }
 
 /// State for the floating MCP audit log panel.
+#[derive(Default)]
 pub struct AuditPanelState {
     /// Shared MCP audit log (set by main.rs after construction).
     pub log: Option<Arc<std::sync::Mutex<photonic_core::AuditLog>>>,
     pub panel_open: bool,
     pub filter: String,
-}
-impl Default for AuditPanelState {
-    fn default() -> Self {
-        Self {
-            log: None,
-            panel_open: false,
-            filter: String::new(),
-        }
-    }
 }
 
 /// State for the diff highlight overlay shown after AI edits.
@@ -735,6 +749,40 @@ pub struct DocTab {
     pub recovery_path: Option<std::path::PathBuf>,
     /// History node id matching the on-disk file — drives the "Last Save" marker.
     pub last_saved_node: Option<u64>,
+    /// Vector/Video mode this tab was in (04 §1). Restored in `switch_tab`.
+    pub mode: AppMode,
+    /// Timeline zoom/scroll for this tab (04 §2.1/§6).
+    pub timeline_view: TimelineView,
+    /// Playhead position for this tab's sequence (04 §6).
+    pub playhead: Tick,
+    /// Selected clip ids in this tab's timeline panel (04 §2.6/§6).
+    pub timeline_selection: Vec<ClipId>,
+}
+
+/// Modal timeline tool armed from the timeline mini-toolbar's segmented
+/// control (17-nle-parity-round2.md §G-13 — Premiere's V/A/N/Y/U row).
+/// Additive over today's hover-zone + modifier drag-kind inference
+/// (`timeline::interact::resolve_drag_kind`): once the G-13 story wires it
+/// in, an armed non-`Select` tool biases which edit a lane drag performs.
+/// Session-only, like `timeline_razor_active` below (which this will
+/// eventually fold `Razor` into — untouched here, existing razor behavior
+/// is unchanged by adding this enum).
+#[allow(dead_code)] // variants beyond the default are constructed by the G-13 story.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum TimelineTool {
+    /// Standard pointer: select/move/trim by hover zone (today's default).
+    #[default]
+    Select,
+    /// Blade: click a lane to split the clip under the cursor (spec 16 §4).
+    Razor,
+    /// Pan the timeline view by dragging anywhere in the lane area.
+    Hand,
+    /// Slip: drag shifts a clip's source in/out without moving its timeline
+    /// position or duration.
+    Slip,
+    /// Slide: drag moves a clip while trimming its neighbours to fill the
+    /// gap; its own in/out is unchanged.
+    Slide,
 }
 
 pub struct PhotonicApp {
@@ -779,6 +827,193 @@ pub struct PhotonicApp {
 
     /// Currently selected node (Select tool).
     pub selected_id: Option<NodeId>,
+
+    /// Vector/Video editor mode for the active tab (04 §1). Per-tab — swapped
+    /// with the parked tab's `DocTab::mode` in `switch_tab`, mirroring
+    /// `selected_id`.
+    pub mode: AppMode,
+    /// Timeline zoom/scroll for the active tab (04 §2.1/§6). Per-tab, same
+    /// swap discipline as `mode`.
+    pub timeline_view: TimelineView,
+    /// Playhead position for the active tab's sequence (04 §6). Per-tab.
+    pub playhead: Tick,
+    /// Selected clip ids in the timeline panel for the active tab (04 §2.6/§6).
+    /// Per-tab.
+    pub timeline_selection: Vec<ClipId>,
+    /// Timeline magnet/snap toggle (04 §2.5). NOT per-tab — persisted to
+    /// `AppPreferences` like other UI toggles (`prefs.save()` pattern), not to
+    /// the document (04 §6).
+    pub timeline_snap_enabled: bool,
+
+    // ── 3/4-point editing session state (spec 16 §1) ────────────────────────
+    // Insert/Overwrite/Lift/Extract support model. Session-only (this struct is
+    // not serde) and deliberately NOT in the document — the armed source and the
+    // patch targets are editor state, not sequence content.
+    /// The armed 3-point source (source op + trim in/out) for Insert/Overwrite.
+    /// `None` = nothing armed; set from source marks (G-10) or selected clip
+    /// (spec 16 §4 minimal arming) at edit time.
+    pub(crate) pending_source: Option<timeline::interact::PendingSource>,
+    /// G-10 source marks + armed asset (session-only, non-undoable; 24 §3.3).
+    pub(crate) source_marks: source_marks::SourceMarksSession,
+    /// Source-patch target (spec 16 §1 M-3): which track receives the edit.
+    /// `None` = default to the first enabled track of the source's kind
+    /// (`interact::resolve_target_track`).
+    pub(crate) target_video_track: Option<TrackId>,
+    pub(crate) target_audio_track: Option<TrackId>,
+    /// Razor/blade tool armed (spec 16 §4 M-4): a lane click splits the clip at
+    /// the click point. The lane-click handler lives in the timeline panel; this
+    /// bit (toggled by `C`) arms it.
+    pub(crate) timeline_razor_active: bool,
+
+    // ── Program monitor / transport (04 §3.2) ───────────────────────────────
+    // Session-only placeholder playback state — there is no engine until P3
+    // lands, so "playing" is simulated by advancing `playhead` from wall-clock
+    // dt each frame (`advance_monitor_playback`, `app/monitor.rs`) purely so
+    // the transport/scrub UX is testable pre-engine. Real playback replaces
+    // this with `EngineCmd`/`EngineStatus` (02 §1) without changing the public
+    // transport methods' call sites (command palette, keyboard, buttons).
+    /// True while the placeholder transport is "playing".
+    pub(crate) monitor_playing: bool,
+    /// Playback direction while `monitor_playing` (J = reverse, L = forward).
+    pub(crate) monitor_play_reverse: bool,
+    /// J/L repeat-press speed multiplier (reference-NLE convention, 04 §3.2).
+    pub(crate) monitor_play_speed: f64,
+    /// Timeline loop-playback toggle (04 §3.2 transport bar).
+    pub(crate) monitor_loop_enabled: bool,
+    /// Safe-area guide overlay toggle (04 §3.3).
+    pub(crate) monitor_safe_area: bool,
+    /// K-E3 composition grid: 0=off, 1=thirds, 2=golden ratio (cycled from toolbar).
+    pub(crate) monitor_comp_grid: u8,
+    /// Transform tool toggle: show the in-monitor reframe/transform handles for
+    /// the selected clip only when on (off by default — the handles are opt-in,
+    /// not always drawn over the picture).
+    pub(crate) monitor_transform_tool: bool,
+    /// One-time keyboard-shortcut overlay (Space/JKL/I/O/S) visible — opened
+    /// automatically on first video-mode entry and re-openable via `?` (04
+    /// §1.2 First-run hint). Session state; the "has this been shown before"
+    /// bit is `prefs.video_shortcuts_intro_shown` (persisted).
+    pub(crate) show_video_shortcut_sheet: bool,
+    /// This session may still show the first-run video coach card. Latched from
+    /// `!prefs.video_coach_shown_once` at startup so the guide is a *first-run*
+    /// guide: once it has appeared on one launch it never returns, whether or
+    /// not the user pressed Next/Skip before quitting. The "Reset video coach
+    /// marks" preference re-arms both this and the persisted bit.
+    pub(crate) coach_allowed_this_session: bool,
+    /// First frame's CLI/double-click auto-enter check (04 §1.2 "Auto-enter on
+    /// open") has run. Guards `ensure_initial_tab`'s one-shot sibling check so
+    /// it only inspects `doc.timeline` once, on the very first `draw` call.
+    pub(crate) initial_mode_checked: bool,
+    /// Live video-engine session (02 §1), attached by the host after the
+    /// shared wgpu device exists. `None` = engine-less host (tests, no GPU):
+    /// the monitor/transport fall back to the placeholder wall-clock paths.
+    pub engine: Option<engine::EngineBridge>,
+    /// K-F1 multi-job export queue (multi-format + marker multi-export).
+    pub(crate) render_queue: photonic_video::export::RenderQueue,
+    /// Whether the render-queue inspector panel is open (K-F1).
+    pub(crate) render_queue_panel_open: bool,
+    /// Media pool drawer state + background import channel (05 §2).
+    pub(crate) media_pool_ui: panels::media_pool::MediaPoolUi,
+    /// Session clip-thumbnail + waveform caches feeding the timeline lane
+    /// painter (spec 15 — NLE parity gap 10). `None` until the first video-mode
+    /// paint; `draw_timeline_panel` constructs it lazily and refreshes it each
+    /// frame from the active document's media pool. Session-only (it owns the
+    /// caches' background worker threads and is never serialized).
+    pub(crate) timeline_media: Option<timeline::TimelineMediaCaches>,
+
+    // ── Video-mode panel session state (04 §4.1) ────────────────────────────
+    // Storage the six video panel stories read/mutate through
+    // `panels::VideoPanelUi` (built by `video_panel_ui`), so panel builders
+    // never touch this struct. Session-only (this struct is not serde; anything
+    // that must persist belongs in `AppPreferences`). Each field names its
+    // owning panel/spec.
+    /// [color_page, 07 §1] Selected grade op in the clip's grade stack.
+    pub(crate) selected_grade_op: Option<GradeOpId>,
+    /// [color_page, 07 §6] Active Color Controls sub-tab.
+    pub(crate) color_page_tab: ColorPageTab,
+    /// [color_page, 07 §6] Floating scopes panel visibility.
+    pub(crate) scopes_panel_open: bool,
+    /// [color_page, 07 §6] Which scope the floating panel shows.
+    pub(crate) scope_kind: ScopeKind,
+    /// [node_editor, 08 §6.1] Graph open in the central node canvas, if any.
+    pub(crate) open_graph: Option<GraphId>,
+    /// [node_editor, 08 §6.1] Selected node in the open graph (drives the
+    /// left-rail inspector).
+    pub(crate) selected_graph_node: Option<GraphNodeId>,
+    /// [node_editor, 08 §6.1] Whether the central panel shows the node canvas
+    /// instead of the program monitor.
+    pub(crate) node_canvas_active: bool,
+    /// [audio_mixer, 09] Track strips whose EQ/comp/automation are expanded.
+    pub(crate) mixer_expanded_tracks: std::collections::HashSet<TrackId>,
+    /// [audio_mixer, 09] The mixer is a floating window, not a right-rail
+    /// drawer. A channel strip is 88 px wide and its fader column alone is
+    /// ~140 px tall, so a rack of them plus the master bus never fitted the
+    /// 220–480 px drawer — every strip past the first was clipped. The rail
+    /// button toggles this instead.
+    pub(crate) audio_mixer_window_open: bool,
+    /// [clip_inspector, 04 §4.1 / 01 §6] Clip whose animated props the keyframe
+    /// editor targets.
+    pub(crate) keyframe_editor_target: Option<ClipId>,
+    /// [caption_editor, 06] Caption cue currently being edited.
+    pub(crate) caption_edit_cue: Option<CueId>,
+    /// [export_dialog, 05 §3] Whether the video export dialog is open.
+    pub(crate) export_dialog_open: bool,
+    /// [export_dialog, 05 §3] Name of the last-used export preset, seed for the
+    /// dialog. Session-only for now; the export story persists it to prefs.
+    pub(crate) last_export_preset: String,
+    /// [duration_dialog, 26 K-A6] Open Edit Duration session (position/in/out/
+    /// duration + ripple). `None` = closed.
+    pub(crate) edit_duration_dialog:
+        Option<crate::panels::video::duration_dialog::EditDurationDialog>,
+    /// [timeline K-A7] Keyboard grab session — arrow keys preview a move; Enter
+    /// commits one undo unit, Esc cancels. `None` = not grabbing.
+    pub(crate) timeline_grab: Option<crate::app::timeline::interact::GrabSession>,
+
+    // ── 17-nle-parity-round2.md choke-point session state ───────────────────
+    // Session fields for the round-2 deferred features (source monitor,
+    // multicam, transcript, the modal timeline-tool palette, sequence tabs,
+    // nested-sequence breadcrumbs). Same discipline as the block above:
+    // session-only (not serde), each field tagged with its owning story. The
+    // four panel-facing fields are threaded through `VideoPanelUi` alongside
+    // the P1 fields above (see `video_panel_ui()`); `timeline_tool` is read
+    // directly off `self` by the (out-of-territory) timeline-panel story, so
+    // it stays `#[allow(dead_code)]` here until that story lands.
+    /// [source_monitor, 17 G-10] Scrub-bar playhead within the armed
+    /// source's own media. The armed source and its in/out trim marks
+    /// already live on `pending_source` above (spec 16 §1).
+    pub(crate) source_monitor_scrub: Option<Tick>,
+    /// [multicam, 17 G-20] Angle currently cut to in the open multicam clip.
+    pub(crate) multicam_active_angle: Option<u8>,
+    /// [multicam, 17 G-20] Whether the central panel shows the multicam
+    /// angle grid instead of the program monitor.
+    pub(crate) multicam_view_open: bool,
+    /// [transcript, 17 G-18] Whether the transcript editing panel is open.
+    pub(crate) transcript_panel_open: bool,
+    /// [transcript, 17 G-18] Scroll offset (px) of the transcript word list.
+    pub(crate) transcript_scroll: f32,
+    /// Document-scoped transcript action waiting for the drawer's egui context.
+    pub(crate) pending_transcript_command: Option<(
+        uuid::Uuid,
+        SequenceId,
+        panels::video::transcript::TranscriptCommand,
+    )>,
+    /// [timeline-panel, 17 G-13] Armed modal timeline tool (see
+    /// `TimelineTool`'s doc comment). Read directly off `self` by
+    /// `app/timeline/mod.rs`'s mini-toolbar once that story lands.
+    #[allow(dead_code)]
+    pub(crate) timeline_tool: TimelineTool,
+    /// [seq_tabs, 17 G-17] Sequence ids pinned open as tabs, in display
+    /// order. `TimelineProject::active_sequence` (document state) decides
+    /// which tab is highlighted. Flat like `pending_source`/
+    /// `target_video_track` above rather than per-`DocTab` — per-document-tab
+    /// swap-on-switch is future work in `tabs.rs`, out of this skeleton.
+    pub(crate) open_sequence_tabs: Vec<SequenceId>,
+    /// [seq_tabs, 17 G-16/G-17] Breadcrumb stack of sequence ids drilled
+    /// into via nested-sequence navigation — empty at the top level.
+    pub(crate) nested_sequence_breadcrumbs: Vec<SequenceId>,
+    pub(crate) precision_trim: Option<editing_workflows::PrecisionTrimSession>,
+    pub(crate) sequence_views:
+        std::collections::HashMap<(uuid::Uuid, SequenceId), editing_workflows::SequenceViewState>,
+    pub(crate) view_sequence: Option<(uuid::Uuid, SequenceId)>,
 
     /// Canvas-space position where the current drag began (shape creation).
     drag_start_canvas: Option<(f64, f64)>,
@@ -950,6 +1185,10 @@ pub struct PhotonicApp {
     /// Canvas viewport rect captured this frame — used to recenter the view
     /// when the Navigator emits a `CenterViewOn` action.
     last_canvas_rect: Option<egui::Rect>,
+    /// [`last_canvas_rect`](Self::last_canvas_rect) in physical pixels, captured
+    /// with the `pixels_per_point` in force when it was laid out. Read by the
+    /// host through [`canvas_viewport_px`](Self::canvas_viewport_px).
+    last_canvas_rect_px: Option<(u32, u32, u32, u32)>,
     /// egui time (seconds) of the last throttled history size-cap check, so
     /// size-mode enforcement runs ~every 1.5 s instead of every frame.
     last_history_size_check: f64,
@@ -1031,6 +1270,12 @@ pub struct PhotonicApp {
     pub prefs: AppPreferences,
     /// Which top-bar drawer is open, if any.
     pub active_drawer: Option<DrawerKind>,
+    /// Height of the open File/Edit/Tools menu drawer this frame, 0 when none is
+    /// open. That drawer is a full-width foreground strip anchored under the top
+    /// toolbar, so it lands squarely on top of the left rail and left drawer —
+    /// its own option list ends up stacked over the rail's icons. The left
+    /// panels step down by this much while it is open.
+    pub(crate) menu_drawer_height: f32,
     /// Which option is selected in the currently open drawer (index into the options list).
     /// Resets to None whenever active_drawer changes.
     selected_drawer_option: Option<usize>,
@@ -1158,6 +1403,12 @@ pub struct PhotonicApp {
     /// frame. This is separate from `gui_clipboard` because egui only exposes
     /// text clipboard events and cannot carry image pixels.
     pending_native_clipboard_paste: Option<(NativeClipboardPaste, bool)>,
+
+    /// Clips copied (Ctrl+C) / cut (Ctrl+X) in video mode, held in-process for
+    /// Ctrl+V paste-at-playhead. Session-wide (not per-tab), mirroring
+    /// `gui_clipboard`; each entry is a full clone of the clip (grade/effects/
+    /// trim preserved) plus its source track kind. (NLE parity QW-3.)
+    pub(crate) timeline_clipboard: Vec<command_center::ClipboardClip>,
 
     // ── Composition Analysis ──────────────────────────────────────────────────
     /// Latest findings from the composition analyzer (shown in the GUI panel).
@@ -1377,6 +1628,59 @@ impl Default for PhotonicApp {
             polar_grid_inner_ratio: 0.0,
             selected_layer_ids: Vec::new(),
             selected_id: None,
+            mode: AppMode::default(),
+            timeline_view: TimelineView::default(),
+            playhead: Tick::default(),
+            timeline_selection: Vec::new(),
+            timeline_snap_enabled: true,
+            pending_source: None,
+            source_marks: source_marks::SourceMarksSession::default(),
+            target_video_track: None,
+            target_audio_track: None,
+            timeline_razor_active: false,
+            monitor_playing: false,
+            monitor_play_reverse: false,
+            monitor_play_speed: 1.0,
+            monitor_loop_enabled: false,
+            monitor_safe_area: false,
+            monitor_comp_grid: 0,
+            monitor_transform_tool: false,
+            show_video_shortcut_sheet: false,
+            coach_allowed_this_session: false,
+            initial_mode_checked: false,
+            engine: None,
+            /// K-F1 shared multi-job export queue (marker multi-export / multi-format).
+            render_queue: photonic_video::export::RenderQueue::new(),
+            render_queue_panel_open: false,
+            media_pool_ui: panels::media_pool::MediaPoolUi::default(),
+            timeline_media: None,
+            selected_grade_op: None,
+            color_page_tab: ColorPageTab::default(),
+            scopes_panel_open: false,
+            scope_kind: ScopeKind::default(),
+            open_graph: None,
+            selected_graph_node: None,
+            node_canvas_active: false,
+            mixer_expanded_tracks: std::collections::HashSet::new(),
+            audio_mixer_window_open: false,
+            keyframe_editor_target: None,
+            caption_edit_cue: None,
+            export_dialog_open: false,
+            last_export_preset: String::new(),
+            edit_duration_dialog: None,
+            timeline_grab: None,
+            source_monitor_scrub: None,
+            multicam_active_angle: None,
+            multicam_view_open: false,
+            transcript_panel_open: false,
+            transcript_scroll: 0.0,
+            pending_transcript_command: None,
+            timeline_tool: TimelineTool::default(),
+            open_sequence_tabs: Vec::new(),
+            nested_sequence_breadcrumbs: Vec::new(),
+            precision_trim: None,
+            sequence_views: std::collections::HashMap::new(),
+            view_sequence: None,
             drag_start_canvas: None,
             pen_points: Vec::new(),
             moving: false,
@@ -1450,6 +1754,7 @@ impl Default for PhotonicApp {
             fill_swatch_dirty: false,
             hotbar_cache: None,
             last_canvas_rect: None,
+            last_canvas_rect_px: None,
             last_history_size_check: 0.0,
             history_pressure_warned: false,
             cached_history_bytes: (f64::NEG_INFINITY, 0),
@@ -1477,6 +1782,7 @@ impl Default for PhotonicApp {
             smooth: SmoothViewState::default(),
             prefs: AppPreferences::default(),
             active_drawer: None,
+            menu_drawer_height: 0.0,
             selected_drawer_option: None,
 
             show_welcome: false,
@@ -1571,6 +1877,7 @@ impl Default for PhotonicApp {
             magic_wand_attribute: SelectSameAttr::FillColor,
             magic_wand_tolerance: 0.05,
             gui_clipboard: GuiClipboard::default(),
+            timeline_clipboard: Vec::new(),
             pending_native_clipboard_paste: None,
         }
     }
@@ -1589,9 +1896,26 @@ impl Default for PhotonicApp {
 /// .../request/...ashpd_...`). Spawning the dialog on a dedicated thread gives
 /// the portal its own context and avoids the re-entrancy. The UI thread blocks
 /// on `join()` while the dialog is open, which is the expected modal behaviour.
-fn run_file_dialog<F>(f: F) -> Option<std::path::PathBuf>
+pub(crate) fn run_file_dialog<F>(f: F) -> Option<std::path::PathBuf>
 where
     F: FnOnce() -> Option<std::path::PathBuf> + Send + 'static,
+{
+    std::thread::spawn(f).join().unwrap_or(None)
+}
+
+/// [`run_file_dialog`] for a multi-select picker.
+///
+/// Every native dialog **must** go through one of these two. `rfd` on Linux
+/// talks to `xdg-desktop-portal` over D-Bus and blocks on the reply; called
+/// straight from the render thread that reply never comes, because the portal
+/// handshake needs the app to keep servicing its own event loop. The window
+/// then stops responding and the desktop offers to force-quit it, which reads
+/// as "importing media crashes the app" (and leaves a `SI_USER` SIGABRT core,
+/// not a panic). Handing the call to a scratch thread keeps the portal
+/// conversation off the thread that has to answer it.
+pub(crate) fn run_file_dialog_multi<F>(f: F) -> Option<Vec<std::path::PathBuf>>
+where
+    F: FnOnce() -> Option<Vec<std::path::PathBuf>> + Send + 'static,
 {
     std::thread::spawn(f).join().unwrap_or(None)
 }
@@ -1978,6 +2302,19 @@ impl PhotonicApp {
     }
 
     /// Take a palette MCP request for execution by the application host.
+    /// The canvas viewport in **physical pixels** `(x, y, w, h)` as laid out on
+    /// the previous frame, or `None` before the first frame.
+    ///
+    /// The host clips the document present to this so the artboard cannot bleed
+    /// into the gutters between the floating panel cards. Converted here rather
+    /// than in the host because the conversion must use the same
+    /// `pixels_per_point` egui laid the rect out with — reading it a frame later
+    /// can pick up a different value across a DPI or zoom change and clip the
+    /// canvas to the wrong box.
+    pub fn canvas_viewport_px(&self) -> Option<(u32, u32, u32, u32)> {
+        self.last_canvas_rect_px
+    }
+
     pub fn take_mcp_operation_request(&mut self) -> Option<String> {
         self.mcp_operation_request.take()
     }
@@ -1994,6 +2331,9 @@ impl PhotonicApp {
         s.prefs = prefs;
         s.fill_color = fill_color;
         s.lua_console.visible = console_visible;
+        s.timeline_snap_enabled = s.prefs.timeline_snap_enabled;
+        // First-run coach: allowed only on a launch that has never shown it.
+        s.coach_allowed_this_session = !s.prefs.video_coach_shown_once;
         s.open_drawer = open_drawer;
         if let Some(g) = open_drawer {
             s.last_drawer_group = g;
@@ -2007,6 +2347,15 @@ impl PhotonicApp {
         s.open_right_drawer = s.prefs.open_right_drawer;
         if let Some(g) = s.prefs.open_right_drawer {
             s.last_right_drawer_group = g;
+        }
+        // The mixer moved out of the right drawer into a floating window; a
+        // preferences file from before that would otherwise open an empty
+        // drawer with no way to notice it was the mixer.
+        if s.open_right_drawer == Some(RightDrawerGroup::AudioMixer) {
+            s.open_right_drawer = None;
+            s.prefs.open_right_drawer = None;
+            s.last_right_drawer_group = RightDrawerGroup::Layers;
+            s.audio_mixer_window_open = true;
         }
         s
     }
@@ -2024,6 +2373,9 @@ impl PhotonicApp {
         s.prefs = prefs;
         s.fill_color = fill_color;
         s.lua_console.visible = console_visible;
+        s.timeline_snap_enabled = s.prefs.timeline_snap_enabled;
+        // First-run coach: allowed only on a launch that has never shown it.
+        s.coach_allowed_this_session = !s.prefs.video_coach_shown_once;
         s.open_drawer = open_drawer;
         if let Some(g) = open_drawer {
             s.last_drawer_group = g;
@@ -2038,7 +2390,58 @@ impl PhotonicApp {
         if let Some(g) = s.prefs.open_right_drawer {
             s.last_right_drawer_group = g;
         }
+        // The mixer moved out of the right drawer into a floating window; a
+        // preferences file from before that would otherwise open an empty
+        // drawer with no way to notice it was the mixer.
+        if s.open_right_drawer == Some(RightDrawerGroup::AudioMixer) {
+            s.open_right_drawer = None;
+            s.prefs.open_right_drawer = None;
+            s.last_right_drawer_group = RightDrawerGroup::Layers;
+            s.audio_mixer_window_open = true;
+        }
         s
+    }
+
+    /// Borrow the video-editor session state as a [`VideoPanelUi`] (04 §4.1) for
+    /// the video panels that do **not** go through [`PropPanelCtx`] — the
+    /// right-rail Color/Audio drawers, the floating scopes/export panels, and the
+    /// central node canvas. The left-rail video drawers get the same view via
+    /// `ctx.video` inside [`Self::draw_property_drawer_content`] instead (that one
+    /// must inline the borrows, since the surrounding `PropPanelCtx` literal
+    /// already holds disjoint `&mut self` field borrows).
+    fn video_panel_ui(&mut self) -> VideoPanelUi<'_> {
+        VideoPanelUi {
+            selection: &self.timeline_selection,
+            selected_grade_op: &mut self.selected_grade_op,
+            color_page_tab: &mut self.color_page_tab,
+            scopes_panel_open: &mut self.scopes_panel_open,
+            scope_kind: &mut self.scope_kind,
+            open_graph: &mut self.open_graph,
+            selected_graph_node: &mut self.selected_graph_node,
+            node_canvas_active: &mut self.node_canvas_active,
+            mixer_expanded_tracks: &mut self.mixer_expanded_tracks,
+            keyframe_editor_target: &mut self.keyframe_editor_target,
+            caption_edit_cue: &mut self.caption_edit_cue,
+            export_dialog_open: &mut self.export_dialog_open,
+            last_export_preset: &mut self.last_export_preset,
+            playhead: self.playhead,
+            source_marks: &mut self.source_marks,
+            source_audition: self
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.status().source_audition.clone()),
+            source_audition_error: self
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.status().source_audition_error.clone()),
+            source_monitor_scrub: &mut self.source_monitor_scrub,
+            multicam_active_angle: &mut self.multicam_active_angle,
+            multicam_view_open: &mut self.multicam_view_open,
+            transcript_panel_open: &mut self.transcript_panel_open,
+            transcript_scroll: &mut self.transcript_scroll,
+            open_sequence_tabs: &mut self.open_sequence_tabs,
+            nested_sequence_breadcrumbs: &mut self.nested_sequence_breadcrumbs,
+        }
     }
 
     /// Build the shared [`PropPanelCtx`] and render one property-drawer group into
@@ -2052,6 +2455,21 @@ impl PhotonicApp {
         history: &CommandHistory,
         group: DrawerGroup,
     ) {
+        if group == DrawerGroup::Transcript {
+            if let Some((document_id, sequence_id, command)) =
+                self.pending_transcript_command.take()
+            {
+                if document_id == doc.id
+                    && doc
+                        .timeline
+                        .as_ref()
+                        .and_then(|project| project.active_sequence)
+                        == Some(sequence_id)
+                {
+                    panels::video::transcript::request_command(ui.ctx(), command);
+                }
+            }
+        }
         let selected_node = self.selected_id.and_then(|id| doc.nodes.get(&id));
         let selection_count = doc.selection.node_ids.len();
         let selected_ids = doc.selection.node_ids.iter().cloned().collect::<Vec<_>>();
@@ -2137,6 +2555,48 @@ impl PhotonicApp {
             event_trigger_event: &mut self.event_trigger_event,
             event_trigger_action: &mut self.event_trigger_action,
             workspace_name_input: &mut self.workspace_name_input,
+            media_ui: &mut self.media_pool_ui,
+            engine_online: self.engine.is_some(),
+            proxy_mode: self
+                .engine
+                .as_ref()
+                .map(|b| b.proxy_mode)
+                .unwrap_or_default(),
+            // Inlined rather than `self.video_panel_ui()` because that borrows
+            // all of `self`, which would collide with the disjoint `&mut self`
+            // field borrows already held by this `PropPanelCtx` literal.
+            video: VideoPanelUi {
+                selection: &self.timeline_selection,
+                selected_grade_op: &mut self.selected_grade_op,
+                color_page_tab: &mut self.color_page_tab,
+                scopes_panel_open: &mut self.scopes_panel_open,
+                scope_kind: &mut self.scope_kind,
+                open_graph: &mut self.open_graph,
+                selected_graph_node: &mut self.selected_graph_node,
+                node_canvas_active: &mut self.node_canvas_active,
+                mixer_expanded_tracks: &mut self.mixer_expanded_tracks,
+                keyframe_editor_target: &mut self.keyframe_editor_target,
+                caption_edit_cue: &mut self.caption_edit_cue,
+                export_dialog_open: &mut self.export_dialog_open,
+                last_export_preset: &mut self.last_export_preset,
+                playhead: self.playhead,
+                source_marks: &mut self.source_marks,
+                source_audition: self
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.status().source_audition.clone()),
+                source_audition_error: self
+                    .engine
+                    .as_ref()
+                    .and_then(|engine| engine.status().source_audition_error.clone()),
+                source_monitor_scrub: &mut self.source_monitor_scrub,
+                multicam_active_angle: &mut self.multicam_active_angle,
+                multicam_view_open: &mut self.multicam_view_open,
+                transcript_panel_open: &mut self.transcript_panel_open,
+                transcript_scroll: &mut self.transcript_scroll,
+                open_sequence_tabs: &mut self.open_sequence_tabs,
+                nested_sequence_breadcrumbs: &mut self.nested_sequence_breadcrumbs,
+            },
             action: None,
             q: String::new(),
             forced_open: None,
@@ -2212,7 +2672,21 @@ impl PhotonicApp {
         // Wayland this handler never fires and File → Open/Place Image… is the
         // way in.
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
+        // In video mode, dropped media files import into the media pool
+        // (05 §2) instead of placing raster layers; anything the pool doesn't
+        // recognize falls through to the image path below.
+        let mut media_drops: Vec<std::path::PathBuf> = Vec::new();
         for file in dropped {
+            if self.mode == AppMode::Video {
+                if let Some(path) = file
+                    .path
+                    .as_deref()
+                    .filter(|p| panels::media_pool::guess_asset_kind(p).is_some())
+                {
+                    media_drops.push(path.to_path_buf());
+                    continue;
+                }
+            }
             if let Some(path) = file.path.as_deref().filter(|p| is_image_path(p)) {
                 let path = path.to_path_buf();
                 self.place_image_file(doc, history, &path);
@@ -2221,6 +2695,126 @@ impl PhotonicApp {
                 let name = std::path::PathBuf::from(&file.name);
                 if is_image_path(&name) {
                     self.place_image_bytes(doc, history, bytes, Some(&name));
+                    doc_modified = true;
+                }
+            }
+        }
+        if !media_drops.is_empty() {
+            let bin = self.media_pool_ui.current_bin;
+            let project_path = self.current_file.clone();
+            // L0-first: stubs land on this frame; L1–L3 meta fills async (24 §2).
+            let stubs = self
+                .media_pool_ui
+                .spawn_import(media_drops, bin, project_path);
+            if !stubs.is_empty() {
+                use photonic_core::timeline::ops;
+                timeline::ops_bridge::ensure_project_and_sequence(
+                    doc,
+                    history,
+                    photonic_core::timeline::FrameRate::FPS_30,
+                );
+                let auto_place = self.prefs.auto_place_import_on_timeline;
+                let at = self.playhead;
+                for asset in stubs {
+                    let id = asset.id;
+                    history.execute_discrete(Command::Timeline(ops::add_asset(asset)), doc);
+                    // Proposal 213: CapCut-class default — land on the timeline.
+                    if auto_place {
+                        timeline::ops_bridge::insert_asset_at_first_fit(doc, history, id, at);
+                    }
+                }
+                if auto_place
+                    && !self.prefs.video_coach_dismissed
+                    && self.prefs.video_coach_step == 0
+                {
+                    self.prefs.video_coach_step = 1;
+                    self.prefs.save();
+                }
+                doc_modified = true;
+            }
+        }
+
+        // ── Video engine upkeep ───────────────────────────────────────────────
+        // Mirror the timeline into the engine's snapshot pair whenever the
+        // history revision moved (see `app/engine.rs`), and apply L1–L3 meta
+        // fills for imports already registered at L0 (24 §2).
+        if let Some(bridge) = self.engine.as_mut() {
+            bridge.sync_document(doc, history);
+        }
+        let meta_updates = self.media_pool_ui.drain_meta();
+        if !meta_updates.is_empty() {
+            use photonic_core::timeline::ops;
+            let auto_proxy = doc
+                .timeline
+                .as_ref()
+                .map(|p| p.settings.generate_proxies)
+                .unwrap_or(false);
+            let meta_asset_ids: Vec<_> = meta_updates.iter().map(|m| m.asset).collect();
+            if let Some(project) = doc.timeline.as_ref() {
+                let commands: Vec<_> = meta_updates
+                    .into_iter()
+                    .filter(|m| !m.waveform_only)
+                    .filter_map(|m| {
+                        ops::set_asset_meta(project, m.asset, m.probe, m.content_hash).ok()
+                    })
+                    .collect();
+                for cmd in commands {
+                    history.execute_discrete(Command::Timeline(cmd), doc);
+                    doc_modified = true;
+                }
+            }
+            // L7: after L1–L4 fill, auto-queue proxies when project policy says so
+            // (24 §2 L7, G-15C). No Pending document mutation — in-flight is
+            // session-only (`proxy_in_flight`); one Ready/Failed history entry
+            // on completion. Manual "Build proxies" shares the same queue guard.
+            if auto_proxy {
+                let candidates: Vec<_> = doc
+                    .timeline
+                    .as_ref()
+                    .map(|project| {
+                        meta_asset_ids
+                            .iter()
+                            .filter_map(|id| project.media.assets.get(id).cloned())
+                            .filter(|a| {
+                                a.content_hash.is_some()
+                                    && !self.media_pool_ui.proxy_job_in_flight(a.id)
+                                    && photonic_video::media::should_auto_generate_proxy(
+                                        a.kind,
+                                        &a.source,
+                                        a.proxy.as_ref(),
+                                        true,
+                                    )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                if !candidates.is_empty() {
+                    self.media_pool_ui
+                        .spawn_proxy_generation(candidates, self.current_file.clone());
+                }
+            }
+        }
+        let finished_proxies = self.media_pool_ui.drain_finished_proxies();
+        if !finished_proxies.is_empty() {
+            use photonic_core::timeline::ops;
+            use photonic_core::timeline::ProxyOrigin;
+            // Skip applying a Generated completion if the user attached a proxy
+            // while the job was in flight (G-15A: never clobber Attached).
+            for result in finished_proxies {
+                let skip = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|p| p.media.assets.get(&result.asset))
+                    .and_then(|a| a.proxy.as_ref())
+                    .is_some_and(|p| p.origin == ProxyOrigin::Attached);
+                if skip {
+                    continue;
+                }
+                let cmd = doc.timeline.as_ref().and_then(|project| {
+                    ops::set_asset_proxy(project, result.asset, result.proxy).ok()
+                });
+                if let Some(cmd) = cmd {
+                    history.execute_discrete(Command::Timeline(cmd), doc);
                     doc_modified = true;
                 }
             }
@@ -2531,11 +3125,20 @@ impl PhotonicApp {
         }
 
         // ── Apply theme ───────────────────────────────────────────────────────
-        if self.prefs.dark_mode {
-            ctx.set_visuals(crate::theme::build_dark_theme());
-        } else {
-            ctx.set_visuals(crate::theme::build_light_theme());
-        }
+        // Install *both* palettes, then let the preference pick between them.
+        //
+        // `Context::set_visuals` writes only the slot for the theme that happens
+        // to be active, and egui's `theme_preference` defaults to `System`. So
+        // writing one palette left the other slot holding egui's stock visuals,
+        // and on a light desktop the app came up in egui's default light theme no
+        // matter what the preference said. Filling both slots makes the palette
+        // correct whichever way the preference — or the desktop — resolves.
+        ctx.set_visuals_of(egui::Theme::Dark, crate::theme::build_dark_theme());
+        ctx.set_visuals_of(egui::Theme::Light, crate::theme::build_light_theme());
+        ctx.set_theme(self.prefs.theme_mode.to_egui());
+        // Mirror the *resolved* choice so the hand-picked colours elsewhere
+        // (rulers, scrims, canvas overlays) follow a System resolution too.
+        self.prefs.dark_mode = ctx.theme() == egui::Theme::Dark;
         // Apply the user's UI scale as a *zoom factor* composed on top of the
         // window's native scale factor — NOT as an absolute pixels-per-point.
         // Using an absolute ppp here decouples egui's layout/hit-testing from the
@@ -2579,6 +3182,33 @@ impl PhotonicApp {
                         self.show_welcome = false;
                         doc_modified = true;
                     }
+                    WelcomeAction::CreateNewVideo(spec) => {
+                        // Video-mode counterpart of `CreateNew` above (04
+                        // §1.2): a fresh document, THEN the timeline project
+                        // it's paired with (§1.3) — same undo-reset discipline
+                        // as `create_document_from_spec`, plus entering Video.
+                        let crate::welcome::VideoProjectSpec {
+                            name,
+                            width,
+                            height,
+                            frame_rate,
+                        } = spec;
+                        *doc = photonic_core::Document::new(name, width, height);
+                        history.reset();
+                        self.fit_pending = true;
+                        self.current_file = None;
+                        self.selected_id = None;
+                        self.ensure_timeline_project_with(
+                            doc,
+                            history,
+                            width as u32,
+                            height as u32,
+                            frame_rate,
+                        );
+                        self.mode = AppMode::Video;
+                        self.show_welcome = false;
+                        doc_modified = true;
+                    }
                     WelcomeAction::OpenFile(path) => match load_document(&path) {
                         Ok((loaded, hist_snap)) => {
                             self.welcome.add_recent(path.clone(), loaded.name.clone());
@@ -2589,6 +3219,13 @@ impl PhotonicApp {
                             self.selected_id = None;
                             self.show_welcome = false;
                             doc_modified = true;
+                            // Auto-enter (04 §1.2): a project with a timeline
+                            // always opens into video mode.
+                            self.mode = if doc.timeline.is_some() {
+                                AppMode::Video
+                            } else {
+                                AppMode::Vector
+                            };
                         }
                         Err(e) => {
                             self.file_status = Some(format!("Open failed: {e}"));
@@ -2666,6 +3303,13 @@ impl PhotonicApp {
                                         self.selected_id = None;
                                         self.show_welcome = false;
                                         doc_modified = true;
+                                        // Auto-enter (04 §1.2), same rule as
+                                        // the WelcomeAction::OpenFile arm.
+                                        self.mode = if doc.timeline.is_some() {
+                                            AppMode::Video
+                                        } else {
+                                            AppMode::Vector
+                                        };
                                     }
                                     Err(e) => {
                                         self.file_status = Some(format!("Open failed: {e}"));
@@ -2684,6 +3328,10 @@ impl PhotonicApp {
         // and the first editor frame), then apply any switch/close requested by
         // last frame's tab-bar UI before the canvas draws this frame.
         self.ensure_initial_tab(doc, history);
+        // Auto-enter video mode (04 §1.2) for a CLI/double-click-opened
+        // document that already has a timeline — runs exactly once, the
+        // first frame after the initial tab lands.
+        self.check_initial_auto_enter(doc);
         if let Some(target) = self.pending_tab_switch.take() {
             self.switch_tab(target, doc, history, view);
         }
@@ -2772,12 +3420,49 @@ impl PhotonicApp {
                         self.selected_drawer_option = None;
                     }
 
+                    // Video mode toggle (video-editor-module 04-ui-mode-timeline.md
+                    // §1.2) — same selectable_label + active_drawer-flush idiom as
+                    // File/Edit/Tools above. `enter_or_exit_video_mode` lazily
+                    // creates `doc.timeline` on the way in (§1.3) and always issues
+                    // the exit-pause seam on the way out (§7).
+                    let video_active = self.mode == AppMode::Video;
+                    let video_resp = ui.selectable_label(video_active, "Video");
+                    if video_resp.clicked() {
+                        if self.active_drawer == Some(DrawerKind::Edit) {
+                            self.prefs.save();
+                        }
+                        self.enter_or_exit_video_mode(doc, history);
+                    }
+                    self.draw_video_hint_callout(ui.ctx(), video_resp.rect);
+
                     // Audit log toggle
                     if ui
                         .selectable_label(self.audit.panel_open, "Audit")
                         .clicked()
                     {
                         self.audit.panel_open = !self.audit.panel_open;
+                    }
+
+                    // Video export dialog toggle (05 §3) — video mode only.
+                    // Toolbar entry for `export_dialog_open`; the floating dialog
+                    // body is filled by the export-dialog (05) story. (The scopes
+                    // panel toggle is owned by the Color Controls drawer instead,
+                    // via `VideoPanelUi::scopes_panel_open`, per 07 §6.)
+                    if self.mode == AppMode::Video
+                        && ui
+                            .selectable_label(self.export_dialog_open, "Export")
+                            .on_hover_text("Export video (04 §4.1)")
+                            .clicked()
+                    {
+                        self.export_dialog_open = !self.export_dialog_open;
+                    }
+                    if self.mode == AppMode::Video
+                        && ui
+                            .selectable_label(self.render_queue_panel_open, "Queue")
+                            .on_hover_text("Render queue inspector (K-F1)")
+                            .clicked()
+                    {
+                        self.render_queue_panel_open = !self.render_queue_panel_open;
                     }
 
                     // Global search (command palette) — tools + actions.
@@ -2826,7 +3511,8 @@ impl PhotonicApp {
             self.selected_drawer_option = None;
         }
 
-        doc_modified = self.draw_menu_drawer(ctx, doc, view, history, &toolbar_resp, doc_modified);
+        let toolbar_rect = toolbar_resp.response.rect;
+        doc_modified = self.draw_menu_drawer(ctx, doc, view, history, toolbar_rect, doc_modified);
 
         // ── Bottom status bar ────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("statusbar")
@@ -2854,19 +3540,28 @@ impl PhotonicApp {
                         );
                     }
                     ui.separator();
-                    let sel_info = self
-                        .selected_id
-                        .and_then(|id| doc.nodes.get(&id))
-                        .map(|n| format!("  •  \"{}\" selected", n.name))
-                        .unwrap_or_default();
-                    ui.label(format!(
-                        "{} {}  •  {} objects{}  •  {:.0}%",
-                        self.active_tool.icon(),
-                        self.active_tool.label(),
-                        doc.node_count(),
-                        sel_info,
-                        view.zoom * 100.0,
-                    ));
+                    // Mode-aware status: vector editing shows tool/objects/zoom;
+                    // video mode shows sequence/format/playhead — the vector
+                    // tool + document node count are meaningless over a timeline.
+                    if self.mode == AppMode::Video {
+                        if let Some(line) = video_status_line(doc, self.playhead) {
+                            ui.label(line);
+                        }
+                    } else {
+                        let sel_info = self
+                            .selected_id
+                            .and_then(|id| doc.nodes.get(&id))
+                            .map(|n| format!("  •  \"{}\" selected", n.name))
+                            .unwrap_or_default();
+                        ui.label(format!(
+                            "{} {}  •  {} objects{}  •  {:.0}%",
+                            self.active_tool.icon(),
+                            self.active_tool.label(),
+                            doc.node_count(),
+                            sel_info,
+                            view.zoom * 100.0,
+                        ));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Clickable MCP status indicator → opens the MCP modal
                         // (status + restart, #170).
@@ -2918,8 +3613,11 @@ impl PhotonicApp {
         // A group with no content for the current context is DISABLED, and an
         // open drawer whose content disappears animates closed (and reappears
         // when the context returns) via `effective_open` — no state churn.
-        let sel_count = doc.selection.node_ids.len();
-        let effective_open = self.open_drawer.filter(|g| g.has_content(sel_count));
+        let node_sel_count = doc.selection.node_ids.len();
+        let clip_sel_count = self.timeline_selection.len();
+        let effective_open = self
+            .open_drawer
+            .filter(|g| g.has_content(node_sel_count, clip_sel_count));
         // ── Rail / drawer card layout ─────────────────────────────────────────
         // Shared knobs for the floating rail + drawer "cards". Both use the same
         // corner radius, border, and vertical float; the rail stays flush with
@@ -2932,7 +3630,13 @@ impl PhotonicApp {
         const RAIL_PAD_Y: f32 = 4.0; // rail inner top/bottom padding
         const RAIL_GAP: f32 = 4.0; // gap on the rail's right, before the drawer
         const DRAWER_GAP: f32 = 3.0; // gap on the drawer's left, after the rail
-        const DRAWER_FLOAT_X: f32 = 4.0; // gap on the drawer's right, off the canvas
+                                     // Gap on the drawer's right, off the canvas. Kept at 0 so the floating
+                                     // card does not leave a pure-black window-fill strip between the left
+                                     // drawer and the preview — that strip stacked with the monitor's
+                                     // pillarbox and read as a stubborn "black box" when flipping tabs.
+                                     // Top/bottom float (`CARD_FLOAT_Y`) still gives the card its rounded
+                                     // corners against the window fill.
+        const DRAWER_FLOAT_X: f32 = 0.0;
         const DRAWER_PAD_X: f32 = 10.0; // drawer inner left/right content gutter
         const DRAWER_PAD_Y: f32 = 8.0; // drawer inner top/bottom content gutter
                                        // Rail width is fully determined by its padding, icon size and right gap.
@@ -2959,7 +3663,7 @@ impl PhotonicApp {
             f.outer_margin = egui::Margin {
                 left: 0.0,
                 right: RAIL_GAP,
-                top: CARD_FLOAT_Y,
+                top: CARD_FLOAT_Y + self.menu_drawer_height,
                 bottom: CARD_FLOAT_Y,
             };
             // Round only the two right corners; the left edge is the window edge.
@@ -2985,9 +3689,9 @@ impl PhotonicApp {
                 ui.add_space(6.0);
                 // Centre the icon column within the rail card.
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                    for group in DrawerGroup::ALL {
+                    for group in DrawerGroup::all_for_mode(self.mode).iter().copied() {
                         let active = effective_open == Some(group);
-                        let enabled = group.has_content(sel_count);
+                        let enabled = group.has_content(node_sel_count, clip_sel_count);
                         let resp = ui
                             .add_enabled(
                                 enabled,
@@ -3062,7 +3766,9 @@ impl PhotonicApp {
         // `animate_bool_with_time_and_easing` requests repaint while in flight.
         // Reduced-motion makes the transition instant.
         // Recompute after the rail click so opening/closing animates this frame.
-        let effective_open = self.open_drawer.filter(|g| g.has_content(sel_count));
+        let effective_open = self
+            .open_drawer
+            .filter(|g| g.has_content(node_sel_count, clip_sel_count));
         let drawer_open = effective_open.is_some();
         let anim_time = if self.prefs.reduced_motion { 0.0 } else { 0.18 };
         let t = ctx.animate_bool_with_time_and_easing(
@@ -3100,13 +3806,25 @@ impl PhotonicApp {
                 f.outer_margin = egui::Margin {
                     left: DRAWER_GAP,
                     right: DRAWER_FLOAT_X,
-                    top: CARD_FLOAT_Y,
+                    top: CARD_FLOAT_Y + self.menu_drawer_height,
                     bottom: CARD_FLOAT_Y,
                 };
                 f.rounding = egui::Rounding::same(CARD_ROUNDING);
                 f.stroke = ctx.style().visuals.widgets.noninteractive.bg_stroke;
                 f
             };
+            // Hold the panel at the user's width; content is never allowed to
+            // widen it (see `pin_side_panel_width`).
+            let drawer_id = egui::Id::new("properties");
+            let dragging_width = pin_side_panel_width(
+                ctx,
+                drawer_id,
+                if fully_open {
+                    target_w
+                } else {
+                    (target_w * t).max(1.0)
+                },
+            );
             let mut panel = egui::SidePanel::left("properties")
                 .frame(drawer_frame)
                 // No default separator line — the card's own border defines its edge.
@@ -3123,38 +3841,78 @@ impl PhotonicApp {
                 panel.resizable(false).exact_width((target_w * t).max(1.0))
             };
             let resp = panel.show(ctx, |ui| {
+                // Fill the panel. `Frame` sizes itself to its *content*, so a
+                // drawer whose widest row is narrower than the panel painted a
+                // card that stopped short of the panel's right edge — leaving a
+                // wide unpainted band between the card and the canvas. (Before
+                // the width was pinned this hid itself, because egui fed that
+                // short frame rect back as the panel's next width and the panel
+                // just crept narrower every frame instead.)
+                // Use `max_rect` (not `available_width`) so the first widget in
+                // the drawer can't shrink the reported width before we pin it.
+                let fill = ui.max_rect().size();
+                ui.set_min_size(fill);
                 // Cross-fade the content with the slide (alpha tracks the eased
                 // width factor) so the transition clearly reads as an animation
                 // rather than a pop.
                 ui.set_opacity(t);
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    if render_group == DrawerGroup::Tools {
-                        // Tools drawer: render the tool palette + apply selection.
-                        if let Some(tool) =
-                            panels::draw_tools_panel(ui, self.active_tool, &self.prefs.pinned_tools)
-                        {
-                            self.pen_points.clear();
-                            self.pencil_points.clear();
-                            self.lasso_points.clear();
-                            self.isolated_group = None;
-                            self.clear_point_edit();
-                            self.active_tool = tool;
-                            if tool != Tool::Select
-                                && tool != Tool::DirectSelect
-                                && tool != Tool::ProportionalMove
-                            {
-                                self.selected_id = None;
-                                doc.selection.clear();
-                            }
-                        }
-                        return;
-                    }
-                    self.draw_property_drawer_content(ui, doc, history, render_group);
+                // Both axes scrollable, `auto_shrink` off on both. A scroll
+                // area only bounds an axis it can actually scroll: a
+                // `vertical()` one still reports its *content's* width, which is
+                // the whole problem here. `auto_shrink` off on BOTH axes is what actually pins the
+                // drawer's width. A `Frame` reports its content's size, and a
+                // `SidePanel` re-reads that as its own width next frame — so a
+                // single intrinsically-wide row (a long media filename plus its
+                // metadata is ~570 px) drags the whole panel out to match,
+                // overriding the width the user picked. A scroll area with
+                // `auto_shrink[0] == false` reports the viewport width instead
+                // of the content width, which severs that feedback loop; content
+                // wider than the drawer now scrolls rather than widening it.
+                // Disable drag-to-scroll while the speed-ramp handles are
+                // being dragged — otherwise `ScrollArea::both` steals the
+                // pointer and the curve never tracks the mouse.
+                let speed_dragging = ui
+                    .ctx()
+                    .data(|d| d.get_temp::<bool>(egui::Id::new("speed_curve_dragging")))
+                    .unwrap_or(false);
+                ui.ctx().data_mut(|d| {
+                    d.insert_temp(egui::Id::new("speed_curve_dragging"), false);
                 });
+                egui::ScrollArea::both()
+                    .auto_shrink([false, false])
+                    .drag_to_scroll(!speed_dragging)
+                    .show(ui, |ui| {
+                        if render_group == DrawerGroup::Tools {
+                            // Tools drawer: render the tool palette + apply selection.
+                            if let Some(tool) = panels::draw_tools_panel(
+                                ui,
+                                self.active_tool,
+                                &self.prefs.pinned_tools,
+                            ) {
+                                self.pen_points.clear();
+                                self.pencil_points.clear();
+                                self.lasso_points.clear();
+                                self.isolated_group = None;
+                                self.clear_point_edit();
+                                self.active_tool = tool;
+                                if tool != Tool::Select
+                                    && tool != Tool::DirectSelect
+                                    && tool != Tool::ProportionalMove
+                                {
+                                    self.selected_id = None;
+                                    doc.selection.clear();
+                                }
+                            }
+                            return;
+                        }
+                        self.draw_property_drawer_content(ui, doc, history, render_group);
+                    });
             });
             // Capture a user resize of the fully-open drawer so it persists
-            // (in-memory now; flushed to disk on the next toggle/close).
-            if fully_open {
+            // (in-memory now; flushed to disk on the next toggle/close). Only a
+            // real handle drag counts — otherwise a content-driven width bump
+            // would be written back as if the user had asked for it.
+            if fully_open && dragging_width {
                 let w = resp.response.rect.width();
                 if (w - self.prefs.drawer_width).abs() > 0.5 {
                     self.prefs.drawer_width = w;
@@ -3200,8 +3958,17 @@ impl PhotonicApp {
             .show(ctx, |ui| {
                 ui.add_space(6.0);
                 ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                    for group in RightDrawerGroup::ALL {
-                        let active = self.open_right_drawer == Some(group);
+                    for group in RightDrawerGroup::all_for_mode(self.mode).iter().copied() {
+                        // The mixer is the one group that does not fit a drawer
+                        // (see `audio_mixer_window_open`); its rail button toggles
+                        // the floating window instead, keeping the entry point
+                        // exactly where it has always been.
+                        let is_mixer = group == RightDrawerGroup::AudioMixer;
+                        let active = if is_mixer {
+                            self.audio_mixer_window_open
+                        } else {
+                            self.open_right_drawer == Some(group)
+                        };
                         let resp = ui
                             .add(
                                 egui::Button::new(RichText::new(group.icon()).size(18.0))
@@ -3210,12 +3977,16 @@ impl PhotonicApp {
                             )
                             .on_hover_text(group.title());
                         if resp.clicked() {
-                            self.open_right_drawer = if active { None } else { Some(group) };
-                            if let Some(g) = self.open_right_drawer {
-                                self.last_right_drawer_group = g;
+                            if is_mixer {
+                                self.audio_mixer_window_open = !active;
+                            } else {
+                                self.open_right_drawer = if active { None } else { Some(group) };
+                                if let Some(g) = self.open_right_drawer {
+                                    self.last_right_drawer_group = g;
+                                }
+                                self.prefs.open_right_drawer = self.open_right_drawer;
+                                self.prefs.save();
                             }
-                            self.prefs.open_right_drawer = self.open_right_drawer;
-                            self.prefs.save();
                         }
                         ui.add_space(4.0);
                     }
@@ -3256,6 +4027,15 @@ impl PhotonicApp {
                 f.stroke = ctx.style().visuals.widgets.noninteractive.bg_stroke;
                 f
             };
+            let right_dragging_width = pin_side_panel_width(
+                ctx,
+                egui::Id::new("right_properties"),
+                if fully_open {
+                    right_target_w
+                } else {
+                    (right_target_w * rt).max(1.0)
+                },
+            );
             let mut panel = egui::SidePanel::right("right_properties")
                 .frame(right_drawer_frame)
                 .show_separator_line(false);
@@ -3270,7 +4050,13 @@ impl PhotonicApp {
                     .resizable(false)
                     .exact_width((right_target_w * rt).max(1.0))
             };
+            // Track history so a grade edit committed inside the drawer (via
+            // SetGrade → CommandHistory) marks the document dirty.
+            let right_rev_before = history.revision();
             let resp = panel.show(ctx, |ui| {
+                // Fill the panel — see the left drawer for why.
+                let fill = ui.max_rect().size();
+                ui.set_min_size(fill);
                 ui.set_opacity(rt);
                 match right_render_group {
                     RightDrawerGroup::Layers => {
@@ -3288,6 +4074,25 @@ impl PhotonicApp {
                     RightDrawerGroup::Chat => {
                         self.draw_claude_tab(ui);
                     }
+                    RightDrawerGroup::ColorControls => {
+                        // Grade edits commit straight through `history`
+                        // (SetGrade → CommandHistory); disjoint `self` field
+                        // borrows keep this off `video_panel_ui`'s whole-self loan.
+                        panels::video::color_page::draw_color_controls(
+                            ui,
+                            doc,
+                            history,
+                            &mut self.pending_panel_actions,
+                            &self.timeline_selection,
+                            &mut self.selected_grade_op,
+                            &mut self.color_page_tab,
+                            &mut self.scopes_panel_open,
+                        );
+                    }
+                    // Hosted in a floating window instead — a stale
+                    // `open_right_drawer` from an older build is migrated away
+                    // in `PhotonicApp::new`, so this arm draws nothing.
+                    RightDrawerGroup::AudioMixer => {}
                     RightDrawerGroup::History => {
                         egui::ScrollArea::vertical()
                             .id_salt("right_history_scroll")
@@ -3300,13 +4105,20 @@ impl PhotonicApp {
                                 );
                             });
                     }
+                    // A group written by a newer build: normalized to the
+                    // default at load, so this renders nothing rather than
+                    // showing an empty right drawer.
+                    RightDrawerGroup::Unknown => {}
                 }
             });
-            if fully_open {
+            if fully_open && right_dragging_width {
                 let w = resp.response.rect.width();
                 if (w - self.prefs.right_drawer_width).abs() > 0.5 {
                     self.prefs.right_drawer_width = w;
                 }
+            }
+            if history.revision() != right_rev_before {
+                doc_modified = true;
             }
         }
 
@@ -3326,6 +4138,46 @@ impl PhotonicApp {
                 self.draw_console(ui);
             });
 
+        // ── Timeline panel (video mode only, 04 §1.1/§2) ───────────────────────
+        // Docked below the console panel, above the (in video mode,
+        // program-monitor) CentralPanel — panel registration order is
+        // egui-stacking order, so this must land after the console panel's
+        // `show_animated` and before `CentralPanel::show`.
+        if self.mode == AppMode::Video {
+            egui::TopBottomPanel::bottom("timeline")
+                .resizable(true)
+                .default_height(220.0)
+                .min_height(120.0)
+                .show(ctx, |ui| {
+                    self.draw_timeline_panel(ui, doc, history);
+                });
+        }
+
+        // ── Audio mixer (floating window, 09) ────────────────────────────────
+        // A rack of 88 px channel strips plus the master bus needs far more
+        // room than the right drawer can give, so the mixer floats. Foreground
+        // order keeps it above every panel (it is a monitoring surface — it has
+        // to stay legible while you drive the timeline underneath it), and both
+        // axes scroll so a narrow app window clips nothing.
+        if self.mode == AppMode::Video && self.audio_mixer_window_open {
+            let mut open = true;
+            egui::Window::new(format!("{}  Audio Mixer", ph::SLIDERS))
+                .id(egui::Id::new("audio_mixer_window"))
+                .order(egui::Order::Foreground)
+                .open(&mut open)
+                .collapsible(true)
+                .resizable(true)
+                .default_size(egui::vec2(620.0, 460.0))
+                .min_width(260.0)
+                .min_height(240.0)
+                .default_pos(ctx.screen_rect().center() - egui::vec2(310.0, 230.0))
+                .show(ctx, |ui| {
+                    let mut vid = self.video_panel_ui();
+                    panels::video::audio_mixer::draw_audio_mixer(ui, &mut vid);
+                });
+            self.audio_mixer_window_open = open;
+        }
+
         // ── Audit panel (floating window) ────────────────────────────────────
         if self.audit.panel_open {
             panels::draw_audit_panel(
@@ -3336,12 +4188,139 @@ impl PhotonicApp {
             );
         }
 
+        // ── Video floating panels (04 §4.1) ──────────────────────────────────
+        // The scopes panel (07 §6) and the video export dialog (05 §3) are
+        // floating windows, not drawers. Gated on their session flags (both
+        // default-off, so vector mode and untouched video mode are unchanged).
+        if self.mode == AppMode::Video {
+            if self.scopes_panel_open {
+                // GPU scopes run over the engine's K-E2 scope tap (the clip's
+                // post-grade / pre-fold texture, or the program pre-caption) via
+                // `photonic_render::scopes` (07 §6 / 03 §3.6). The engine shares
+                // the renderer's device (02 §1), so the same device/queue read it.
+                let frame = self
+                    .engine
+                    .as_ref()
+                    .and_then(|b| b.session().latest_frame());
+                // K-E1: publish latest master-bus spectrum for the Spectrum scope.
+                if let Some(spec) = self
+                    .engine
+                    .as_ref()
+                    .and_then(|b| b.session().status().spectrum_db.clone())
+                {
+                    ctx.data_mut(|d| d.insert_temp(egui::Id::new("ke1_spectrum_db"), spec));
+                }
+                let device = renderer.device_arc();
+                let queue = renderer.queue_arc();
+                let want = panels::video::color_page::draw_scopes_panel(
+                    ctx,
+                    &device,
+                    &queue,
+                    frame.as_deref(),
+                    doc,
+                    &self.timeline_selection,
+                    &mut self.scopes_panel_open,
+                    &mut self.scope_kind,
+                );
+                // Stateless resend: the engine echoes the tap it was asked for on
+                // `EngineStatus`, so comparing against that sends one command per
+                // real change instead of one per frame.
+                if let Some(bridge) = self.engine.as_ref() {
+                    if bridge.session().status().scope_tap != want {
+                        bridge
+                            .session()
+                            .send(photonic_video::EngineCmd::SetScopeTap(want));
+                    }
+                }
+            }
+            // K-A6 Edit Duration floating form (position / in / out / duration +
+            // ripple). Drawn next to the export dialog so both can share the
+            // post-timeline borrow window on `doc`/`history`.
+            panels::video::duration_dialog::draw_edit_duration_dialog(
+                ctx,
+                doc,
+                history,
+                &mut self.edit_duration_dialog,
+            );
+            if self.export_dialog_open {
+                // Widened from the skeleton's `(ctx, vid)` stub — `VideoPanelUi`
+                // carries no `doc`/history handle (unlike the timeline panel's
+                // call site just above), and a real preset/format/range picker
+                // needs both; same "necessary minimal call-site growth" move
+                // already used for `draw_timeline_panel`. `vid`'s borrow of
+                // `self` ends when this call returns, so reaching into
+                // `self.engine` right after for the real `EngineCmd::Export`
+                // send is a plain sequential borrow, not a conflict.
+                let mut vid = self.video_panel_ui();
+                let jobs =
+                    panels::video::export_dialog::draw_export_dialog(ctx, &mut vid, doc, history);
+                if !jobs.is_empty() {
+                    if jobs.len() == 1 {
+                        // Single job: the existing engine export path (progress
+                        // on EngineStatus.export).
+                        if let Some(bridge) = self.engine.as_ref() {
+                            bridge
+                                .session()
+                                .send(photonic_video::EngineCmd::Export(Box::new(
+                                    jobs.into_iter().next().unwrap(),
+                                )));
+                        }
+                    } else if let Some(bridge) = self.engine.as_ref() {
+                        // Multi-format / marker multi-export (K-F1/F2): freeze
+                        // the project and drain via the shared render queue.
+                        if let Ok(tools) = photonic_video::media::ffmpeg_locate::locate() {
+                            self.render_queue.ensure_worker(bridge.gpu().clone(), tools);
+                            if let Some(project) = doc.timeline.clone() {
+                                for job in jobs {
+                                    let label = job
+                                        .output
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "export".into());
+                                    let _ = self.render_queue.enqueue(label, project.clone(), job);
+                                }
+                                // Surface the queue inspector when multi-job lands.
+                                self.render_queue_panel_open = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if self.render_queue_panel_open {
+                panels::video::render_queue_panel::draw_render_queue_panel(
+                    ctx,
+                    &mut self.render_queue_panel_open,
+                    &self.render_queue,
+                );
+            }
+        }
+
         // ── Central canvas area ──────────────────────────────────────────────
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 self.last_canvas_rect = Some(rect);
+                {
+                    let ppp = ui.ctx().pixels_per_point();
+                    let x = (rect.min.x * ppp).floor().max(0.0) as u32;
+                    let y = (rect.min.y * ppp).floor().max(0.0) as u32;
+                    let w = (rect.width() * ppp).ceil().max(0.0) as u32;
+                    let h = (rect.height() * ppp).ceil().max(0.0) as u32;
+                    let px = Some((x, y, w, h));
+                    // The host clips the document to this, but it only learns
+                    // about it on the *next* frame — so the frame a panel opens,
+                    // closes, or is dragged, the document is still clipped to the
+                    // old viewport. Left alone that would be permanent, not
+                    // transient: egui stops repainting the moment the UI settles,
+                    // so the mis-clipped frame is the one left on screen. Asking
+                    // for one more frame whenever the viewport moves guarantees
+                    // the last frame drawn is always a correctly clipped one.
+                    if px != self.last_canvas_rect_px {
+                        ui.ctx().request_repaint();
+                    }
+                    self.last_canvas_rect_px = px;
+                }
                 let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
 
                 // ── Deferred fit-to-viewport on new/open ─────────────────────
@@ -3359,8 +4338,12 @@ impl PhotonicApp {
                 }
 
                 // ── Cursor coordinate overlay (Info Panel) ───────────────────
+                // Vector-editing affordance only: in video mode this same canvas
+                // rect is the program monitor, whose bottom edge holds the
+                // transport/player controls (04 §3.2). Painting the X/Y readout
+                // there covered the players — so it is drawn in Vector mode only.
                 if let Some(cursor_screen) = ui.input(|i| i.pointer.hover_pos()) {
-                    if rect.contains(cursor_screen) {
+                    if self.mode == AppMode::Vector && rect.contains(cursor_screen) {
                         let (cx, cy) =
                             view.screen_to_canvas(cursor_screen.x as f64, cursor_screen.y as f64);
                         let coord_text = format!("  X: {:.1}  Y: {:.1}  ", cx, cy);
@@ -3385,6 +4368,41 @@ impl PhotonicApp {
                         fg_painter.rect_filled(text_rect.expand(2.0), 2.0, bg_color);
                         fg_painter.galley(text_pos, galley, text_color);
                     }
+                }
+
+                // ── Video-mode program monitor (04 §1.1 point 3, §3) ─────────
+                // D-02: same canvas rect, same fit/zoom/pan session state —
+                // reused, not duplicated. Branches here and returns for the
+                // rest of this frame's central-panel content: every block
+                // below (raster/preview overlays, outline mode, grid,
+                // gradient handles, the tool if-chain, and the space-pan/
+                // arrow-nudge/WASD-pan blocks §5.2 calls out as colliding
+                // with video-mode keys) is a *vector-canvas* concern and is
+                // skipped this frame instead of being individually wrapped —
+                // the same "gate vector-canvas input by mode, dispatch video.*
+                // as a sibling block at the same call site" effect as one
+                // early exit, at far lower risk than threading if/else
+                // through the ~2000-line vector tool if-chain below.
+                if self.mode == AppMode::Video {
+                    debug_assert!(
+                        doc.timeline.is_some(),
+                        "AppMode::Video requires doc.timeline once entered (04 \
+                         §1.3) — every entry path must call \
+                         ensure_timeline_project[_with] first"
+                    );
+                    // Central-panel content state (08 §6.1): the node canvas
+                    // replaces the program monitor while a composition is being
+                    // edited; otherwise the monitor draws as before. Node-canvas
+                    // entry/escape is wired by the node-editor (08) story.
+                    if self.node_canvas_active {
+                        let mut vid = self.video_panel_ui();
+                        panels::video::node_editor::draw_node_canvas(
+                            ui, rect, doc, history, &mut vid,
+                        );
+                    } else {
+                        self.draw_video_monitor(ui, ctx, rect, doc, history);
+                    }
+                    return;
                 }
 
                 // ── Raster (pixel) layers ──────────────────────────────────────
@@ -4056,7 +5074,7 @@ impl PhotonicApp {
                                 let area = handle_rect.union(name_rect).expand(3.0);
                                 let hovered_area = ui
                                     .input(|i| i.pointer.hover_pos())
-                                    .map_or(false, |p| area.contains(p));
+                                    .is_some_and(|p| area.contains(p));
 
                                 // Name → select / rename, with a text-edit cursor.
                                 let nresp = ui.interact(
@@ -4190,7 +5208,7 @@ impl PhotonicApp {
                                             let diff = tx - mx;
                                             if diff.abs() < thresh
                                                 && best_dx
-                                                    .map_or(true, |bb: f64| diff.abs() < bb.abs())
+                                                    .is_none_or(|bb: f64| diff.abs() < bb.abs())
                                             {
                                                 best_dx = Some(diff);
                                                 guide_x = Some(tx);
@@ -4202,7 +5220,7 @@ impl PhotonicApp {
                                             let diff = ty - my;
                                             if diff.abs() < thresh
                                                 && best_dy
-                                                    .map_or(true, |bb: f64| diff.abs() < bb.abs())
+                                                    .is_none_or(|bb: f64| diff.abs() < bb.abs())
                                             {
                                                 best_dy = Some(diff);
                                                 guide_y = Some(ty);
@@ -4260,7 +5278,7 @@ impl PhotonicApp {
                                                 let a = t - nx;
                                                 if a.abs() < thresh
                                                     && best_adj
-                                                        .map_or(true, |b: f64| a.abs() < b.abs())
+                                                        .is_none_or(|b: f64| a.abs() < b.abs())
                                                 {
                                                     best_adj = Some(a);
                                                     snap_g = Some(g);
@@ -4319,7 +5337,7 @@ impl PhotonicApp {
                                                 let a = t - ny;
                                                 if a.abs() < thresh
                                                     && best_adj
-                                                        .map_or(true, |b: f64| a.abs() < b.abs())
+                                                        .is_none_or(|b: f64| a.abs() < b.abs())
                                                 {
                                                     best_adj = Some(a);
                                                     snap_g = Some(g);
@@ -4791,7 +5809,7 @@ impl PhotonicApp {
                         let on_peek = self
                             .radial_wheel
                             .as_ref()
-                            .map_or(false, |w| w.peek_hovered.is_some());
+                            .is_some_and(|w| w.peek_hovered.is_some());
                         if on_peek {
                             if let Some(ref mut wheel) = self.radial_wheel {
                                 wheel.jump_peek(now);
@@ -5199,7 +6217,7 @@ impl PhotonicApp {
                                             pn.path_data.split_at_point(lpt.x, lpt.y)
                                         {
                                             let layer_id = node.layer_id;
-                                            let t = node.transform.clone();
+                                            let t = node.transform;
                                             let opacity = node.opacity;
                                             let blend_mode = node.blend_mode;
                                             let name_base = node.name.clone();
@@ -5214,7 +6232,7 @@ impl PhotonicApp {
                                                     },
                                                 ),
                                             );
-                                            na.transform = t.clone();
+                                            na.transform = t;
                                             na.opacity = opacity;
                                             na.blend_mode = blend_mode;
 
@@ -5500,7 +6518,7 @@ impl PhotonicApp {
                             }
                             if let Ok(path) = PathData::from_svg(&svg) {
                                 let num = doc.node_count() + 1;
-                                let stroke_arg = self.prefs.default_stroke_enabled.then(|| {
+                                let stroke_arg = self.prefs.default_stroke_enabled.then_some({
                                     (
                                         self.prefs.default_stroke_color,
                                         self.prefs.default_stroke_width,
@@ -5632,7 +6650,7 @@ impl PhotonicApp {
                         };
                         if (ex - sx).abs() > 2.0 || (ey - sy).abs() > 2.0 {
                             if let Some(path) = self.build_shape(bsx, bsy, bex, bey) {
-                                let stroke_arg = self.prefs.default_stroke_enabled.then(|| {
+                                let stroke_arg = self.prefs.default_stroke_enabled.then_some({
                                     (
                                         self.prefs.default_stroke_color,
                                         self.prefs.default_stroke_width,
@@ -5657,7 +6675,7 @@ impl PhotonicApp {
                         if let Some(path) =
                             self.build_shape(cx - 50.0, cy - 50.0, cx + 50.0, cy + 50.0)
                         {
-                            let stroke_arg = self.prefs.default_stroke_enabled.then(|| {
+                            let stroke_arg = self.prefs.default_stroke_enabled.then_some({
                                 (
                                     self.prefs.default_stroke_color,
                                     self.prefs.default_stroke_width,
@@ -5882,6 +6900,43 @@ impl PhotonicApp {
 /// every viewport shortcut so typing never accidentally mutates the canvas.
 fn viewport_kb(ctx: &egui::Context) -> bool {
     !ctx.wants_keyboard_input()
+}
+
+/// Force the width `egui` remembers for `panel_id` to `want`, and report whether
+/// the user is currently dragging that panel's resize handle.
+///
+/// `SidePanel` derives its width from the rect it stored on the previous frame,
+/// and that stored rect is the *frame* rect — which is the content's minimum
+/// size, not the size we asked for. So any drawer whose widest row needs more
+/// room than the panel currently has silently widens the panel, permanently.
+/// Our drawers trip that on every single open, because the width tween renders
+/// real content into a panel only a few pixels wide; the panel then settles at
+/// whatever that group's content demanded rather than at the user's width, which
+/// is why flipping between rail tabs appeared to resize the drawer at random.
+///
+/// Overwriting the stored width before egui reads it makes a deliberate drag the
+/// only thing that can change the width. Returns `true` while such a drag is in
+/// flight (the caller must leave the width alone, and only then persist it).
+fn pin_side_panel_width(ctx: &egui::Context, panel_id: egui::Id, want: f32) -> bool {
+    let resizing = ctx
+        .read_response(panel_id.with("__resize"))
+        .is_some_and(|r| r.dragged());
+    if resizing {
+        return true;
+    }
+    // Only the width of the stored rect is read back; its position is recomputed
+    // from the available area each frame, so anchoring at `min.x` is fine for a
+    // right-hand panel too.
+    if let Some(state) = egui::containers::panel::PanelState::load(ctx, panel_id) {
+        if (state.rect.width() - want).abs() > 0.01 {
+            let mut rect = state.rect;
+            rect.max.x = rect.min.x + want;
+            ctx.data_mut(|d| {
+                d.insert_persisted(panel_id, egui::containers::panel::PanelState { rect })
+            });
+        }
+    }
+    false
 }
 
 /// Flatten a kurbo `BezPath` into screen-space egui points, approximating
@@ -6361,4 +7416,38 @@ mod crash_report_url_tests {
         let body = url.split("&body=").nth(1).unwrap();
         assert!(!body.contains(&percent_encode("truncated to fit")));
     }
+}
+
+/// One-line video-mode status bar content: active sequence, frame/format,
+/// playhead timecode, and track counts — the video analogue of the vector
+/// tool/objects/zoom line. `None` when there's no active sequence (degrades
+/// gracefully; the 04 §1.3 invariant means video mode normally has one).
+fn video_status_line(doc: &Document, playhead: photonic_core::timeline::Tick) -> Option<String> {
+    let p = doc.timeline.as_ref()?;
+    let seq = p.sequences.get(&p.active_sequence?)?;
+    let fmt = seq.formats.get(seq.active_format)?;
+    let fr = seq.frame_rate;
+    let fps = fr.num as f64 / fr.den.max(1) as f64;
+    let frame_idx = fr.frame_at(playhead).max(0);
+    let fpsi = (fps.round() as i64).max(1);
+    let ff = frame_idx % fpsi;
+    let secs = frame_idx / fpsi;
+    let tc = format!(
+        "{:02}:{:02}:{:02}:{:02}",
+        secs / 3600,
+        (secs / 60) % 60,
+        secs % 60,
+        ff
+    );
+    Some(format!(
+        "{} {}  •  {}×{} {:.0}fps  •  {}  •  {}V / {}A",
+        ph::FILM_SLATE,
+        seq.name,
+        fmt.width,
+        fmt.height,
+        fps,
+        tc,
+        seq.video_tracks.len(),
+        seq.audio_tracks.len(),
+    ))
 }

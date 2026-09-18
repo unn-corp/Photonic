@@ -15,9 +15,41 @@ struct KeymapFile {
     keymap: HashMap<String, KeyBinding>,
 }
 
+/// Which palette the app paints with.
+///
+/// `System` is the default and follows the desktop's colour-scheme setting via
+/// egui's [`ThemePreference::System`](egui::ThemePreference); the other two pin
+/// the choice regardless of what the desktop does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    pub fn to_egui(self) -> egui::ThemePreference {
+        match self {
+            ThemeMode::System => egui::ThemePreference::System,
+            ThemeMode::Dark => egui::ThemePreference::Dark,
+            ThemeMode::Light => egui::ThemePreference::Light,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPreferences {
     // APPEARANCE
+    /// Which of the two palettes is live, or `System` to follow the desktop.
+    /// Defaults to `System`.
+    #[serde(default)]
+    pub theme_mode: ThemeMode,
+    /// Whether the *resolved* theme is the dark one. Kept in sync with
+    /// [`theme_mode`](Self::theme_mode) each frame (including when that resolves
+    /// through the system), so the handful of places that pick a colour by hand
+    /// — rulers, scrims, canvas overlays — stay correct without each having to
+    /// resolve the preference themselves.
     pub dark_mode: bool,
     pub ui_scale: f32, // 0.75, 1.0, 1.25, 1.5, 2.0
 
@@ -78,7 +110,7 @@ pub struct AppPreferences {
     /// recovery folder). See the autosave loop in `app::PhotonicApp::draw`.
     #[serde(default = "default_true")]
     pub autosave_enabled: bool,
-    /// Seconds between autosave passes. Default 5 minutes.
+    /// Seconds between autosave passes. Default 2 minutes.
     #[serde(default = "default_autosave_interval_secs")]
     pub autosave_interval_secs: f64,
 
@@ -134,6 +166,21 @@ pub struct AppPreferences {
     #[serde(default)]
     pub reduced_motion: bool,
 
+    // VIDEO TIMELINE (video-editor-module 04-ui-mode-timeline.md §2.5/§6) —
+    /// Timeline magnet/snap toggle. Session state that persists like other UI
+    /// toggles, not document state.
+    #[serde(default = "default_true")]
+    pub timeline_snap_enabled: bool,
+    /// First-run discoverability callout on the toolbar's Video toggle (04
+    /// §1.2) has been dismissed — never shown again once true.
+    #[serde(default)]
+    pub video_hint_dismissed: bool,
+    /// The one-time keyboard-shortcut overlay has already been shown on a
+    /// first video-mode entry (04 §1.2). Re-openable anytime after via `?`
+    /// regardless of this flag — it only gates the *automatic* first showing.
+    #[serde(default)]
+    pub video_shortcuts_intro_shown: bool,
+
     // HOTBAR — the always-on adaptive second toolbar row (#154 Phase 4).
     /// Static (curated default order) or Adaptive (ranked by the user's usage).
     #[serde(default)]
@@ -149,6 +196,107 @@ pub struct AppPreferences {
     // the Keyboard Shortcuts settings page populate this and persist to disk.
     #[serde(default)]
     pub keymap: HashMap<String, KeyBinding>,
+    /// Schema version for [`Self::keymap`] migrations (proposal 212). Missing
+    /// field deserializes as 0 and is advanced through [`migrate_keymap`] on load.
+    #[serde(default)]
+    pub keymap_schema_version: u32,
+
+    /// First-run social/video coach marks dismissed (proposal 213).
+    #[serde(default)]
+    pub video_coach_dismissed: bool,
+    /// The coach has been shown once on this install. Set (and persisted) the
+    /// first frame the card renders, so the guide is genuinely a *first-run*
+    /// guide: closing the app without pressing Next/Skip no longer brings it
+    /// back on the next launch.
+    #[serde(default)]
+    pub video_coach_shown_once: bool,
+    /// Current coach-mark step 0..2 while coaching is active (proposal 213).
+    /// Ignored when [`Self::video_coach_dismissed`] is true.
+    #[serde(default)]
+    pub video_coach_step: u8,
+    /// After media import, also place the asset on the first video/audio track
+    /// at the playhead (proposal 213 AS-1 step 1). Default **true** for social
+    /// velocity; power users can turn it off in Preferences → Behavior.
+    #[serde(default = "default_true")]
+    pub auto_place_import_on_timeline: bool,
+}
+
+/// Current keymap schema version. Bump in the same PR that ships a default
+/// binding change that must reach existing installs (proposal 212).
+pub const KEYMAP_SCHEMA_CURRENT: u32 = 1;
+
+// ── Social coach step machine (proposal 213 / 43-gesture-chrome-ui-paths §2.6) ─
+
+/// Auto-advance Import → Split once the sequence has clips.
+pub fn coach_auto_advance_on_clips(step: u8, has_clips: bool) -> u8 {
+    if step == 0 && has_clips {
+        1
+    } else {
+        step
+    }
+}
+
+/// Next/Done button: returns `(new_step, dismissed)`.
+pub fn coach_advance_button(step: u8) -> (u8, bool) {
+    if step >= 2 {
+        (step, true)
+    } else {
+        (step.saturating_add(1).min(2), false)
+    }
+}
+
+/// Skip always dismisses the coach.
+pub fn coach_skip_dismisses() -> bool {
+    true
+}
+
+/// Apply ordered keymap migrations up to [`KEYMAP_SCHEMA_CURRENT`].
+///
+/// Migrations **never** overwrite a binding the user customized (value differs
+/// from the pre-migration registry default). New command ids need no migration
+/// (absence ⇒ follow registry default).
+pub fn migrate_keymap(prefs: &mut AppPreferences) {
+    while prefs.keymap_schema_version < KEYMAP_SCHEMA_CURRENT {
+        match prefs.keymap_schema_version {
+            0 => {
+                // v0 → v1: ensure `video.add_bookmark` is available. New ids
+                // resolve via registry when absent — nothing to write. Reserved
+                // for documenting the first schema bump (proposal 210/212).
+                prefs.keymap_schema_version = 1;
+            }
+            v => {
+                // Unknown future version: clamp forward so we don't loop.
+                prefs.keymap_schema_version = KEYMAP_SCHEMA_CURRENT.max(v);
+            }
+        }
+    }
+}
+
+/// Insert `id → new_default` only when the user has not customized `id`.
+#[allow(dead_code)] // used by future migrations; v0→v1 is a no-op insert.
+fn migrate_set_default_if_uncustomized(
+    prefs: &mut AppPreferences,
+    id: &str,
+    old_default: Option<KeyBinding>,
+    new_default: Option<KeyBinding>,
+) {
+    let current = prefs.keymap.get(id).copied();
+    let customized = match (current, old_default) {
+        (Some(b), Some(old)) => b != old,
+        (Some(_), None) => true, // user set a binding where there was none
+        (None, _) => false,
+    };
+    if customized {
+        return;
+    }
+    match new_default {
+        Some(b) => {
+            prefs.keymap.insert(id.to_string(), b);
+        }
+        None => {
+            prefs.keymap.remove(id);
+        }
+    }
 }
 
 fn default_nudge_distance() -> f64 {
@@ -156,7 +304,7 @@ fn default_nudge_distance() -> f64 {
 }
 
 fn default_autosave_interval_secs() -> f64 {
-    300.0
+    120.0
 }
 
 fn default_open_drawer() -> Option<DrawerGroup> {
@@ -210,6 +358,7 @@ fn default_snap_tolerance() -> f32 {
 impl Default for AppPreferences {
     fn default() -> Self {
         Self {
+            theme_mode: ThemeMode::default(),
             dark_mode: true,
             ui_scale: 1.0,
             show_grid: false,
@@ -233,7 +382,7 @@ impl Default for AppPreferences {
             force_x11_backend: false,
             nudge_distance: 1.0,
             autosave_enabled: true,
-            autosave_interval_secs: 300.0,
+            autosave_interval_secs: 120.0,
             history_limit_mode: HistoryLimitMode::Size,
             history_max_steps: 200,
             history_max_mb: 50.0,
@@ -246,9 +395,17 @@ impl Default for AppPreferences {
             open_right_drawer: Some(RightDrawerGroup::Layers),
             right_drawer_width: 280.0,
             reduced_motion: false,
+            timeline_snap_enabled: true,
+            video_hint_dismissed: false,
+            video_shortcuts_intro_shown: false,
             hotbar_mode: HotbarMode::default(),
             hotbar_usage: HashMap::new(),
             keymap: HashMap::new(),
+            keymap_schema_version: KEYMAP_SCHEMA_CURRENT,
+            video_coach_dismissed: false,
+            video_coach_shown_once: false,
+            video_coach_step: 0,
+            auto_place_import_on_timeline: true,
         }
     }
 }
@@ -339,6 +496,14 @@ impl AppPreferences {
     }
 
     /// Load from disk, falling back to Default on any error.
+    ///
+    /// Drawer groups written by a *newer* build deserialize to the
+    /// `#[serde(other)] Unknown` arm rather than failing the whole struct, and
+    /// are normalized to this build's defaults here. Without that pair, a user
+    /// who opened a drawer this build lacks and then downgraded would lose
+    /// **every** preference — keymap, hotbar usage, widths, snap toggles — not
+    /// just the drawer choice, because `unwrap_or_default()` below cannot tell
+    /// "one unrecognised token" from "corrupt file".
     pub fn load() -> Self {
         let path = match Self::prefs_path() {
             Some(p) => p,
@@ -348,7 +513,15 @@ impl AppPreferences {
             Ok(j) => j,
             Err(_) => return Self::default(),
         };
-        serde_json::from_str(&json).unwrap_or_default()
+        let mut prefs: Self = serde_json::from_str(&json).unwrap_or_default();
+        if prefs.open_drawer == Some(DrawerGroup::Unknown) {
+            prefs.open_drawer = default_open_drawer();
+        }
+        if prefs.open_right_drawer == Some(RightDrawerGroup::Unknown) {
+            prefs.open_right_drawer = default_open_right_drawer();
+        }
+        migrate_keymap(&mut prefs);
+        prefs
     }
 
     /// Serialize and write to disk, silently ignoring errors.
@@ -368,6 +541,132 @@ impl AppPreferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::mode::AppMode;
+
+    /// 37 §2.5 lowered the autosave default to two minutes. The `Default` impl
+    /// and the serde `default = ...` fn must agree on that single number.
+    #[test]
+    fn autosave_default_is_two_minutes() {
+        assert_eq!(AppPreferences::default().autosave_interval_secs, 120.0);
+        assert_eq!(default_autosave_interval_secs(), 120.0);
+    }
+
+    #[test]
+    fn keymap_migration_advances_schema_to_current() {
+        let mut prefs = AppPreferences::default();
+        prefs.keymap_schema_version = 0;
+        migrate_keymap(&mut prefs);
+        assert_eq!(prefs.keymap_schema_version, KEYMAP_SCHEMA_CURRENT);
+    }
+
+    #[test]
+    fn keymap_migration_does_not_clobber_custom_binding() {
+        let mut prefs = AppPreferences::default();
+        prefs.keymap_schema_version = 0;
+        let custom = KeyBinding::plain(egui::Key::X);
+        prefs.keymap.insert("video.add_bookmark".into(), custom);
+        migrate_keymap(&mut prefs);
+        assert_eq!(prefs.keymap.get("video.add_bookmark"), Some(&custom));
+    }
+
+    #[test]
+    fn social_as1_defaults_favour_velocity() {
+        let p = AppPreferences::default();
+        assert!(p.auto_place_import_on_timeline);
+        assert!(!p.video_coach_dismissed);
+        assert_eq!(p.video_coach_step, 0);
+    }
+
+    /// T15 (205 §4.5 / 206 §3.3): a `preferences.json` naming a drawer group
+    /// this build lacks — as a downgrade after using a newer build's drawer
+    /// produces — must load with every *other* field intact and only the
+    /// drawer defaulted. Before the `#[serde(other)] Unknown` arms, the parse
+    /// failed outright and `unwrap_or_default()` discarded the lot.
+    #[test]
+    fn unknown_drawer_group_does_not_discard_other_preferences() {
+        let json = r#"{
+            "dark_mode": false,
+            "ui_scale": 1.5,
+            "show_grid": true,
+            "grid_size": 32,
+            "snap_to_grid": true,
+            "grid_color": [0.1, 0.2, 0.3, 0.4],
+            "show_rulers": true,
+            "default_fill_color": [1.0, 0.0, 0.0, 1.0],
+            "default_stroke_enabled": true,
+            "default_stroke_color": [0.0, 1.0, 0.0, 1.0],
+            "default_stroke_width": 3.5,
+            "console_open_on_start": true,
+            "nudge_distance": 7.0,
+            "open_drawer": "ProjectNotes",
+            "drawer_width": 321.0,
+            "open_right_drawer": "SomeFutureGroup",
+            "right_drawer_width": 432.0
+        }"#;
+
+        let mut prefs: AppPreferences =
+            serde_json::from_str(json).expect("unknown drawer tokens must not fail the parse");
+
+        // The unknown tokens land on the catch-all rather than erroring.
+        assert_eq!(prefs.open_drawer, Some(DrawerGroup::Unknown));
+        assert_eq!(prefs.open_right_drawer, Some(RightDrawerGroup::Unknown));
+
+        // Everything else survived — this is the actual regression being pinned.
+        assert_eq!(prefs.ui_scale, 1.5);
+        assert_eq!(prefs.grid_size, 32);
+        assert_eq!(prefs.nudge_distance, 7.0);
+        assert_eq!(prefs.drawer_width, 321.0);
+        assert_eq!(prefs.right_drawer_width, 432.0);
+        assert_eq!(prefs.default_stroke_width, 3.5);
+        assert_eq!(prefs.grid_color, [0.1, 0.2, 0.3, 0.4]);
+
+        // `load()` then normalizes the unknown drawers to this build's defaults.
+        // (Mirrors the tail of `load`, which is not callable here because it
+        // reads the real config dir.)
+        if prefs.open_drawer == Some(DrawerGroup::Unknown) {
+            prefs.open_drawer = default_open_drawer();
+        }
+        if prefs.open_right_drawer == Some(RightDrawerGroup::Unknown) {
+            prefs.open_right_drawer = default_open_right_drawer();
+        }
+        assert_eq!(prefs.open_drawer, default_open_drawer());
+        assert_eq!(prefs.open_right_drawer, default_open_right_drawer());
+    }
+
+    /// The catch-all must not swallow *known* tokens — a round-trip of every
+    /// rail-offered group in both modes still resolves to itself.
+    #[test]
+    fn known_drawer_groups_still_round_trip() {
+        for g in DrawerGroup::ALL.iter().chain(DrawerGroup::VIDEO_ALL.iter()) {
+            let s = serde_json::to_string(&g).unwrap();
+            let back: DrawerGroup = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, *g, "DrawerGroup {g:?} round-tripped to {back:?}");
+        }
+        for g in RightDrawerGroup::ALL
+            .iter()
+            .chain(RightDrawerGroup::VIDEO_ALL.iter())
+        {
+            let s = serde_json::to_string(&g).unwrap();
+            let back: RightDrawerGroup = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, *g, "RightDrawerGroup {g:?} round-tripped to {back:?}");
+        }
+    }
+
+    /// The catch-all is a *load* concern only — it must never be offered on a
+    /// rail, or the user could select "Unknown" as a drawer.
+    #[test]
+    fn unknown_is_never_offered_on_a_rail() {
+        for mode in [AppMode::Vector, AppMode::Video] {
+            assert!(!DrawerGroup::all_for_mode(mode).contains(&DrawerGroup::Unknown));
+            assert!(!RightDrawerGroup::all_for_mode(mode).contains(&RightDrawerGroup::Unknown));
+        }
+        assert!(!DrawerGroup::Unknown.has_content(0, 0));
+        assert!(!DrawerGroup::Unknown.has_content(5, 5));
+        // Clip Inspector gates on timeline clip selection, not vector nodes.
+        assert!(!DrawerGroup::ClipInspector.has_content(0, 0));
+        assert!(!DrawerGroup::ClipInspector.has_content(3, 0));
+        assert!(DrawerGroup::ClipInspector.has_content(0, 1));
+    }
 
     #[test]
     fn x11_backend_is_opt_in_and_backwards_compatible() {

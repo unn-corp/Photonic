@@ -14,6 +14,68 @@ pub struct HistoryTree {
     pub next_id: u64,
 }
 
+/// Which editing surface produced a history entry.
+///
+/// A `.photon` holds one document and therefore **one** edit tree, shared by
+/// vector mode and the video timeline. A history browser needs to tell the two
+/// apart to badge and filter entries (26 §15 K-G5), and the edge `Command` is
+/// not part of [`HistoryGraphNode`], so the classification is done here rather
+/// than by a view reaching into the tree's internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HistoryEntryKind {
+    /// The synthetic root — the pre-edit state, no edge command.
+    #[default]
+    Root,
+    /// A vector/document edit (nodes, layers, artboards, …).
+    Vector,
+    /// A video timeline edit ([`Command::Timeline`]).
+    Timeline,
+    /// A batch whose members span both surfaces.
+    Mixed,
+}
+
+impl HistoryEntryKind {
+    /// Classify one edge command. `Batch` folds its members, so a batch of pure
+    /// timeline commands still reads as [`HistoryEntryKind::Timeline`] and only a
+    /// genuinely cross-surface batch becomes [`HistoryEntryKind::Mixed`].
+    pub fn of(cmd: &Command) -> Self {
+        match cmd {
+            Command::Timeline(_) => Self::Timeline,
+            Command::Batch(cmds) => cmds
+                .iter()
+                .map(Self::of)
+                .fold(Self::Root, |acc, k| acc.merge(k)),
+            _ => Self::Vector,
+        }
+    }
+
+    /// Combine two classifications: `Root` is the identity (an empty batch has no
+    /// surface), equal kinds collapse, anything else is `Mixed`.
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Root, k) | (k, Self::Root) => k,
+            (a, b) if a == b => a,
+            _ => Self::Mixed,
+        }
+    }
+
+    /// Whether this entry touched the video timeline (`Timeline` or `Mixed`).
+    pub fn touches_timeline(self) -> bool {
+        matches!(self, Self::Timeline | Self::Mixed)
+    }
+
+    /// Short, stable label for a history surface (also the search term a user
+    /// can type to filter by surface).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Root => "initial",
+            Self::Vector => "vector",
+            Self::Timeline => "timeline",
+            Self::Mixed => "mixed",
+        }
+    }
+}
+
 /// One node of the edit tree flattened for rendering (e.g. the GUI commit graph).
 /// Carries just what a view needs — topology, label, and the HEAD/root flags.
 #[derive(Debug, Clone)]
@@ -28,6 +90,8 @@ pub struct HistoryGraphNode {
     pub description: String,
     pub is_current: bool,
     pub is_root: bool,
+    /// Which editing surface produced this entry (26 §15 K-G5).
+    pub kind: HistoryEntryKind,
 }
 
 impl CommandHistory {
@@ -146,9 +210,9 @@ impl CommandHistory {
     pub(crate) fn ancestor_edges(&self, mut id: u64) -> Vec<u64> {
         let mut out = vec![];
         while let Some(node) = self.nodes.get(&id) {
-            if node.parent.is_some() {
+            if let Some(parent) = node.parent {
                 out.push(id);
-                id = node.parent.unwrap();
+                id = parent;
             } else {
                 break;
             }
@@ -282,9 +346,14 @@ impl CommandHistory {
                     .unwrap_or_else(|| "Initial state".to_string()),
                 is_current: n.id == self.current,
                 is_root: n.id == self.root,
+                kind: n
+                    .command
+                    .as_ref()
+                    .map(HistoryEntryKind::of)
+                    .unwrap_or(HistoryEntryKind::Root),
             })
             .collect();
-        out.sort_by(|a, b| b.id.cmp(&a.id));
+        out.sort_by_key(|entry| std::cmp::Reverse(entry.id));
         out
     }
 
@@ -351,5 +420,197 @@ impl CommandHistory {
             }
         }
         self.current == target
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Read-only query surface behind the Undo History panel (26 §15 K-G5).
+
+    use super::*;
+    use crate::node::{PathNode, SceneNodeKind};
+    use crate::path::PathData;
+    use crate::timeline::{AssetId, TimelineCmd};
+
+    fn doc() -> Document {
+        Document::new("test", 100.0, 100.0)
+    }
+
+    fn add_node(doc: &Document) -> Command {
+        let layer_id = doc.active_layer_id.unwrap();
+        Command::AddNode {
+            node: SceneNode::new(
+                "rect",
+                layer_id,
+                SceneNodeKind::Path(PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0))),
+            ),
+            layer_id: None,
+        }
+    }
+
+    fn rate_asset() -> Command {
+        Command::Timeline(TimelineCmd::SetAssetRating {
+            asset: AssetId::nil(),
+            old: None,
+            new: Some(3),
+        })
+    }
+
+    #[test]
+    fn entry_kind_classifies_each_surface() {
+        let d = doc();
+        assert_eq!(
+            HistoryEntryKind::of(&add_node(&d)),
+            HistoryEntryKind::Vector
+        );
+        assert_eq!(
+            HistoryEntryKind::of(&rate_asset()),
+            HistoryEntryKind::Timeline
+        );
+    }
+
+    #[test]
+    fn entry_kind_folds_batches_by_membership() {
+        let d = doc();
+        // A batch of one surface keeps that surface…
+        assert_eq!(
+            HistoryEntryKind::of(&Command::Batch(vec![rate_asset(), rate_asset()])),
+            HistoryEntryKind::Timeline
+        );
+        assert_eq!(
+            HistoryEntryKind::of(&Command::Batch(vec![add_node(&d), add_node(&d)])),
+            HistoryEntryKind::Vector
+        );
+        // …a cross-surface batch is Mixed, in either member order.
+        assert_eq!(
+            HistoryEntryKind::of(&Command::Batch(vec![add_node(&d), rate_asset()])),
+            HistoryEntryKind::Mixed
+        );
+        assert_eq!(
+            HistoryEntryKind::of(&Command::Batch(vec![rate_asset(), add_node(&d)])),
+            HistoryEntryKind::Mixed
+        );
+        // An empty batch has no surface at all.
+        assert_eq!(
+            HistoryEntryKind::of(&Command::Batch(vec![])),
+            HistoryEntryKind::Root
+        );
+    }
+
+    #[test]
+    fn touches_timeline_covers_timeline_and_mixed_only() {
+        for k in [HistoryEntryKind::Timeline, HistoryEntryKind::Mixed] {
+            assert!(
+                k.touches_timeline(),
+                "{k:?} should count as a timeline edit"
+            );
+        }
+        for k in [HistoryEntryKind::Root, HistoryEntryKind::Vector] {
+            assert!(!k.touches_timeline(), "{k:?} must not count as timeline");
+        }
+    }
+
+    #[test]
+    fn graph_nodes_carry_their_kind_and_root_is_root() {
+        let mut d = doc();
+        let mut h = CommandHistory::new(200);
+        h.execute(add_node(&d), &mut d);
+        h.execute(rate_asset(), &mut d);
+
+        let graph = h.history_graph();
+        // Newest-first: timeline edit, vector edit, root.
+        let kinds: Vec<HistoryEntryKind> = graph.iter().map(|n| n.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                HistoryEntryKind::Timeline,
+                HistoryEntryKind::Vector,
+                HistoryEntryKind::Root
+            ]
+        );
+        // The root node is exactly the one classified Root.
+        let root_ids: Vec<u64> = graph.iter().filter(|n| n.is_root).map(|n| n.id).collect();
+        let root_kinds: Vec<u64> = graph
+            .iter()
+            .filter(|n| n.kind == HistoryEntryKind::Root)
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(root_ids, root_kinds);
+    }
+
+    /// Browsing the history is navigation, not editing: a jump (the panel's only
+    /// write) must never append a node, and jumping away and back must land on
+    /// the same HEAD. Without this, clicking around the Undo History panel would
+    /// grow the very list it is showing.
+    #[test]
+    fn jumping_records_no_history_and_round_trips() {
+        let mut d = doc();
+        let mut h = CommandHistory::new(200);
+        h.execute(add_node(&d), &mut d);
+        h.execute(rate_asset(), &mut d);
+        h.execute(add_node(&d), &mut d);
+
+        let before = h.history_graph();
+        let head = h.current_node();
+        let oldest_edit = before
+            .iter()
+            .filter(|n| !n.is_root)
+            .min_by_key(|n| n.id)
+            .expect("an edit exists")
+            .id;
+        let doc_at_head = serde_json::to_string(&d).expect("serialize doc");
+
+        assert!(h.jump_to_node(oldest_edit, &mut d));
+        assert_eq!(h.current_node(), oldest_edit);
+        assert_eq!(
+            h.history_graph().len(),
+            before.len(),
+            "a jump must not append a history entry"
+        );
+
+        assert!(h.jump_to_node(head, &mut d));
+        assert_eq!(h.current_node(), head);
+        assert_eq!(
+            h.history_graph().len(),
+            before.len(),
+            "the return jump must not append one either"
+        );
+        assert_eq!(
+            serde_json::to_string(&d).expect("serialize doc"),
+            doc_at_head,
+            "jump away and back is document identity"
+        );
+    }
+
+    /// The panel's "N branches" readout counts childless nodes in the flattened
+    /// graph, so pin that the graph exposes the topology that makes it correct:
+    /// one tip while linear, two after undo-then-edit forks the tree.
+    #[test]
+    fn graph_exposes_one_tip_per_divergent_path() {
+        let tips = |h: &CommandHistory| {
+            h.history_graph()
+                .iter()
+                .filter(|n| n.children.is_empty())
+                .count()
+        };
+
+        let mut d = doc();
+        let mut h = CommandHistory::new(200);
+        assert_eq!(tips(&h), 1, "a bare root is its own single tip");
+
+        h.execute(add_node(&d), &mut d);
+        h.execute(add_node(&d), &mut d);
+        assert_eq!(tips(&h), 1, "linear history: one tip");
+
+        // Undo then edit → fork. The retained branch is a second tip.
+        assert!(h.undo(&mut d));
+        h.execute(add_node(&d), &mut d);
+        assert_eq!(tips(&h), 2, "undo-then-edit must retain the old branch");
+        assert!(
+            h.history_graph()
+                .iter()
+                .any(|n| n.is_current && n.children.is_empty()),
+            "HEAD is a leaf after the fork"
+        );
     }
 }

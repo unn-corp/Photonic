@@ -1,0 +1,139 @@
+{
+  "format_version": 2,
+  "id": "6bc2707a-3eac-4220-b5b0-1abdf159ef5b",
+  "name": "nested-groups",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "9ecf7137-f289-40a9-ba64-6bea213193c1"
+  ],
+  "layers": {
+    "9ecf7137-f289-40a9-ba64-6bea213193c1": {
+      "id": "9ecf7137-f289-40a9-ba64-6bea213193c1",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "d9ea03d2-5a7e-47d7-92e4-4beac7b0c00a"
+      ]
+    }
+  },
+  "nodes": {
+    "194a2920-8266-44f2-ac8f-e3dcf1fd3bdd": {
+      "id": "194a2920-8266-44f2-ac8f-e3dcf1fd3bdd",
+      "name": "leaf",
+      "layer_id": "9ecf7137-f289-40a9-ba64-6bea213193c1",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M20,20 L80,20 L80,80 L20,80 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.8,
+            "g": 0.3,
+            "b": 0.3,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    },
+    "e2e59e2b-1280-4873-a26b-913c90721294": {
+      "id": "e2e59e2b-1280-4873-a26b-913c90721294",
+      "name": "inner-group",
+      "layer_id": "9ecf7137-f289-40a9-ba64-6bea213193c1",
+      "kind": {
+        "type": "group",
+        "children": [
+          "194a2920-8266-44f2-ac8f-e3dcf1fd3bdd"
+        ],
+        "clip_children": false
+      }
+    },
+    "d9ea03d2-5a7e-47d7-92e4-4beac7b0c00a": {
+      "id": "d9ea03d2-5a7e-47d7-92e4-4beac7b0c00a",
+      "name": "outer-group",
+      "layer_id": "9ecf7137-f289-40a9-ba64-6bea213193c1",
+      "kind": {
+        "type": "group",
+        "children": [
+          "e2e59e2b-1280-4873-a26b-913c90721294"
+        ],
+        "clip_children": false
+      },
+      "opacity": 0.4
+    }
+  },
+  "active_layer_id": "9ecf7137-f289-40a9-ba64-6bea213193c1",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "b4b0bc87-34bb-427c-bf88-f1695b7eaa21",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "b4b0bc87-34bb-427c-bf88-f1695b7eaa21",
+  "photon_format": 1
+}

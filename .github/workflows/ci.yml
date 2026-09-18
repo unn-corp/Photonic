@@ -2,8 +2,20 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # Long-lived feature branches must be gated too. Before this, CI only ran
+    # on push-to-main and on `pull_request`; because no PR was ever opened for
+    # `feat/video-editor-module`, 238 commits landed without a single CI run
+    # (a test file stopped compiling for several commits and nobody noticed).
+    # `feat/**` matches nested names like `feat/video-editor-module`.
+    branches:
+      - main
+      - 'feat/**'
   pull_request:
+  schedule:
+    # Nightly, 03:00 UTC. Only the video-nightly job below runs on this
+    # trigger (build-test/lint stay gated to push/pull_request) — see
+    # docs/specs/video-editor/11-testing-phasing.md §1.6 / §4.
+    - cron: '0 3 * * *'
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -13,31 +25,74 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Deep wgpu/Metal and video-engine eval stacks overflow the default 2 MiB
+  # on macOS CI for render_frame_at determinism; 16 MiB matches local dev.
+  RUST_MIN_STACK: "16777216"
 
 jobs:
   build-test:
     name: Build & Test (${{ matrix.os }})
+    # Skip on the nightly schedule trigger — that trigger is only for the
+    # video-nightly job below; this job already runs on every push/PR.
+    if: github.event_name != 'schedule'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Matrix width is scoped by trigger, deliberately:
+        #
+        #   * branch pushes (feat/**)  -> ubuntu-latest only
+        #   * push to main + every PR  -> full ubuntu/windows/macos matrix
+        #
+        # Rationale: the point of gating feature-branch pushes is to catch
+        # "does it still compile / do the tests still pass" fast, and that
+        # signal is ~100% captured by one OS. The macOS runner bills at 10x
+        # and Windows at 2x a Linux minute, and this workspace's per-OS cost
+        # is dominated by the ffmpeg install + a cold wgpu/egui build — so a
+        # 3-OS matrix on every intermediate commit of a 238-commit branch is
+        # ~13x the minutes for near-zero extra signal. Genuinely
+        # platform-specific breakage (MSVC/schannel, Cocoa/Metal, path
+        # handling) is still caught before anything merges, because the full
+        # matrix runs on the PR and again on push to main.
+        #
+        # If a feature branch needs the wide matrix early, open a draft PR —
+        # `pull_request` gets full coverage.
+        # (kept on one line: GHA re-parses this string as an expression, so
+        # no YAML folding surprises)
+        os: ${{ (github.event_name == 'push' && github.ref != 'refs/heads/main') && fromJSON('["ubuntu-latest"]') || fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') }}
     steps:
       - uses: actions/checkout@v4
 
       # Linux needs system libraries for winit/wgpu/egui (X11 + Wayland),
       # rfd (GTK file dialogs), reqwest's native-tls (OpenSSL), and mlua needs a
-      # C toolchain (preinstalled on the runner). Windows pulls these in via the
-      # MSVC toolchain + schannel and needs no extra packages.
+      # C toolchain (preinstalled on the runner), plus ffmpeg for video-decode
+      # tests (docs/specs/video-editor/11-testing-phasing.md §3.4). Windows
+      # pulls the Rust-side deps in via the MSVC toolchain + schannel and
+      # needs no extra packages beyond ffmpeg; macOS needs only ffmpeg too
+      # (native Cocoa/Metal + Security.framework cover the rest).
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: |
+          # Hosted images include Chrome's third-party apt source even though
+          # this job does not use Chrome. A repository mirror sync there must
+          # not prevent installation of Photonic's Ubuntu dependencies.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config libssl-dev libgtk-3-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev \
+            ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -50,15 +105,36 @@ jobs:
       - name: Build (workspace)
         run: cargo build --workspace --locked
 
-      - name: Test (workspace)
-        run: cargo test --workspace --locked
+      - name: Test (workspace, all features)
+        # --all-features so a test module behind a cargo feature cannot be
+        # silently excluded from CI. The `video-p1-contract` feature stranded
+        # 8 passing contract tests this way; see 29-qa-spec.md and
+        # 40-spec-verification.md §3.6.
+        # Windows' software/GPU and FFmpeg tests share process-global native
+        # resources. Serial execution avoids backend contention and matches the
+        # strict video-outcomes job's one-workflow-at-a-time contract.
+        run: cargo test --workspace --locked --all-features ${{ runner.os == 'Windows' && '-- --test-threads=1' || '' }}
 
   lint:
     name: Lint (fmt + clippy)
+    # Skip on the nightly schedule trigger — see build-test's comment above.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
-    # Blocking: `cargo fmt --all --check` is enforced (the tree is now
-    # rustfmt-clean). clippy runs but warnings are not denied yet (~50 in the
-    # backlog) — add `-D warnings` to enforce once those are cleared.
+    # `cargo fmt --all --check` is BLOCKING — that is the intended policy and
+    # it stays. What the old comment here claimed ("the tree is now
+    # rustfmt-clean") was not true: because this workflow never ran on
+    # `feat/**` pushes, formatting drifted unchecked on that branch (13+ files
+    # in photonic-core alone), so the first CI run on the branch would have
+    # red-lighted on fmt alone. The tree is being reconciled with
+    # `cargo fmt --all` as part of enabling this gate; if this step fails,
+    # the fix is to run `cargo fmt --all` locally and commit the result, not
+    # to relax the gate. Pinned toolchain note: fmt output is stable-channel
+    # dependent, so `dtolnay/rust-toolchain@stable` below must match what
+    # contributors run locally (rustfmt 1.9.0-stable / rustc 1.96 at the time
+    # of writing).
+    #
+    # clippy runs but warnings are not denied yet (~50 in the backlog) — add
+    # `-D warnings` to enforce once those are cleared.
     steps:
       - uses: actions/checkout@v4
 
@@ -69,7 +145,8 @@ jobs:
             pkg-config libssl-dev libgtk-3-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -96,6 +173,16 @@ jobs:
       - name: Check MCP API docs are up to date
         run: git diff --exit-code docs/mcp-api.md
 
+      # Structural spec-vs-code drift gate (40-spec-verification.md §3). Blocking:
+      # deterministic and machine-independent, so hard-gate tier per 37 §4.2.
+      # spec-extract carries no photonic-* dependency, so this stays in the cheap
+      # lint job (it needs neither ffmpeg nor the GUI system deps).
+      - name: Extract workspace API index
+        run: cargo run -q -p spec-extract -- --out spec-index.json
+
+      - name: Check spec drift
+        run: python3 tools/check-spec-drift.py --index spec-index.json
+
       # Supply-chain / license / advisory gate using the committed deny.toml.
       - name: Install cargo-deny
         uses: taiki-e/install-action@v2
@@ -104,6 +191,77 @@ jobs:
 
       - name: cargo-deny
         run: cargo deny check
+
+  acceptance-stories:
+    name: Video outcomes (software Vulkan + strict acceptance)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    # This lane proves render/edit/export correctness with Mesa software Vulkan.
+    # It makes no realtime hardware performance claim. Missing adapters/codecs
+    # fail the lane instead of turning required checks into silent skips.
+    env:
+      PHOTONIC_REQUIRE_GPU: "1"
+      PHOTONIC_AS_STRICT: "1"
+      WGPU_BACKEND: vulkan
+      RUST_TEST_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same system deps as build-test (photonic-app links winit/wgpu/egui/rfd
+      # even in --headless mode) + ffmpeg/ffprobe, which the stories need for
+      # media import and for verifying exported files.
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libgtk-3-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev \
+            ffmpeg
+
+      # A software adapter is sufficient for deterministic pixel assertions.
+      - name: Install software Vulkan adapter (lavapipe)
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
+          export XDG_RUNTIME_DIR="${RUNNER_TEMP}/photonic-xdg"
+          mkdir -p "$XDG_RUNTIME_DIR"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          vulkaninfo --summary
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Required agent and GPU rendering outcomes
+        run: |
+          cargo test -p photonic-mcp --locked --test ai_contracts --test video_agent_workflows
+          cargo test -p photonic-mcp --locked --lib full_render_resolves_one_pixel_detail_after_preview
+          cargo test -p photonic-mcp --locked --lib video_readback::tests
+          cargo test -p photonic-video --locked --lib changing_processing_canvas_preserves_full_detail_in_cached_outputs
+          cargo test -p photonic-video --locked --lib production_session_serves_cache_with_codec_tolerance_and_undo_reuse
+
+      - name: Run AS-1 / AS-2 / AS-3 acceptance stories
+        run: |
+          scripts/run-acceptance-stories.sh --strict \
+            --log-dir "${RUNNER_TEMP}/as-logs" \
+            --out-dir "${RUNNER_TEMP}/as-exports"
+
+      # Always retain evidence, including failures and export artifacts.
+      - name: Upload acceptance-story logs and exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-stories
+          path: |
+            ${{ runner.temp }}/as-logs
+            ${{ runner.temp }}/as-exports
+          if-no-files-found: warn
 
   preflight-gate:
     name: PDF/X-1a preflight gate
@@ -126,3 +284,43 @@ jobs:
 
       - name: Preflight the committed sample card (must be valid PDF/X-1a)
         run: scripts/preflight-pdfx.sh docs/print/samples/kamatu-business-card.pdf
+
+  video-nightly:
+    name: Video nightly (soak / SS-3, advisory)
+    # Only runs on the cron schedule above, never on push/PR — these are the
+    # long-running #[ignore]-annotated tests (playback soak test, 10-minute
+    # SS-3 sync-drift export test) that must never run in the default
+    # `cargo test --workspace` path. continue-on-error at the job level so a
+    # soak-test flake never blocks merges (nothing in this job gates PRs).
+    #
+    # These #[ignore]-annotated tests now exist and are matched by
+    # `-- --ignored`: crates/photonic-video/tests/playback_soak.rs (SS-1
+    # sustained real-decode soak) and crates/photonic-video/tests/ss3_sync_drift.rs
+    # (SS-3 10-minute synthetic export). The job stays advisory
+    # (continue-on-error) and skips cleanly where ffmpeg / a GPU adapter are
+    # absent — see docs/specs/video-editor/11-testing-phasing.md §1.6 / §4.
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libssl-dev libgtk-3-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxi-dev libxrandr-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libasound2-dev \
+            ffmpeg
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run ignored video soak / SS-3 tests
+        run: cargo test --workspace --locked -- --ignored

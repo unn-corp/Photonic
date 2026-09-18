@@ -1,0 +1,3 @@
+doc.md:1
+  spec-assert: symbol-exists crates/photonic-matte/src/lib.rs::MatteEngine
+  actual:      not found in index

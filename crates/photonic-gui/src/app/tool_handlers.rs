@@ -313,6 +313,14 @@ impl PhotonicApp {
             doc_modified = true;
         }
 
+        // Video mode toggle (default Ctrl+Shift+V) — keymap-resolved, mode-
+        // agnostic (it's the one binding that must fire in *both* modes: it's
+        // how you leave Video too), routed through the same `dispatch_command`
+        // entry point as every other global shortcut here (04 §1.2).
+        if self.binding_pressed(ctx, "mode.toggle_video") {
+            self.dispatch_command("mode.toggle_video", doc, history);
+        }
+
         doc_modified
     }
 
@@ -384,12 +392,10 @@ impl PhotonicApp {
         }
 
         // ── Isolation Mode: Escape exits ─────────────────────────────────────
-        if self.isolated_group.is_some() {
-            if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.isolated_group = None;
-                doc.selection.clear();
-                self.selected_id = None;
-            }
+        if self.isolated_group.is_some() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.isolated_group = None;
+            doc.selection.clear();
+            self.selected_id = None;
         }
 
         // ── Double-click: enter Isolation Mode on a group ─────────────────────
@@ -1293,19 +1299,17 @@ impl PhotonicApp {
 
         // Single click: add an anchor point — or close the path if the click lands
         // on the first anchor (Illustrator-style click-to-close).
-        if response.clicked_by(egui::PointerButton::Primary) {
-            if !ui.input(|i| i.modifiers.alt) {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    if self.pen_over_first_anchor(view, pos) {
-                        if let Some(path) = self.build_pen_path(true) {
-                            self.finalize_pen_node(path, doc, history, doc_modified);
-                        }
-                        self.pen_points.clear();
-                        return;
+        if response.clicked_by(egui::PointerButton::Primary) && !ui.input(|i| i.modifiers.alt) {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if self.pen_over_first_anchor(view, pos) {
+                    if let Some(path) = self.build_pen_path(true) {
+                        self.finalize_pen_node(path, doc, history, doc_modified);
                     }
-                    let (cx, cy) = view.screen_to_canvas(pos.x as f64, pos.y as f64);
-                    self.pen_points.push((cx, cy));
+                    self.pen_points.clear();
+                    return;
                 }
+                let (cx, cy) = view.screen_to_canvas(pos.x as f64, pos.y as f64);
+                self.pen_points.push((cx, cy));
             }
         }
 
@@ -1419,7 +1423,7 @@ impl PhotonicApp {
         history: &mut CommandHistory,
         doc_modified: &mut bool,
     ) {
-        let stroke_arg = self.prefs.default_stroke_enabled.then(|| {
+        let stroke_arg = self.prefs.default_stroke_enabled.then_some({
             (
                 self.prefs.default_stroke_color,
                 self.prefs.default_stroke_width,
@@ -1729,22 +1733,21 @@ impl PhotonicApp {
                 if ui.small_button("Clear").clicked() {
                     self.lua_console.log.clear();
                 }
-                if self.lua_console.tab == ConsoleTab::Claude {
-                    if ui
+                if self.lua_console.tab == ConsoleTab::Claude
+                    && ui
                         .small_button("Copy")
                         .on_hover_text("Copy conversation to clipboard")
                         .clicked()
-                    {
-                        let mut text = String::new();
-                        for (is_user, msg) in &self.claude_chat.messages {
-                            let role = if *is_user { "You" } else { "Claude" };
-                            text.push_str(role);
-                            text.push_str(": ");
-                            text.push_str(msg);
-                            text.push_str("\n\n");
-                        }
-                        ui.output_mut(|o| o.copied_text = text);
+                {
+                    let mut text = String::new();
+                    for (is_user, msg) in &self.claude_chat.messages {
+                        let role = if *is_user { "You" } else { "Claude" };
+                        text.push_str(role);
+                        text.push_str(": ");
+                        text.push_str(msg);
+                        text.push_str("\n\n");
                     }
+                    ui.output_mut(|o| o.copied_text = text);
                 }
             });
         });
@@ -2035,7 +2038,7 @@ mod clipboard_shortcut_tests {
         input.events.push(egui::Event::Copy);
         input.events.push(egui::Event::Paste("ignored".to_string()));
         let mut seen = (false, false);
-        ctx.run(input, |ctx| {
+        let _ = ctx.run(input, |ctx| {
             seen = ctx.input(|i| {
                 (
                     i.events.iter().any(|e| matches!(e, egui::Event::Copy)),

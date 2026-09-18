@@ -7,6 +7,8 @@ members = [
     "crates/photonic-app",
     "crates/photonic-embed",
     "crates/photonic-matte",
+    "crates/photonic-video",
+    "tools/spec-extract",
 ]
 resolver = "2"
 
@@ -72,4 +74,31 @@ pollster = "0.3"
 bitflags = "2"
 smallvec = "1"
 roxmltree = "0.20"
+
+# Property-based testing (dev-only; timeline edit-op invariants, 11 §3.1)
 proptest = "1"
+
+# ── Build profiles (Linux + Windows top-tier runtime) ─────────────────────────
+# Default `release` stays safe for distribution; use `release-perf` when you want
+# maximum runtime speed (longer link). `dev-opt` is a fast iterative middle ground.
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+debug = false
+strip = "debuginfo"
+panic = "abort"
+# Windows: avoid /INCREMENTAL noise; Unix: same semantics.
+incremental = false
+
+[profile.release-perf]
+inherits = "release"
+lto = true
+codegen-units = 1
+# Fat LTO + single CGU for peak inlining on hot graph/eval/decode paths.
+
+[profile.dev-opt]
+inherits = "dev"
+opt-level = 2
+# Keep debuginfo for local profiling of video scrub/play.

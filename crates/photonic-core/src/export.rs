@@ -35,20 +35,15 @@ impl Default for SvgExportOptions {
 }
 
 /// How a selection SVG frames its content in the `viewBox`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum SvgNormalize {
     /// Tight union bbox of the selected nodes (legacy default).
+    #[default]
     Tight,
     /// Center the content in a uniform square viewBox. `pad` is the padding as a
     /// fraction of the square side (e.g. `0.1` = 10% breathing room each way), so
     /// every icon in a set comes out at the same aspect ratio and scale.
     Square { pad: f64 },
-}
-
-impl Default for SvgNormalize {
-    fn default() -> Self {
-        SvgNormalize::Tight
-    }
 }
 
 /// Options controlling selection / icon SVG export.
@@ -328,7 +323,7 @@ pub fn export_nodes_as_svg_opts(
 
     let tight = match combined_bbox {
         Some(r) => (r.x0, r.y0, r.x1 - r.x0, r.y1 - r.y0),
-        None => (0.0, 0.0, doc.width as f64, doc.height as f64),
+        None => (0.0, 0.0, doc.width, doc.height),
     };
 
     // Frame the viewBox per the normalization mode. Content coordinates are never
@@ -1151,7 +1146,7 @@ fn emit_marks(content: &mut pdf_writer::Content, boxes: &PageBoxes, opts: &PdfEx
     // Gap between trim edge and start of the crop mark hairline (3 pt).
     let gap = 3.0_f32;
     // Crop mark length in points (≈ 12 pt or up to 60% of mark_room).
-    let mark_len = (mark_room_x * 0.6).min(12.0_f32).max(6.0_f32);
+    let mark_len = (mark_room_x * 0.6).clamp(6.0_f32, 12.0_f32);
 
     // Registration colour: CMYK all-ink (prints in all channels simultaneously).
     content.set_stroke_cmyk(1.0, 1.0, 1.0, 1.0);
@@ -1192,7 +1187,7 @@ fn emit_marks(content: &mut pdf_writer::Content, boxes: &PageBoxes, opts: &PdfEx
     // (between bleed edge and media edge).  A crosshair + circle.
 
     // Radius for the registration circle (half the mark band width, capped at 6 pt).
-    let r = (mark_room_x * 0.4).min(6.0_f32).max(3.0_f32);
+    let r = (mark_room_x * 0.4).clamp(3.0_f32, 6.0_f32);
 
     // Cubic bezier approximation constant for a quarter circle.
     let k = 0.5523_f32;
@@ -1788,8 +1783,8 @@ fn pdf_blend_mode(m: crate::layer::BlendMode) -> pdf_writer::types::BlendMode {
     }
 }
 
-/// Recursively emit a node's geometry into the PDF content stream, applying its
-/// affine transform within a save/restore so siblings are unaffected.
+// Recursively emit a node's geometry into the PDF content stream, applying its
+// affine transform within a save/restore so siblings are unaffected.
 // ─── Deferred page resources (images + gradient shadings) ────────────────────
 
 /// A placed raster prepared for PDF embedding as an image XObject. Pixel data is
@@ -2499,7 +2494,7 @@ fn build_pdf_shading(
     let mut stops: Vec<(f32, Vec<f32>)> = g
         .stops
         .iter()
-        .map(|s| ((s.offset as f32).clamp(0.0, 1.0), comps(&s.color)))
+        .map(|s| (s.offset.clamp(0.0, 1.0), comps(&s.color)))
         .collect();
     if stops.len() < 2 {
         return None;
@@ -2716,11 +2711,7 @@ fn emit_node_pdf(
                 // its SMask, so the backdrop is unused there).
                 let backdrop = backdrop_scene_for(doc, opts, node);
                 let idx = res.add_image(build_pdf_image(
-                    &r.image,
-                    opts,
-                    node_scale,
-                    doc.dpi as f64,
-                    &backdrop,
+                    &r.image, opts, node_scale, doc.dpi, &backdrop,
                 ));
                 let w = r.image.width as f32;
                 let h = r.image.height as f32;

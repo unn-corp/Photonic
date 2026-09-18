@@ -33,7 +33,7 @@ ico = "0.3"
 image = { workspace = true }
 arboard = { version = "3.6", features = ["wayland-data-control"] }
 # Cross-platform deps. These power modules compiled on every OS — mlua/uuid
-# (repl.rs, script.rs, cli.rs) and reqwest (mcp_proxy.rs, claude_client.rs) —
+# (repl.rs, script.rs, cli.rs) and reqwest (mcp_proxy.rs) —
 # so they must NOT live under [target.'cfg(windows)'.dependencies].
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 uuid = { workspace = true }

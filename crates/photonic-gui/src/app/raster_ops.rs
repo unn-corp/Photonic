@@ -273,7 +273,7 @@ impl PhotonicApp {
             self.raster_stroke_orig = doc.get_node(&nid).cloned().map(|n| (nid, n));
         }
 
-        if (response.dragged() || response.drag_started()) {
+        if response.dragged() || response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
                 // Screen → canvas → node-local pixel coordinates.
                 let (cx, cy) = view.screen_to_canvas(pos.x as f64, pos.y as f64);

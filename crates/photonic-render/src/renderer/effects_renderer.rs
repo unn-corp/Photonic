@@ -14,7 +14,10 @@ impl PhotonicRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: self.surface_format,
+            // The document-effects intermediates are the sRGB scene format so
+            // blur/composite sampling + blending run in linear light (03 §4.5.4),
+            // matching every other document-pass target and the headless path.
+            format: self.scene_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })

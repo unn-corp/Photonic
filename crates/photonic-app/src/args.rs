@@ -1,3 +1,5 @@
+#![cfg_attr(test, expect(clippy::items_after_test_module))]
+
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -8,6 +10,11 @@ pub struct Args {
     /// Run without a GUI window (MCP server only)
     #[arg(long)]
     pub headless: bool,
+
+    /// Speak MCP on stdin/stdout (Content-Length framing). Implies headless.
+    /// Prefer attach via `mcp-proxy` when a GUI is already listening.
+    #[arg(long)]
+    pub mcp_stdio: bool,
 
     /// Force the X11/XWayland backend on Linux (enables winit file drag-and-drop)
     #[arg(long)]
@@ -21,6 +28,10 @@ pub struct Args {
     /// server; clients must send it in the X-MCP-Secret header on every request.
     #[arg(long)]
     pub mcp_secret: Option<String>,
+
+    /// MCP protocol negotiation: `dual` (default) or `strict` (2026-07-28 only)
+    #[arg(long, default_value = "dual", value_parser = parse_mcp_protocol)]
+    pub mcp_protocol: photonic_mcp::protocol::ProtocolMode,
 
     /// Address of a running Photonic instance (for CLI commands)
     #[arg(long, global = true, default_value = "127.0.0.1:7842")]
@@ -239,4 +250,9 @@ mod tests {
         let x11_args = Args::try_parse_from(["photonic", "--x11"]).expect("--x11 parses");
         assert!(x11_args.x11);
     }
+}
+
+fn parse_mcp_protocol(s: &str) -> Result<photonic_mcp::protocol::ProtocolMode, String> {
+    photonic_mcp::protocol::ProtocolMode::parse(s)
+        .ok_or_else(|| format!("invalid --mcp-protocol {s:?}; expected dual|strict"))
 }

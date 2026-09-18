@@ -5,6 +5,7 @@ use crate::protocol::{
     ToolResult,
 };
 use crate::server::AppState;
+use photonic_core::Command;
 use serde_json::json;
 
 /// Define (or update) a named document grammar rule.
@@ -221,7 +222,7 @@ pub async fn check_grammar(state: &AppState, args: CheckGrammarArgs) -> ToolResu
                     false
                 };
                 if found {
-                    (true, format!("Required layer is present."))
+                    (true, "Required layer is present.".to_string())
                 } else {
                     let desc = if !target_name.is_empty() {
                         format!("'{}'", target_name)
@@ -515,13 +516,22 @@ pub async fn save_workspace(state: &AppState, args: SaveWorkspaceArgs) -> ToolRe
         return ToolResult::error("Workspace name must not be empty.");
     }
     let mut doc = state.document.lock().await;
-    if let Some(ws) = doc.workspaces.iter_mut().find(|w| w.name == args.name) {
+    // Persisted document state, so it rides the history like the GUI route
+    // (SPEC: every document mutation, without exception, is undoable).
+    // `execute_discrete` because a save is a discrete act, never a drag.
+    let old = doc.workspaces.clone();
+    let mut new = old.clone();
+    if let Some(ws) = new.iter_mut().find(|w| w.name == args.name) {
         ws.search_query = args.search_query.clone();
     } else {
-        doc.workspaces.push(photonic_core::Workspace {
+        new.push(photonic_core::Workspace {
             name: args.name.clone(),
             search_query: args.search_query.clone(),
         });
+    }
+    if new != old {
+        let mut history = state.history.lock().await;
+        history.execute_discrete(Command::SetWorkspaces { old, new }, &mut doc);
     }
     ToolResult::text(format!(
         "Workspace '{}' saved (query: {:?}).",
@@ -564,9 +574,16 @@ pub async fn list_workspaces(state: &AppState) -> ToolResult {
 pub async fn delete_workspace(state: &AppState, args: DeleteWorkspaceArgs) -> ToolResult {
     tracing::debug!("tool: delete_workspace name={}", args.name);
     let mut doc = state.document.lock().await;
-    let before = doc.workspaces.len();
-    doc.workspaces.retain(|w| w.name != args.name);
-    if doc.workspaces.len() < before {
+    let old = doc.workspaces.clone();
+    let new: Vec<_> = old
+        .iter()
+        .filter(|w| w.name != args.name)
+        .cloned()
+        .collect();
+    if new.len() < old.len() {
+        // Undoable, like the GUI route — see `save_workspace`.
+        let mut history = state.history.lock().await;
+        history.execute_discrete(Command::SetWorkspaces { old, new }, &mut doc);
         ToolResult::text(format!("Workspace '{}' deleted.", args.name))
             .with_data(serde_json::json!({ "name": args.name }))
     } else {

@@ -437,6 +437,48 @@ impl PhotonicApp {
             // and needs the seed coordinates, not just a Color) — never reaches
             // this color-slot dispatcher.
             Some(EyedropperTarget::RasterColorRange { .. }) => {}
+            // Seed a clip grade's HSL qualifier from the sampled colour (07 §5).
+            // Routes through the one eyedropper idiom → `SetGrade` → history.
+            Some(EyedropperTarget::GradeQualifier {
+                seq,
+                track,
+                clip,
+                op,
+            }) => {
+                use photonic_core::timeline::{ops as tlops, GradeOpParams};
+                let (h, s, l) =
+                    crate::panels::video::color_page::rgb_to_hsl(picked.r, picked.g, picked.b);
+                let (nh, ns, nl) = crate::panels::video::color_page::seed_qualifier(h, s, l);
+                let grade = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(&seq))
+                    .and_then(|sq| sq.track(track))
+                    .and_then(|t| t.clips.iter().find(|c| c.id == clip))
+                    .and_then(|c| c.grade.clone());
+                if let Some(mut grade) = grade {
+                    let mut seeded = false;
+                    if let Some(o) = grade.ops.iter_mut().find(|o| o.id == op) {
+                        if let GradeOpParams::HslQualifier { hue, sat, lum, .. } =
+                            &mut o.params.base
+                        {
+                            *hue = nh;
+                            *sat = ns;
+                            *lum = nl;
+                            seeded = true;
+                        }
+                    }
+                    if seeded {
+                        let cmd = doc.timeline.as_ref().and_then(|proj| {
+                            tlops::set_grade(proj, seq, track, clip, Some(grade)).ok()
+                        });
+                        if let Some(cmd) = cmd {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            *doc_modified = true;
+                        }
+                    }
+                }
+            }
             None => {}
         }
     }

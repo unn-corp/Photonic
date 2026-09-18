@@ -695,7 +695,7 @@ mod tests {
         let m = Mask::polygon(10, 10, &pts);
         // Produces a sane mask: something selected, nothing out of bounds.
         assert_eq!(m.data.len(), 100);
-        assert!(m.data.iter().any(|&v| v == 255), "expected some coverage");
+        assert!(m.data.contains(&255), "expected some coverage");
     }
 
     #[test]
@@ -785,7 +785,7 @@ mod tests {
         let m = Mask::ellipse(16, 16, 2.0, 2.0, 12.0, 12.0);
         assert!(!m.is_empty_selection(), "ellipse should select something");
         assert!(
-            m.data.iter().any(|&v| v == 255),
+            m.data.contains(&255),
             "interior should be fully saturated somewhere"
         );
         assert!(
@@ -801,7 +801,7 @@ mod tests {
         let pts = [(1.0, 1.0), (14.0, 2.0), (2.0, 14.0)];
         let m = Mask::polygon(16, 16, &pts);
         assert!(
-            m.data.iter().any(|&v| v == 255),
+            m.data.contains(&255),
             "interior of triangle should saturate"
         );
         assert!(

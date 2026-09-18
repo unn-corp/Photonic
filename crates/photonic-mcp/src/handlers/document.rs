@@ -71,6 +71,10 @@ pub async fn save_document(state: &AppState, args: SaveDocumentArgs) -> ToolResu
             }
         }
     };
+    let path = match crate::path_guard::check_path(state, &path, photonic_core::PathAccess::Write) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     if let Some(parent) = path.parent() {
         if let Err(error) = std::fs::create_dir_all(parent) {
             return ToolResult::error(format!("Could not create save directory: {error}"));

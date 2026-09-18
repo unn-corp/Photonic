@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "items": [
+    {
+      "file": "x.rs",
+      "line": 1,
+      "krate": "x",
+      "module_path": "x",
+      "name": "E",
+      "kind": "Enum",
+      "visibility": "pub",
+      "fields": [],
+      "variants": [
+        {
+          "name": "A",
+          "fields": []
+        },
+        {
+          "name": "B",
+          "fields": []
+        }
+      ],
+      "value": null,
+      "signature": null,
+      "cfg": []
+    }
+  ]
+}

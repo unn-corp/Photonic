@@ -11,6 +11,7 @@ photonic-render = { path = "../photonic-render" }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 glyphon = { workspace = true }
+photonic-video = { path = "../photonic-video" }
 axum = { workspace = true }
 tokio = { workspace = true }
 tower = { workspace = true }
@@ -22,6 +23,7 @@ clap = { workspace = true }
 mlua = { workspace = true }
 image = { workspace = true }
 base64 = "0.22"
+crossbeam-channel = "0.5"
 regex = "1"
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -30,4 +32,8 @@ tracing-subscriber = { workspace = true }
 kurbo = { workspace = true }
 
 [dev-dependencies]
+# `ServiceExt::oneshot` (drives the router without binding a socket) lives
+# behind `util`; the workspace `tower` dep is featureless.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 tokio = { workspace = true, features = ["test-util"] }

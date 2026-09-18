@@ -19,7 +19,7 @@ pub(crate) fn draw_combine(ui: &mut Ui, ctx: &mut PropPanelCtx) {
         ui.label(
             RichText::new("Combine & Paths")
                 .small()
-                .color(Color32::from_rgb(80, 80, 110)),
+                .color(crate::theme::section_header_color(ui)),
         );
         ui.add_space(2.0);
     }
@@ -199,14 +199,13 @@ pub(crate) fn draw_pathfinder(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                 {
                     action = Some(PanelAction::PathfinderOutline { node_ids: vec![] });
                 }
-                if selection_count == 2 {
-                    if ui.button("Divide")
+                if selection_count == 2
+                    && ui.button("Divide")
                         .on_hover_text("Split two shapes at every overlap edge into distinct colored face nodes")
                         .clicked()
                     {
                         action = Some(PanelAction::PathfinderDivide { node_ids: vec![] });
                     }
-                }
             });
         ui.add_space(4.0);
     }
@@ -282,14 +281,13 @@ pub(crate) fn draw_compound_path(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             .default_open(true)
             .open(forced_open)
             .show(ui, |ui| {
-                if selection_count >= 2 {
-                    if ui.button("Make Compound Path")
+                if selection_count >= 2
+                    && ui.button("Make Compound Path")
                         .on_hover_text("Combine selected paths into one shape; overlapping areas create holes (even-odd fill rule)")
                         .clicked()
                     {
                         action = Some(PanelAction::MakeCompoundPath { node_ids: vec![] });
                     }
-                }
                 if is_compound_selected {
                     if let Some(nid) = selected_id {
                         if ui.button("Release Compound Path")
@@ -537,9 +535,9 @@ pub(crate) fn draw_copy_appearance(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     // ── Copy Appearance (visible when 2+ nodes selected) ─────────────────────
     if selection_count >= 2 && matches("Copy Appearance") {
         thread_local! {
-            static COPY_FILL: std::cell::RefCell<bool> = std::cell::RefCell::new(true);
-            static COPY_STROKE: std::cell::RefCell<bool> = std::cell::RefCell::new(true);
-            static COPY_OPACITY: std::cell::RefCell<bool> = std::cell::RefCell::new(false);
+            static COPY_FILL: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) };
+            static COPY_STROKE: std::cell::RefCell<bool> = const { std::cell::RefCell::new(true) };
+            static COPY_OPACITY: std::cell::RefCell<bool> = const { std::cell::RefCell::new(false) };
         }
         egui::CollapsingHeader::new("Copy Appearance")
             .default_open(false)

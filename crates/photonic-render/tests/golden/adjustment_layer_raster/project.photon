@@ -1,0 +1,133 @@
+{
+  "format_version": 2,
+  "id": "6369a025-63d9-4f46-91f7-c38e51fde627",
+  "name": "adjustment-layer-raster",
+  "width": 100.0,
+  "height": 100.0,
+  "layer_order": [
+    "446cf89b-955b-4741-b81a-4be9990e6504"
+  ],
+  "layers": {
+    "446cf89b-955b-4741-b81a-4be9990e6504": {
+      "id": "446cf89b-955b-4741-b81a-4be9990e6504",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "6760fcc5-039a-4a16-ba77-2176b79ca137",
+        "ce035b9d-bf69-4777-ae12-c575ef9f47bd"
+      ]
+    }
+  },
+  "nodes": {
+    "6760fcc5-039a-4a16-ba77-2176b79ca137": {
+      "id": "6760fcc5-039a-4a16-ba77-2176b79ca137",
+      "name": "base",
+      "layer_id": "446cf89b-955b-4741-b81a-4be9990e6504",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M0,0 L100,0 L100,100 L0,100 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.5,
+            "g": 0.5,
+            "b": 0.5,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    },
+    "ce035b9d-bf69-4777-ae12-c575ef9f47bd": {
+      "id": "ce035b9d-bf69-4777-ae12-c575ef9f47bd",
+      "name": "brightness-contrast",
+      "layer_id": "446cf89b-955b-4741-b81a-4be9990e6504",
+      "kind": {
+        "type": "raster",
+        "image": {
+          "width": 1,
+          "height": 1,
+          "png": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAEElEQVR4AQEFAPr/AAAAAAAABQABZHiVOAAAAABJRU5ErkJggg=="
+        },
+        "adjustment": {
+          "kind": "brightness_contrast",
+          "brightness": 0.3,
+          "contrast": 0.2
+        }
+      }
+    }
+  },
+  "active_layer_id": "446cf89b-955b-4741-b81a-4be9990e6504",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "c560449e-8a28-402b-8710-2a95cbf8d938",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 100.0,
+      "height": 100.0
+    }
+  ],
+  "active_artboard": "c560449e-8a28-402b-8710-2a95cbf8d938",
+  "photon_format": 1
+}

@@ -21,7 +21,9 @@ fn raster_node_survives_v2_json_roundtrip() {
     let id = doc.add_node(node, None);
 
     assert_eq!(doc.format_version, CURRENT_FORMAT_VERSION);
-    assert_eq!(CURRENT_FORMAT_VERSION, 2);
+    // v5 added the §35 effect-scope / marker / group model; raster nodes are
+    // unaffected and still round-trip.
+    assert_eq!(CURRENT_FORMAT_VERSION, 5);
 
     let json = doc.to_json().unwrap();
     assert!(json.contains("\"type\": \"raster\"") || json.contains("\"type\":\"raster\""));
@@ -40,13 +42,14 @@ fn raster_node_survives_v2_json_roundtrip() {
 }
 
 #[test]
-fn v1_document_migrates_to_v2() {
-    // A minimal v1 doc with no raster nodes should load and become v2.
+fn v1_document_migrates_to_current() {
+    // A minimal v1 doc with no raster nodes should load and migrate forward
+    // through the whole chain (v1→v2→v3→v4→v5) to the current version.
     let mut doc = Document::new("t", 32.0, 32.0);
     doc.format_version = 1;
     let json = doc.to_json().unwrap();
     let back = Document::from_json(&json).unwrap();
-    assert_eq!(back.format_version, 2);
+    assert_eq!(back.format_version, CURRENT_FORMAT_VERSION);
 }
 
 #[test]

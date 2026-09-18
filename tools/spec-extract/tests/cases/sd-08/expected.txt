@@ -1,0 +1,3 @@
+doc.md:1
+  spec-assert: dep-present triple_buffer
+  actual:      absent from all Cargo.toml

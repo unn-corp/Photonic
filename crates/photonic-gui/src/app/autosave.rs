@@ -37,6 +37,37 @@ fn sanitize_stem(title: &str) -> String {
     }
 }
 
+// ─── Test hooks (CAP-022 crash-recovery integration test) ─────────────────────
+//
+// `write_photon_file`/`load_document` (defined in `app/mod.rs`) are private to
+// the `app` module tree, and `apply_opened_history` is trivial enough to
+// reproduce inline from `CommandHistory`'s already-public API — so no hook is
+// needed for it. An external integration test crate
+// (`crates/photonic-gui/tests/timeline_recovery.rs`) can only reach items
+// through a fully `pub` module chain, so exercising the *real* write/load
+// functions from there (rather than duplicating their logic) requires both:
+// this pair of thin wrappers, and `app::autosave` itself being declared `pub`
+// in `app/mod.rs` (was `pub(crate)`; documented there). Nothing else in the
+// crash-recovery machinery changes visibility.
+
+/// Test hook: the exact write call `autosave_all` makes for an untitled tab's
+/// recovery snapshot (`write_photon_file(&recovery_path, doc, history)`).
+pub fn recovery_write_for_test(
+    path: &std::path::Path,
+    doc: &Document,
+    history: &mut CommandHistory,
+) -> Result<(), String> {
+    write_photon_file(path, doc, history)
+}
+
+/// Test hook: the exact load call `draw_recovery_prompt`'s Restore branch
+/// makes for each discovered recovery candidate (`load_document(&path)`).
+pub fn recovery_load_for_test(
+    path: &std::path::Path,
+) -> Result<(Document, Option<photonic_core::HistorySnapshot>), String> {
+    load_document(path)
+}
+
 impl PhotonicApp {
     /// Run the autosave timer. Called once per frame from `draw`. Fires a full
     /// autosave pass every `autosave_interval_secs` while enabled.

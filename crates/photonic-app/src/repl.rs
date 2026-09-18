@@ -240,7 +240,7 @@ fn register_live_api(
                 if let Ok(uuid) = id.parse::<uuid::Uuid>() {
                     let mut doc = d.blocking_lock();
                     let mut h = hist.blocking_lock();
-                    h.execute_discrete(Command::RemoveNode { node_id: uuid }, &mut *doc);
+                    h.execute_discrete(Command::RemoveNode { node_id: uuid }, &mut doc);
                 }
                 Ok(())
             })?,
@@ -260,7 +260,7 @@ fn register_live_api(
                     .collect();
                 if !cmds.is_empty() {
                     hist.blocking_lock()
-                        .execute_discrete(Command::Batch(cmds), &mut *doc);
+                        .execute_discrete(Command::Batch(cmds), &mut doc);
                 }
                 Ok(())
             })?,
@@ -337,7 +337,7 @@ fn register_live_api(
                         node,
                         layer_id: None,
                     },
-                    &mut *doc,
+                    &mut doc,
                 );
                 Ok(node_id.to_string())
             })?,
@@ -466,7 +466,7 @@ fn add_live_shape(
             node,
             layer_id: None,
         },
-        &mut *doc,
+        &mut doc,
     );
     Ok(node_id.to_string())
 }

@@ -491,7 +491,7 @@ impl WheelState {
         }
 
         let items = self.current_items();
-        if dist < INNER_R || dist > OUTER_R || items.is_empty() {
+        if !(INNER_R..=OUTER_R).contains(&dist) || items.is_empty() {
             return;
         }
 

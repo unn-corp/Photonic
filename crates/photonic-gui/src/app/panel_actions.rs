@@ -34,6 +34,282 @@ impl PhotonicApp {
                         ctx.request_repaint();
                     }
                 }
+                // ── Media pool (video mode, 05 §2) ───────────────────────────
+                PanelAction::MediaImportDialog { bin } => {
+                    if self.import_media_files(doc, history, bin) {
+                        doc_modified = true;
+                    }
+                }
+                PanelAction::MediaCreateBin { name, parent } => {
+                    use photonic_core::timeline::ops;
+                    timeline::ops_bridge::ensure_project_and_sequence(
+                        doc,
+                        history,
+                        photonic_core::timeline::FrameRate::FPS_30,
+                    );
+                    history.execute_discrete(Command::Timeline(ops::create_bin(name, parent)), doc);
+                    doc_modified = true;
+                }
+                PanelAction::MediaRemoveBin { bin } => {
+                    use photonic_core::timeline::ops;
+                    if let Some(p) = doc.timeline.as_ref() {
+                        if let Ok(cmd) = ops::remove_bin(p, bin) {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            doc_modified = true;
+                        }
+                    }
+                    if self.media_pool_ui.current_bin == Some(bin) {
+                        self.media_pool_ui.current_bin = None;
+                    }
+                }
+                PanelAction::MediaRemoveAsset { asset } => {
+                    use photonic_core::timeline::ops;
+                    if let Some(p) = doc.timeline.as_ref() {
+                        if let Ok(cmd) = ops::remove_asset(p, asset) {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            doc_modified = true;
+                        }
+                    }
+                    if self.media_pool_ui.selected == Some(asset) {
+                        self.media_pool_ui.selected = None;
+                    }
+                }
+                PanelAction::MediaRemoveUnused => {
+                    use photonic_core::timeline::ops;
+                    if let Some(p) = doc.timeline.as_ref() {
+                        let cmds = ops::remove_unused_assets(p);
+                        if !cmds.is_empty() {
+                            let batch = cmds.into_iter().map(Command::Timeline).collect();
+                            history.execute_discrete(Command::Batch(batch), doc);
+                            doc_modified = true;
+                            self.media_pool_ui.selected = None;
+                        }
+                    }
+                }
+                PanelAction::MediaSetRating { asset, rating } => {
+                    use photonic_core::timeline::ops;
+                    if let Some(p) = doc.timeline.as_ref() {
+                        if let Ok(cmd) = ops::set_asset_rating(p, asset, rating) {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            doc_modified = true;
+                        }
+                    }
+                }
+                PanelAction::MediaSetTags { asset, tags } => {
+                    use photonic_core::timeline::ops;
+                    if let Some(p) = doc.timeline.as_ref() {
+                        if let Ok(cmds) = ops::set_asset_tags_resolved(p, asset, tags) {
+                            if !cmds.is_empty() {
+                                let batch = cmds.into_iter().map(Command::Timeline).collect();
+                                history.execute_discrete(Command::Batch(batch), doc);
+                                doc_modified = true;
+                            }
+                        }
+                    }
+                }
+                PanelAction::MediaCreateSubclip {
+                    asset,
+                    in_ticks,
+                    out_ticks,
+                    name,
+                } => {
+                    use photonic_core::timeline::Tick;
+                    if let Some(id) = crate::app::timeline::ops_bridge::create_subclip(
+                        doc,
+                        history,
+                        asset,
+                        (Tick(in_ticks), Tick(out_ticks)),
+                        name,
+                    ) {
+                        self.media_pool_ui.selected = Some(id);
+                        doc_modified = true;
+                    }
+                }
+                PanelAction::MediaAssignBin { asset, bin } => {
+                    use photonic_core::timeline::ops;
+                    if let Some(p) = doc.timeline.as_ref() {
+                        if let Ok(cmd) = ops::assign_asset_bin(p, asset, bin) {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            doc_modified = true;
+                        }
+                    }
+                }
+                PanelAction::MediaRelink { asset } => {
+                    use photonic_core::timeline::ops;
+                    let dialog = rfd::FileDialog::new().set_title("Relink media");
+                    let picked = super::run_file_dialog(move || dialog.pick_file());
+                    if let Some(new_path) = picked {
+                        if let Some(p) = doc.timeline.as_ref() {
+                            if let Ok(cmd) = ops::relink_asset(p, asset, new_path) {
+                                history.execute_discrete(Command::Timeline(cmd), doc);
+                                doc_modified = true;
+                            }
+                        }
+                    }
+                }
+                PanelAction::MediaSetProxyMode { mode } => {
+                    if let Some(bridge) = self.engine.as_mut() {
+                        // Reconciled into `EngineCmd::SetProxyMode` next frame.
+                        bridge.proxy_mode = mode;
+                    }
+                }
+                PanelAction::MediaGenerateProxies => {
+                    let assets = doc
+                        .timeline
+                        .as_ref()
+                        .map(|project| project.media.assets.values().cloned().collect())
+                        .unwrap_or_default();
+                    self.media_pool_ui
+                        .spawn_proxy_generation(assets, self.current_file.clone());
+                }
+                PanelAction::MediaSetGenerateProxiesOnImport { enabled } => {
+                    use photonic_core::timeline::ops;
+                    if let Some(project) = doc.timeline.as_ref() {
+                        let cmd = ops::set_generate_proxies_on_import(project, enabled);
+                        history.execute_discrete(Command::Timeline(cmd), doc);
+                        doc_modified = true;
+                    }
+                }
+                PanelAction::MediaAttachProxy { asset } => {
+                    // G-15A: file picker → validate (ffprobe) → optional mismatch
+                    // override → undoable set_asset_proxy with Attached origin.
+                    use photonic_core::timeline::{ops, AssetSource};
+                    let Some(project) = doc.timeline.as_ref() else {
+                        continue;
+                    };
+                    let Some(media) = project.media.assets.get(&asset) else {
+                        continue;
+                    };
+                    let AssetSource::File { path: original, .. } = &media.source else {
+                        continue;
+                    };
+                    let original = original.clone();
+                    let dialog = rfd::FileDialog::new()
+                        .set_title("Attach Proxy")
+                        .add_filter("Video", &["mp4", "mov", "mxf", "mkv", "m4v", "avi", "webm"]);
+                    let picked = super::run_file_dialog(move || dialog.pick_file());
+                    let Some(proxy_path) = picked else {
+                        continue;
+                    };
+                    let tools = match photonic_video::media::ffmpeg_locate::locate() {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tracing::warn!("attach proxy: ffmpeg unavailable: {e}");
+                            continue;
+                        }
+                    };
+                    let validation = match photonic_video::media::proxy::validate_attach(
+                        &tools,
+                        &original,
+                        &proxy_path,
+                        false,
+                    ) {
+                        Ok(v) => v,
+                        Err(
+                            photonic_video::media::proxy::AttachError::DurationMismatch
+                            | photonic_video::media::proxy::AttachError::FrameRateMismatch,
+                        ) => {
+                            // Soft override: re-validate with allow_mismatch when
+                            // the user confirms. rfd has no custom modal; use a
+                            // second pick-style MessageDialog if available, else
+                            // proceed after logging a clear warning.
+                            let proceed = rfd::MessageDialog::new()
+                                .set_title("Proxy mismatch")
+                                .set_description(
+                                    "Proxy duration or frame rate does not match the original. Attach anyway?",
+                                )
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .show()
+                                == rfd::MessageDialogResult::Yes;
+                            if !proceed {
+                                continue;
+                            }
+                            match photonic_video::media::proxy::validate_attach(
+                                &tools,
+                                &original,
+                                &proxy_path,
+                                true,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    tracing::warn!("attach proxy failed after override: {e}");
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("attach proxy failed: {e}");
+                            let _ = rfd::MessageDialog::new()
+                                .set_title("Attach Proxy failed")
+                                .set_description(e.to_string())
+                                .set_buttons(rfd::MessageButtons::Ok)
+                                .show();
+                            continue;
+                        }
+                    };
+                    if !validation.warnings.is_empty() {
+                        tracing::info!("attach proxy warnings: {}", validation.warnings.join("; "));
+                    }
+                    if let Some(project) = doc.timeline.as_ref() {
+                        if let Ok(cmd) =
+                            ops::set_asset_proxy(project, asset, Some(validation.proxy))
+                        {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            doc_modified = true;
+                        }
+                    }
+                }
+                PanelAction::MediaDetachProxy { asset } => {
+                    // Clears the ProxyRef only — never deletes disk files
+                    // (Attached user files stay; Generated cleanup is out of
+                    // scope for G-15A).
+                    use photonic_core::timeline::ops;
+                    if let Some(project) = doc.timeline.as_ref() {
+                        if let Ok(cmd) = ops::set_asset_proxy(project, asset, None) {
+                            history.execute_discrete(Command::Timeline(cmd), doc);
+                            doc_modified = true;
+                        }
+                    }
+                }
+                PanelAction::MediaInsertAtPlayhead { asset } => {
+                    let at = self.playhead;
+                    if timeline::ops_bridge::insert_asset_at_first_fit(doc, history, asset, at) {
+                        doc_modified = true;
+                    }
+                }
+                // ── Captions (video mode) ─────────────────────────────────────
+                PanelAction::CaptionEditBatch(cmds) => {
+                    if !cmds.is_empty() {
+                        let batch = cmds.into_iter().map(Command::Timeline).collect();
+                        history.execute_discrete(Command::Batch(batch), doc);
+                        doc_modified = true;
+                    }
+                }
+                // ── Marker navigation (video mode, 26 K-A2) ──────────────────
+                // Deliberately does NOT touch `history` or set `doc_modified`:
+                // moving the playhead is session state, and a review pass that
+                // walks twenty markers must leave the undo stack untouched.
+                // Assigning the field is enough — `app/monitor.rs` notices the
+                // disagreement with `bridge.agreed_playhead` and issues the seek.
+                PanelAction::SeekPlayhead { at } => {
+                    self.playhead = at.max(photonic_core::timeline::Tick::ZERO);
+                }
+                // ── Clip inspector / effects browser (video mode) ────────────
+                PanelAction::ClipEditDiscrete(cmd) => {
+                    history.execute_discrete(Command::Timeline(cmd), doc);
+                    doc_modified = true;
+                }
+                PanelAction::ClipEditCoalesced(cmd) => {
+                    history.execute(Command::Timeline(cmd), doc);
+                    doc_modified = true;
+                }
+                PanelAction::ClipEditBatch(cmds) => {
+                    if !cmds.is_empty() {
+                        let batch = cmds.into_iter().map(Command::Timeline).collect();
+                        history.execute_discrete(Command::Batch(batch), doc);
+                        doc_modified = true;
+                    }
+                }
                 PanelAction::ReorderNode { node_id, op } => {
                     if let Some((layer_id, cur_idx)) = doc.node_layer_and_index(&node_id) {
                         let layer_len = doc
@@ -2424,7 +2700,7 @@ impl PhotonicApp {
                             ShapeKind::Text => unreachable!(),
                         };
                         if let Some(path) = self.build_shape_with_tool(tool, sx, sy, ex, ey) {
-                            let stroke_arg = self.prefs.default_stroke_enabled.then(|| {
+                            let stroke_arg = self.prefs.default_stroke_enabled.then_some({
                                 (
                                     self.prefs.default_stroke_color,
                                     self.prefs.default_stroke_width,
@@ -2594,6 +2870,105 @@ impl PhotonicApp {
                     }) {
                         self.place_image_file(doc, history, &path);
                         doc_modified = true;
+                    }
+                }
+
+                PanelAction::OpenEditDuration { seq, track, clip } => {
+                    // K-A6: seed the Edit Duration floating form from the live clip.
+                    self.edit_duration_dialog =
+                        crate::panels::video::duration_dialog::EditDurationDialog::seed(
+                            doc, seq, track, clip,
+                        );
+                }
+
+                PanelAction::FreezeFrame {
+                    seq,
+                    track,
+                    clip,
+                    at,
+                } => {
+                    // K-B14: hold the source frame at `at` for the clip's duration.
+                    crate::app::timeline::ops_bridge::freeze_frame(
+                        doc, history, seq, track, clip, at,
+                    );
+                    doc_modified = true;
+                }
+
+                PanelAction::ImportMotionMetadata { clip } => {
+                    // Parse synchronously, right here: a bad file is then
+                    // rejected while the user is still looking at the picker,
+                    // rather than surfacing later as a mysterious failed
+                    // analysis. 22 §6.6 — report, never guess.
+                    let dialog = rfd::FileDialog::new()
+                        .add_filter("Gyro metadata", &["gcsv", "json"])
+                        .set_title("Select gyro/IMU sidecar");
+                    if let Some(path) = super::run_file_dialog(move || dialog.pick_file()) {
+                        match photonic_video::media::parse_motion(&path) {
+                            Ok(series) => {
+                                let spec = photonic_core::timeline::StabilizationSpec::new(
+                                    photonic_core::timeline::MotionBinding {
+                                        source: photonic_core::timeline::MotionSourceRef::Sidecar {
+                                            path: path.clone(),
+                                            rel_path: None,
+                                            format: series.format,
+                                        },
+                                        sync: Default::default(),
+                                        // Uncalibrated until the user picks a
+                                        // profile: rotation-only is the honest
+                                        // default, and 22 §6.6 requires it be
+                                        // an explicit state rather than a
+                                        // silent fallback.
+                                        lens: photonic_core::timeline::LensProfileRef::RotationOnly,
+                                    },
+                                );
+                                if crate::app::timeline::ops_bridge::set_clip_stabilization(
+                                    doc,
+                                    history,
+                                    clip,
+                                    Some(spec),
+                                ) {
+                                    doc_modified = true;
+                                    self.file_status = Some(format!(
+                                        "Bound {} — {} samples{}{}. Run Analyze to stabilize.",
+                                        path.file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_default(),
+                                        series.samples.len(),
+                                        series
+                                            .sample_rate_hz()
+                                            .map(|hz| format!(", {hz:.0} Hz"))
+                                            .unwrap_or_default(),
+                                        if series.has_accel() {
+                                            ", with accelerometer"
+                                        } else {
+                                            ", gyro only (horizon lock unavailable)"
+                                        },
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                self.file_status = Some(format!("Motion metadata rejected: {e}"));
+                            }
+                        }
+                    }
+                }
+
+                PanelAction::AnalyzeStabilization { clip } => {
+                    // Runs on the engine thread: integrating a long clip's
+                    // motion series would stall the UI.
+                    match self.engine.as_ref() {
+                        Some(engine) => {
+                            engine.send_analyze_stabilization(clip);
+                            self.file_status = Some("Stabilization analysis running…".into());
+                        }
+                        // No engine means no preview to stabilize; say so
+                        // rather than silently dropping the request.
+                        None => {
+                            self.file_status = Some(
+                                "Stabilization needs the video engine; open a sequence first."
+                                    .into(),
+                            );
+                        }
                     }
                 }
 
@@ -3810,13 +4185,9 @@ impl PhotonicApp {
                             for crit in &criteria {
                                 let ok = match *crit {
                                     "fill_color" => match &node.kind {
-                                        SceneNodeKind::Path(p) => {
-                                            if p.fill.enabled {
-                                                if let FillKind::Solid(c) = &p.fill.kind {
-                                                    color_matches([c.r, c.g, c.b])
-                                                } else {
-                                                    false
-                                                }
+                                        SceneNodeKind::Path(p) if p.fill.enabled => {
+                                            if let FillKind::Solid(c) = &p.fill.kind {
+                                                color_matches([c.r, c.g, c.b])
                                             } else {
                                                 false
                                             }
@@ -4209,7 +4580,7 @@ impl PhotonicApp {
                     let mut cmds: Vec<Command> = Vec::new();
                     for nid in target {
                         if let Some(node) = doc.nodes.get(&nid) {
-                            let node_opacity = node.opacity as f32;
+                            let node_opacity = node.opacity;
                             if node_opacity >= 1.0 - f32::EPSILON
                                 && match &node.kind {
                                     SceneNodeKind::Path(pn) => pn.fill.opacity >= 1.0 - 1e-6,
@@ -4223,13 +4594,13 @@ impl PhotonicApp {
                             new_node.opacity = 1.0;
                             match &mut new_node.kind {
                                 SceneNodeKind::Path(pn) => {
-                                    let combined = (pn.fill.opacity as f32) * node_opacity;
+                                    let combined = pn.fill.opacity * node_opacity;
                                     pn.fill = bake_fill(&pn.fill, combined);
                                     pn.stroke.color.a *= node_opacity;
                                     pn.stroke.opacity = 1.0;
                                 }
                                 SceneNodeKind::Text(tn) => {
-                                    let combined = (tn.fill.opacity as f32) * node_opacity;
+                                    let combined = tn.fill.opacity * node_opacity;
                                     tn.fill = bake_fill(&tn.fill, combined);
                                 }
                                 SceneNodeKind::Group(_) => {}
@@ -4691,8 +5062,8 @@ impl PhotonicApp {
                     use photonic_core::style::FillKind;
                     let mut findings: Vec<String> = Vec::new();
 
-                    let canvas_w = doc.width as f64;
-                    let canvas_h = doc.height as f64;
+                    let canvas_w = doc.width;
+                    let canvas_h = doc.height;
                     let mid_x = canvas_w / 2.0;
                     let mid_y = canvas_h / 2.0;
                     let (mut q_tl, mut q_tr, mut q_bl, mut q_br) = (0usize, 0usize, 0usize, 0usize);
@@ -5020,7 +5391,7 @@ impl PhotonicApp {
                             let cnt = rot_gaps.iter().filter(|&&g| (g - best).abs() < 3.0).count();
                             if cnt + 1 >= min_count && *best >= 5.0 {
                                 let n = (360.0 / best).round() as u32;
-                                let sym = if n >= 2 && n <= 12 {
+                                let sym = if (2..=12).contains(&n) {
                                     format!(" ({}× symmetry)", n)
                                 } else {
                                     String::new()
@@ -5337,7 +5708,7 @@ impl PhotonicApp {
                                     )
                                 }
                             }
-                            _ => (false, format!("unknown rule type")),
+                            _ => (false, "unknown rule type".to_string()),
                         };
                         results.push((rule.name.clone(), passed, msg));
                     }
@@ -5563,7 +5934,7 @@ impl PhotonicApp {
                                 continue 'actions;
                             };
                             const GOLDEN_ANGLE: f64 =
-                                std::f64::consts::TAU * (1.0 - 1.0 / 1.6180339887498949);
+                                std::f64::consts::TAU * (1.0 - 1.0 / 1.618_033_988_749_895);
                             for i in 0..count {
                                 let r = spread * ((i as f64 + 0.5) / count as f64).sqrt();
                                 let theta = i as f64 * GOLDEN_ANGLE;
@@ -5664,13 +6035,21 @@ impl PhotonicApp {
                 }
 
                 PanelAction::SaveWorkspace { name, search_query } => {
-                    if let Some(ws) = doc.workspaces.iter_mut().find(|w| w.name == name) {
+                    // `doc.workspaces` is persisted, so this goes through the
+                    // history like any other document edit rather than mutating
+                    // the vec in place (SPEC: every document mutation, without
+                    // exception, is undoable).
+                    let old = doc.workspaces.clone();
+                    let mut new = old.clone();
+                    if let Some(ws) = new.iter_mut().find(|w| w.name == name) {
                         ws.search_query = search_query;
                     } else {
-                        doc.workspaces
-                            .push(photonic_core::Workspace { name, search_query });
+                        new.push(photonic_core::Workspace { name, search_query });
                     }
-                    doc_modified = true;
+                    if new != old {
+                        history.execute(Command::SetWorkspaces { old, new }, doc);
+                        doc_modified = true;
+                    }
                     self.workspace_name_input.clear();
                 }
 
@@ -5681,8 +6060,12 @@ impl PhotonicApp {
                 }
 
                 PanelAction::DeleteWorkspace { name } => {
-                    doc.workspaces.retain(|w| w.name != name);
-                    doc_modified = true;
+                    let old = doc.workspaces.clone();
+                    let new: Vec<_> = old.iter().filter(|w| w.name != name).cloned().collect();
+                    if new.len() != old.len() {
+                        history.execute(Command::SetWorkspaces { old, new }, doc);
+                        doc_modified = true;
+                    }
                 }
 
                 PanelAction::SetTextArea {
@@ -6943,5 +7326,58 @@ impl PhotonicApp {
             }
         }
         doc_modified
+    }
+
+    /// OS media picker → media pool L0 stubs → optional auto-place on timeline
+    /// (proposal 213). Shared by Media panel and the empty-timeline Import CTA.
+    /// Returns true when at least one asset was added.
+    pub(crate) fn import_media_files(
+        &mut self,
+        doc: &mut Document,
+        history: &mut CommandHistory,
+        bin: Option<photonic_core::timeline::BinId>,
+    ) -> bool {
+        // Off the render thread — see `run_file_dialog_multi`. Called inline
+        // here, the portal never replies and the app hangs hard enough to be
+        // force-quit mid-import.
+        let dialog = rfd::FileDialog::new().set_title("Import media").add_filter(
+            "Media",
+            &[
+                "mp4", "mov", "mkv", "avi", "webm", "m4v", "mts", "mxf", "mp3", "wav", "aac",
+                "flac", "ogg", "m4a", "opus", "png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff",
+                "tif", "exr", "svg", "photon", "cube",
+            ],
+        );
+        let files = super::run_file_dialog_multi(move || dialog.pick_files());
+        let Some(paths) = files else {
+            return false;
+        };
+        let project_path = self.current_file.clone();
+        let stubs = self.media_pool_ui.spawn_import(paths, bin, project_path);
+        if stubs.is_empty() {
+            return false;
+        }
+        use photonic_core::timeline::ops;
+        timeline::ops_bridge::ensure_project_and_sequence(
+            doc,
+            history,
+            photonic_core::timeline::FrameRate::FPS_30,
+        );
+        let auto_place = self.prefs.auto_place_import_on_timeline;
+        let at = self.playhead;
+        let mut placed_any = false;
+        for asset in stubs {
+            let id = asset.id;
+            history.execute_discrete(Command::Timeline(ops::add_asset(asset)), doc);
+            if auto_place {
+                placed_any |= timeline::ops_bridge::insert_asset_at_first_fit(doc, history, id, at);
+            }
+        }
+        if placed_any && !self.prefs.video_coach_dismissed && self.prefs.video_coach_step == 0 {
+            // Advance coach: Import done → Split.
+            self.prefs.video_coach_step = 1;
+            self.prefs.save();
+        }
+        true
     }
 }

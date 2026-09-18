@@ -45,7 +45,7 @@ pub fn offset_path(path: &PathData, distance: f64, join: Join) -> Result<PathDat
         // Inset on a closed path: the inner contour is the second sub-path.
         sub_paths
             .get(1)
-            .map(|p| PathData::from_bez_path(p))
+            .map(PathData::from_bez_path)
             .ok_or_else(|| {
                 format!(
                     "Path is too small to inset by {:.1} — inner contour collapsed",
@@ -62,7 +62,7 @@ pub fn offset_path(path: &PathData, distance: f64, join: Join) -> Result<PathDat
 fn is_path_closed(bez: &BezPath) -> bool {
     bez.elements()
         .last()
-        .map_or(false, |el| matches!(el, PathEl::ClosePath))
+        .is_some_and(|el| matches!(el, PathEl::ClosePath))
 }
 
 /// Split a `BezPath` into individual sub-paths at every `MoveTo`.

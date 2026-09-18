@@ -64,7 +64,6 @@ yanked = "deny"
 # Acknowledged unmaintained *transitive* dependencies (no vulnerability, no
 # maintained drop-in). Revisit when upstreams migrate off them.
 ignore = [
-    "RUSTSEC-2025-0057", # fxhash — unmaintained (pulled in transitively)
     "RUSTSEC-2024-0436", # paste — unmaintained (pulled in transitively)
     "RUSTSEC-2025-0119", # number_prefix — unmaintained (transitive via indicatif/hf-hub)
     "RUSTSEC-2026-0192", # ttf-parser — unmaintained (text shaping via glyphon/text-on-path)

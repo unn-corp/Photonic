@@ -80,9 +80,7 @@ fn parse_heading(s: &str) -> Option<(String, Option<String>)> {
     }
     let version = s[1..close].trim().to_string();
     // A bracketed token that isn't a version (e.g. "Unreleased") → reject.
-    if parse_semver(&version).is_none() {
-        return None;
-    }
+    parse_semver(&version)?;
     let date = s[close + 1..]
         .trim_start_matches([' ', '-'])
         .trim()

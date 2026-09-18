@@ -2,7 +2,7 @@ use crate::handlers;
 use crate::protocol::*;
 use crate::server::{AppState, ToolOutput};
 use photonic_core::{audit_timestamp, AuditEntry, Command, Document};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 /// Notify the checkpoint system that a mutation has occurred.
 /// Resets the 60-second debounce window; the background task flushes it.
@@ -76,13 +76,69 @@ fn document_changed(before: &Document, after: &Document) -> bool {
     serde_json::to_value(before).ok() != serde_json::to_value(after).ok()
 }
 
+/// Keep transcript speech in the document/undo history rather than duplicating
+/// it into the separate tool audit log. Nested edit plans follow the same rule.
+fn audit_arguments(name: &str, mut args: Value) -> Value {
+    match name {
+        "edit_transcript_word" => {
+            if let Some(text) = args.get_mut("text") {
+                *text = json!("[transcript text]");
+            }
+        }
+        "remove_filler_words" => {
+            if let Some(matches) = args.get_mut("matches").and_then(Value::as_array_mut) {
+                for token in matches {
+                    if let Some(text) = token.get_mut("text") {
+                        *text = json!("[transcript text]");
+                    }
+                }
+            }
+        }
+        "apply_video_edit_plan" => {
+            if let Some(operations) = args.get_mut("operations").and_then(Value::as_array_mut) {
+                for operation in operations {
+                    if let Some(tool) = operation
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    {
+                        if let Some(arguments) = operation.get_mut("arguments") {
+                            *arguments = audit_arguments(&tool, arguments.take());
+                        }
+                    }
+                }
+            }
+        }
+        "execute_action" => {
+            if let Some(tool) = args.get("name").and_then(Value::as_str).map(str::to_owned) {
+                if let Some(arguments) = args.get_mut("arguments") {
+                    *arguments = audit_arguments(&tool, arguments.take());
+                }
+            }
+        }
+        _ => {}
+    }
+    args
+}
+
+/// Entry point for a single MCP tool call.
+///
+/// `pub` (29 §3 / CAP-019): the out-of-crate acceptance-story harness scripts
+/// real tool calls through this fn precisely because it — not
+/// `dispatch_tool_inner` — carries the document-snapshot, undo-history and
+/// audit-log side effects a client observes.
 pub async fn dispatch_tool(
     state: &AppState,
     name: &str,
     args: Value,
 ) -> Result<ToolResult, String> {
     let start = std::time::Instant::now();
-    let snapshot_before = if needs_document_snapshot(name) {
+    let effective_name = if name == "execute_action" {
+        args["name"].as_str().unwrap_or(name)
+    } else {
+        name
+    };
+    let snapshot_before = if needs_document_snapshot(effective_name) {
         Some(state.document.lock().await.clone())
     } else {
         None
@@ -92,7 +148,12 @@ pub async fn dispatch_tool(
     } else {
         None
     };
-    let output = dispatch_tool_inner(state, name, args.clone()).await;
+    let output = match dispatch_tool_inner(state, name, args.clone()).await {
+        Err(message) if crate::catalog::tool_schema(name).is_some() => Ok(ToolOutput::readonly(
+            ToolResult::error_with_code("InvalidArguments", message),
+        )),
+        output => output,
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
 
     // Direct handlers leave the history head unchanged. Turn their completed
@@ -144,7 +205,7 @@ pub async fn dispatch_tool(
         id: 0, // assigned by AuditLog::record
         timestamp: audit_timestamp(),
         tool_name: name.to_string(),
-        args,
+        args: audit_arguments(name, args),
         result_summary,
         duration_ms,
         is_error,
@@ -169,7 +230,173 @@ pub(crate) async fn dispatch_tool_inner(
     args: Value,
 ) -> Result<ToolOutput, String> {
     match name {
+        "set_preview_zones" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video_workflows::set_preview_zones(state, args).await,
+            ))
+        }
+        "precision_trim" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video_workflows::precision_trim(state, args).await,
+            ))
+        }
+        "cancel_preview" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::cancel_preview(state, args).await,
+            ))
+        }
+        "get_preview_status" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::get_preview_status(state, args).await,
+            ))
+        }
+        "audition_source" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::audition_source(state, args).await,
+            ))
+        }
+        "render_preview" | "clear_preview" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::preview_command(state, args, name == "clear_preview")
+                    .await,
+            ))
+        }
+        "stop_source_audition" => {
+            let _: handlers::video_inspect::EmptyArgs =
+                serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_workflows::stop_source_audition(state).await,
+            ))
+        }
+        "get_transcript" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_transcript::get_transcript(state, args).await,
+            ))
+        }
+        "edit_transcript_word" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::mutating(
+                handlers::video_transcript::edit_transcript_word(state, args).await,
+            ))
+        }
+        "delete_transcript_range" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::mutating(
+                handlers::video_transcript::delete_transcript_range(state, args).await,
+            ))
+        }
+        "find_filler_words" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_transcript::find_filler_words(state, args).await,
+            ))
+        }
+        "remove_filler_words" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::mutating(
+                handlers::video_transcript::remove_filler_words(state, args).await,
+            ))
+        }
+        "get_video_capabilities" => {
+            let _: handlers::video_inspect::EmptyArgs =
+                serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_inspect::get_video_capabilities(state).await,
+            ))
+        }
+        "render_frames_at" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_inspect::render_frames_at(state, args).await,
+            ))
+        }
+        "get_timeline_snapshot" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            Ok(ToolOutput::readonly(
+                handlers::video_inspect::get_timeline_snapshot(state, args).await,
+            ))
+        }
+        "apply_video_edit_plan" => {
+            let args = serde_json::from_value(args)
+                .map_err(|error| format!("Invalid arguments: {error}"))?;
+            let result = handlers::video_edits::apply_video_edit_plan(state, args).await;
+            let mutated = result
+                .structured_content
+                .as_ref()
+                .is_some_and(|data| data["undo_steps"] == 1 && data["replayed"] == false);
+            Ok(if mutated {
+                ToolOutput::mutating(result)
+            } else {
+                ToolOutput::readonly(result)
+            })
+        }
+        "get_action_schema" => {
+            let name = args
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or("name is required")?;
+            let result = match crate::catalog::tool_schema(name) {
+                Some(schema) => {
+                    ToolResult::text(format!("Complete schema for {name}")).with_data(schema)
+                }
+                None => {
+                    ToolResult::error_with_code("UnknownTool", format!("No action named {name}"))
+                }
+            };
+            Ok(ToolOutput::readonly(result))
+        }
         // ── Mutating tools (write to the document) ──────────────────────────────
+        "search_actions" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(15) as usize;
+            let data = crate::catalog::search_actions(&query, limit);
+            Ok(ToolOutput::readonly(
+                crate::protocol::ToolResult::text(format!(
+                    "Found {} action(s) for {query:?}",
+                    data["count"]
+                ))
+                .with_data(data),
+            ))
+        }
+        "execute_action" => {
+            let action = args
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| "execute_action requires name".to_string())?
+                .to_string();
+            if action == "search_actions" || action == "execute_action" {
+                return Ok(ToolOutput::readonly(crate::protocol::ToolResult::error(
+                    "execute_action cannot invoke itself or search_actions",
+                )));
+            }
+            let nested = args.get("arguments").cloned().unwrap_or(json!({}));
+            if crate::catalog::tool_schema(&action).is_none() {
+                return Ok(ToolOutput::readonly(ToolResult::error_with_code(
+                    "UnknownAction",
+                    format!("Unknown action: {action}"),
+                )));
+            }
+            // Box::pin: async recursion through dispatch_tool_inner.
+            return Box::pin(dispatch_tool_inner(state, &action, nested)).await;
+        }
         "create_shape" => {
             let a: CreateShapeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
@@ -2174,6 +2401,986 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::nodes::release_clipping_mask(state, a).await,
             ))
         }
+
+        // ── Video domain (10-mcp-tools.md, P2: timeline-EDIT tools) ─────────────
+        // Sequence (10 §3.2)
+        "create_sequence" => {
+            let a: CreateSequenceArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::create_sequence(state, a).await,
+            ))
+        }
+        "delete_sequence" => {
+            let a: DeleteSequenceArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::delete_sequence(state, a).await,
+            ))
+        }
+        "list_sequences" => {
+            let a: ListSequencesArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_sequences(state, a).await,
+            ))
+        }
+        "set_active_sequence" => {
+            let a: SetActiveSequenceArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_active_sequence(state, a).await,
+            ))
+        }
+        "set_sequence_format" => {
+            let a: SetSequenceFormatArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_sequence_format(state, a).await,
+            ))
+        }
+        "set_active_format" => {
+            let a: SetActiveFormatArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_active_format(state, a).await,
+            ))
+        }
+        "set_work_range" => {
+            let a: SetWorkRangeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_work_range(state, a).await,
+            ))
+        }
+        "add_marker" => {
+            let a: AddMarkerArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_marker(state, a).await,
+            ))
+        }
+        "remove_marker" => {
+            let a: RemoveMarkerArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_marker(state, a).await,
+            ))
+        }
+        "list_markers" => {
+            let a: ListMarkersArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::list_markers(state, a).await,
+            ))
+        }
+
+        // Marker depth: editing, clip scope, categories (26 K-A2)
+        "set_marker" => {
+            let a: SetMarkerArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_marker(state, a).await,
+            ))
+        }
+        "add_clip_marker" => {
+            let a: AddClipMarkerArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_clip_marker(state, a).await,
+            ))
+        }
+        "remove_clip_marker" => {
+            let a: RemoveClipMarkerArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_clip_marker(state, a).await,
+            ))
+        }
+        "list_clip_markers" => {
+            let a: ListClipMarkersArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::list_clip_markers(state, a).await,
+            ))
+        }
+        "list_marker_categories" => {
+            let a: ListMarkerCategoriesArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::list_marker_categories(state, a).await,
+            ))
+        }
+        "add_marker_category" => {
+            let a: AddMarkerCategoryArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_marker_category(state, a).await,
+            ))
+        }
+        "seed_marker_categories" => {
+            let a: SeedMarkerCategoriesArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::seed_marker_categories(state, a).await,
+            ))
+        }
+        "update_marker_category" => {
+            let a: UpdateMarkerCategoryArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::update_marker_category(state, a).await,
+            ))
+        }
+        "remove_marker_category" => {
+            let a: RemoveMarkerCategoryArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_marker_category(state, a).await,
+            ))
+        }
+
+        // Track (10 §3.3)
+        "add_track" => {
+            let a: AddTrackArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_track(state, a).await,
+            ))
+        }
+        "remove_track" => {
+            let a: RemoveTrackArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_track(state, a).await,
+            ))
+        }
+        "set_track_prop" => {
+            let a: SetTrackPropArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_track_prop(state, a).await,
+            ))
+        }
+        "reorder_track" => {
+            let a: ReorderTrackArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::reorder_track(state, a).await,
+            ))
+        }
+
+        // Clip edit ops (10 §3.4)
+        "insert_clip" => {
+            let a: InsertClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::insert_clip(state, a).await,
+            ))
+        }
+        "move_clip" => {
+            let a: MoveClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::move_clip(state, a).await,
+            ))
+        }
+        "move_clips" => {
+            let a: MoveClipsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::move_clips(state, a).await,
+            ))
+        }
+        "trim_clip" => {
+            let a: TrimClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::trim_clip(state, a).await,
+            ))
+        }
+        "split_clip" => {
+            let a: SplitClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::split_clip(state, a).await,
+            ))
+        }
+        "remove_clip" => {
+            let a: RemoveClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_clip(state, a).await,
+            ))
+        }
+        "roll_edit" => {
+            let a: RollEditArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::roll_edit(state, a).await,
+            ))
+        }
+        "slip_clip" => {
+            let a: SlipClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::slip_clip(state, a).await,
+            ))
+        }
+        "slide_clip" => {
+            let a: SlideClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::slide_clip(state, a).await,
+            ))
+        }
+        "ripple_edit" => {
+            let a: RippleEditArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::ripple_edit(state, a).await,
+            ))
+        }
+
+        // 3/4-point editing (16 §2, CAP-019 MCP parity)
+        "insert_edit" => {
+            let a: InsertEditArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::insert_edit(state, a).await,
+            ))
+        }
+        "overwrite_edit" => {
+            let a: OverwriteEditArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::overwrite_edit(state, a).await,
+            ))
+        }
+        "lift_edit" => {
+            let a: LiftEditArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::lift_edit(state, a).await,
+            ))
+        }
+        "extract_edit" => {
+            let a: ExtractEditArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::extract_edit(state, a).await,
+            ))
+        }
+
+        // NLE parity round-2 (17-nle-parity-round2.md, G21 CAP-019 MCP parity)
+        "replace_clip_source" => {
+            let a: ReplaceClipSourceArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::replace_clip_source(state, a).await,
+            ))
+        }
+        "add_edit_all_tracks" => {
+            let a: AddEditAllTracksArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_edit_all_tracks(state, a).await,
+            ))
+        }
+        "close_gap" => {
+            let a: CloseGapArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::close_gap(state, a).await,
+            ))
+        }
+        "insert_space" => {
+            let a: InsertSpaceArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::insert_space(state, a).await,
+            ))
+        }
+        "remove_space" => {
+            let a: RemoveSpaceArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_space(state, a).await,
+            ))
+        }
+        "remove_all_spaces_after" => {
+            let a: SpaceAfterArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_all_spaces_after(state, a).await,
+            ))
+        }
+        "remove_clips_after" => {
+            let a: SpaceAfterArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_clips_after(state, a).await,
+            ))
+        }
+        "match_frame" => {
+            let a: MatchFrameArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::match_frame(state, a).await,
+            ))
+        }
+        "insert_adjustment_clip" => {
+            let a: InsertAdjustmentClipArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::insert_adjustment_clip(state, a).await,
+            ))
+        }
+        "insert_text_clip" => {
+            let a: InsertTextClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::insert_text_clip(state, a).await,
+            ))
+        }
+
+        // Clip properties (10 §3.5)
+        "set_clip_prop" => {
+            let a: SetClipPropArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_clip_prop(state, a).await,
+            ))
+        }
+        // D-12 gyro stabilization (22 §6.5)
+        "import_motion_metadata" => {
+            let a: ImportMotionMetadataArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::import_motion_metadata(state, a).await,
+            ))
+        }
+        "set_stabilization" => {
+            let a: SetStabilizationArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_stabilization(state, a).await,
+            ))
+        }
+        "analyze_stabilization" => {
+            let a: AnalyzeStabilizationArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            // Analysis is generation, not history (22 §6.5): it produces a
+            // cache entry, never an undo step, so it is not `mutating`.
+            Ok(ToolOutput::readonly(
+                handlers::video::analyze_stabilization(state, a).await,
+            ))
+        }
+        "get_stabilization_status" => {
+            let a: GetStabilizationStatusArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_stabilization_status(state, a).await,
+            ))
+        }
+        "set_clip_speed" => {
+            let a: SetClipSpeedArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_clip_speed(state, a).await,
+            ))
+        }
+        "set_transition" => {
+            let a: SetTransitionArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_transition(state, a).await,
+            ))
+        }
+
+        // Clip organization: linking (14 §M-2, CAP-019 MCP parity)
+        "link_clips" => {
+            let a: LinkClipsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::link_clips(state, a).await,
+            ))
+        }
+        "unlink_clips" => {
+            let a: UnlinkClipsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::unlink_clips(state, a).await,
+            ))
+        }
+
+        "list_clips" => {
+            let a: ListClipsArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_clips(state, a).await,
+            ))
+        }
+        "get_clip" => {
+            let a: GetClipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_clip(state, a).await,
+            ))
+        }
+
+        // Effects (10 §3.6)
+        "add_effect" => {
+            let a: AddEffectArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_effect(state, a).await,
+            ))
+        }
+        "remove_effect" => {
+            let a: RemoveEffectArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_effect(state, a).await,
+            ))
+        }
+        "reorder_effects" => {
+            let a: ReorderEffectsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::reorder_effects(state, a).await,
+            ))
+        }
+        "set_effect_param" => {
+            let a: SetEffectParamArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_effect_param(state, a).await,
+            ))
+        }
+        "set_effect_zone" => {
+            let a: SetEffectZoneArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_effect_zone(state, a).await,
+            ))
+        }
+        "effect_stack" => {
+            let a: EffectStackArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let readonly = a.op == EffectStackOp::List;
+            let res = handlers::video::effect_stack(state, a).await;
+            Ok(if readonly {
+                ToolOutput::readonly(res)
+            } else {
+                ToolOutput::mutating(res)
+            })
+        }
+        "paste_attributes" => {
+            let a: PasteAttributesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::paste_attributes(state, a).await,
+            ))
+        }
+        "freeze_frame" => {
+            let a: FreezeFrameArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::freeze_frame(state, a).await,
+            ))
+        }
+
+        // Effect presets, custom stacks and favourites (26 §10 K-B4). The
+        // library is a config file, so only `effect_preset_apply` is
+        // `mutating` — the rest never produce a document edit or an undo step.
+        "effect_preset_list" => {
+            let a: EffectPresetListArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::effect_preset_list(state, a).await,
+            ))
+        }
+        "effect_preset_save" => {
+            let a: EffectPresetSaveArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::effect_preset_save(state, a).await,
+            ))
+        }
+        "effect_preset_apply" => {
+            let a: EffectPresetApplyArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::effect_preset_apply(state, a).await,
+            ))
+        }
+        "effect_preset_delete" => {
+            let a: EffectPresetDeleteArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::effect_preset_delete(state, a).await,
+            ))
+        }
+        "effect_preset_rename" => {
+            let a: EffectPresetRenameArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::effect_preset_rename(state, a).await,
+            ))
+        }
+        "effect_favourite_list" => {
+            let a: EffectFavouriteListArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::effect_favourite_list(state, a).await,
+            ))
+        }
+        "effect_favourite_set" => {
+            let a: EffectFavouriteSetArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::effect_favourite_set(state, a).await,
+            ))
+        }
+        "list_effect_kinds" => {
+            let a: ListEffectKindsArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_effect_kinds(state, a).await,
+            ))
+        }
+
+        // Keyframes (10 §3.7)
+        "set_keyframe" => {
+            let a: SetKeyframeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_keyframe(state, a).await,
+            ))
+        }
+        "remove_keyframe" => {
+            let a: RemoveKeyframeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_keyframe(state, a).await,
+            ))
+        }
+        "batch_set_keyframes" => {
+            let a: BatchSetKeyframesArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::batch_set_keyframes(state, a).await,
+            ))
+        }
+        "get_keyframes" => {
+            let a: GetKeyframesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_keyframes(state, a).await,
+            ))
+        }
+        "copy_keyframes" => {
+            let a: CopyKeyframesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::copy_keyframes(state, a).await,
+            ))
+        }
+        "paste_keyframes" => {
+            let a: PasteKeyframesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::paste_keyframes(state, a).await,
+            ))
+        }
+
+        // Media (P2 subset)
+        "import_media" => {
+            let a: ImportMediaArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::import_media(state, a).await,
+            ))
+        }
+        "relink_media" => {
+            let a: RelinkMediaArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::relink_media(state, a).await,
+            ))
+        }
+        "find_offline_media" => {
+            let a: FindOfflineMediaArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::find_offline_media(state, a).await,
+            ))
+        }
+        "relink_media_batch" => {
+            let a: RelinkMediaBatchArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            // A dry run mutates nothing, so it must not schedule a checkpoint
+            // (same rule `effect_stack`'s list op follows).
+            let readonly = a.dry_run.unwrap_or(false);
+            let res = handlers::video::relink_media_batch(state, a).await;
+            Ok(if readonly {
+                ToolOutput::readonly(res)
+            } else {
+                ToolOutput::mutating(res)
+            })
+        }
+        "list_media" => {
+            let a: ListMediaArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_media(state, a).await,
+            ))
+        }
+        "remove_asset" => {
+            let a: RemoveAssetArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_asset(state, a).await,
+            ))
+        }
+        "create_subclip" => {
+            let a: CreateSubclipArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::create_subclip(state, a).await,
+            ))
+        }
+        "set_asset_tags" => {
+            let a: SetAssetTagsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_asset_tags(state, a).await,
+            ))
+        }
+        "create_bin" => {
+            let a: CreateBinArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::create_bin(state, a).await,
+            ))
+        }
+        "remove_bin" => {
+            let a: RemoveBinArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_bin(state, a).await,
+            ))
+        }
+        "set_asset_bin" => {
+            let a: SetAssetBinArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_asset_bin(state, a).await,
+            ))
+        }
+        "list_bins" => {
+            let a: ListBinsArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_bins(state, a).await,
+            ))
+        }
+
+        // ── Video domain (10-mcp-tools.md, P3: engine-backed tools) ─────────────
+        // Playback (10 §3.13): these mutate ENGINE/SESSION state, never the
+        // document — §3.13's `mutating*`. Classified readonly here so no
+        // checkpoint debounce is scheduled (design rule: playhead is session
+        // state, 01 §11 — no Command, no undo step).
+        "play" => {
+            let a: PlayArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(handlers::video::play(state, a).await))
+        }
+        "pause" => {
+            let a: PauseArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(handlers::video::pause(state, a).await))
+        }
+        "seek" => {
+            let a: SeekArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(handlers::video::seek(state, a).await))
+        }
+        "step" => {
+            let a: StepArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(handlers::video::step(state, a).await))
+        }
+        "set_loop_range" => {
+            let a: SetLoopRangeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::set_loop_range(state, a).await,
+            ))
+        }
+        "set_proxy_mode" => {
+            let a: SetProxyModeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::set_proxy_mode(state, a).await,
+            ))
+        }
+        "get_engine_status" => {
+            let a: GetEngineStatusArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::get_engine_status(state, a).await,
+            ))
+        }
+
+        // Render (10 §3.14 / §4)
+        "render_frame_at" => {
+            let a: RenderFrameAtArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::render_frame_at(state, a).await,
+            ))
+        }
+
+        // Media engine ops (10 §3.1). `probe_media` starts a job that commits
+        // its asset update from the worker (design rule 6 — the worker
+        // schedules its own checkpoint); the start call itself mutates nothing.
+        "probe_media" => {
+            let a: ProbeMediaArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::probe_media(state, a).await,
+            ))
+        }
+        "generate_proxies" => {
+            let a: GenerateProxiesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::generate_proxies(state, a).await,
+            ))
+        }
+        "remove_proxy" => {
+            let a: RemoveProxyArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::remove_proxy(state, a).await,
+            ))
+        }
+        "attach_proxy" => {
+            let a: AttachProxyArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            // Document mutation happens inside the handler (set_asset_proxy +
+            // MCP checkpoint); treat as readonly dispatch like generate/remove.
+            Ok(ToolOutput::readonly(
+                handlers::video::attach_proxy(state, a).await,
+            ))
+        }
+        "detach_proxy" => {
+            let a: DetachProxyArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::detach_proxy(state, a).await,
+            ))
+        }
+        "transcode_media" => {
+            let a: TranscodeMediaArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::transcode_media(state, a).await,
+            ))
+        }
+
+        // Export + jobs (10 §3.15 / §6). `export_sequence` is readonly at call
+        // time (10 §6: "the export itself never mutates the timeline");
+        // preset save/delete are app-config side effects, not document
+        // mutations (10 §3.15).
+        "export_sequences" => {
+            let args = serde_json::from_value(args).map_err(|error| error.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_export::export_sequences(state, args).await,
+            ))
+        }
+        "export_sequence" => {
+            let a: ExportSequenceArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::export_sequence(state, a).await,
+            ))
+        }
+        "get_job_status" => {
+            let a: GetJobStatusArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_job_status(state, a).await,
+            ))
+        }
+        "cancel_job" => {
+            let a: CancelJobArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::cancel_job(state, a).await,
+            ))
+        }
+        "list_export_presets" => {
+            let a: ListExportPresetsArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_export_presets(state, a).await,
+            ))
+        }
+        "save_export_preset" => {
+            let a: SaveExportPresetArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::save_export_preset(state, a).await,
+            ))
+        }
+        "delete_export_preset" => {
+            let a: DeleteExportPresetArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::delete_export_preset(state, a).await,
+            ))
+        }
+
+        // ── Video domain, P4+ slice (10-mcp-tools.md §3.8–§3.12, 05 §4b) ────────
+        // Captions (10 §3.8)
+        "auto_caption" => {
+            let a: AutoCaptionArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::auto_caption(state, a).await,
+            ))
+        }
+        "add_caption_track" => {
+            let a: AddCaptionTrackArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_caption_track(state, a).await,
+            ))
+        }
+        "remove_caption_track" => {
+            let a: RemoveCaptionTrackArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_caption_track(state, a).await,
+            ))
+        }
+        "get_caption_track" => {
+            let a: GetCaptionTrackArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_caption_track(state, a).await,
+            ))
+        }
+        "set_caption_cue" => {
+            let a: SetCaptionCueArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_caption_cue(state, a).await,
+            ))
+        }
+        "split_caption_cue" => {
+            let a: SplitCaptionCueArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::split_caption_cue(state, a).await,
+            ))
+        }
+        "merge_caption_cues" => {
+            let a: MergeCaptionCuesArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::merge_caption_cues(state, a).await,
+            ))
+        }
+        "set_caption_word" => {
+            let a: SetCaptionWordArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_caption_word(state, a).await,
+            ))
+        }
+        "set_caption_style" => {
+            let a: SetCaptionStyleArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_caption_style(state, a).await,
+            ))
+        }
+        "import_captions" => {
+            let a: ImportCaptionsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::import_captions(state, a).await,
+            ))
+        }
+        "export_captions" => {
+            let a: ExportCaptionsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::export_captions(state, a).await,
+            ))
+        }
+
+        // TTS (10 §3.9). Job start touches no document; the worker commits.
+        "generate_voiceover" => {
+            let a: GenerateVoiceoverArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::generate_voiceover(state, a).await,
+            ))
+        }
+
+        // Grade (10 §3.10)
+        "set_grade" => {
+            let a: SetGradeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_grade(state, a).await,
+            ))
+        }
+        "apply_lut" => {
+            let a: ApplyLutArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::apply_lut(state, a).await,
+            ))
+        }
+        "copy_grade" => {
+            let a: CopyGradeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::copy_grade(state, a).await,
+            ))
+        }
+        "grade_preset" => {
+            let a: GradePresetArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::grade_preset(state, a).await,
+            ))
+        }
+        "get_scopes" => {
+            let a: GetScopesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_scopes(state, a).await,
+            ))
+        }
+
+        // Node graph (10 §3.11)
+        "create_clip_composition" => {
+            let a: CreateClipCompositionArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::create_clip_composition(state, a).await,
+            ))
+        }
+        "add_graph_node" => {
+            let a: AddGraphNodeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_graph_node(state, a).await,
+            ))
+        }
+        "remove_graph_node" => {
+            let a: RemoveGraphNodeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_graph_node(state, a).await,
+            ))
+        }
+        "add_graph_edge" => {
+            let a: AddGraphEdgeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::add_graph_edge(state, a).await,
+            ))
+        }
+        "remove_graph_edge" => {
+            let a: RemoveGraphEdgeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_graph_edge(state, a).await,
+            ))
+        }
+        "set_graph_node_param" => {
+            let a: SetGraphNodeParamArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_graph_node_param(state, a).await,
+            ))
+        }
+        "set_project_graph" => {
+            let a: SetProjectGraphArgs =
+                serde_json::from_value(args).unwrap_or(SetProjectGraphArgs {
+                    graph_id: None,
+                    clear: false,
+                });
+            Ok(ToolOutput::mutating(
+                handlers::video::set_project_graph(state, a).await,
+            ))
+        }
+        "get_graph" => {
+            let a: GetGraphArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_graph(state, a).await,
+            ))
+        }
+
+        // Audio (10 §3.12)
+        "set_clip_audio" => {
+            let a: SetClipAudioArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_clip_audio(state, a).await,
+            ))
+        }
+        "set_track_audio" => {
+            let a: SetTrackAudioArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_track_audio(state, a).await,
+            ))
+        }
+        "audio_fx" => {
+            let a: AudioFxArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::audio_fx(state, a).await,
+            ))
+        }
+        "set_master_bus" => {
+            let a: SetMasterBusArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_master_bus(state, a).await,
+            ))
+        }
+        "get_audio_meters" => {
+            let a: GetAudioMetersArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::get_audio_meters(state, a).await,
+            ))
+        }
+        "get_waveform" => {
+            let a: GetWaveformArgs = serde_json::from_value(args).unwrap_or(GetWaveformArgs {
+                asset_id: None,
+                clip_id: None,
+                resolution: None,
+            });
+            Ok(ToolOutput::readonly(
+                handlers::video::get_waveform(state, a).await,
+            ))
+        }
+
+        // Title templates (05 §4b)
+        "list_title_templates" => {
+            let a: ListTitleTemplatesArgs = serde_json::from_value(args).unwrap_or_default();
+            Ok(ToolOutput::readonly(
+                handlers::video::list_title_templates(state, a).await,
+            ))
+        }
+        "insert_title_template" => {
+            let a: InsertTitleTemplateArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::insert_title_template(state, a).await,
+            ))
+        }
+
         _ => Err(format!("Unknown tool: {}", name)),
     }
 }
@@ -2203,8 +3410,13 @@ mod tests {
             document_path: Arc::new(StdMutex::new(None)),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
+            path_policy: photonic_core::PathPolicy::test_default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(new_clipboard_ring()),
+            video_engine: Arc::new(crate::handlers::video_jobs::VideoEngineHandle::new()),
+            video_jobs: Arc::new(StdMutex::new(
+                crate::handlers::video_jobs::JobRegistry::new(),
+            )),
         }
     }
 
@@ -2606,13 +3818,14 @@ mod tests {
         );
         let contents = std::fs::read_to_string(&path).unwrap();
         let (loaded, _) = photonic_core::load_photon(&contents).unwrap();
+        let canonical_path = std::fs::canonicalize(&path).unwrap();
         assert_eq!(
             (loaded.artboards.len(), loaded.nodes.len()),
             expected_counts
         );
         assert_eq!(
             state.document_path.lock().unwrap().as_deref(),
-            Some(path.as_path())
+            Some(canonical_path.as_path())
         );
 
         let repeat = dispatch_tool(&state, "save_document", json!({}))

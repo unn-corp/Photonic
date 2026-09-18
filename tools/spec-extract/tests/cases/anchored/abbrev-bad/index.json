@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "items": [
+    {
+      "file": "x.rs",
+      "line": 1,
+      "krate": "x",
+      "module_path": "x",
+      "name": "Foo",
+      "kind": "Struct",
+      "visibility": "pub",
+      "fields": [
+        "a",
+        "b",
+        "c"
+      ],
+      "variants": [],
+      "value": null,
+      "signature": null,
+      "cfg": []
+    }
+  ]
+}

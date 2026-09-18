@@ -1,0 +1,98 @@
+Title: Shooting PAL 25P in US suggested setting for existing light and LED lighting.
+
+URL Source: https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/
+
+Markdown Content:
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-357026)
+*   [#1](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-357026)
+
+Tomorrow I'm shooting PAL 25P in the US for a client sending the footage overseas.
+
+Does this make sense for use with existing light and my LED lights?
+
+From [http://www.red.com/learn/red-101/flicker-free-video-tutorial](http://www.red.com/learn/red-101/flicker-free-video-tutorial)
+
+Safe Shutter Angles: 75, 150, 225°
+
+ Corresponding Shutter Speeds: 1/120, 1/60, 1/40 sec
+
+Any suggestions, thoughts, recommendations from those that've successfully done this?
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641500)
+*   [#2](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641500)
+
+One of the first shoots I did with my F55 after getting it in 2015 was for a production company here in the US for a client in Germany. We shot UHD/25P and I lit the interviews with my LitePanel Astra's and I do not recall having any issues with flicker.
+
+If you have time to test this evening, I'd suggest testing it out tonight.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641501)
+*   [#3](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641501)
+
+Thanks for responding. I'm not so much concerned with my LEDs as I am the existing lights in the background of my shots.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641508)
+*   [#4](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641508)
+
+Just found the drive with the footage back-up. Opened it up with the Sony software to check the metadata and play it. We shot UHD, 25P and 1/50 shutter. The sit-downs were all inside, natural backgrounds. I looked at the first one that was in a house with the kitchen as the background with 60hz tungsten practicals in the background and I didn't see any flickering on my laptop and we never heard anything from the client about issues with flicker, either. The second interview was in an office, but I believe we turned all existing lights out and used our LED's and augmented the daylight coming in. I also didn't see any flicker in the b-roll in the office after the interview. There was a lot of daylight coming in lighting the room up. I can see the light from tungsten cans in the ceiling reflecting on the leather seats, but I don't recall if there were fluorescent lights in there and there were no(inadvertent) shots of the ceiling to tell if they had flo's in there.
+
+EDIT:
+
+ I did have a wide shot of the room, no flo's and there was a big monitor on and no flicker in it, either.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641510)
+*   [#5](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641510)
+
+Thanks. I'll toggle between 1/60th and 1/50th and see if I can tell a difference.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641521)
+*   [#7](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641521)
+
+> Never filmed 25p anywhere, but often 24p in countries with 50 Hz utility frequency.
+> 
+> 
+> If your an iPhone user suggest downloading the FLICKERfree Calculator app, especially if filming off-speed. It's a great tool to have at hand.
+> 
+> 
+> [http://www.fdtimes.com/2011/08/19/flickerfree-calculator-app/](http://www.fdtimes.com/2011/08/19/flickerfree-calculator-app/)
+
+Thanks. The off-speed stuff is what will bite you in the @ss a lot, especially with all of the cameras that shoot over 60 now. I got bit by 72fps under some industrial discharge lights in a loading dock a few weeks ago. Just playing around with my F55 when I first got it a few years ago, I saw flicker from tungsten in my house shooting high speed (over 100fps), but not the fluorescents in the kitchen...
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641546)
+*   [#8](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641546)
+
+I shoot 24-30-60-120 fps here in 50Hz Europe, and never have flicker if I set the shutter speed at 1/50s or multiples of that. So, 25 fps with 1/60s *should* work for you.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641552)
+*   [#9](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641552)
+
+yes what Samuel said worked for me
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641564)
+*   [#10](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641564)
+
+On a side note: seems some LEDs will flicker no matter what shutter speed/angle the camera is set to, even 360*.
+
+We recently encountered these in the Sarejevo War Tunnel in 50 Hz Bosnia, & at The Rolling Stones Exhibitionism show in 60 Hz NYC. Was especially surprised to see them at the NYC museum, but only portions of the show had issues, & it was always the same model architectural LEDs that were the offenders, while the rest were fine.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641566)
+*   [#11](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641566)
+
+(and others won't flicker no matter what; my DIY fresnel LED is flicker free at any setting up to 960 fps 1/2000s, which is all I could test; and I think it stays flicker free even when dimmed)
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641618)
+*   [#12](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641618)
+
+1/60th worked on interview lit with LEDs on subject and who know what mix in background.
+
+Only flicker I got was in a workshop lit with sodium vapor and I just dialed shutter to eliminate/minimize but it was probably coming and going.
+
+Thanks for the suggestions. Bottom line is 1/60th worked.
+
+*   [](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641621)
+*   [#13](https://www.dvxuser.com/threads/shooting-pal-25p-in-us-suggested-setting-for-existing-light-and-led-lighting.357026/post-4641621)
+
+> On a side note: seems some LEDs will flicker no matter what shutter speed/angle the camera is set to, even 360*.
+
+Bern - reading your post just reminded me of a shoot I did about 3 months ago. Simple conf room recording of an important presenter for a corporation here in the states. So - just me, Fs7 and wireless mics. No lights wanted - just there to record for employees to watch later.
+
+ I spent the first 20 minutes after arriving trying to find a setting in camera that didn't cause the flickering from the overheads in the room. No frame rate or shutter speed (including off) would totally get rid of it (some were better than others at minimizing). I had never run into this before in 25+ years of shooting. They were the type of lights - I usually associate with flourescents - that have the bulbs facing up (unseen) for bounced light downward. So perhaps this is my first encounter with that type of LED.

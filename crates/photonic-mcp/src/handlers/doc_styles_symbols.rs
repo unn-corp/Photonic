@@ -378,7 +378,9 @@ pub async fn place_symbol(state: &AppState, args: PlaceSymbolArgs) -> ToolResult
 
     let master = match doc.nodes.get(&symbol.master_node_id) {
         Some(n) => n.clone(),
-        None => return ToolResult::error(format!("Symbol master node is missing from document.")),
+        None => {
+            return ToolResult::error("Symbol master node is missing from document.".to_string())
+        }
     };
 
     // Clone the master to create an instance.
@@ -492,7 +494,7 @@ pub async fn spray_symbol_instances(
     use photonic_core::history::Command;
     use photonic_core::transform::Transform;
 
-    let count = args.count.max(1).min(200);
+    let count = args.count.clamp(1, 200);
     let spread = if args.spread <= 0.0 {
         100.0
     } else {
@@ -520,7 +522,7 @@ pub async fn spray_symbol_instances(
     };
 
     // Golden-angle spiral: even distribution of N points within a disk.
-    const GOLDEN_ANGLE: f64 = std::f64::consts::TAU * (1.0 - 1.0 / 1.6180339887498949);
+    const GOLDEN_ANGLE: f64 = std::f64::consts::TAU * (1.0 - 1.0 / 1.618_033_988_749_895);
     let mut instance_ids = Vec::with_capacity(count);
     let mut history = state.history.lock().await;
 

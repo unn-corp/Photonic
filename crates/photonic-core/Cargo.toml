@@ -23,11 +23,20 @@ miniz_oxide = { workspace = true }
 moxcms = "0.8"
 qrcodegen = "1.8"
 tracing = { workspace = true }
+# UAX #29 grapheme/word boundaries for the caption text-metrics module
+# (42 §6.3/§6.5). Already resolved at 1.13.3 via cosmic-text/winit; MIT/Apache-2.0.
+unicode-segmentation = "1.13"
+# East Asian Width property only, for authoring-time caption cell budgeting
+# (42 §6.3). Already resolved at 0.2.2; cargo-deny clean (deny.toml allows
+# Unicode-3.0).
+unicode-width = "0.2"
+# Parallel CPU raster (epic #228): filters, blends, adjustments.
 rayon = "1"
 
 [dev-dependencies]
-criterion = "0.5"
+# Property-based testing for timeline edit-op invariants (11 §3.1).
 proptest = { workspace = true }
+criterion = "0.5"
 
 [[bench]]
 name = "convolution"

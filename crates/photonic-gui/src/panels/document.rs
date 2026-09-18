@@ -110,14 +110,13 @@ pub(crate) fn draw_import_export(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                 action = Some(PanelAction::OpenExportDialog);
             }
             // Batch export: one file per artboard, over a chosen range.
-            if ctx.doc.artboards.len() > 1 {
-                if ui
+            if ctx.doc.artboards.len() > 1
+                && ui
                     .button(format!("{}  Export Artboards…", ph::EXPORT))
                     .on_hover_text("Export each artboard (all, or a range) to its own image file")
                     .clicked()
-                {
-                    action = Some(PanelAction::OpenArtboardExportDialog);
-                }
+            {
+                action = Some(PanelAction::OpenArtboardExportDialog);
             }
         });
     ui.add_space(4.0);
@@ -497,7 +496,7 @@ pub(crate) fn draw_analysis(ui: &mut Ui, ctx: &mut PropPanelCtx) {
         ui.label(
             RichText::new("Analysis")
                 .small()
-                .color(Color32::from_rgb(80, 80, 110)),
+                .color(crate::theme::section_header_color(ui)),
         );
         ui.add_space(2.0);
     }
@@ -654,7 +653,7 @@ pub(crate) fn draw_document_grammar(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                         let color = if *passed {
                             Color32::from_rgb(60, 160, 60)
                         } else {
-                            Color32::from_rgb(200, 60, 60)
+                            ui.visuals().error_fg_color
                         };
                         ui.label(
                             RichText::new(format!("{} {}: {}", icon, rule_name, message))
@@ -692,7 +691,7 @@ pub(crate) fn draw_document_workflow(ui: &mut Ui, ctx: &mut PropPanelCtx) {
         ui.label(
             RichText::new("Document & Workflow")
                 .small()
-                .color(Color32::from_rgb(80, 80, 110)),
+                .color(crate::theme::section_header_color(ui)),
         );
         ui.add_space(2.0);
     }

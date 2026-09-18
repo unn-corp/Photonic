@@ -73,6 +73,7 @@ mod tests {
             config: McpServerConfig::default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            ..AppState::headless_for_test()
         }
     }
 

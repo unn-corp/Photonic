@@ -1,0 +1,25 @@
+[package]
+name = "spec-extract"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+
+# Structural spec-vs-code drift tooling (40-spec-verification.md §3). This crate
+# is the ONLY Rust parser in the drift system and MUST NOT depend on any
+# `photonic-*` crate — it runs in CI's cheap `lint` job, so a photonic dep
+# (which would force a full workspace build) is forbidden by 40 §7 task 1.
+
+[[bin]]
+name = "spec-extract"
+path = "src/main.rs"
+
+[dependencies]
+syn = { version = "2", features = ["full", "extra-traits", "parsing", "printing", "visit"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

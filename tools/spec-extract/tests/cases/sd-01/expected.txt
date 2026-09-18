@@ -1,0 +1,3 @@
+doc.md:1
+  spec-assert: symbol-exists crates/photonic-video/src/session.rs::EngineSession
+  actual:      not found in index

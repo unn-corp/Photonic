@@ -562,7 +562,7 @@ pub async fn detect_rhythms(state: &AppState, args: DetectRhythmsArgs) -> ToolRe
         }
         if best_count >= min_count - 1 && best_interval >= 5.0 {
             let symmetry_n = (360.0 / best_interval).round() as u32;
-            let sym_note = if symmetry_n >= 2 && symmetry_n <= 12 {
+            let sym_note = if (2..=12).contains(&symmetry_n) {
                 format!(" ({}× rotational symmetry)", symmetry_n)
             } else {
                 String::new()

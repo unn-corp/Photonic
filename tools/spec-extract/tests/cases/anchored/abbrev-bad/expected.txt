@@ -1,0 +1,3 @@
+doc.md:4
+  spec-source: x.rs::Foo
+  actual:      a, +b, +c, -z  (x.rs:1)

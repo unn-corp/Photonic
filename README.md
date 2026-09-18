@@ -30,23 +30,41 @@ cargo build --release
 ```sh
 cargo run --release
 # or open a saved document:
-cargo run --release -- path/to/file.photon
+cargo run --release -- path/to/file.photonic
 ```
 
-### Running the MCP server (headless)
+### Running the MCP server
 
-```sh
-cargo run --release -- --headless --mcp-port 7842 --mcp-secret '<unique secret>'
+Photonic embeds an MCP server for AI-assisted editing. Protocol details, PathPolicy,
+Pattern B (`search_actions` / compact `tools/list`), and MCPB packaging:
+
+→ **[docs/specs/mcp-2026-07-28.md](docs/specs/mcp-2026-07-28.md)** · full tool reference **[docs/mcp-api.md](docs/mcp-api.md)**
+
+```bash
+# HTTP (loopback). A session token is generated and written securely unless
+# --mcp-secret or PHOTONIC_MCP_SECRET supplies one.
+cargo run -p photonic-app -- --headless --mcp-port 7842
+
+# Stdio (Content-Length; MCPB / Inspector)
+cargo run -p photonic-app -- --mcp-stdio
+
+# Attach to a running GUI instance
+PHOTONIC_MCP_TOKEN=$(cat ~/.config/Photonic/mcp_token) \
+  cargo run -p photonic-app -- mcp-proxy --server 127.0.0.1:7842
+
+# Pack a local .mcpb (debug structural smoke)
+./packaging/mcpb/scripts/pack-debug.sh
 ```
+
+Default `tools/list` is **compact** (search + promoted tools). Full catalog: `params.full: true`.
 
 The MCP server listens on `http://localhost:7842` and accepts JSON-RPC 2.0 requests.
-Pass `--mcp-secret <SECRET>` (or set `PHOTONIC_MCP_SECRET`) to configure the
-required `X-MCP-Secret: <SECRET>` header on every request. The server refuses to
-start without a non-empty secret, and authentication is checked before
-request-body parsing. MCP request bodies are limited to 2 MiB. The generated
-Claude configuration includes the authentication header and is created or
-updated with owner-only permissions on Unix; Windows uses the user profile's
-inherited ACL. The endpoint does not enable browser CORS; native MCP clients do
+Pass `--mcp-secret <SECRET>` to require the `X-MCP-Secret: <SECRET>` header on
+every request. Authentication is checked before request-body parsing, and MCP
+request bodies are limited to 2 MiB. The generated Claude configuration is
+created and updated with owner-only permissions on Unix; Windows uses the user
+profile's inherited ACL. Without a secret, local development behavior remains
+unchanged. The endpoint does not enable browser CORS; native MCP clients do
 not need it.
 
 ### Lua REPL
@@ -65,9 +83,11 @@ photonic/
 │   ├── photonic-gui/      # egui GUI
 │   ├── photonic-mcp/      # MCP server & JSON-RPC handlers
 │   └── photonic-app/      # Binary entry point
+├── packaging/mcpb/        # MCP Bundle (.mcpb) pack scripts + manifest
 ├── docs/
 │   ├── architecture.md    # Crate design and internals
 │   ├── mcp-api.md         # MCP tool reference
+│   ├── specs/mcp-2026-07-28.md  # Protocol, PathPolicy, Pattern B, MCPB
 │   └── file-format.md     # .photon file format
 └── ROADMAP.md             # Planned features
 ```
@@ -79,6 +99,7 @@ photonic/
 | [docs/architecture.md](docs/architecture.md) | Crate breakdown, data model, concurrency model |
 | [docs/raster-editing.md](docs/raster-editing.md) | Raster (pixel) editing subsystem — model, ops, MCP surface, phasing |
 | [docs/mcp-api.md](docs/mcp-api.md) | Every MCP tool with parameters and examples |
+| [docs/specs/mcp-2026-07-28.md](docs/specs/mcp-2026-07-28.md) | MCP protocol 2026-07-28, auth, PathPolicy, Pattern B, MCPB packaging |
 | [docs/file-format.md](docs/file-format.md) | `.photon` JSON schema reference |
 
 ## Crates at a Glance

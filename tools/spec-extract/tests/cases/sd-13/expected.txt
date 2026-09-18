@@ -1,0 +1,3 @@
+doc.md:1
+  spec-assert: dep-absent rubato
+  actual:      present in a Cargo.toml

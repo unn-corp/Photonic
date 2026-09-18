@@ -6,10 +6,12 @@
 use crate::{
     canvas::CanvasView,
     pipeline::{
-        coalesce_segments, create_blur_bgl, create_blur_pipeline_with_blend,
-        create_camera_bind_group_layout, create_fill_pipeline, create_fill_pipeline_with_blend,
-        draw_segments, separable_blend_state, BlurBlend, BlurParams, CameraUniform, DrawSegment,
-        Vertex, SEPARABLE_BLEND_MODES,
+        blend_mode_index, coalesce_segments, create_blur_bgl, create_blur_pipeline_with_blend,
+        create_camera_bind_group_layout, create_composite_bgl, create_composite_pipeline,
+        create_convert_bgl, create_convert_pipeline, create_fill_pipeline,
+        create_fill_pipeline_with_blend, draw_segments, segments_need_isolation,
+        separable_blend_state, BlurBlend, BlurParams, CameraUniform, CompositeParams, DrawSegment,
+        Vertex, SEPARABLE_BLEND_MODES, WORKING_FORMAT,
     },
     tessellator::{adaptive_tolerance, tessellate_fill, tessellate_stroke},
 };
@@ -79,6 +81,12 @@ impl Default for ExportOptions {
 pub struct HeadlessRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Whether the adapter supports reinterpreting `Rgba8UnormSrgb` as
+    /// `Rgba8Unorm` via `view_formats` (needed for Tier B GPU→working). Soft
+    /// adapters (llvmpipe on GitHub Linux runners) often lack
+    /// [`wgpu::DownlevelFlags::VIEW_FORMATS`]; we empty `view_formats` and
+    /// fall back to the Tier A readback path when this is false.
+    supports_view_formats: bool,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     fill_pipeline: wgpu::RenderPipeline,
@@ -94,6 +102,18 @@ pub struct HeadlessRenderer {
     /// texture-passthrough compositor.
     blur_pipeline: wgpu::RenderPipeline,
     blur_sampler: wgpu::Sampler,
+    // ── Full-blend isolation compositing (03 §2.4) ─────────────────────────────
+    /// `COMPOSITE_SHADER` pipeline + its bind-group layout + a clamp sampler,
+    /// used to composite an isolated layer over a backdrop for the 22 blend
+    /// modes that fixed-function blending can't express.
+    composite_bgl: wgpu::BindGroupLayout,
+    composite_pipeline: wgpu::RenderPipeline,
+    composite_sampler: wgpu::Sampler,
+    // ── Tier B asset→working conversion (03 §2.5) ──────────────────────────────
+    /// `CONVERT_SHADER` pipeline + layout, converting a rendered `SCENE_FORMAT`
+    /// vector layer into a linear premultiplied `Rgba16Float` working texture.
+    convert_bgl: wgpu::BindGroupLayout,
+    convert_pipeline: wgpu::RenderPipeline,
 }
 
 impl HeadlessRenderer {
@@ -111,6 +131,11 @@ impl HeadlessRenderer {
             })
             .await
             .expect("No suitable GPU adapter for headless rendering");
+
+        let supports_view_formats = adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(wgpu::DownlevelFlags::VIEW_FORMATS);
 
         let (device, queue) = adapter
             .request_device(
@@ -172,9 +197,25 @@ impl HeadlessRenderer {
             ..Default::default()
         });
 
+        let composite_bgl = create_composite_bgl(&device);
+        let composite_pipeline = create_composite_pipeline(&device, FORMAT, &composite_bgl);
+        // 1:1 fullscreen sampling — clamp, and linear is exact at texel centres.
+        let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("headless_composite_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let convert_bgl = create_convert_bgl(&device);
+        let convert_pipeline = create_convert_pipeline(&device, &convert_bgl);
+
         Self {
             device,
             queue,
+            supports_view_formats,
             camera_buffer,
             camera_bind_group,
             fill_pipeline,
@@ -183,6 +224,11 @@ impl HeadlessRenderer {
             blur_bgl,
             blur_pipeline,
             blur_sampler,
+            composite_bgl,
+            composite_pipeline,
+            composite_sampler,
+            convert_bgl,
+            convert_pipeline,
         }
     }
 
@@ -289,47 +335,7 @@ impl HeadlessRenderer {
         // `FillKind::sample_at`. (Like the raster path, glyph text is not painted
         // by the CPU compositor; a document mixing pattern fills and text follows
         // the same long-standing limitation as raster+text documents.)
-        let has_raster = document
-            .nodes
-            .values()
-            .any(|n| matches!(&n.kind, SceneNodeKind::Raster(_)));
-        let has_pattern = document.nodes.values().any(|n| {
-            matches!(
-                &n.kind,
-                SceneNodeKind::Path(pn)
-                    if matches!(pn.fill.kind, photonic_core::style::FillKind::Pattern(_))
-            )
-        });
-        // A layer with opacity < 1 or a non-Normal blend mode must composite as an
-        // isolated unit (P0). The CPU compositor already does that per layer, so
-        // route such documents through it — correct and exact, matching on-canvas.
-        // The GPU fast path below only handles the common all-opaque/Normal case.
-        let has_isolated_layer = document.layer_order.iter().any(|lid| {
-            document.layers.get(lid).is_some_and(|l| {
-                l.visible
-                    && !l.node_ids.is_empty()
-                    && (l.opacity < 1.0 || l.blend_mode != BlendMode::Normal)
-            })
-        });
-        // Non-print layers must be excluded from export; the CPU compositor does
-        // that, so route such documents through it too.
-        let has_non_print_layer = document.layer_order.iter().any(|lid| {
-            document
-                .layers
-                .get(lid)
-                .is_some_and(|l| !l.print && l.visible && !l.node_ids.is_empty())
-        });
-        // Layer Styles (the effect stack) render on the CPU compositor path.
-        let has_stack_effects = document
-            .nodes
-            .values()
-            .any(|n| n.effects.iter().any(|e| e.enabled()));
-        if has_raster
-            || has_pattern
-            || has_isolated_layer
-            || has_non_print_layer
-            || has_stack_effects
-        {
+        if document_needs_cpu_compositor(document) {
             let mut pixels = vec![0u8; (w as usize) * (h as usize) * 4];
             let bg = match opts.background {
                 ExportBackground::Artboard => [
@@ -365,90 +371,19 @@ impl HeadlessRenderer {
             return (pixels, w, h);
         }
 
-        // Final readback target: single-sample, COPY_SRC.
-        let tex = self.make_color_tex(
+        // Render the vector scene into an off-screen SCENE_FORMAT texture (shared
+        // with the §2.5 Tier B GPU-to-GPU path so both produce identical pixels).
+        let tex = self.render_scene_texture(
+            &verts,
+            &idxs,
+            &segments,
+            &blur_jobs,
+            &view,
+            clear,
+            include_artboard_bg,
             w,
             h,
-            1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         );
-        let tex_view = tex.create_view(&Default::default());
-
-        // MSAA render target for the sharp document geometry.
-        let msaa_tex =
-            self.make_color_tex(w, h, MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let msaa_view = msaa_tex.create_view(&Default::default());
-
-        let mut enc = self.device.create_command_encoder(&Default::default());
-
-        if blur_jobs.is_empty() {
-            // Fast path: render the document straight into the readback target.
-            self.record_pass(
-                &mut enc, &msaa_view, &tex_view, &verts, &idxs, &segments, clear,
-            );
-        } else {
-            // Layered path: the live-effects blur layer must sit *between* the
-            // artboard background and the sharp shapes. So render the shapes
-            // (minus the artboard rect) to a transparent offscreen texture, blur
-            // the effect silhouettes into a separate layer, then composite
-            //   background → effects → shapes
-            // into the readback target.
-            let doc_tex = self.make_color_tex(
-                w,
-                h,
-                1,
-                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            );
-            let doc_view = doc_tex.create_view(&Default::default());
-
-            // The artboard rect is the first 4 verts / 6 indices when present;
-            // skip it here and reproduce it via the composite clear colour.
-            let skip = if include_artboard_bg { 6 } else { 0 } as u32;
-            // Re-base the blend segments onto the sliced index buffer: drop the
-            // artboard segment and shift the rest down by `skip` so the
-            // separable-blend draw still covers exactly the shape geometry.
-            let fx_segments: Vec<DrawSegment> = segments
-                .iter()
-                .filter_map(|s| {
-                    let end = s.start + s.count;
-                    if end <= skip {
-                        None
-                    } else {
-                        let new_start = s.start.saturating_sub(skip);
-                        Some(DrawSegment {
-                            mode: s.mode,
-                            start: new_start,
-                            count: end - skip - new_start,
-                        })
-                    }
-                })
-                .collect();
-            let transparent = wgpu::Color::TRANSPARENT;
-            self.record_pass(
-                &mut enc,
-                &msaa_view,
-                &doc_view,
-                &verts,
-                &idxs[skip as usize..],
-                &fx_segments,
-                transparent,
-            );
-
-            let (fx_tex, fx_view) =
-                self.render_effects_layer(&mut enc, &blur_jobs, view.zoom, w, h);
-
-            // Composite: clear to the artboard/background, then effects, then shapes.
-            let comp_clear = if include_artboard_bg {
-                wgpu::Color::WHITE
-            } else {
-                clear
-            };
-            self.composite_layers(&mut enc, &tex_view, &[&fx_view, &doc_view], comp_clear);
-            drop(fx_tex);
-            drop(doc_tex);
-        }
-        drop(msaa_tex); // keep alive until submit
-        self.queue.submit([enc.finish()]);
 
         // Copy texture → staging buffer (row stride must be aligned to 256)
         let bpr = align256(w * 4);
@@ -653,6 +588,340 @@ impl HeadlessRenderer {
         Ok(buf)
     }
 
+    /// Render the vector scene into a fresh single-sample `SCENE_FORMAT`
+    /// (`Rgba8UnormSrgb`) texture and return it (submitted, ready to read or
+    /// convert). Shared by the RGBA readback path (`render_rgba_with_opts`) and
+    /// the §2.5 Tier B GPU-to-GPU working-texture path, so both render identical
+    /// pixels. The caller must have written the camera uniform for `view`.
+    ///
+    /// The returned texture carries `COPY_SRC | TEXTURE_BINDING` so it can be
+    /// either read back or sampled by the Tier B conversion pass.
+    #[allow(clippy::too_many_arguments)]
+    fn render_scene_texture(
+        &self,
+        verts: &[Vertex],
+        idxs: &[u32],
+        segments: &[DrawSegment],
+        blur_jobs: &[BlurJob],
+        view: &CanvasView,
+        clear: wgpu::Color,
+        include_artboard_bg: bool,
+        w: u32,
+        h: u32,
+    ) -> wgpu::Texture {
+        // `view_formats` includes the non-sRGB counterpart so the Tier B
+        // conversion pass can sample the stored bytes raw (03 §2.5); it does not
+        // affect readback (Tier A) or the sRGB render itself. Soft adapters
+        // (llvmpipe) often lack VIEW_FORMATS — leave the list empty then.
+        let view_formats: &[wgpu::TextureFormat] = if self.supports_view_formats {
+            &[wgpu::TextureFormat::Rgba8Unorm]
+        } else {
+            &[]
+        };
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("headless_scene_tex"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats,
+        });
+        let tex_view = tex.create_view(&Default::default());
+
+        // MSAA render target for the sharp document geometry.
+        let msaa_tex =
+            self.make_color_tex(w, h, MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let msaa_view = msaa_tex.create_view(&Default::default());
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+
+        if blur_jobs.is_empty() && segments_need_isolation(segments) {
+            // Full-blend path (03 §2.4): the document uses a blend mode that
+            // fixed-function GPU blending can't express, so composite each
+            // segment as an isolated layer through COMPOSITE_SHADER instead of
+            // the normal-alpha approximation. Entered only for such documents,
+            // so all-Normal/separable exports keep the byte-identical fast path.
+            self.record_pass_isolated(&mut enc, &tex_view, verts, idxs, segments, clear, w, h);
+        } else if blur_jobs.is_empty() {
+            // Fast path: render the document straight into the readback target.
+            self.record_pass(
+                &mut enc, &msaa_view, &tex_view, verts, idxs, segments, clear,
+            );
+        } else {
+            // Layered path: the live-effects blur layer must sit *between* the
+            // artboard background and the sharp shapes. So render the shapes
+            // (minus the artboard rect) to a transparent offscreen texture, blur
+            // the effect silhouettes into a separate layer, then composite
+            //   background → effects → shapes
+            // into the readback target.
+            let doc_tex = self.make_color_tex(
+                w,
+                h,
+                1,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            );
+            let doc_view = doc_tex.create_view(&Default::default());
+
+            // The artboard rect is the first 4 verts / 6 indices when present;
+            // skip it here and reproduce it via the composite clear colour.
+            let skip = if include_artboard_bg { 6 } else { 0 } as u32;
+            // Re-base the blend segments onto the sliced index buffer: drop the
+            // artboard segment and shift the rest down by `skip` so the
+            // separable-blend draw still covers exactly the shape geometry.
+            let fx_segments: Vec<DrawSegment> = segments
+                .iter()
+                .filter_map(|s| {
+                    let end = s.start + s.count;
+                    if end <= skip {
+                        None
+                    } else {
+                        let new_start = s.start.saturating_sub(skip);
+                        Some(DrawSegment {
+                            mode: s.mode,
+                            start: new_start,
+                            count: end - skip - new_start,
+                        })
+                    }
+                })
+                .collect();
+            let transparent = wgpu::Color::TRANSPARENT;
+            self.record_pass(
+                &mut enc,
+                &msaa_view,
+                &doc_view,
+                verts,
+                &idxs[skip as usize..],
+                &fx_segments,
+                transparent,
+            );
+
+            let (fx_tex, fx_view) = self.render_effects_layer(&mut enc, blur_jobs, view.zoom, w, h);
+
+            // Composite: clear to the artboard/background, then effects, then shapes.
+            let comp_clear = if include_artboard_bg {
+                wgpu::Color::WHITE
+            } else {
+                clear
+            };
+            self.composite_layers(&mut enc, &tex_view, &[&fx_view, &doc_view], comp_clear);
+            drop(fx_tex);
+            drop(doc_tex);
+        }
+        drop(msaa_tex); // keep alive until submit
+        self.queue.submit([enc.finish()]);
+        tex
+    }
+
+    /// Convert a rendered `SCENE_FORMAT` layer (sampled through `src_view` as
+    /// **raw** sRGB bytes) into a fresh linear, premultiplied [`WORKING_FORMAT`]
+    /// (`Rgba16Float`) texture — the asset→working boundary (03 §2.5 / §4.2).
+    /// Shared by Tier B (a raw view of the GPU scene texture) and Tier A (an
+    /// `Rgba8Unorm` upload of the CPU-readback bytes), so both are numerically
+    /// identical. The result carries `TEXTURE_BINDING | COPY_SRC`.
+    fn convert_srgb_texture_to_working(
+        &self,
+        src_view: &wgpu::TextureView,
+        w: u32,
+        h: u32,
+    ) -> wgpu::Texture {
+        let out = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("working_texture"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_view = out.create_view(&Default::default());
+        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("convert_bg"),
+            layout: &self.convert_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(src_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.composite_sampler),
+                },
+            ],
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("convert_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &out_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.convert_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        self.queue.submit([enc.finish()]);
+        out
+    }
+
+    /// Tier B (03 §2.5): render a **pure-vector** `document` straight to a GPU
+    /// working texture — linear, premultiplied `Rgba16Float`, transparent
+    /// outside the artboard so it composites over video — with no CPU
+    /// round-trip. This is the fast path for the common vector-title case;
+    /// `photonic-video` consumes it in P3.
+    ///
+    /// Gated on [`document_needs_cpu_compositor`] (reused, not re-derived): for a
+    /// document that predicate reports `true`, use the universal Tier A path
+    /// (`render_rgba_with_opts` → upload → [`convert`]) instead. This
+    /// debug-asserts the precondition.
+    pub fn render_vector_to_working_texture(
+        &self,
+        document: &Document,
+        w: u32,
+        h: u32,
+    ) -> wgpu::Texture {
+        debug_assert!(
+            !document_needs_cpu_compositor(document),
+            "render_vector_to_working_texture is the pure-vector Tier B fast path; \
+             route CPU-composited documents through Tier A"
+        );
+        let w = w.max(1);
+        let h = h.max(1);
+        // Transparent background (no artboard fill) — a vector asset composites
+        // over the video graph, so its alpha must be meaningful.
+        let mut view = CanvasView::new(w, h);
+        view.fit_to_rect(0.0, 0.0, document.width, document.height);
+        let (verts, idxs, segments, blur_jobs) = build_geometry(document, false, false, view.zoom);
+        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
+        let scene = self.render_scene_texture(
+            &verts,
+            &idxs,
+            &segments,
+            &blur_jobs,
+            &view,
+            wgpu::Color::TRANSPARENT,
+            false,
+            w,
+            h,
+        );
+        if self.supports_view_formats {
+            // Sample the sRGB scene texture through a non-sRGB view so the bytes
+            // are read raw and the conversion applies the sRGB EOTF explicitly —
+            // the exact same math Tier A runs on the CPU-readback bytes.
+            let raw_view = scene.create_view(&wgpu::TextureViewDescriptor {
+                format: Some(wgpu::TextureFormat::Rgba8Unorm),
+                ..Default::default()
+            });
+            self.convert_srgb_texture_to_working(&raw_view, w, h)
+        } else {
+            // Soft adapters (no VIEW_FORMATS): fall back to the Tier A path —
+            // readback sRGB bytes, re-upload as raw Unorm, then convert.
+            let rgba = self
+                .readback_rgba8(&scene, w, h)
+                .expect("scene texture readback for Tier A working conversion");
+            let src = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("tier_a_srgb_upload"),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            self.queue.write_texture(
+                src.as_image_copy(),
+                &rgba,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let src_view = src.create_view(&Default::default());
+            self.convert_srgb_texture_to_working(&src_view, w, h)
+        }
+    }
+
+    /// Read a `FORMAT` (`COPY_SRC`) texture back as tightly-packed RGBA8.
+    fn readback_rgba8(&self, tex: &wgpu::Texture, w: u32, h: u32) -> Option<Vec<u8>> {
+        let bpr = align256(w * 4);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("text_readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().ok()?.ok()?;
+        let raw = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * bpr) as usize;
+            out.extend_from_slice(&raw[start..start + (w * 4) as usize]);
+        }
+        drop(raw);
+        staging.unmap();
+        Some(out)
+    }
+
     fn record_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -717,6 +986,190 @@ impl HeadlessRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+        }
+    }
+
+    /// Full-blend document pass (03 §2.4): composite each draw segment as an
+    /// isolated layer through `COMPOSITE_SHADER`, giving correct output for the
+    /// 22 blend modes fixed-function blending can't express (HSL + backdrop-read
+    /// separable). Each segment is rendered alone (MSAA, resolved) to an isolated
+    /// `FORMAT` texture, then composited over the running backdrop with the
+    /// segment's `blend_mode_index`. Backdrops ping-pong between two textures;
+    /// the final segment composites straight into `target_view`.
+    #[allow(clippy::too_many_arguments)]
+    fn record_pass_isolated(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        vertices: &[Vertex],
+        indices: &[u32],
+        segments: &[DrawSegment],
+        clear: wgpu::Color,
+        w: u32,
+        h: u32,
+    ) {
+        // Nothing to draw, or degenerate segment list — just clear the target.
+        if vertices.is_empty() || segments.is_empty() {
+            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("hl_iso_clear"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(clear),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            return;
+        }
+
+        let vbuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("hl_iso_vbuf"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let ibuf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("hl_iso_ibuf"),
+                contents: bytemuck::cast_slice(indices),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+
+        let sampleable =
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        // Ping-pong backdrops (single-sample, sampleable), the isolated layer's
+        // MSAA target + its resolved single-sample copy.
+        let back_a = self.make_color_tex(w, h, 1, sampleable);
+        let back_b = self.make_color_tex(w, h, 1, sampleable);
+        let iso_msaa =
+            self.make_color_tex(w, h, MSAA_SAMPLES, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let iso_ss = self.make_color_tex(w, h, 1, sampleable);
+        let view_a = back_a.create_view(&Default::default());
+        let view_b = back_b.create_view(&Default::default());
+        let iso_msaa_view = iso_msaa.create_view(&Default::default());
+        let iso_ss_view = iso_ss.create_view(&Default::default());
+
+        // Seed backdrop A with the clear colour (the artboard/BG the first
+        // segment composites over).
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("hl_iso_seed"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view_a,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        let mut backdrop_is_a = true;
+        for (i, seg) in segments.iter().enumerate() {
+            // 1. Render this segment alone to the isolated MSAA target, resolved
+            //    into `iso_ss`. Cleared transparent so only the segment's
+            //    coverage is present.
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("hl_iso_layer"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &iso_msaa_view,
+                        resolve_target: Some(&iso_ss_view),
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Discard,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_bind_group(0, &self.camera_bind_group, &[]);
+                pass.set_vertex_buffer(0, vbuf.slice(..));
+                pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                pass.set_pipeline(&self.fill_pipeline);
+                pass.draw_indexed(seg.start..seg.start + seg.count, 0, 0..1);
+            }
+
+            // 2. Composite `iso_ss` over the current backdrop with this segment's
+            //    blend mode. The final segment writes straight to `target_view`.
+            let backdrop_view = if backdrop_is_a { &view_a } else { &view_b };
+            let is_last = i == segments.len() - 1;
+            let out_view = if is_last {
+                target_view
+            } else if backdrop_is_a {
+                &view_b
+            } else {
+                &view_a
+            };
+
+            let params = CompositeParams {
+                mode: blend_mode_index(seg.mode),
+                opacity: 1.0,
+                _pad: [0.0; 2],
+            };
+            let pbuf = self
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("hl_iso_params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("hl_iso_composite_bg"),
+                layout: &self.composite_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(backdrop_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&iso_ss_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::Sampler(&self.composite_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: pbuf.as_entire_binding(),
+                    },
+                ],
+            });
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("hl_iso_composite"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: out_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            // The shader writes every pixel of the full-screen
+                            // quad, so the load value is irrelevant.
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.composite_pipeline);
+                pass.set_bind_group(0, &bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            if !is_last {
+                backdrop_is_a = !backdrop_is_a;
+            }
         }
     }
 
@@ -1018,7 +1471,7 @@ fn group_opacity_map(
 /// One blurred effect to render into the offscreen effects layer (composited
 /// beneath the sharp document): geometry already transformed into document
 /// space, plus the blur radius in document units (scaled by zoom at render time).
-struct BlurJob {
+pub(crate) struct BlurJob {
     verts: Vec<Vertex>,
     idxs: Vec<u32>,
     radius_doc: f64,
@@ -1056,7 +1509,54 @@ fn silhouette_job(
     })
 }
 
-fn build_geometry(
+/// Whether `document` must be composited on the CPU rather than the pure-GPU
+/// vector path. True for documents containing raster (pixel) layers, pattern
+/// fills, a layer that isolates (opacity < 1 or non-Normal blend), a non-print
+/// layer, or an enabled layer-style effect stack. Pure-vector documents
+/// (predicate `false`) can take the GPU fast path — and the §2.5 Tier B
+/// GPU-to-GPU working-texture path.
+///
+/// The single source of truth for this routing decision, reused by
+/// [`HeadlessRenderer::render_rgba_with_opts`] (Tier A / CPU fallback) and
+/// [`HeadlessRenderer::render_vector_to_working_texture`] (Tier B) and imported
+/// by `photonic-video` rather than re-derived (03 §2.5).
+pub fn document_needs_cpu_compositor(document: &Document) -> bool {
+    let has_raster = document
+        .nodes
+        .values()
+        .any(|n| matches!(&n.kind, SceneNodeKind::Raster(_)));
+    let has_pattern = document.nodes.values().any(|n| {
+        matches!(
+            &n.kind,
+            SceneNodeKind::Path(pn)
+                if matches!(pn.fill.kind, photonic_core::style::FillKind::Pattern(_))
+        )
+    });
+    // A layer with opacity < 1 or a non-Normal blend mode must composite as an
+    // isolated unit (P0); the CPU compositor does that per layer.
+    let has_isolated_layer = document.layer_order.iter().any(|lid| {
+        document.layers.get(lid).is_some_and(|l| {
+            l.visible
+                && !l.node_ids.is_empty()
+                && (l.opacity < 1.0 || l.blend_mode != BlendMode::Normal)
+        })
+    });
+    // Non-print layers must be excluded from export.
+    let has_non_print_layer = document.layer_order.iter().any(|lid| {
+        document
+            .layers
+            .get(lid)
+            .is_some_and(|l| !l.print && l.visible && !l.node_ids.is_empty())
+    });
+    // Layer Styles (the effect stack) render on the CPU compositor path.
+    let has_stack_effects = document
+        .nodes
+        .values()
+        .any(|n| n.effects.iter().any(|e| e.enabled()));
+    has_raster || has_pattern || has_isolated_layer || has_non_print_layer || has_stack_effects
+}
+
+pub(crate) fn build_geometry(
     doc: &Document,
     include_artboard_bg: bool,
     overprint_preview: bool,
@@ -1548,6 +2048,170 @@ mod blend_tests {
         Some(pollster::block_on(HeadlessRenderer::new()))
     }
 
+    /// Decode an IEEE-754 half (`Rgba16Float` storage) to `f32`. Inline to avoid
+    /// pulling `half` in as a direct dependency for one test.
+    fn f16_to_f32(bits: u16) -> f32 {
+        let sign = ((bits >> 15) & 1) as u32;
+        let exp = ((bits >> 10) & 0x1f) as i32;
+        let frac = (bits & 0x3ff) as u32;
+        let v = if exp == 0 {
+            (frac as f32) * 2f32.powi(-24)
+        } else if exp == 0x1f {
+            if frac == 0 {
+                f32::INFINITY
+            } else {
+                f32::NAN
+            }
+        } else {
+            (1.0 + frac as f32 / 1024.0) * 2f32.powi(exp - 15)
+        };
+        if sign == 1 {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// Read back an `Rgba16Float` texture as linear `f32` RGBA.
+    fn readback_working(r: &HeadlessRenderer, tex: &wgpu::Texture, w: u32, h: u32) -> Vec<f32> {
+        let bpr = align256(w * 8); // 4 channels × 2 bytes
+        let staging = r.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("working_staging"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = r.device.create_command_encoder(&Default::default());
+        enc.copy_texture_to_buffer(
+            tex.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        r.queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |x| {
+            let _ = tx.send(x);
+        });
+        r.device.poll(wgpu::Maintain::Wait);
+        rx.recv().unwrap().unwrap();
+        let raw = slice.get_mapped_range();
+        let mut out = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * bpr) as usize;
+            for px in raw[start..start + (w * 8) as usize].chunks_exact(2) {
+                out.push(f16_to_f32(u16::from_le_bytes([px[0], px[1]])));
+            }
+        }
+        drop(raw);
+        staging.unmap();
+        out
+    }
+
+    /// 03 §2.5 / §4.4 rule 4: the Tier B GPU-to-GPU vector→working path must
+    /// produce the same premultiplied-linear pixels as Tier A (render to RGBA8,
+    /// upload, convert) for a pure-vector document. Uses overlapping partial-alpha
+    /// fills on a transparent background so both premultiplication and edge alpha
+    /// are exercised.
+    #[test]
+    fn tier_a_and_tier_b_working_textures_match() {
+        let Some(r) = try_renderer() else {
+            eprintln!("no GPU adapter — skipping Tier A/B equivalence test");
+            return;
+        };
+        let (w, h) = (48u32, 48u32);
+        let mut doc = Document::new("tierab", w as f64, h as f64);
+        doc.add_node(
+            SceneNode::new(
+                "bg-rect",
+                doc.active_layer_id.unwrap(),
+                SceneNodeKind::Path(
+                    PathNode::new(PathData::rect(4.0, 4.0, 40.0, 40.0))
+                        .with_fill(Fill::solid(Color::new(0.9, 0.3, 0.2, 0.6))),
+                ),
+            ),
+            None,
+        );
+        doc.add_node(
+            SceneNode::new(
+                "fg-rect",
+                doc.active_layer_id.unwrap(),
+                SceneNodeKind::Path(
+                    PathNode::new(PathData::rect(16.0, 16.0, 24.0, 24.0))
+                        .with_fill(Fill::solid(Color::new(0.2, 0.5, 0.95, 0.8))),
+                ),
+            ),
+            None,
+        );
+        assert!(
+            !crate::document_needs_cpu_compositor(&doc),
+            "fixture must be a pure-vector document (Tier B eligible)"
+        );
+
+        // Tier B: GPU-to-GPU.
+        let tier_b = r.render_vector_to_working_texture(&doc, w, h);
+        let b = readback_working(&r, &tier_b, w, h);
+
+        // Tier A: render to RGBA8 (transparent bg), upload as Rgba8Unorm, convert.
+        let opts = ExportOptions {
+            background: ExportBackground::Transparent,
+            ..ExportOptions::default()
+        };
+        let (rgba, _, _) = r.render_rgba_with_opts(&doc, w, h, &opts);
+        let src = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tierA_src"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm, // raw bytes, no hardware decode
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        r.queue.write_texture(
+            src.as_image_copy(),
+            &rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let src_view = src.create_view(&Default::default());
+        let tier_a = r.convert_srgb_texture_to_working(&src_view, w, h);
+        let a = readback_working(&r, &tier_a, w, h);
+
+        assert_eq!(a.len(), b.len());
+        let mut max_diff = 0.0f32;
+        for (x, y) in a.iter().zip(&b) {
+            max_diff = max_diff.max((x - y).abs());
+        }
+        assert!(
+            max_diff < 1e-3,
+            "Tier A vs Tier B max linear diff {max_diff:.5} exceeds 1e-3"
+        );
+    }
+
     #[test]
     fn raster_export_preserves_compound_path_cutouts() {
         let Some(renderer) = try_renderer() else {
@@ -1689,6 +2353,40 @@ mod blend_tests {
                     "{mode:?} channel {i}: got {:.3}, want {:.3}",
                     got[i],
                     want[i],
+                );
+            }
+        }
+    }
+
+    /// The isolation-compositing path (03 §2.4) produces the correct blend for
+    /// modes fixed-function blending can't express. Difference `|Cb-Cs|` and
+    /// Exclusion `Cb+Cs-2·Cb·Cs` have unambiguous per-channel formulas and force
+    /// `segments_need_isolation` true, so this exercises `record_pass_isolated` +
+    /// `COMPOSITE_SHADER` end to end. Both are evaluated in linear light (the
+    /// sRGB SCENE_FORMAT round-trip), matching the fixed-function separable path.
+    #[test]
+    fn nonseparable_blend_modes_match_reference() {
+        let Some(r) = try_renderer() else {
+            eprintln!("no GPU adapter — skipping non-separable blend test");
+            return;
+        };
+        const TOL: f32 = 0.03;
+        for mode in [BlendMode::Difference, BlendMode::Exclusion] {
+            let got = render_center_pixel(&r, mode);
+            for i in 0..3 {
+                let (b, s) = (BACKDROP[i], SOURCE[i]);
+                let want = match mode {
+                    BlendMode::Difference => (b - s).abs(),
+                    BlendMode::Exclusion => b + s - 2.0 * b * s,
+                    // Unreachable: the enclosing loop only iterates over
+                    // `[Difference, Exclusion]`.
+                    _ => unreachable!(),
+                };
+                assert!(
+                    (got[i] - want).abs() < TOL,
+                    "{mode:?} channel {i}: got {:.3}, want {:.3}",
+                    got[i],
+                    want,
                 );
             }
         }
@@ -2212,7 +2910,7 @@ mod blend_tests {
         let mut tile = RasterImage::new(n, n);
         for y in 0..n {
             for x in 0..n {
-                let on = ((x / cell) + (y / cell)) % 2 == 0;
+                let on = ((x / cell) + (y / cell)).is_multiple_of(2);
                 let rgba = if on {
                     [230, 30, 30, 255]
                 } else {

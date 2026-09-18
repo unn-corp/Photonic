@@ -1,0 +1,163 @@
+{
+  "format_version": 4,
+  "id": "ee23e2c3-d75f-40dd-b140-a0806e775590",
+  "name": "paths-fills-basic",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "3a450e9d-cb47-418d-8ba2-5692c6812340"
+  ],
+  "layers": {
+    "3a450e9d-cb47-418d-8ba2-5692c6812340": {
+      "id": "3a450e9d-cb47-418d-8ba2-5692c6812340",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "8812947d-4fd9-494d-b6f3-f1bb118eaf6d",
+        "57a127c2-7f69-43c9-8671-044dca4a17e9"
+      ]
+    }
+  },
+  "nodes": {
+    "8812947d-4fd9-494d-b6f3-f1bb118eaf6d": {
+      "id": "8812947d-4fd9-494d-b6f3-f1bb118eaf6d",
+      "name": "rect",
+      "layer_id": "3a450e9d-cb47-418d-8ba2-5692c6812340",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,10 L50,10 L50,50 L10,50 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.85,
+            "g": 0.15,
+            "b": 0.15,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    },
+    "57a127c2-7f69-43c9-8671-044dca4a17e9": {
+      "id": "57a127c2-7f69-43c9-8671-044dca4a17e9",
+      "name": "ellipse",
+      "layer_id": "3a450e9d-cb47-418d-8ba2-5692c6812340",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M105,45 C105,56.045694996615865 93.80711874576984,65 80,65 C66.19288125423017,65 55,56.045694996615865 55,45 C55,33.954305003384135 66.19288125423016,25.000000000000004 80,25 C93.80711874576983,24.999999999999996 105,33.95430500338413 105,44.99999999999999"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.15,
+            "g": 0.35,
+            "b": 0.85,
+            "a": 0.7
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "3a450e9d-cb47-418d-8ba2-5692c6812340",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "cbc1490e-4976-4da1-a2f5-a4146c4de734",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "cbc1490e-4976-4da1-a2f5-a4146c4de734",
+  "dpi": 72.0,
+  "display_unit": "px",
+  "color_mode": "rgb",
+  "photon_format": 1
+}

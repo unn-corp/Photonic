@@ -979,7 +979,7 @@ mod tests {
         let mut img = RasterImage::new(w, h);
         for y in 0..h {
             for x in 0..w {
-                let on = ((x / cell) + (y / cell)) % 2 == 0;
+                let on = ((x / cell) + (y / cell)).is_multiple_of(2);
                 img.set_pixel(x, y, if on { light } else { dark });
             }
         }

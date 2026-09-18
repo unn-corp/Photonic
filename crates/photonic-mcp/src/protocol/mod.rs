@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub mod envelope;
+pub use envelope::{
+    Dialect, ProtocolMode, RpcError, DEFAULT_BODY_LIMIT, ERR_HEADER_MISMATCH, ERR_INVALID_PARAMS,
+    ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ERR_UNSUPPORTED_PROTOCOL, PROTOCOL_2024_11_05,
+    PROTOCOL_2026_07_28,
+};
+
 // ─── JSON-RPC 2.0 envelope types ────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -44,12 +51,35 @@ impl JsonRpcResponse {
             }),
         }
     }
+
+    pub fn error_with_data(
+        id: Option<Value>,
+        code: i32,
+        message: impl Into<String>,
+        data: Option<Value>,
+    ) -> Self {
+        Self {
+            jsonrpc: "2.0".to_string(),
+            id,
+            result: None,
+            error: Some(JsonRpcError {
+                code,
+                message: message.into(),
+                data,
+            }),
+        }
+    }
+
+    pub fn from_rpc_error(id: Option<Value>, err: RpcError) -> Self {
+        Self::error_with_data(id, err.code, err.message, err.data)
+    }
 }
 
 #[derive(Debug, Serialize)]
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 

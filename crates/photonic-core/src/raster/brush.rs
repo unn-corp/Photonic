@@ -93,9 +93,7 @@ impl Brush {
             return 0.0;
         }
         let inner = self.hardness * self.radius;
-        if dist <= inner {
-            1.0
-        } else if self.radius - inner <= 1e-3 {
+        if dist <= inner || self.radius - inner <= 1e-3 {
             1.0
         } else {
             // smooth falloff from inner..radius

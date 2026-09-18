@@ -69,6 +69,12 @@ pub struct DiskScanner {
     pub scanning: bool,
 }
 
+impl Default for DiskScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DiskScanner {
     pub fn new() -> Self {
         let (req_tx, req_rx) = channel::<Request>();

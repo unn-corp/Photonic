@@ -1,0 +1,194 @@
+{
+  "media": {
+    "assets": {}
+  },
+  "sequences": {
+    "00000000-0000-0000-0000-000000c65d40": {
+      "id": "00000000-0000-0000-0000-000000c65d40",
+      "name": "project_graph_vignette",
+      "frame_rate": {
+        "num": 30,
+        "den": 1
+      },
+      "formats": [
+        {
+          "name": "16:9",
+          "width": 64,
+          "height": 64
+        }
+      ],
+      "active_format": 0,
+      "video_tracks": [
+        {
+          "id": "00000000-0000-0000-0000-000000c65d4a",
+          "name": "V1",
+          "kind": "video",
+          "clips": [
+            {
+              "id": "00000000-0000-0000-0000-000000c65d54",
+              "name": "",
+              "start": 0,
+              "duration": 1411200000,
+              "source": {
+                "source": "solid_color",
+                "color": {
+                  "r": 0.7,
+                  "g": 0.55,
+                  "b": 0.35,
+                  "a": 1.0
+                }
+              },
+              "source_in": 0,
+              "speed": {
+                "speed": "constant",
+                "num": 1,
+                "den": 1
+              },
+              "transform": {
+                "base": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "scale_x": 1.0,
+                  "scale_y": 1.0,
+                  "rotation": 0.0,
+                  "anchor_x": 0.0,
+                  "anchor_y": 0.0,
+                  "opacity": 1.0
+                }
+              },
+              "enabled": true
+            }
+          ],
+          "enabled": true,
+          "locked": false,
+          "height_px": 64.0
+        }
+      ],
+      "audio_master": {
+        "params": {
+          "base": {
+            "volume_db": 0.0
+          }
+        },
+        "fx_chain": [
+          {
+            "kind": "limiter",
+            "enabled": true,
+            "params": {
+              "base": [
+                [
+                  "params.ceiling_db",
+                  {
+                    "t": "float",
+                    "v": -1.0
+                  }
+                ],
+                [
+                  "params.release_ms",
+                  {
+                    "t": "float",
+                    "v": 50.0
+                  }
+                ]
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "sequence_order": [
+    "00000000-0000-0000-0000-000000c65d40"
+  ],
+  "active_sequence": "00000000-0000-0000-0000-000000c65d40",
+  "graphs": {
+    "00000000-0000-0000-0000-000000c65d68": {
+      "id": "00000000-0000-0000-0000-000000c65d68",
+      "name": "vignette-pg",
+      "nodes": {
+        "00000000-0000-0000-0000-000000c65d60": {
+          "id": "00000000-0000-0000-0000-000000c65d60",
+          "op": {
+            "op": "merge",
+            "mode": "normal"
+          },
+          "params": {
+            "base": [
+              [
+                "params.opacity",
+                {
+                  "t": "float",
+                  "v": 0.4
+                }
+              ]
+            ]
+          }
+        },
+        "00000000-0000-0000-0000-000000c65d61": {
+          "id": "00000000-0000-0000-0000-000000c65d61",
+          "op": {
+            "op": "output"
+          },
+          "params": {
+            "base": []
+          }
+        },
+        "00000000-0000-0000-0000-000000c65d5f": {
+          "id": "00000000-0000-0000-0000-000000c65d5f",
+          "op": {
+            "op": "solid_color"
+          },
+          "params": {
+            "base": [
+              [
+                "params.color",
+                {
+                  "t": "color",
+                  "v": {
+                    "r": 0.0,
+                    "g": 0.0,
+                    "b": 0.0,
+                    "a": 1.0
+                  }
+                }
+              ]
+            ]
+          }
+        }
+      },
+      "edges": [
+        {
+          "from": [
+            "00000000-0000-0000-0000-000000c65d5f",
+            0
+          ],
+          "to": [
+            "00000000-0000-0000-0000-000000c65d60",
+            0
+          ]
+        },
+        {
+          "from": [
+            "00000000-0000-0000-0000-000000c65d60",
+            0
+          ],
+          "to": [
+            "00000000-0000-0000-0000-000000c65d61",
+            0
+          ]
+        }
+      ],
+      "output": "00000000-0000-0000-0000-000000c65d61",
+      "ui": {}
+    }
+  },
+  "project_graph": "00000000-0000-0000-0000-000000c65d68",
+  "settings": {
+    "generate_proxies": false,
+    "default_frame_rate": {
+      "num": 30,
+      "den": 1
+    },
+    "audio_sample_rate": 48000
+  }
+}

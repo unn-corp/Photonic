@@ -323,8 +323,10 @@ mod tests {
         let e = LayerEffect::Stroke(StrokeEffect::default());
         assert_eq!(e.kind(), "stroke");
         assert!(e.enabled());
-        let mut cs = ColorOverlay::default();
-        cs.enabled = false;
+        let cs = ColorOverlay {
+            enabled: false,
+            ..Default::default()
+        };
         assert!(!LayerEffect::ColorOverlay(cs).enabled());
     }
 }

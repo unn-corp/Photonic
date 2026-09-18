@@ -46,6 +46,10 @@ impl CommandHistory {
         self.warned_at_limit = false;
         self.pending_warning = None;
         self.revision = self.revision.wrapping_add(1);
+        // A whole-document swap — no per-node affected-nodes set describes it,
+        // so clear rather than push an entry. Forces `changes_since` to report
+        // `overflowed = true` for any query spanning this point (03 §2.1).
+        self.revision_ring.clear();
         self.enforce_steps();
         self.enforce_size();
     }
@@ -61,6 +65,7 @@ impl CommandHistory {
         self.warned_at_limit = false;
         self.pending_warning = None;
         self.revision = self.revision.wrapping_add(1);
+        self.revision_ring.clear();
     }
 
     // ── Checkpoints (git-style commits) ──────────────────────────────────

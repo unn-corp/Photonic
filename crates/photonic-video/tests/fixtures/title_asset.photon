@@ -1,0 +1,138 @@
+{
+  "format_version": 4,
+  "id": "5da16b01-3a66-4dbf-9e68-12023e10a46a",
+  "name": "title-asset",
+  "width": 1920.0,
+  "height": 1080.0,
+  "layer_order": [
+    "b3fc5ed2-3f8b-4f55-b076-2e391855f88f"
+  ],
+  "layers": {
+    "b3fc5ed2-3f8b-4f55-b076-2e391855f88f": {
+      "id": "b3fc5ed2-3f8b-4f55-b076-2e391855f88f",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "11a50000-0000-0000-0000-000000000001"
+      ]
+    }
+  },
+  "nodes": {
+    "11a50000-0000-0000-0000-000000000001": {
+      "id": "11a50000-0000-0000-0000-000000000001",
+      "name": "title",
+      "layer_id": "b3fc5ed2-3f8b-4f55-b076-2e391855f88f",
+      "kind": {
+        "type": "text",
+        "content": "Photonic",
+        "font_family": "sans-serif",
+        "font_size": 96.0,
+        "font_weight": 400,
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 1.0,
+            "g": 1.0,
+            "b": 1.0,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "align": "left",
+        "line_height": 1.2,
+        "letter_spacing": 0.0,
+        "path_offset": 0.0,
+        "vertical": false,
+        "font_style": "normal",
+        "paragraph_spacing_before": 0.0,
+        "paragraph_spacing_after": 0.0,
+        "text_indent": 0.0,
+        "baseline_shift": 0.0,
+        "script_position": "normal"
+      },
+      "transform": {
+        "matrix": [
+          1.0,
+          0.0,
+          0.0,
+          1.0,
+          200.0,
+          480.0
+        ]
+      }
+    }
+  },
+  "active_layer_id": "b3fc5ed2-3f8b-4f55-b076-2e391855f88f",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "09beaa5a-2c7c-4d81-9544-ef2593dc5f4f",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 1920.0,
+      "height": 1080.0
+    }
+  ],
+  "active_artboard": "09beaa5a-2c7c-4d81-9544-ef2593dc5f4f",
+  "dpi": 72.0,
+  "display_unit": "px",
+  "color_mode": "rgb",
+  "photon_format": 1
+}

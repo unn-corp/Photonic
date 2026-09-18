@@ -1,0 +1,143 @@
+{
+  "media": {
+    "assets": {}
+  },
+  "sequences": {
+    "00000000-0000-0000-0000-000000895440": {
+      "id": "00000000-0000-0000-0000-000000895440",
+      "name": "grade_cdl",
+      "frame_rate": {
+        "num": 30,
+        "den": 1
+      },
+      "formats": [
+        {
+          "name": "16:9",
+          "width": 64,
+          "height": 64
+        }
+      ],
+      "active_format": 0,
+      "video_tracks": [
+        {
+          "id": "00000000-0000-0000-0000-00000089544a",
+          "name": "V1",
+          "kind": "video",
+          "clips": [
+            {
+              "id": "00000000-0000-0000-0000-000000895454",
+              "name": "",
+              "start": 0,
+              "duration": 1411200000,
+              "source": {
+                "source": "solid_color",
+                "color": {
+                  "r": 0.45,
+                  "g": 0.35,
+                  "b": 0.25,
+                  "a": 1.0
+                }
+              },
+              "source_in": 0,
+              "speed": {
+                "speed": "constant",
+                "num": 1,
+                "den": 1
+              },
+              "transform": {
+                "base": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "scale_x": 1.0,
+                  "scale_y": 1.0,
+                  "rotation": 0.0,
+                  "anchor_x": 0.0,
+                  "anchor_y": 0.0,
+                  "opacity": 1.0
+                }
+              },
+              "grade": {
+                "ops": [
+                  {
+                    "id": "80c5a2fb-1c37-4122-a83c-86832debb5c3",
+                    "enabled": true,
+                    "kind": "cdl",
+                    "params": {
+                      "base": {
+                        "kind": "cdl",
+                        "slope": [
+                          1.25,
+                          1.0,
+                          0.75
+                        ],
+                        "offset": [
+                          0.05,
+                          0.0,
+                          -0.05
+                        ],
+                        "power": [
+                          0.9,
+                          1.0,
+                          1.15
+                        ],
+                        "sat": 1.4
+                      }
+                    }
+                  }
+                ],
+                "bypass": false
+              },
+              "enabled": true
+            }
+          ],
+          "enabled": true,
+          "locked": false,
+          "height_px": 64.0
+        }
+      ],
+      "audio_master": {
+        "params": {
+          "base": {
+            "volume_db": 0.0
+          }
+        },
+        "fx_chain": [
+          {
+            "kind": "limiter",
+            "enabled": true,
+            "params": {
+              "base": [
+                [
+                  "params.ceiling_db",
+                  {
+                    "t": "float",
+                    "v": -1.0
+                  }
+                ],
+                [
+                  "params.release_ms",
+                  {
+                    "t": "float",
+                    "v": 50.0
+                  }
+                ]
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "sequence_order": [
+    "00000000-0000-0000-0000-000000895440"
+  ],
+  "active_sequence": "00000000-0000-0000-0000-000000895440",
+  "settings": {
+    "generate_proxies": false,
+    "default_frame_rate": {
+      "num": 30,
+      "den": 1
+    },
+    "audio_sample_rate": 48000
+  }
+}

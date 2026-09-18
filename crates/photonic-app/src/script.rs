@@ -221,7 +221,7 @@ fn register_api(
                 if let Ok(uuid) = id.parse::<uuid::Uuid>() {
                     let mut doc = d.lock().unwrap();
                     let mut h = hist.lock().unwrap();
-                    h.execute_discrete(Command::RemoveNode { node_id: uuid }, &mut *doc);
+                    h.execute_discrete(Command::RemoveNode { node_id: uuid }, &mut doc);
                 }
                 Ok(())
             })?,
@@ -242,7 +242,7 @@ fn register_api(
                 if !cmds.is_empty() {
                     hist.lock()
                         .unwrap()
-                        .execute_discrete(Command::Batch(cmds), &mut *doc);
+                        .execute_discrete(Command::Batch(cmds), &mut doc);
                 }
                 Ok(())
             })?,
@@ -328,7 +328,7 @@ fn register_api(
                         node,
                         layer_id: None,
                     },
-                    &mut *doc,
+                    &mut doc,
                 );
                 Ok(node_id.to_string())
             })?,
@@ -516,7 +516,7 @@ fn add_shape(
             node,
             layer_id: None,
         },
-        &mut *doc,
+        &mut doc,
     );
     Ok(node_id.to_string())
 }

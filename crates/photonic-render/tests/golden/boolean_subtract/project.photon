@@ -1,0 +1,173 @@
+{
+  "format_version": 2,
+  "id": "0813b08d-7c05-4fb9-9421-994d0cba39aa",
+  "name": "boolean-subtract",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "86927670-9daf-43a7-b61f-23b156f3a9c4"
+  ],
+  "layers": {
+    "86927670-9daf-43a7-b61f-23b156f3a9c4": {
+      "id": "86927670-9daf-43a7-b61f-23b156f3a9c4",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "3a309c6b-5889-4e96-b787-af33f01042cb"
+      ]
+    }
+  },
+  "nodes": {
+    "3a309c6b-5889-4e96-b787-af33f01042cb": {
+      "id": "3a309c6b-5889-4e96-b787-af33f01042cb",
+      "name": "resolved",
+      "layer_id": "86927670-9daf-43a7-b61f-23b156f3a9c4",
+      "kind": {
+        "type": "group",
+        "children": [
+          "fb7999ed-5442-473a-877d-7359ae5e6758",
+          "e4ec2079-e6a8-460c-a6c3-1bda14e934ca"
+        ],
+        "clip_children": false,
+        "live_boolean": "subtract"
+      }
+    },
+    "e4ec2079-e6a8-460c-a6c3-1bda14e934ca": {
+      "id": "e4ec2079-e6a8-460c-a6c3-1bda14e934ca",
+      "name": "operand-b",
+      "layer_id": "86927670-9daf-43a7-b61f-23b156f3a9c4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M50,50 L100,50 L100,100 L50,100 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.9,
+            "g": 0.5,
+            "b": 0.1,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    },
+    "fb7999ed-5442-473a-877d-7359ae5e6758": {
+      "id": "fb7999ed-5442-473a-877d-7359ae5e6758",
+      "name": "operand-a",
+      "layer_id": "86927670-9daf-43a7-b61f-23b156f3a9c4",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M20,20 L70,20 L70,70 L20,70 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.9,
+            "g": 0.5,
+            "b": 0.1,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "86927670-9daf-43a7-b61f-23b156f3a9c4",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "73300867-6ebc-4e35-b807-15b30280b861",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "73300867-6ebc-4e35-b807-15b30280b861",
+  "photon_format": 1
+}

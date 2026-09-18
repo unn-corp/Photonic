@@ -1,0 +1,11 @@
+# Golden case: adjustment_reroot
+# Authored by tests/gen_video_golden.rs (11 §1.1). Bless PNGs with
+# PHOTONIC_BLESS_GOLDEN=1 cargo test -p photonic-video --test golden_frames.
+notes = "adjustment clip re-roots a red+white@0.5 pink fold, unchanged"
+format_index = 0
+doc_generation = 1
+
+[[frames]]
+n = 0
+name = "reroot"
+

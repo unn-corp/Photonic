@@ -101,7 +101,20 @@ impl Guide {
 /// - v1 → v2: introduced `SceneNodeKind::Raster` (pixel layers). Additive — v1
 ///   files contain no raster nodes and load unchanged; the migration is a
 ///   no-op version bump (see `migration::migrations`).
-pub const CURRENT_FORMAT_VERSION: u32 = 2;
+/// - v2 → v3: introduced the video-editor `timeline` field (01 §2). Additive —
+///   `timeline` is `Option` + `#[serde(default)]`, so v2 files load untouched;
+///   the migration is a no-op version bump.
+/// - v3 → v4: clip anchors gained an explicit coordinate space. The migration
+///   tags existing base and per-format reframe transforms as absolute without
+///   changing their stored values.
+/// - v4 → v5: the §35 scope / marker / group model (folded with the 01 §9.1
+///   sibling changes). Tracks, sequence masters and media assets gain
+///   effect+grade scopes; markers gain duration/category/anchor; `ClipEffect`
+///   gains `id`/`version`; the unknown-preserving enum variants land. All
+///   additive (serde defaults) except the deprecated `link_group` →
+///   `GroupKind::AvLink` projection. The compiler now applies the effect scopes
+///   in normative order (02 §2 / 35 §2.4).
+pub const CURRENT_FORMAT_VERSION: u32 = 5;
 
 fn default_format_version() -> u32 {
     CURRENT_FORMAT_VERSION
@@ -773,6 +786,11 @@ pub struct Document {
     /// Colour model used when exporting for print. Default Rgb.
     #[serde(default)]
     pub color_mode: ColorMode,
+    /// The video-editor timeline project (01 §2). `None` until the first
+    /// video-mode action creates it (undoably, via `TimelineCmd::CreateProject`).
+    /// Additive at the 01 §2 seam: v2 files load with this absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeline: Option<crate::timeline::TimelineProject>,
 }
 
 // ─── Dimension Annotation ─────────────────────────────────────────────────────
@@ -844,7 +862,10 @@ impl DimensionAnnotation {
 // ─── Workspace ────────────────────────────────────────────────────────────────
 
 /// A named workspace preset that stores a properties-panel search filter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq` lets the save/delete call sites skip a no-op history entry when
+/// the list is unchanged — an undo step that undoes nothing is worse than none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Workspace {
     /// Unique workspace name.
     pub name: String,
@@ -933,6 +954,7 @@ impl Document {
             dpi: 72.0,
             display_unit: crate::units::DocumentUnit::default(),
             color_mode: ColorMode::default(),
+            timeline: None,
         }
     }
 
@@ -1421,9 +1443,7 @@ impl Document {
     /// If it is a group child, the search walks up the group hierarchy until a
     /// top-level node is found.  Returns `None` if the node does not exist.
     pub fn top_level_ancestor(&self, node_id: NodeId) -> Option<NodeId> {
-        if self.nodes.get(&node_id).is_none() {
-            return None;
-        }
+        self.nodes.get(&node_id)?;
         // Already top-level?
         let is_top = self.layer_order.iter().any(|lid| {
             self.layers
@@ -1683,7 +1703,21 @@ impl Document {
     /// Deserialize from an already-parsed JSON tree, migrating it forward to
     /// [`CURRENT_FORMAT_VERSION`] first. Shared by [`from_json`] and the
     /// `.photon` file wrapper (which carries the document as a sub-value).
-    pub fn from_value(mut value: serde_json::Value) -> Result<Self, serde_json::Error> {
+    ///
+    /// The [`LoadReport`](crate::timeline::load::LoadReport) is discarded; use
+    /// [`from_value_with_report`](Self::from_value_with_report) to observe the
+    /// unknown-variant findings (39 §2.2).
+    pub fn from_value(value: serde_json::Value) -> Result<Self, serde_json::Error> {
+        Self::from_value_with_report(value).map(|(doc, _report)| doc)
+    }
+
+    /// Like [`from_value`](Self::from_value) but also returns the load-time
+    /// [`LoadReport`](crate::timeline::load::LoadReport), which names any
+    /// unknown enum variants preserved from a newer-build file (39 §2.2 rule 3:
+    /// once per load). The report is empty for a document with no unknowns.
+    pub fn from_value_with_report(
+        mut value: serde_json::Value,
+    ) -> Result<(Self, crate::timeline::load::LoadReport), serde_json::Error> {
         use crate::migration;
 
         // Migrate at the JSON-tree level before struct deserialization so new
@@ -1710,7 +1744,16 @@ impl Document {
         let mut doc: Document = serde_json::from_value(value)?;
         // Legacy documents predate multi-artboard — synthesize the first one.
         doc.ensure_default_artboard();
-        Ok(doc)
+        // Finalize a loaded timeline: flag orphaned property paths (repair) and
+        // enforce the per-sequence invariants (reject a corrupt/overlapping
+        // timeline with a load error). Only runs when a timeline is present
+        // (01 §4, §6.2).
+        let report = if let Some(timeline) = doc.timeline.as_mut() {
+            crate::timeline::load::finalize_load(timeline).map_err(serde::de::Error::custom)?
+        } else {
+            crate::timeline::load::LoadReport::default()
+        };
+        Ok((doc, report))
     }
 }
 

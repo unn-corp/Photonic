@@ -1,0 +1,8 @@
+{
+  "total_frames": 300,
+  "fps": 30,
+  "duration_s": 10,
+  "gop_size": 60,
+  "keyframe_interval_s": 2,
+  "text_pattern": "0-based frame index burned in as decimal text, top-left (drawtext %{n}); frame N's burned-in text is exactly str(N)"
+}

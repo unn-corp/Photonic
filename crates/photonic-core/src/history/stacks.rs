@@ -28,9 +28,70 @@ impl CommandHistory {
             gui_debounce: DebounceCheckpoint::new(30),
             mcp_debounce: DebounceCheckpoint::new(60),
             revision: 0,
+            revision_ring: std::collections::VecDeque::new(),
             coalescing: false,
             coalesce_started: false,
             size_cache: std::cell::Cell::new(None),
+        }
+    }
+
+    /// How many recent revisions' affected-node sets [`changes_since`] can
+    /// answer precisely (03 §2.1: "a small ring (last ~64 entries)"). Older
+    /// gaps report `overflowed = true`.
+    const REVISION_RING_CAPACITY: usize = 64;
+
+    /// The current content revision — bumped by every mutation (`execute`,
+    /// `undo`, `redo`, checkpoint/branch restore, reset). Cheap to poll every
+    /// frame to detect "did anything change" without diffing the document.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Bump `revision` and record `affected` in the ring under the new
+    /// revision number. Shared by every mutation site (`execute`'s two exit
+    /// paths, `undo`, `redo`).
+    fn record_revision_change(&mut self, affected: SmallVec<[NodeId; 4]>) {
+        self.revision = self.revision.wrapping_add(1);
+        self.revision_ring.push_back((self.revision, affected));
+        while self.revision_ring.len() > Self::REVISION_RING_CAPACITY {
+            self.revision_ring.pop_front();
+        }
+    }
+
+    /// Which nodes changed between revision `from` and now (03 §2.1). Returns
+    /// `overflowed = true` — meaning "invalidate everything, `touched` is not
+    /// trustworthy" — when `from` predates what the ring retains (including
+    /// the case where a whole-document swap, e.g. `restore_state`/`reset`,
+    /// cleared the ring after `from` was observed). `from == revision()` (no
+    /// gap) always returns an empty, non-overflowed summary.
+    pub fn changes_since(&self, from: u64) -> ChangeSummary {
+        let current = self.revision;
+        if from >= current {
+            return ChangeSummary {
+                revision: current,
+                touched: std::collections::HashSet::new(),
+                overflowed: false,
+            };
+        }
+        let overflowed = match self.revision_ring.front() {
+            Some((oldest, _)) => from + 1 < *oldest,
+            // Revision advanced past `from` but the ring holds nothing for
+            // it — a document-wide event cleared the ring in between.
+            None => true,
+        };
+        let touched = if overflowed {
+            std::collections::HashSet::new()
+        } else {
+            self.revision_ring
+                .iter()
+                .filter(|(rev, _)| *rev > from)
+                .flat_map(|(_, nodes)| nodes.iter().copied())
+                .collect()
+        };
+        ChangeSummary {
+            revision: current,
+            touched,
+            overflowed,
         }
     }
 
@@ -251,6 +312,10 @@ impl CommandHistory {
         // [`Command::hydrate`].
         let cmd = cmd.hydrate(doc).into_raster_delta();
         let desc = cmd.description();
+        // Captured before `cmd` is consumed below (into a merged command or a
+        // new `HistNode`) — 03 §2.1's revision ring needs the id(s) this
+        // command touches regardless of which exit path records them.
+        let affected = cmd.affected_nodes();
 
         // Gesture coalescing (#182): during an open pointer gesture, fold a
         // mergeable same-target command into the gesture's anchor node's edge
@@ -269,6 +334,7 @@ impl CommandHistory {
                 if let Some(n) = self.nodes.get_mut(&self.current) {
                     n.command = Some(merged);
                 }
+                self.record_revision_change(affected);
                 self.gui_debounce.schedule(desc);
                 return;
             }
@@ -312,6 +378,7 @@ impl CommandHistory {
         if self.coalescing {
             self.coalesce_started = true;
         }
+        self.record_revision_change(affected);
         self.gui_debounce.schedule(desc);
     }
 
@@ -357,12 +424,16 @@ impl CommandHistory {
             None => return false,
         };
         if let Some(inv) = cmd.inverse(doc) {
+            // The edge command's own affected_nodes() — undo touches the same
+            // node(s) its forward application did.
+            let affected = cmd.affected_nodes();
             inv.apply(doc);
             reevaluate_constraints(doc);
             if let Some(pn) = self.nodes.get_mut(&parent) {
                 pn.primary_child = Some(cur);
             }
             self.current = parent;
+            self.record_revision_change(affected);
             true
         } else {
             // Can't invert — stay put.
@@ -380,9 +451,11 @@ impl CommandHistory {
         };
         if let Some(c) = child {
             if let Some(cmd) = self.nodes.get(&c).and_then(|n| n.command.clone()) {
+                let affected = cmd.affected_nodes();
                 cmd.apply(doc);
                 reevaluate_constraints(doc);
                 self.current = c;
+                self.record_revision_change(affected);
                 return true;
             }
         }

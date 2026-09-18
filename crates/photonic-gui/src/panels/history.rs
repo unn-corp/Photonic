@@ -1,5 +1,49 @@
 use super::*;
 
+use photonic_core::history::{HistoryEntryKind, HistoryGraphNode};
+
+/// Glyph badge naming the editing surface an entry came from, or `None` for a
+/// plain vector edit — the unmarked default, so the badge stays signal, not
+/// noise, in a document that is mostly one kind of work (26 §15 K-G5).
+fn kind_badge(kind: HistoryEntryKind) -> Option<&'static str> {
+    kind.touches_timeline().then_some(ph::FILM_STRIP)
+}
+
+/// Lower-cased text the drawer search matches an entry against: its description,
+/// its branch name, and its surface (so `timeline` filters to video edits).
+fn search_haystack(node: &HistoryGraphNode) -> String {
+    format!(
+        "{} {} {}",
+        node.description,
+        node.label.as_deref().unwrap_or(""),
+        node.kind.label()
+    )
+    .to_lowercase()
+}
+
+/// Keys that move the commit-graph keyboard cursor, in the order they are polled.
+const NAV_KEYS: &[egui::Key] = &[
+    egui::Key::ArrowDown,
+    egui::Key::ArrowUp,
+    egui::Key::Home,
+    egui::Key::End,
+];
+
+/// Where the keyboard cursor lands from row `at` of `len` rows for a navigation
+/// key. Rows are newest-first, so `ArrowDown` walks *backwards* in time. Both
+/// ends clamp rather than wrap — wrapping in a history list reads as a jump to
+/// an unrelated state. `None` for any key that is not in [`NAV_KEYS`].
+fn cursor_step(at: usize, len: usize, key: egui::Key) -> Option<usize> {
+    let last = len.saturating_sub(1);
+    match key {
+        egui::Key::ArrowDown => Some((at + 1).min(last)),
+        egui::Key::ArrowUp => Some(at.saturating_sub(1)),
+        egui::Key::Home => Some(0),
+        egui::Key::End => Some(last),
+        _ => None,
+    }
+}
+
 /// Synthesize a short, stable, git-like commit id for a history entry so the
 /// graph reads like a real commit log. Deterministic per (position, label).
 fn short_hash(abs: usize, label: &str) -> String {
@@ -29,6 +73,11 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let cur_node = by_id.get(&current).copied();
     let edit_count = graph.len().saturating_sub(1); // minus the root
 
+    // A branch tip is a childless node. One tip == a linear history; more than
+    // one means undo-then-edit forked the tree and every divergent path is still
+    // reachable — the thing this surface exists to make visible (26 §15 K-G5).
+    let tip_count = graph.iter().filter(|n| n.children.is_empty()).count();
+
     // ── Header: title + total + quick undo/redo ──────────────────────────────
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("{}  History", ph::GIT_COMMIT)).strong());
@@ -42,6 +91,18 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                 .weak()
                 .small(),
             );
+            if tip_count > 1 {
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(format!("{} {tip_count}", ph::GIT_FORK))
+                        .weak()
+                        .small(),
+                )
+                .on_hover_text(format!(
+                    "{tip_count} branches — editing after an undo forks the history \
+                     instead of discarding the redo path; every branch is still reachable"
+                ));
+            }
             ui.add_space(4.0);
             let redo_target = cur_node.and_then(|n| n.primary_child);
             if ui
@@ -147,13 +208,7 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             .auto_shrink([false, true])
             .show(ui, |ui| {
                 for node in graph.iter() {
-                    let hay = format!(
-                        "{} {}",
-                        node.description,
-                        node.label.as_deref().unwrap_or("")
-                    )
-                    .to_lowercase();
-                    if node.is_root || !hay.contains(&query) {
+                    if node.is_root || !search_haystack(node).contains(&query) {
                         continue;
                     }
                     any = true;
@@ -165,6 +220,9 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                         }
                         if saved {
                             lead.push_str(&format!("{} ", ph::FLOPPY_DISK));
+                        }
+                        if let Some(badge) = kind_badge(node.kind) {
+                            lead.push_str(&format!("{badge} "));
                         }
                         if let Some(l) = &node.label {
                             lead.push_str(&format!("{} {l}  ", ph::BOOKMARK_SIMPLE));
@@ -267,11 +325,102 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let hash_col = Color32::from_rgb(102, 104, 132);
     let lane_color = |c: usize| lane_palette[c % lane_palette.len()];
 
+    // Keyboard affordance hint — the graph below is *painted*, not built from
+    // widgets, so nothing else tells a keyboard user it can be driven at all.
+    ui.label(
+        RichText::new(format!(
+            "Tab to focus · {}{} browse · Enter jump",
+            ph::ARROW_UP,
+            ph::ARROW_DOWN
+        ))
+        .weak()
+        .small(),
+    );
+    ui.add_space(2.0);
+
     let n = graph.len();
     let (block, _) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), n as f32 * row_h),
         egui::Sense::hover(),
     );
+
+    // ── Keyboard route into the commit graph (41 §3 R-4/R-5) ─────────────────
+    // One focusable region owns the whole list rather than N tab stops: Tab
+    // focuses it, Up/Down walk a cursor through every node — branch nodes
+    // included, so branches are reachable without a mouse — and Enter jumps the
+    // document there. Registered *before* the per-row `interact`s so the rows
+    // stay on top for the pointer and click behaviour is unchanged.
+    let nav = ui.interact(block, ui.id().with("hist_graph_nav"), egui::Sense::click());
+    let cursor_id = ui.id().with("hist_graph_cursor");
+    let mut cursor: u64 = ui.data(|d| d.get_temp(cursor_id)).unwrap_or(current);
+    // Re-entering the list, or a cursor left dangling by a history trim/reload,
+    // both re-home the cursor on HEAD.
+    if nav.gained_focus() || !by_id.contains_key(&cursor) {
+        cursor = current;
+    }
+    let mut scroll_to_cursor = false;
+    if nav.has_focus() {
+        // Own the vertical arrows while focused. Without an EventFilter, egui's
+        // focus navigation turns the first ArrowUp/Down into a focus *move*, so
+        // the cursor would step exactly once and then die (41 §3 R-4). Tab is
+        // deliberately left free — it is how a keyboard user leaves the list.
+        ui.ctx().memory_mut(|m| {
+            m.set_focus_lock_filter(
+                nav.id,
+                egui::EventFilter {
+                    tab: false,
+                    horizontal_arrows: false,
+                    vertical_arrows: true,
+                    escape: false,
+                },
+            )
+        });
+        let at = index.get(&cursor).copied().unwrap_or(0);
+        // Consume at most one navigation key per frame, then resolve where it
+        // lands via the pure `cursor_step` (unit-tested below).
+        let moved = ui
+            .input_mut(|i| {
+                NAV_KEYS
+                    .iter()
+                    .copied()
+                    .find(|k| i.consume_key(egui::Modifiers::NONE, *k))
+            })
+            .and_then(|k| cursor_step(at, n, k));
+        if let Some(to) = moved {
+            if let Some(target) = graph.get(to) {
+                cursor = target.id;
+                scroll_to_cursor = true;
+            }
+        }
+        // Enter/Space commit the cursor — the keyboard twin of clicking a row.
+        let commit = ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
+                || i.consume_key(egui::Modifiers::NONE, egui::Key::Space)
+        });
+        if commit && cursor != current {
+            action = Some(PanelAction::JumpToHistoryNode { id: cursor });
+        }
+    }
+    // Announce the list and the entry under the cursor when focus lands on it.
+    nav.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Other,
+            true,
+            format!(
+                "Edit history, {edit_count} edits — {}",
+                by_id
+                    .get(&cursor)
+                    .map(|c| c.description.as_str())
+                    .unwrap_or("Initial state")
+            ),
+        )
+    });
+    // The cursor row painted this frame; `cursor` itself may still move below
+    // when a click retargets it, so snapshot it before the row loop.
+    let cursor_row = cursor;
+    let nav_focused = nav.has_focus();
+    let focus_ring = ui.visuals().selection.stroke.color;
+
     let painter = ui.painter_at(block);
     let left = block.left();
     let top = block.top();
@@ -353,6 +502,19 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                 Color32::from_rgba_unmultiplied(255, 255, 255, 12),
             );
         }
+        // Keyboard cursor: a focus ring on the row Enter would jump to. Drawn
+        // only while the list holds focus, so it never competes with the HEAD
+        // highlight for a mouse user.
+        if nav_focused && node.id == cursor_row {
+            painter.rect_stroke(
+                row_rect.shrink(1.0),
+                egui::Rounding::same(4.0),
+                egui::Stroke::new(1.5, focus_ring),
+            );
+            if scroll_to_cursor {
+                ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
+            }
+        }
 
         // Marker: HEAD ring, root hollow, trunk filled, branch hollow-dim.
         painter.circle_filled(center, node_r + 2.0, panel_bg);
@@ -424,6 +586,17 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             );
             msg_left = text_left + fg.size().x + 4.0;
         }
+        // Surface badge: a film-strip glyph marks entries that touched the video
+        // timeline, so a document holding both vector and timeline work reads at
+        // a glance (26 §15 K-G5). Plain vector edits stay unbadged.
+        if let Some(badge) = kind_badge(node.kind) {
+            let bg = ui
+                .painter()
+                .layout_no_wrap(badge.to_string(), font.clone(), tcol);
+            let w = bg.size().x;
+            painter.galley(egui::pos2(msg_left, cy - bg.size().y * 0.5), bg, tcol);
+            msg_left += w + 4.0;
+        }
         // Named states render a purple ref pill (like a git branch tag) before the
         // message, shifting it right.
         if let Some(l) = &node.label {
@@ -464,8 +637,12 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             "Click to jump here · right-click for options".to_string()
         });
         // Left-click: jump straight to this commit (reversible — it's a tree, so
-        // you can jump back). Doubles as click-to-preview per #174.
+        // you can jump back). Doubles as click-to-preview per #174. It also hands
+        // the list keyboard focus and parks the cursor here, so pointer and
+        // keyboard drive one shared position instead of two.
         if resp.clicked() {
+            cursor = node.id;
+            nav.request_focus();
             action = Some(PanelAction::JumpToHistoryNode { id: node.id });
         }
         // Right-click: jump + naming affordances. Branching is implicit in the
@@ -537,7 +714,96 @@ pub(crate) fn draw_edit_history(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     }
     ui.add_space(6.0);
 
+    ui.data_mut(|d| d.insert_temp(cursor_id, cursor));
     if action.is_some() {
         ctx.action = action;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Pure pieces of the Undo History surface (26 §15 K-G5) — the parts that do
+    //! not need an egui context: cursor arithmetic, the search haystack and the
+    //! surface badge.
+
+    use super::*;
+
+    fn node(id: u64, description: &str, kind: HistoryEntryKind) -> HistoryGraphNode {
+        HistoryGraphNode {
+            id,
+            parent: None,
+            children: vec![],
+            primary_child: None,
+            label: None,
+            description: description.to_string(),
+            is_current: false,
+            is_root: false,
+            kind,
+        }
+    }
+
+    #[test]
+    fn cursor_steps_newest_first_and_clamps_at_both_ends() {
+        let len = 4;
+        // Down walks backwards in time (rows are newest-first); Up walks forward.
+        assert_eq!(cursor_step(1, len, egui::Key::ArrowDown), Some(2));
+        assert_eq!(cursor_step(1, len, egui::Key::ArrowUp), Some(0));
+        // Clamp, never wrap.
+        assert_eq!(
+            cursor_step(len - 1, len, egui::Key::ArrowDown),
+            Some(len - 1)
+        );
+        assert_eq!(cursor_step(0, len, egui::Key::ArrowUp), Some(0));
+        // Jump to either end.
+        assert_eq!(cursor_step(2, len, egui::Key::Home), Some(0));
+        assert_eq!(cursor_step(2, len, egui::Key::End), Some(len - 1));
+    }
+
+    #[test]
+    fn cursor_step_ignores_non_navigation_keys() {
+        for key in [egui::Key::Enter, egui::Key::ArrowLeft, egui::Key::Escape] {
+            assert_eq!(cursor_step(1, 4, key), None, "{key:?} must not move");
+        }
+    }
+
+    /// Every key the handler polls must be one `cursor_step` actually answers —
+    /// otherwise a keypress would be swallowed and do nothing.
+    #[test]
+    fn every_polled_nav_key_resolves_to_a_row() {
+        for key in NAV_KEYS {
+            assert!(
+                cursor_step(1, 4, *key).is_some(),
+                "{key:?} is polled but unhandled"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_step_survives_a_single_row_graph() {
+        for key in NAV_KEYS {
+            assert_eq!(cursor_step(0, 1, *key), Some(0), "{key:?} on a lone root");
+        }
+    }
+
+    #[test]
+    fn only_timeline_touching_entries_get_a_badge() {
+        assert_eq!(kind_badge(HistoryEntryKind::Timeline), Some(ph::FILM_STRIP));
+        assert_eq!(kind_badge(HistoryEntryKind::Mixed), Some(ph::FILM_STRIP));
+        assert_eq!(kind_badge(HistoryEntryKind::Vector), None);
+        assert_eq!(kind_badge(HistoryEntryKind::Root), None);
+    }
+
+    #[test]
+    fn search_matches_description_branch_name_and_surface() {
+        let mut n = node(7, "Trim clip", HistoryEntryKind::Timeline);
+        n.label = Some("Rough cut".to_string());
+        let hay = search_haystack(&n);
+        for needle in ["trim clip", "rough cut", "timeline"] {
+            assert!(hay.contains(needle), "{needle:?} not in {hay:?}");
+        }
+        // A vector edit must not answer a "timeline" search.
+        let v = node(8, "Add rect", HistoryEntryKind::Vector);
+        assert!(!search_haystack(&v).contains("timeline"));
+        assert!(search_haystack(&v).contains("vector"));
     }
 }

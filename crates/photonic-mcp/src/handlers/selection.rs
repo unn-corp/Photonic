@@ -253,7 +253,7 @@ pub async fn find_replace_style(state: &AppState, args: FindReplaceStyleArgs) ->
             None => doc
                 .nodes
                 .values()
-                .filter(|n| args.layer_id.map_or(true, |lid| n.layer_id == lid))
+                .filter(|n| args.layer_id.is_none_or(|lid| n.layer_id == lid))
                 .cloned()
                 .collect(),
         }
@@ -791,7 +791,7 @@ pub async fn magic_wand_select(state: &AppState, args: MagicWandSelectArgs) -> T
             if !node.visible || node.locked {
                 continue;
             }
-            let (bx0, by0, bx1, by1) = match node_world_aabb(&node) {
+            let (bx0, by0, bx1, by1) = match node_world_aabb(node) {
                 Some(b) => b,
                 None => continue,
             };

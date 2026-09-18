@@ -71,6 +71,27 @@ impl KeyBinding {
             command: false,
         }
     }
+    /// Shift + key, no primary modifier, e.g. Shift+Z.
+    pub const fn shift(key: egui::Key) -> Self {
+        Self {
+            key,
+            ctrl: false,
+            shift: true,
+            alt: false,
+            command: false,
+        }
+    }
+
+    /// Alt + key, no primary modifier, e.g. Alt+Left.
+    pub const fn alt(key: egui::Key) -> Self {
+        Self {
+            key,
+            ctrl: false,
+            shift: false,
+            alt: true,
+            command: false,
+        }
+    }
 
     /// True if this binding fires for the given live modifier state. Ctrl and Cmd
     /// are interchangeable (primary). Shift/Alt must match exactly.
@@ -153,6 +174,7 @@ fn display_key(k: egui::Key) -> &'static str {
         egui::Key::OpenBracket => "[",
         egui::Key::CloseBracket => "]",
         egui::Key::Semicolon => ";",
+        egui::Key::Quote => "'",
         egui::Key::Plus => "+",
         egui::Key::Minus => "-",
         egui::Key::Equals => "=",
@@ -344,6 +366,452 @@ pub static REGISTRY: &[CommandDef] = &[
         id: "palette.open",
         label: "Open Command Palette",
         default: Some(KeyBinding::ctrl(Key::K)),
+    },
+    // ── Mode switch (video-editor-module 04-ui-mode-timeline.md §1.2) ───────
+    CommandDef {
+        id: "mode.toggle_video",
+        label: "Toggle Video Mode",
+        default: Some(KeyBinding::ctrl_shift(Key::V)),
+    },
+    CommandDef {
+        id: "mode.enter_video",
+        label: "Enter Video Mode",
+        default: None,
+    },
+    CommandDef {
+        id: "mode.exit_video",
+        label: "Exit Video Mode",
+        default: None,
+    },
+    // ── Video transport / timeline (04 §5.1) ─────────────────────────────────
+    CommandDef {
+        id: "video.play_pause",
+        label: "Play/Pause",
+        default: Some(KeyBinding::plain(Key::Space)),
+    },
+    CommandDef {
+        id: "video.play_reverse",
+        label: "Play Reverse",
+        default: Some(KeyBinding::plain(Key::J)),
+    },
+    CommandDef {
+        id: "video.pause",
+        label: "Pause",
+        default: Some(KeyBinding::plain(Key::K)),
+    },
+    CommandDef {
+        id: "video.play_forward",
+        label: "Play Forward",
+        default: Some(KeyBinding::plain(Key::L)),
+    },
+    CommandDef {
+        id: "video.step_back",
+        label: "Step Back One Frame",
+        default: Some(KeyBinding::plain(Key::ArrowLeft)),
+    },
+    CommandDef {
+        id: "video.step_forward",
+        label: "Step Forward One Frame",
+        default: Some(KeyBinding::plain(Key::ArrowRight)),
+    },
+    CommandDef {
+        id: "video.prev_edit_point",
+        label: "Previous Edit Point",
+        default: Some(KeyBinding::shift(Key::ArrowLeft)),
+    },
+    CommandDef {
+        id: "video.next_edit_point",
+        label: "Next Edit Point",
+        default: Some(KeyBinding::shift(Key::ArrowRight)),
+    },
+    // K-A4: jump the playhead between snap targets (clip edges, markers, zone
+    // in/out, keyframes, sequence start) rather than only between edit points.
+    CommandDef {
+        id: "video.prev_snap",
+        label: "Previous Snap Point",
+        default: Some(KeyBinding::alt(Key::ArrowLeft)),
+    },
+    CommandDef {
+        id: "video.next_snap",
+        label: "Next Snap Point",
+        default: Some(KeyBinding::alt(Key::ArrowRight)),
+    },
+    CommandDef {
+        id: "video.set_in",
+        label: "Set In Point",
+        default: Some(KeyBinding::plain(Key::I)),
+    },
+    CommandDef {
+        id: "video.set_out",
+        label: "Set Out Point",
+        default: Some(KeyBinding::plain(Key::O)),
+    },
+    CommandDef {
+        id: "video.split_at_playhead",
+        label: "Split Clip at Playhead",
+        default: Some(KeyBinding::plain(Key::S)),
+    },
+    // Clip editing (NLE parity QW-1/QW-3/QW-4). Delete/Backspace both remove the
+    // timeline selection — Backspace is handled as a second hardwired
+    // accelerator in `app/monitor.rs` since the keymap holds one binding per id.
+    CommandDef {
+        id: "video.delete_clip",
+        label: "Delete Selected Clip",
+        default: Some(KeyBinding::plain(Key::Delete)),
+    },
+    CommandDef {
+        id: "video.ripple_delete",
+        label: "Ripple Delete Selected Clip",
+        default: Some(KeyBinding::shift(Key::Delete)),
+    },
+    CommandDef {
+        id: "video.copy",
+        label: "Copy Clip",
+        default: Some(KeyBinding::ctrl(Key::C)),
+    },
+    CommandDef {
+        id: "video.cut",
+        label: "Cut Clip",
+        default: Some(KeyBinding::ctrl(Key::X)),
+    },
+    CommandDef {
+        id: "video.paste",
+        label: "Paste Clip at Playhead",
+        default: Some(KeyBinding::ctrl(Key::V)),
+    },
+    CommandDef {
+        id: "video.add_marker",
+        label: "Add Marker at Playhead",
+        default: Some(KeyBinding::plain(Key::M)),
+    },
+    // Proposal 210: CapCut-class bookmark = sequence marker in the Bookmarks
+    // category (not a parallel type). `B` is free in video mode (blade is `C`).
+    CommandDef {
+        id: "video.add_bookmark",
+        label: "Add Bookmark at Playhead",
+        default: Some(KeyBinding::plain(Key::B)),
+    },
+    CommandDef {
+        id: "video.prev_bookmark",
+        label: "Go to Previous Bookmark",
+        default: None,
+    },
+    CommandDef {
+        id: "video.next_bookmark",
+        label: "Go to Next Bookmark",
+        default: None,
+    },
+    // K-A2 marker depth. `video.add_range_marker` is the keyboard route to a
+    // RANGED marker — the unit "Export each ranged marker" (K-F2) fans out
+    // over, and previously uncreatable from anywhere in the app.
+    // Marker navigation is deliberately distinct from `video.{prev,next}_snap`:
+    // snap points also include clip edges, keyframes and the zone, so walking a
+    // review pass marker-by-marker is not the same gesture. No default binding
+    // — every plain and modified arrow key in video mode is already taken.
+    CommandDef {
+        id: "video.add_range_marker",
+        label: "Add Ranged Marker from Work Range",
+        default: None,
+    },
+    CommandDef {
+        id: "video.prev_marker",
+        label: "Go to Previous Marker",
+        default: None,
+    },
+    CommandDef {
+        id: "video.next_marker",
+        label: "Go to Next Marker",
+        default: None,
+    },
+    // 3/4-point editing (spec 16, Premiere defaults). Insert/Overwrite lay down
+    // the armed source at the playhead; Lift/Extract clear the timeline in/out.
+    // Razor is a blade-mode toggle. Bound here + dispatched in `command_center`;
+    // the video-mode keyboard poll that fires them each frame lives in
+    // `app/monitor.rs` (a separate story's file — see this story's report).
+    CommandDef {
+        id: "video.insert_edit",
+        label: "Insert Edit (3-point)",
+        default: Some(KeyBinding::plain(Key::Comma)),
+    },
+    CommandDef {
+        id: "video.overwrite_edit",
+        label: "Overwrite Edit (3-point)",
+        default: Some(KeyBinding::plain(Key::Period)),
+    },
+    CommandDef {
+        id: "video.lift_edit",
+        label: "Lift (clear timeline in/out)",
+        default: Some(KeyBinding::plain(Key::Semicolon)),
+    },
+    CommandDef {
+        id: "video.extract_edit",
+        label: "Extract (ripple-clear timeline in/out)",
+        default: Some(KeyBinding::plain(Key::Quote)),
+    },
+    CommandDef {
+        id: "video.extract_frame",
+        label: "Extract Frame to File",
+        default: Some(KeyBinding::ctrl_shift(Key::E)),
+    },
+    CommandDef {
+        id: "video.extract_frame_to_bin",
+        label: "Extract Frame to Media Pool",
+        default: None,
+    },
+    CommandDef {
+        id: "video.toggle_razor",
+        label: "Razor Tool (blade)",
+        default: Some(KeyBinding::plain(Key::C)),
+    },
+    CommandDef {
+        id: "video.toggle_snap",
+        label: "Toggle Timeline Snapping",
+        default: Some(KeyBinding::plain(Key::N)),
+    },
+    // K-A10: fixed playhead + edge auto-pan while dragging (view state).
+    CommandDef {
+        id: "video.toggle_fixed_playhead",
+        label: "Toggle Fixed Playhead",
+        default: None,
+    },
+    CommandDef {
+        id: "video.zoom_in",
+        label: "Timeline Zoom In",
+        default: Some(KeyBinding::plain(Key::Plus)),
+    },
+    CommandDef {
+        id: "video.zoom_out",
+        label: "Timeline Zoom Out",
+        default: Some(KeyBinding::plain(Key::Minus)),
+    },
+    CommandDef {
+        id: "video.zoom_fit",
+        label: "Timeline Zoom to Fit",
+        default: Some(KeyBinding::shift(Key::Z)),
+    },
+    CommandDef {
+        id: "video.playhead_home",
+        label: "Playhead to Sequence Start",
+        default: Some(KeyBinding::plain(Key::Home)),
+    },
+    CommandDef {
+        id: "video.playhead_end",
+        label: "Playhead to Sequence End",
+        default: Some(KeyBinding::plain(Key::End)),
+    },
+    // ── NLE parity round-2 (spec 17) — keyboard-velocity editing riding on the
+    // shipped split/trim/roll ops. G1 (add-edit-all-tracks / close-gap /
+    // simplify), G2 (Q/W/E ripple-trims + Shift+Q/W rolls), G3 (Match Frame /
+    // Reveal). Bound here; dispatched in `command_center`; the per-frame poll
+    // that fires them lives in `timeline/mod.rs::draw_timeline_panel`
+    // (`handle_timeline_shortcuts`) — the timeline panel owns these keys.
+    CommandDef {
+        id: "video.split_all_tracks",
+        label: "Add Edit to All Tracks",
+        default: Some(KeyBinding::ctrl_shift(Key::K)),
+    },
+    CommandDef {
+        id: "video.close_gap",
+        label: "Close Gap at Playhead",
+        default: None,
+    },
+    CommandDef {
+        id: "video.close_gaps",
+        label: "Close All Gaps",
+        default: None,
+    },
+    // K-A3 spacer / space operations (across all unlocked tracks).
+    CommandDef {
+        id: "video.insert_space",
+        label: "Insert Space at Playhead (1s)",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_space",
+        label: "Remove Space at Playhead (1s)",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_all_spaces_after",
+        label: "Remove All Spaces After Playhead",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_clips_after",
+        label: "Remove All Clips After Playhead",
+        default: None,
+    },
+    CommandDef {
+        id: "video.simplify_sequence",
+        label: "Simplify Sequence (remove through-edits)",
+        default: None,
+    },
+    CommandDef {
+        id: "video.trim_start_to_playhead",
+        label: "Ripple Trim Start to Playhead",
+        default: Some(KeyBinding::plain(Key::Q)),
+    },
+    CommandDef {
+        id: "video.trim_end_to_playhead",
+        label: "Ripple Trim End to Playhead",
+        default: Some(KeyBinding::plain(Key::W)),
+    },
+    CommandDef {
+        id: "video.extend_edit",
+        label: "Extend Edit to Playhead",
+        default: Some(KeyBinding::plain(Key::E)),
+    },
+    CommandDef {
+        id: "video.roll_prev_to_playhead",
+        label: "Roll Previous Edit to Playhead",
+        default: Some(KeyBinding::shift(Key::Q)),
+    },
+    CommandDef {
+        id: "video.roll_next_to_playhead",
+        label: "Roll Next Edit to Playhead",
+        default: Some(KeyBinding::shift(Key::W)),
+    },
+    CommandDef {
+        id: "video.match_frame",
+        label: "Match Frame (arm source at playhead)",
+        default: Some(KeyBinding::plain(Key::F)),
+    },
+    CommandDef {
+        id: "video.reveal_in_project",
+        label: "Reveal in Media Pool",
+        default: None,
+    },
+    CommandDef {
+        id: "video.audition_source",
+        label: "Audition Source Audio",
+        default: Some(KeyBinding::alt(egui::Key::Space)),
+    },
+    CommandDef {
+        id: "video.stop_source_audition",
+        label: "Stop Source Audition",
+        default: None,
+    },
+    CommandDef {
+        id: "video.precision_trim",
+        label: "Precision Trim Mode",
+        default: Some(KeyBinding::shift(egui::Key::T)),
+    },
+    CommandDef {
+        id: "video.enter_nested_sequence",
+        label: "Enter Nested Sequence",
+        default: Some(KeyBinding::alt(egui::Key::ArrowRight)),
+    },
+    CommandDef {
+        id: "video.leave_nested_sequence",
+        label: "Back to Parent Sequence",
+        default: Some(KeyBinding::alt(egui::Key::ArrowLeft)),
+    },
+    CommandDef {
+        id: "video.add_preview_zone",
+        label: "Add Preview Zone from In/Out",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_preview_zone",
+        label: "Remove Preview Zone in In/Out",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_all_preview_zones",
+        label: "Remove All Preview Zones",
+        default: None,
+    },
+    CommandDef {
+        id: "video.render_preview",
+        label: "Render Timeline Preview",
+        default: None,
+    },
+    CommandDef {
+        id: "video.stop_preview_render",
+        label: "Stop Preview Render",
+        default: None,
+    },
+    CommandDef {
+        id: "video.open_transcript",
+        label: "Open Transcript",
+        default: None,
+    },
+    CommandDef {
+        id: "video.remove_transcript_selection",
+        label: "Ripple Delete Selected Transcript Words",
+        default: None,
+    },
+    CommandDef {
+        id: "video.find_fillers",
+        label: "Preview Transcript Filler Words",
+        default: None,
+    },
+    CommandDef {
+        id: "video.edit_duration",
+        label: "Edit Duration…",
+        // No default — Ctrl+D is `edit.duplicate`; palette / context menu /
+        // inspector open the form. Users can rebind in preferences.
+        default: None,
+    },
+    // K-B14 freeze frame — hold the source frame under the playhead for the
+    // selected clip's duration (zero-rate SpeedMap). Palette / context menu;
+    // no default binding (Shift+F is Match Frame in some NLEs, and F is ours).
+    CommandDef {
+        id: "video.freeze_frame",
+        label: "Freeze Frame",
+        default: None,
+    },
+    // K-B17 alpha view — program-monitor present channel (view state, zero
+    // undo units). The util.alpha_view / util.unpremultiply *effects* already
+    // live in the catalogue for per-clip use.
+    CommandDef {
+        id: "video.alpha_view",
+        label: "Toggle Alpha View",
+        default: None,
+    },
+    CommandDef {
+        id: "video.compare_effects",
+        label: "Toggle Effect Compare (A|B)",
+        default: None,
+    },
+    // K-A7 grab item / arrow-key nudge (Shift+G engage; arrows while grabbed;
+    // Enter commit; Esc cancel). Arrow keys are handled specially while grab
+    // is active so they don't step the playhead.
+    CommandDef {
+        id: "video.grab_item",
+        label: "Grab Item (keyboard move)",
+        default: Some(KeyBinding::shift(Key::G)),
+    },
+    CommandDef {
+        id: "video.grab_commit",
+        label: "Commit Grabbed Item Move",
+        default: None, // Enter hardwired while grab active
+    },
+    CommandDef {
+        id: "video.grab_cancel",
+        label: "Cancel Grabbed Item Move",
+        default: None, // Esc hardwired while grab active
+    },
+    // K-B15 Paste Attributes: copy the LOOK of the clip on the timeline
+    // clipboard (`video.copy`, Ctrl+C) onto every selected clip, as ONE undo
+    // step — Premiere's Ctrl+C → Ctrl+Alt+V flow, Kdenlive's "Paste Effects"
+    // for the narrower form. No timing, source or trim is touched.
+    //
+    // No default binding on purpose: the video-mode key poll that fires
+    // `video.*` bindings is a fixed id list in `app/monitor.rs`, which this
+    // story does not own, so advertising Ctrl+Alt+V in the palette would show
+    // a shortcut that does not fire. Reachable from the command palette
+    // (Ctrl+K) and rebindable in preferences; wiring the accelerator and the
+    // clip context menu is a filed follow-up.
+    CommandDef {
+        id: "video.paste_attributes",
+        label: "Paste Attributes onto Selected Clips",
+        default: None,
+    },
+    CommandDef {
+        id: "video.paste_effects",
+        label: "Paste Effects onto Selected Clips",
+        default: None,
     },
     CommandDef {
         id: "keymap.import",

@@ -3,11 +3,11 @@
 <!-- GENERATED FILE — do not edit by hand. -->
 <!-- Regenerate with: cargo run -p photonic-mcp --bin dump_tools | python3 tools/gen-mcp-docs.py > docs/mcp-api.md -->
 
-This document lists all **329** MCP tools exposed by `photonic-mcp`, generated directly from `server::tool_list()` so it cannot drift from the implementation.
+This document lists all **495** MCP tools exposed by `photonic-mcp`, generated directly from `server::tool_list()` so it cannot drift from the implementation.
 
 ## Tools
 
-[`add_anchor_points`](#add-anchor-points), [`add_annotation`](#add-annotation), [`add_artboard`](#add-artboard), [`add_color_swatch`](#add-color-swatch), [`add_construction_line`](#add-construction-line), [`add_dimension`](#add-dimension), [`add_dimension_line`](#add-dimension-line), [`add_drop_shadow`](#add-drop-shadow), [`add_export_profile`](#add-export-profile), [`add_guide`](#add-guide), [`adjust_colors`](#adjust-colors), [`align_nodes`](#align-nodes), [`analyze_composition`](#analyze-composition), [`apply_adjustment`](#apply-adjustment), [`apply_character_style`](#apply-character-style), [`apply_color_swatch`](#apply-color-swatch), [`apply_document_template`](#apply-document-template), [`apply_filter`](#apply-filter), [`apply_flex_layout`](#apply-flex-layout), [`apply_gradient_swatch`](#apply-gradient-swatch), [`apply_graphic_style`](#apply-graphic-style), [`apply_grid_layout`](#apply-grid-layout), [`apply_paragraph_style`](#apply-paragraph-style), [`apply_pattern_fill`](#apply-pattern-fill), [`apply_spot_color`](#apply-spot-color), [`apply_stack_layout`](#apply-stack-layout), [`apply_transform`](#apply-transform), [`apply_variables`](#apply-variables), [`apply_width_profile`](#apply-width-profile), [`auto_name_nodes`](#auto-name-nodes), [`average_anchor_points`](#average-anchor-points), [`bind_text_variable`](#bind-text-variable), [`blend_colors`](#blend-colors), [`blend_objects`](#blend-objects), [`boolean_operation`](#boolean-operation), [`branch_create`](#branch-create), [`branch_delete`](#branch-delete), [`branch_list`](#branch-list), [`branch_switch`](#branch-switch), [`break_link_to_symbol`](#break-link-to-symbol), [`brush_stroke`](#brush-stroke), [`bucket_fill`](#bucket-fill), [`build_shape_from_points`](#build-shape-from-points), [`center_on_canvas`](#center-on-canvas), [`check_grammar`](#check-grammar), [`check_style_continuity`](#check-style-continuity), [`clean_up`](#clean-up), [`clear_blend_spine`](#clear-blend-spine), [`clear_guides`](#clear-guides), [`clear_layer_mask`](#clear-layer-mask), [`clear_symbol_overrides`](#clear-symbol-overrides), [`clear_tab_stops`](#clear-tab-stops), [`clear_text_area`](#clear-text-area), [`clear_text_path`](#clear-text-path), [`collect_in_new_layer`](#collect-in-new-layer), [`color_guide`](#color-guide), [`convert_anchor_points`](#convert-anchor-points), [`convert_to_grayscale`](#convert-to-grayscale), [`copy_appearance`](#copy-appearance), [`copy_nodes_to_clipboard`](#copy-nodes-to-clipboard), [`create_adjustment_layer`](#create-adjustment-layer), [`create_array`](#create-array), [`create_arrow_shape`](#create-arrow-shape), [`create_bar_chart`](#create-bar-chart), [`create_character_style`](#create-character-style), [`create_cross`](#create-cross), [`create_curvature_path`](#create-curvature-path), [`create_donut`](#create-donut), [`create_flare`](#create-flare), [`create_freehand_path`](#create-freehand-path), [`create_gear`](#create-gear), [`create_grid`](#create-grid), [`create_heart`](#create-heart), [`create_layer`](#create-layer), [`create_line_chart`](#create-line-chart), [`create_paragraph_style`](#create-paragraph-style), [`create_parametric_shape`](#create-parametric-shape), [`create_path`](#create-path), [`create_pie_chart`](#create-pie-chart), [`create_polar_grid`](#create-polar-grid), [`create_qr_code`](#create-qr-code), [`create_radar_chart`](#create-radar-chart), [`create_raster_layer`](#create-raster-layer), [`create_scatter_plot`](#create-scatter-plot), [`create_shape`](#create-shape), [`create_speech_bubble`](#create-speech-bubble), [`create_spiral`](#create-spiral), [`create_stacked_bar_chart`](#create-stacked-bar-chart), [`create_sunburst`](#create-sunburst), [`create_text`](#create-text), [`create_truchet_tiling`](#create-truchet-tiling), [`create_vectors_from_css`](#create-vectors-from-css), [`create_vectors_from_react`](#create-vectors-from-react), [`create_wave_pattern`](#create-wave-pattern), [`crystallize_path`](#crystallize-path), [`define_action`](#define-action), [`define_grammar_rule`](#define-grammar-rule), [`define_graphic_style`](#define-graphic-style), [`define_pattern`](#define-pattern), [`define_spot_color`](#define-spot-color), [`define_symbol`](#define-symbol), [`define_variable`](#define-variable), [`define_width_profile`](#define-width-profile), [`delete_action`](#delete-action), [`delete_anchor_point`](#delete-anchor-point), [`delete_character_style`](#delete-character-style), [`delete_color_swatch`](#delete-color-swatch), [`delete_gradient_swatch`](#delete-gradient-swatch), [`delete_grammar_rule`](#delete-grammar-rule), [`delete_graphic_style`](#delete-graphic-style), [`delete_layer`](#delete-layer), [`delete_nodes`](#delete-nodes), [`delete_paragraph_style`](#delete-paragraph-style), [`delete_pattern`](#delete-pattern), [`delete_spot_color`](#delete-spot-color), [`delete_symbol`](#delete-symbol), [`delete_variable`](#delete-variable), [`delete_width_profile`](#delete-width-profile), [`delete_workspace`](#delete-workspace), [`deselect_all`](#deselect-all), [`detect_rhythms`](#detect-rhythms), [`diff_checkpoints`](#diff-checkpoints), [`distribute_no_overlap`](#distribute-no-overlap), [`distribute_on_path`](#distribute-on-path), [`divide_objects_below`](#divide-objects-below), [`duplicate_artboard`](#duplicate-artboard), [`duplicate_layer`](#duplicate-layer), [`duplicate_nodes`](#duplicate-nodes), [`enter_isolation_mode`](#enter-isolation-mode), [`exit_isolation_mode`](#exit-isolation-mode), [`expand_blend`](#expand-blend), [`export_artboards`](#export-artboards), [`export_audit_log`](#export-audit-log), [`export_design_tokens`](#export-design-tokens), [`export_icon_set`](#export-icon-set), [`export_pdf`](#export-pdf), [`export_raster`](#export-raster), [`export_selection_as_svg`](#export-selection-as-svg), [`export_svg`](#export-svg), [`export_tagged_assets`](#export-tagged-assets), [`find_nodes`](#find-nodes), [`find_replace_style`](#find-replace-style), [`find_replace_text`](#find-replace-text), [`fit_to_canvas`](#fit-to-canvas), [`fit_to_margins`](#fit-to-margins), [`flatten_artwork`](#flatten-artwork), [`flatten_group`](#flatten-group), [`flatten_transparency`](#flatten-transparency), [`flip_nodes`](#flip-nodes), [`get_artboard_margins`](#get-artboard-margins), [`get_canvas_overview`](#get-canvas-overview), [`get_clipboard_history`](#get-clipboard-history), [`get_css_preview`](#get-css-preview), [`get_document_bleed`](#get-document-bleed), [`get_document_color_mode`](#get-document-color-mode), [`get_document_dpi`](#get-document-dpi), [`get_document_info`](#get-document-info), [`get_document_state`](#get-document-state), [`get_document_template`](#get-document-template), [`get_node`](#get-node), [`get_node_prompts`](#get-node-prompts), [`get_opentype_features`](#get-opentype-features), [`get_raster_info`](#get-raster-info), [`get_recent_colors`](#get-recent-colors), [`get_selection`](#get-selection), [`gradient_fill`](#gradient-fill), [`group_nodes`](#group-nodes), [`hatch_fill`](#hatch-fill), [`import_design_tokens`](#import-design-tokens), [`inspect_node`](#inspect-node), [`invert_colors`](#invert-colors), [`join_paths`](#join-paths), [`jump_to_history`](#jump-to-history), [`lasso_select`](#lasso-select), [`layout_nodes`](#layout-nodes), [`link_text_frames`](#link-text-frames), [`liquify`](#liquify), [`list_actions`](#list-actions), [`list_annotations`](#list-annotations), [`list_artboards`](#list-artboards), [`list_audit_log`](#list-audit-log), [`list_character_styles`](#list-character-styles), [`list_checkpoints`](#list-checkpoints), [`list_color_swatches`](#list-color-swatches), [`list_constraints`](#list-constraints), [`list_dimensions`](#list-dimensions), [`list_event_triggers`](#list-event-triggers), [`list_export_profiles`](#list-export-profiles), [`list_gradient_swatches`](#list-gradient-swatches), [`list_grammar_rules`](#list-grammar-rules), [`list_graphic_styles`](#list-graphic-styles), [`list_guides`](#list-guides), [`list_history`](#list-history), [`list_paragraph_styles`](#list-paragraph-styles), [`list_patterns`](#list-patterns), [`list_spot_colors`](#list-spot-colors), [`list_symbols`](#list-symbols), [`list_variables`](#list-variables), [`list_width_profiles`](#list-width-profiles), [`list_workspaces`](#list-workspaces), [`load_swatch_library`](#load-swatch-library), [`load_symbol_library`](#load-symbol-library), [`load_workspace`](#load-workspace), [`magic_wand_select`](#magic-wand-select), [`make_clipping_mask`](#make-clipping-mask), [`make_compound_path`](#make-compound-path), [`make_live_boolean`](#make-live-boolean), [`measure_distance`](#measure-distance), [`measure_distances`](#measure-distances), [`measure_nodes`](#measure-nodes), [`measure_path`](#measure-path), [`merge_layers`](#merge-layers), [`mirror_copy`](#mirror-copy), [`move_artboard`](#move-artboard), [`move_to_layer`](#move-to-layer), [`noise_deform`](#noise-deform), [`offset_path`](#offset-path), [`outline_stroke`](#outline-stroke), [`paste_from_history`](#paste-from-history), [`pathfinder_crop`](#pathfinder-crop), [`pathfinder_divide`](#pathfinder-divide), [`pathfinder_merge`](#pathfinder-merge), [`pathfinder_minus_back`](#pathfinder-minus-back), [`pathfinder_minus_front`](#pathfinder-minus-front), [`pathfinder_outline`](#pathfinder-outline), [`pathfinder_trim`](#pathfinder-trim), [`pin_object_guides`](#pin-object-guides), [`place_image`](#place-image), [`place_symbol`](#place-symbol), [`play_action`](#play-action), [`point_on_path`](#point-on-path), [`preview_selection`](#preview-selection), [`proportional_move_anchor`](#proportional-move-anchor), [`pucker_bloat`](#pucker-bloat), [`randomize_colors`](#randomize-colors), [`recolor_artwork`](#recolor-artwork), [`redo`](#redo), [`register_event_trigger`](#register-event-trigger), [`release_clipping_mask`](#release-clipping-mask), [`release_compound_path`](#release-compound-path), [`release_to_layers`](#release-to-layers), [`remove_artboard`](#remove-artboard), [`remove_background`](#remove-background), [`remove_constraint`](#remove-constraint), [`remove_dimension`](#remove-dimension), [`remove_event_trigger`](#remove-event-trigger), [`remove_export_profile`](#remove-export-profile), [`remove_fill`](#remove-fill), [`remove_guide`](#remove-guide), [`remove_stroke`](#remove-stroke), [`reorder_layers`](#reorder-layers), [`reorder_node`](#reorder-node), [`resize_canvas`](#resize-canvas), [`resolve_annotation`](#resolve-annotation), [`restore_checkpoint`](#restore-checkpoint), [`retouch`](#retouch), [`reverse_blend_spine`](#reverse-blend-spine), [`reverse_node_order`](#reverse-node-order), [`reverse_path_direction`](#reverse-path-direction), [`rotate_copies`](#rotate-copies), [`roughen_path`](#roughen-path), [`round_corners`](#round-corners), [`run_export_profile`](#run-export-profile), [`sample_color_at`](#sample-color-at), [`save_document`](#save-document), [`save_gradient_swatch`](#save-gradient-swatch), [`save_workspace`](#save-workspace), [`scallop_path`](#scallop-path), [`scatter_copies`](#scatter-copies), [`scissors_cut`](#scissors-cut), [`screenshot`](#screenshot), [`select_all`](#select-all), [`select_by_kind`](#select-by-kind), [`select_inside_group`](#select-inside-group), [`select_same`](#select-same), [`select_similar`](#select-similar), [`set_active_artboard`](#set-active-artboard), [`set_active_layer`](#set-active-layer), [`set_artboard_margins`](#set-artboard-margins), [`set_blend_mode`](#set-blend-mode), [`set_blend_spine`](#set-blend-spine), [`set_character_metrics`](#set-character-metrics), [`set_constraint`](#set-constraint), [`set_document_bleed`](#set-document-bleed), [`set_document_color_mode`](#set-document-color-mode), [`set_document_dpi`](#set-document-dpi), [`set_font_style`](#set-font-style), [`set_font_weight`](#set-font-weight), [`set_layer_mask`](#set-layer-mask), [`set_locked`](#set-locked), [`set_node_prompt`](#set-node-prompt), [`set_node_size`](#set-node-size), [`set_opacity`](#set-opacity), [`set_opentype_features`](#set-opentype-features), [`set_paint`](#set-paint), [`set_paragraph_options`](#set-paragraph-options), [`set_selection`](#set-selection), [`set_symbol_override`](#set-symbol-override), [`set_tab_stops`](#set-tab-stops), [`set_text_area`](#set-text-area), [`set_text_decoration`](#set-text-decoration), [`set_text_direction`](#set-text-direction), [`set_text_path`](#set-text-path), [`set_variable_value`](#set-variable-value), [`set_visibility`](#set-visibility), [`simplify_path`](#simplify-path), [`smooth_path`](#smooth-path), [`snap_to_pixel`](#snap-to-pixel), [`split_into_grid`](#split-into-grid), [`spray_symbol_instances`](#spray-symbol-instances), [`stipple_fill`](#stipple-fill), [`style_transfer`](#style-transfer), [`swap_fill_stroke`](#swap-fill-stroke), [`tag_node_for_export`](#tag-node-for-export), [`tag_nodes`](#tag-nodes), [`transform_copies`](#transform-copies), [`transform_image`](#transform-image), [`twirl_path`](#twirl-path), [`unbind_text_variable`](#unbind-text-variable), [`undo`](#undo), [`undo_node`](#undo-node), [`ungroup_nodes`](#ungroup-nodes), [`unlink_text_frames`](#unlink-text-frames), [`update_artboard`](#update-artboard), [`update_color_swatch`](#update-color-swatch), [`update_layer`](#update-layer), [`update_node`](#update-node), [`warp_envelope`](#warp-envelope), [`zig_zag_path`](#zig-zag-path)
+[`add_anchor_points`](#add-anchor-points), [`add_annotation`](#add-annotation), [`add_artboard`](#add-artboard), [`add_caption_track`](#add-caption-track), [`add_clip_marker`](#add-clip-marker), [`add_color_swatch`](#add-color-swatch), [`add_construction_line`](#add-construction-line), [`add_dimension`](#add-dimension), [`add_dimension_line`](#add-dimension-line), [`add_drop_shadow`](#add-drop-shadow), [`add_edit_all_tracks`](#add-edit-all-tracks), [`add_effect`](#add-effect), [`add_export_profile`](#add-export-profile), [`add_graph_edge`](#add-graph-edge), [`add_graph_node`](#add-graph-node), [`add_guide`](#add-guide), [`add_marker`](#add-marker), [`add_marker_category`](#add-marker-category), [`add_track`](#add-track), [`adjust_colors`](#adjust-colors), [`align_nodes`](#align-nodes), [`analyze_composition`](#analyze-composition), [`analyze_stabilization`](#analyze-stabilization), [`apply_adjustment`](#apply-adjustment), [`apply_character_style`](#apply-character-style), [`apply_color_swatch`](#apply-color-swatch), [`apply_document_template`](#apply-document-template), [`apply_filter`](#apply-filter), [`apply_flex_layout`](#apply-flex-layout), [`apply_gradient_swatch`](#apply-gradient-swatch), [`apply_graphic_style`](#apply-graphic-style), [`apply_grid_layout`](#apply-grid-layout), [`apply_lut`](#apply-lut), [`apply_paragraph_style`](#apply-paragraph-style), [`apply_pattern_fill`](#apply-pattern-fill), [`apply_spot_color`](#apply-spot-color), [`apply_stack_layout`](#apply-stack-layout), [`apply_transform`](#apply-transform), [`apply_variables`](#apply-variables), [`apply_video_edit_plan`](#apply-video-edit-plan), [`apply_width_profile`](#apply-width-profile), [`attach_proxy`](#attach-proxy), [`audio_fx`](#audio-fx), [`audition_source`](#audition-source), [`auto_caption`](#auto-caption), [`auto_name_nodes`](#auto-name-nodes), [`average_anchor_points`](#average-anchor-points), [`batch_set_keyframes`](#batch-set-keyframes), [`bind_text_variable`](#bind-text-variable), [`blend_colors`](#blend-colors), [`blend_objects`](#blend-objects), [`boolean_operation`](#boolean-operation), [`branch_create`](#branch-create), [`branch_delete`](#branch-delete), [`branch_list`](#branch-list), [`branch_switch`](#branch-switch), [`break_link_to_symbol`](#break-link-to-symbol), [`brush_stroke`](#brush-stroke), [`bucket_fill`](#bucket-fill), [`build_shape_from_points`](#build-shape-from-points), [`cancel_job`](#cancel-job), [`cancel_preview`](#cancel-preview), [`center_on_canvas`](#center-on-canvas), [`check_grammar`](#check-grammar), [`check_style_continuity`](#check-style-continuity), [`clean_up`](#clean-up), [`clear_blend_spine`](#clear-blend-spine), [`clear_guides`](#clear-guides), [`clear_layer_mask`](#clear-layer-mask), [`clear_preview`](#clear-preview), [`clear_symbol_overrides`](#clear-symbol-overrides), [`clear_tab_stops`](#clear-tab-stops), [`clear_text_area`](#clear-text-area), [`clear_text_path`](#clear-text-path), [`close_gap`](#close-gap), [`collect_in_new_layer`](#collect-in-new-layer), [`color_guide`](#color-guide), [`convert_anchor_points`](#convert-anchor-points), [`convert_to_grayscale`](#convert-to-grayscale), [`copy_appearance`](#copy-appearance), [`copy_grade`](#copy-grade), [`copy_keyframes`](#copy-keyframes), [`copy_nodes_to_clipboard`](#copy-nodes-to-clipboard), [`create_adjustment_layer`](#create-adjustment-layer), [`create_array`](#create-array), [`create_arrow_shape`](#create-arrow-shape), [`create_bar_chart`](#create-bar-chart), [`create_bin`](#create-bin), [`create_character_style`](#create-character-style), [`create_clip_composition`](#create-clip-composition), [`create_cross`](#create-cross), [`create_curvature_path`](#create-curvature-path), [`create_donut`](#create-donut), [`create_flare`](#create-flare), [`create_freehand_path`](#create-freehand-path), [`create_gear`](#create-gear), [`create_grid`](#create-grid), [`create_heart`](#create-heart), [`create_layer`](#create-layer), [`create_line_chart`](#create-line-chart), [`create_paragraph_style`](#create-paragraph-style), [`create_parametric_shape`](#create-parametric-shape), [`create_path`](#create-path), [`create_pie_chart`](#create-pie-chart), [`create_polar_grid`](#create-polar-grid), [`create_qr_code`](#create-qr-code), [`create_radar_chart`](#create-radar-chart), [`create_raster_layer`](#create-raster-layer), [`create_scatter_plot`](#create-scatter-plot), [`create_sequence`](#create-sequence), [`create_shape`](#create-shape), [`create_speech_bubble`](#create-speech-bubble), [`create_spiral`](#create-spiral), [`create_stacked_bar_chart`](#create-stacked-bar-chart), [`create_subclip`](#create-subclip), [`create_sunburst`](#create-sunburst), [`create_text`](#create-text), [`create_truchet_tiling`](#create-truchet-tiling), [`create_vectors_from_css`](#create-vectors-from-css), [`create_vectors_from_react`](#create-vectors-from-react), [`create_wave_pattern`](#create-wave-pattern), [`crystallize_path`](#crystallize-path), [`define_action`](#define-action), [`define_grammar_rule`](#define-grammar-rule), [`define_graphic_style`](#define-graphic-style), [`define_pattern`](#define-pattern), [`define_spot_color`](#define-spot-color), [`define_symbol`](#define-symbol), [`define_variable`](#define-variable), [`define_width_profile`](#define-width-profile), [`delete_action`](#delete-action), [`delete_anchor_point`](#delete-anchor-point), [`delete_character_style`](#delete-character-style), [`delete_color_swatch`](#delete-color-swatch), [`delete_export_preset`](#delete-export-preset), [`delete_gradient_swatch`](#delete-gradient-swatch), [`delete_grammar_rule`](#delete-grammar-rule), [`delete_graphic_style`](#delete-graphic-style), [`delete_layer`](#delete-layer), [`delete_nodes`](#delete-nodes), [`delete_paragraph_style`](#delete-paragraph-style), [`delete_pattern`](#delete-pattern), [`delete_sequence`](#delete-sequence), [`delete_spot_color`](#delete-spot-color), [`delete_symbol`](#delete-symbol), [`delete_transcript_range`](#delete-transcript-range), [`delete_variable`](#delete-variable), [`delete_width_profile`](#delete-width-profile), [`delete_workspace`](#delete-workspace), [`deselect_all`](#deselect-all), [`detach_proxy`](#detach-proxy), [`detect_rhythms`](#detect-rhythms), [`diff_checkpoints`](#diff-checkpoints), [`distribute_no_overlap`](#distribute-no-overlap), [`distribute_on_path`](#distribute-on-path), [`divide_objects_below`](#divide-objects-below), [`duplicate_artboard`](#duplicate-artboard), [`duplicate_layer`](#duplicate-layer), [`duplicate_nodes`](#duplicate-nodes), [`edit_transcript_word`](#edit-transcript-word), [`effect_favourite_list`](#effect-favourite-list), [`effect_favourite_set`](#effect-favourite-set), [`effect_preset_apply`](#effect-preset-apply), [`effect_preset_delete`](#effect-preset-delete), [`effect_preset_list`](#effect-preset-list), [`effect_preset_rename`](#effect-preset-rename), [`effect_preset_save`](#effect-preset-save), [`effect_stack`](#effect-stack), [`enter_isolation_mode`](#enter-isolation-mode), [`execute_action`](#execute-action), [`exit_isolation_mode`](#exit-isolation-mode), [`expand_blend`](#expand-blend), [`export_artboards`](#export-artboards), [`export_audit_log`](#export-audit-log), [`export_captions`](#export-captions), [`export_design_tokens`](#export-design-tokens), [`export_icon_set`](#export-icon-set), [`export_pdf`](#export-pdf), [`export_raster`](#export-raster), [`export_selection_as_svg`](#export-selection-as-svg), [`export_sequence`](#export-sequence), [`export_sequences`](#export-sequences), [`export_svg`](#export-svg), [`export_tagged_assets`](#export-tagged-assets), [`extract_edit`](#extract-edit), [`find_filler_words`](#find-filler-words), [`find_nodes`](#find-nodes), [`find_offline_media`](#find-offline-media), [`find_replace_style`](#find-replace-style), [`find_replace_text`](#find-replace-text), [`fit_to_canvas`](#fit-to-canvas), [`fit_to_margins`](#fit-to-margins), [`flatten_artwork`](#flatten-artwork), [`flatten_group`](#flatten-group), [`flatten_transparency`](#flatten-transparency), [`flip_nodes`](#flip-nodes), [`freeze_frame`](#freeze-frame), [`generate_proxies`](#generate-proxies), [`generate_voiceover`](#generate-voiceover), [`get_action_schema`](#get-action-schema), [`get_artboard_margins`](#get-artboard-margins), [`get_audio_meters`](#get-audio-meters), [`get_canvas_overview`](#get-canvas-overview), [`get_caption_track`](#get-caption-track), [`get_clip`](#get-clip), [`get_clipboard_history`](#get-clipboard-history), [`get_css_preview`](#get-css-preview), [`get_document_bleed`](#get-document-bleed), [`get_document_color_mode`](#get-document-color-mode), [`get_document_dpi`](#get-document-dpi), [`get_document_info`](#get-document-info), [`get_document_state`](#get-document-state), [`get_document_template`](#get-document-template), [`get_engine_status`](#get-engine-status), [`get_graph`](#get-graph), [`get_job_status`](#get-job-status), [`get_keyframes`](#get-keyframes), [`get_node`](#get-node), [`get_node_prompts`](#get-node-prompts), [`get_opentype_features`](#get-opentype-features), [`get_preview_status`](#get-preview-status), [`get_raster_info`](#get-raster-info), [`get_recent_colors`](#get-recent-colors), [`get_scopes`](#get-scopes), [`get_selection`](#get-selection), [`get_stabilization_status`](#get-stabilization-status), [`get_timeline_snapshot`](#get-timeline-snapshot), [`get_transcript`](#get-transcript), [`get_video_capabilities`](#get-video-capabilities), [`get_waveform`](#get-waveform), [`grade_preset`](#grade-preset), [`gradient_fill`](#gradient-fill), [`group_nodes`](#group-nodes), [`hatch_fill`](#hatch-fill), [`import_captions`](#import-captions), [`import_design_tokens`](#import-design-tokens), [`import_media`](#import-media), [`import_motion_metadata`](#import-motion-metadata), [`insert_adjustment_clip`](#insert-adjustment-clip), [`insert_clip`](#insert-clip), [`insert_edit`](#insert-edit), [`insert_space`](#insert-space), [`insert_text_clip`](#insert-text-clip), [`insert_title_template`](#insert-title-template), [`inspect_node`](#inspect-node), [`invert_colors`](#invert-colors), [`join_paths`](#join-paths), [`jump_to_history`](#jump-to-history), [`lasso_select`](#lasso-select), [`layout_nodes`](#layout-nodes), [`lift_edit`](#lift-edit), [`link_clips`](#link-clips), [`link_text_frames`](#link-text-frames), [`liquify`](#liquify), [`list_actions`](#list-actions), [`list_annotations`](#list-annotations), [`list_artboards`](#list-artboards), [`list_audit_log`](#list-audit-log), [`list_bins`](#list-bins), [`list_character_styles`](#list-character-styles), [`list_checkpoints`](#list-checkpoints), [`list_clip_markers`](#list-clip-markers), [`list_clips`](#list-clips), [`list_color_swatches`](#list-color-swatches), [`list_constraints`](#list-constraints), [`list_dimensions`](#list-dimensions), [`list_effect_kinds`](#list-effect-kinds), [`list_event_triggers`](#list-event-triggers), [`list_export_presets`](#list-export-presets), [`list_export_profiles`](#list-export-profiles), [`list_gradient_swatches`](#list-gradient-swatches), [`list_grammar_rules`](#list-grammar-rules), [`list_graphic_styles`](#list-graphic-styles), [`list_guides`](#list-guides), [`list_history`](#list-history), [`list_marker_categories`](#list-marker-categories), [`list_markers`](#list-markers), [`list_media`](#list-media), [`list_paragraph_styles`](#list-paragraph-styles), [`list_patterns`](#list-patterns), [`list_sequences`](#list-sequences), [`list_spot_colors`](#list-spot-colors), [`list_symbols`](#list-symbols), [`list_title_templates`](#list-title-templates), [`list_variables`](#list-variables), [`list_width_profiles`](#list-width-profiles), [`list_workspaces`](#list-workspaces), [`load_swatch_library`](#load-swatch-library), [`load_symbol_library`](#load-symbol-library), [`load_workspace`](#load-workspace), [`magic_wand_select`](#magic-wand-select), [`make_clipping_mask`](#make-clipping-mask), [`make_compound_path`](#make-compound-path), [`make_live_boolean`](#make-live-boolean), [`match_frame`](#match-frame), [`measure_distance`](#measure-distance), [`measure_distances`](#measure-distances), [`measure_nodes`](#measure-nodes), [`measure_path`](#measure-path), [`merge_caption_cues`](#merge-caption-cues), [`merge_layers`](#merge-layers), [`mirror_copy`](#mirror-copy), [`move_artboard`](#move-artboard), [`move_clip`](#move-clip), [`move_clips`](#move-clips), [`move_to_layer`](#move-to-layer), [`noise_deform`](#noise-deform), [`offset_path`](#offset-path), [`outline_stroke`](#outline-stroke), [`overwrite_edit`](#overwrite-edit), [`paste_attributes`](#paste-attributes), [`paste_from_history`](#paste-from-history), [`paste_keyframes`](#paste-keyframes), [`pathfinder_crop`](#pathfinder-crop), [`pathfinder_divide`](#pathfinder-divide), [`pathfinder_merge`](#pathfinder-merge), [`pathfinder_minus_back`](#pathfinder-minus-back), [`pathfinder_minus_front`](#pathfinder-minus-front), [`pathfinder_outline`](#pathfinder-outline), [`pathfinder_trim`](#pathfinder-trim), [`pause`](#pause), [`pin_object_guides`](#pin-object-guides), [`place_image`](#place-image), [`place_symbol`](#place-symbol), [`play`](#play), [`play_action`](#play-action), [`point_on_path`](#point-on-path), [`precision_trim`](#precision-trim), [`preview_selection`](#preview-selection), [`probe_media`](#probe-media), [`proportional_move_anchor`](#proportional-move-anchor), [`pucker_bloat`](#pucker-bloat), [`randomize_colors`](#randomize-colors), [`recolor_artwork`](#recolor-artwork), [`redo`](#redo), [`register_event_trigger`](#register-event-trigger), [`release_clipping_mask`](#release-clipping-mask), [`release_compound_path`](#release-compound-path), [`release_to_layers`](#release-to-layers), [`relink_media`](#relink-media), [`relink_media_batch`](#relink-media-batch), [`remove_all_spaces_after`](#remove-all-spaces-after), [`remove_artboard`](#remove-artboard), [`remove_asset`](#remove-asset), [`remove_background`](#remove-background), [`remove_bin`](#remove-bin), [`remove_caption_track`](#remove-caption-track), [`remove_clip`](#remove-clip), [`remove_clip_marker`](#remove-clip-marker), [`remove_clips_after`](#remove-clips-after), [`remove_constraint`](#remove-constraint), [`remove_dimension`](#remove-dimension), [`remove_effect`](#remove-effect), [`remove_event_trigger`](#remove-event-trigger), [`remove_export_profile`](#remove-export-profile), [`remove_fill`](#remove-fill), [`remove_filler_words`](#remove-filler-words), [`remove_graph_edge`](#remove-graph-edge), [`remove_graph_node`](#remove-graph-node), [`remove_guide`](#remove-guide), [`remove_keyframe`](#remove-keyframe), [`remove_marker`](#remove-marker), [`remove_marker_category`](#remove-marker-category), [`remove_proxy`](#remove-proxy), [`remove_space`](#remove-space), [`remove_stroke`](#remove-stroke), [`remove_track`](#remove-track), [`render_frame_at`](#render-frame-at), [`render_frames_at`](#render-frames-at), [`render_preview`](#render-preview), [`reorder_effects`](#reorder-effects), [`reorder_layers`](#reorder-layers), [`reorder_node`](#reorder-node), [`reorder_track`](#reorder-track), [`replace_clip_source`](#replace-clip-source), [`resize_canvas`](#resize-canvas), [`resolve_annotation`](#resolve-annotation), [`restore_checkpoint`](#restore-checkpoint), [`retouch`](#retouch), [`reverse_blend_spine`](#reverse-blend-spine), [`reverse_node_order`](#reverse-node-order), [`reverse_path_direction`](#reverse-path-direction), [`ripple_edit`](#ripple-edit), [`roll_edit`](#roll-edit), [`rotate_copies`](#rotate-copies), [`roughen_path`](#roughen-path), [`round_corners`](#round-corners), [`run_export_profile`](#run-export-profile), [`sample_color_at`](#sample-color-at), [`save_document`](#save-document), [`save_export_preset`](#save-export-preset), [`save_gradient_swatch`](#save-gradient-swatch), [`save_workspace`](#save-workspace), [`scallop_path`](#scallop-path), [`scatter_copies`](#scatter-copies), [`scissors_cut`](#scissors-cut), [`screenshot`](#screenshot), [`search_actions`](#search-actions), [`seed_marker_categories`](#seed-marker-categories), [`seek`](#seek), [`select_all`](#select-all), [`select_by_kind`](#select-by-kind), [`select_inside_group`](#select-inside-group), [`select_same`](#select-same), [`select_similar`](#select-similar), [`set_active_artboard`](#set-active-artboard), [`set_active_format`](#set-active-format), [`set_active_layer`](#set-active-layer), [`set_active_sequence`](#set-active-sequence), [`set_artboard_margins`](#set-artboard-margins), [`set_asset_bin`](#set-asset-bin), [`set_asset_tags`](#set-asset-tags), [`set_blend_mode`](#set-blend-mode), [`set_blend_spine`](#set-blend-spine), [`set_caption_cue`](#set-caption-cue), [`set_caption_style`](#set-caption-style), [`set_caption_word`](#set-caption-word), [`set_character_metrics`](#set-character-metrics), [`set_clip_audio`](#set-clip-audio), [`set_clip_prop`](#set-clip-prop), [`set_clip_speed`](#set-clip-speed), [`set_constraint`](#set-constraint), [`set_document_bleed`](#set-document-bleed), [`set_document_color_mode`](#set-document-color-mode), [`set_document_dpi`](#set-document-dpi), [`set_effect_param`](#set-effect-param), [`set_effect_zone`](#set-effect-zone), [`set_font_style`](#set-font-style), [`set_font_weight`](#set-font-weight), [`set_grade`](#set-grade), [`set_graph_node_param`](#set-graph-node-param), [`set_keyframe`](#set-keyframe), [`set_layer_mask`](#set-layer-mask), [`set_locked`](#set-locked), [`set_loop_range`](#set-loop-range), [`set_marker`](#set-marker), [`set_master_bus`](#set-master-bus), [`set_node_prompt`](#set-node-prompt), [`set_node_size`](#set-node-size), [`set_opacity`](#set-opacity), [`set_opentype_features`](#set-opentype-features), [`set_paint`](#set-paint), [`set_paragraph_options`](#set-paragraph-options), [`set_preview_zones`](#set-preview-zones), [`set_project_graph`](#set-project-graph), [`set_proxy_mode`](#set-proxy-mode), [`set_selection`](#set-selection), [`set_sequence_format`](#set-sequence-format), [`set_stabilization`](#set-stabilization), [`set_symbol_override`](#set-symbol-override), [`set_tab_stops`](#set-tab-stops), [`set_text_area`](#set-text-area), [`set_text_decoration`](#set-text-decoration), [`set_text_direction`](#set-text-direction), [`set_text_path`](#set-text-path), [`set_track_audio`](#set-track-audio), [`set_track_prop`](#set-track-prop), [`set_transition`](#set-transition), [`set_variable_value`](#set-variable-value), [`set_visibility`](#set-visibility), [`set_work_range`](#set-work-range), [`simplify_path`](#simplify-path), [`slide_clip`](#slide-clip), [`slip_clip`](#slip-clip), [`smooth_path`](#smooth-path), [`snap_to_pixel`](#snap-to-pixel), [`split_caption_cue`](#split-caption-cue), [`split_clip`](#split-clip), [`split_into_grid`](#split-into-grid), [`spray_symbol_instances`](#spray-symbol-instances), [`step`](#step), [`stipple_fill`](#stipple-fill), [`stop_source_audition`](#stop-source-audition), [`style_transfer`](#style-transfer), [`swap_fill_stroke`](#swap-fill-stroke), [`tag_node_for_export`](#tag-node-for-export), [`tag_nodes`](#tag-nodes), [`transcode_media`](#transcode-media), [`transform_copies`](#transform-copies), [`transform_image`](#transform-image), [`trim_clip`](#trim-clip), [`twirl_path`](#twirl-path), [`unbind_text_variable`](#unbind-text-variable), [`undo`](#undo), [`undo_node`](#undo-node), [`ungroup_nodes`](#ungroup-nodes), [`unlink_clips`](#unlink-clips), [`unlink_text_frames`](#unlink-text-frames), [`update_artboard`](#update-artboard), [`update_color_swatch`](#update-color-swatch), [`update_layer`](#update-layer), [`update_marker_category`](#update-marker-category), [`update_node`](#update-node), [`warp_envelope`](#warp-envelope), [`zig_zag_path`](#zig-zag-path)
 
 ---
 
@@ -24,7 +24,7 @@ Insert a new anchor point at the midpoint of every segment in the selected path 
 
 Attach a non-printing text comment to a node or to the document as a whole.
 
-Annotations are stored in the `.photon` file but are completely invisible in all export formats (SVG, PNG, ICO). They are not part of the undo/redo history.
+Annotations are stored in the `.photonic` file but are completely invisible in all export formats (SVG, PNG, ICO). They are not part of the undo/redo history.
 
 Use cases:
 - AI agents recording *why* a design decision was made: "Chose this radius because the brief said 'approachable'."
@@ -50,6 +50,32 @@ Create a new artboard (a named crop/export rectangle) at the given top-left (x, 
 | `x` | number | yes | Top-left X in document units. |
 | `y` | number | yes | Top-left Y in document units. |
 | `name` | string | no | Optional name. Default: 'Artboard N'. |
+
+## `add_caption_track`
+
+Add an empty caption track to a sequence (06 §3.6). Undoable.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `name` | string | no |  |
+
+## `add_clip_marker`
+
+Add a clip-scoped marker. `at` is CLIP-RELATIVE (0 = the clip's first frame) and the marker travels with the clip. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no | Parsed as a duration into the clip, not a sequence timecode. |
+| `at_ticks` | integer | no |  |
+| `category_id` | string | no |  |
+| `color` | string | no | #rrggbb or #rrggbbaa. |
+| `duration_seconds` | number | no |  |
+| `duration_ticks` | integer | no |  |
+| `name` | string | no |  |
+| `note` | string | no |  |
 
 ## `add_color_swatch`
 
@@ -113,6 +139,27 @@ The shadow copy has its fill replaced with the shadow color and stroke removed. 
 | `offset_y` | number | no | Shadow Y offset (default: 5) |
 | `opacity` | number | no | Shadow opacity 0–1 (default: 0.4) |
 
+## `add_edit_all_tracks`
+
+Add Edit to All Tracks (Premiere Ctrl+Shift+K, G-1): split every unlocked track's clip that `at` sits strictly inside, across the whole sequence, as ONE undo step. Returns the number split and their new (right-hand) clip ids; a no-op (no history entry) if nothing is under `at`.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+
+## `add_effect`
+
+Push (or insert at `index`) an effect onto a clip's effect stack, seeded with the kind's registry default params. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `kind` | enum (`blur`, `deflicker`, `invert`, `chroma_key`, `luma_key`, `sharpen`, `glow`, `mask_shape_gen`) | yes |  |
+| `index` | integer | no |  |
+
 ## `add_export_profile`
 
 Save a named export configuration to the document. Profiles store format and quality settings so you can re-export with consistent settings using run_export_profile. If a profile with the same name exists it is replaced.
@@ -126,6 +173,26 @@ Save a named export configuration to the document. Profiles store format and qua
 | `semantic_ids` | boolean | no | SVG-only: emit semantic id attributes (default: true). |
 | `width` | integer | no | Raster-only: output pixel width. |
 
+## `add_graph_edge`
+
+Connect one node's output port to another's input port. Cycle-checked at edit time (01 §8) — fails clean with error_code CycleDetected, never panics.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `from` | object | yes | {node_id, port?} — output port, default 0. |
+| `graph_id` | string | yes |  |
+| `to` | object | yes | {node_id, port?} — input port, default 0. |
+
+## `add_graph_node`
+
+Add a node to a graph (08 §2). `op` is a GraphOp in serde shape, e.g. {"op":"blur"}, {"op":"solid_color"}, {"op":"merge","mode":"normal"}, {"op":"grade","grade":{...}}. Returns node_id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `graph_id` | string | yes |  |
+| `op` | object | yes | GraphOp serde shape (08 §2). |
+| `pos` | array<number> | no | Editor [x, y]. |
+
 ## `add_guide`
 
 Add a ruler guide (horizontal or vertical reference line) at a precise document-unit position. Guides are visible in the editor and stripped from all export formats.
@@ -135,6 +202,45 @@ Add a ruler guide (horizontal or vertical reference line) at a precise document-
 | `orientation` | enum (`horizontal`, `vertical`) | yes | Guide orientation. 'horizontal' creates a fixed-Y line; 'vertical' creates a fixed-X line. |
 | `position` | number | yes | Position in document units. Y coordinate for horizontal guides; X coordinate for vertical guides. |
 | `color` | array<number> | no | Optional RGBA color override as [R, G, B, A] in [0, 1] range. Omit to use the default cyan. |
+
+## `add_marker`
+
+Add a marker to a sequence. Give a duration (or end_tc) to create a RANGED marker — the unit export_per_marker exports. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+| `category_id` | string | no | A MarkerCategory id from list_marker_categories. |
+| `color` | string | no | #rrggbb or #rrggbbaa. |
+| `duration_seconds` | number | no |  |
+| `duration_ticks` | integer | no | 0 (default) = point marker; > 0 = ranged. |
+| `end_tc` | string | no | Alternative to a duration: duration = end_tc - at. |
+| `name` | string | no |  |
+| `note` | string | no |  |
+
+## `add_marker_category`
+
+Add a project marker category. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `color` | string | yes | #rrggbb or #rrggbbaa. |
+| `name` | string | yes |  |
+| `glyph` | enum (`diamond`, `circle`, `square`, `triangle`, `flag`, `bar`) | no |  |
+
+## `add_track`
+
+Append (or insert at `index`) a video or audio track on a sequence. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `kind` | enum (`video`, `audio`) | yes |  |
+| `sequence_id` | string | yes |  |
+| `index` | integer | no | Insertion index within the track's lane; defaults to the end. |
+| `name` | string | no |  |
 
 ## `adjust_colors`
 
@@ -167,6 +273,14 @@ Analyze the visual composition of the current document and return advisory findi
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | no | Optional list of node UUIDs or names to restrict the analysis to. Defaults to all visible nodes. |
+
+## `analyze_stabilization`
+
+Run D-12 stabilization analysis for a clip: estimate gyro bias, integrate the camera orientation, smooth it, apply horizon lock, and solve the crop path. Returns diagnostics including estimated bias, sample rate, clock drift, maximum required zoom, and any frame range that cannot be covered within max_zoom. Does not modify the document and creates no undo step — analysis is generation, not history.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
 
 ## `apply_adjustment`
 
@@ -264,6 +378,16 @@ Arrange the direct children of a Group node in a CSS-grid-style layout: left-to-
 | `gap_y` | number | no | Vertical gap between rows in document units. Default: 8.0. |
 | `padding` | number | no | Offset from origin before placing the first cell. Default: 0.0. |
 
+## `apply_lut`
+
+Attach a 3D LUT (.cube) to the clip's grade stack, importing it as a LUT asset (07 §3.8). Omit/null lut_path to remove the LUT. Replaces any existing LUT on the clip.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `intensity` | number | no | 0..1 blend, default 1.0. |
+| `lut_path` | string | no | Path to a .cube LUT; omit/null removes. |
+
 ## `apply_paragraph_style`
 
 Apply a named paragraph style to one or more text nodes. Only defined attributes are changed.
@@ -326,6 +450,18 @@ Apply all document variables — replaces the text content of every bound text n
 
 _No parameters._
 
+## `apply_video_edit_plan`
+
+Validate or commit a sequence-scoped edit plan as one undo step. Requires expected_revision from get_timeline_snapshot and a unique request_id. dry_run changes nothing. Operations execute in order against isolated state; any failure or concurrent edit rejects all. Retry the identical committed request_id to receive its receipt without repeating edits (retained 10 minutes, bounded cache). A value {"$ref":"0.clip_id"} refers to a previous operation result; dry-run generated IDs are provisional. File, job, transport and undo tools are excluded.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `expected_revision` | integer | yes |  |
+| `operations` | array<any> | yes |  |
+| `request_id` | string | yes |  |
+| `sequence_id` | string | yes |  |
+| `dry_run` | boolean | no |  |
+
 ## `apply_width_profile`
 
 Apply a named width profile to path nodes — sets stroke.width to the profile average. Undo-safe batch command.
@@ -334,6 +470,52 @@ Apply a named width profile to path nodes — sets stroke.width to the profile a
 | --- | --- | --- | --- |
 | `name` | string | yes | Name of the width profile to apply. |
 | `node_ids` | array<string> | yes | Node UUIDs or names to apply the profile to. |
+
+## `attach_proxy`
+
+Attach an existing user-owned proxy file to a file-backed video asset without re-encoding (G-15A). Validates path, video stream, duration (within one source frame) and nominal frame rate. Set allow_mismatch=true to accept mismatches as warnings. Never copies the file. Export still uses originals (CAP-014).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+| `path` | string | yes | Absolute path to the proxy media file. |
+| `allow_mismatch` | boolean | no | If true, duration/frame-rate mismatches become warnings instead of errors. |
+
+## `audio_fx`
+
+Add/remove/reorder an EQ/compressor/limiter/gate unit in a track's pre-fader fx chain (09 §4). op: add (kind, index?) | remove (index) | reorder (new_order).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `op` | enum (`add`, `remove`, `reorder`) | yes |  |
+| `track_id` | string | yes |  |
+| `index` | integer | no |  |
+| `kind` | enum (`eq`, `compressor`, `limiter`, `gate`) | no |  |
+| `new_order` | array<integer> | no |  |
+
+## `audition_source`
+
+Play an explicit probed source interval on the source monitor and local audio output. Program playback pauses; document and sequence playhead stay unchanged. Poll get_engine_status for source_audition and source_audition_error. Requires audio output for audible sources.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+| `end_ticks` | integer | yes |  |
+| `start_ticks` | integer | yes |  |
+
+## `auto_caption`
+
+Transcribe audio into word-level caption cues (CAP-009; async job — poll get_job_status). Supply clip_id (transcribe that clip's asset) or sequence_id. provider defaults to the configured hosted service (set PHOTONIC_TRANSCRIBE_URL/PHOTONIC_TRANSCRIBE_TOKEN); pass provider="mock" with mock_transcript for a deterministic offline/CI run. On completion inserts grouped cues on a new or existing caption track.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | no |  |
+| `language_hint` | string | no |  |
+| `mock_transcript` | string | no | provider=mock only: the deterministic transcript distributed across the target range. |
+| `name` | string | no | Name for a newly-created caption track. |
+| `provider` | enum (`hosted`, `mock`) | no | Default hosted. |
+| `sequence_id` | string | no |  |
+| `track_id` | string | no | Existing caption track to append to; omit to create one. |
 
 ## `auto_name_nodes`
 
@@ -359,6 +541,14 @@ Reposition all on-curve anchor points in each selected path node to their averag
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | yes | IDs of path nodes to average |
 | `axis` | enum (`horizontal`, `vertical`, `both`) | no | Which axis to average (default: both) |
+
+## `batch_set_keyframes`
+
+Set N keyframes (same or different targets/paths) as ONE undo step. Each entry has the same shape as set_keyframe's args.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `ops` | array<object> | yes |  |
 
 ## `bind_text_variable`
 
@@ -489,6 +679,22 @@ Place any number of [x,y] points and connect them in any order to build a filled
 | `stroke` | object | no | Stroke outline. Fields: color (#RRGGBB), width (number), enabled (bool), opacity (0-1), line_cap (butt\|round\|square), line_join (miter\|round\|bevel), align (center\|inside\|outside), dash_array ([dash,gap,...] up to 6 values), dash_offset (number). Example: {"color":"#000000","width":2,"enabled":true,"dash_array":[8,4]} |
 | `tags` | array<string> | no |  |
 
+## `cancel_job`
+
+Request cancellation of an async job. Cooperative: the worker stops at its next check point (between frames for exports; partial output files are removed for transcodes). Cancelling an already-finished job is a no-op, not an error.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | yes |  |
+
+## `cancel_preview`
+
+Cancel queued/current preview rendering for this sequence; no partial chunk is published.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+
 ## `center_on_canvas`
 
 Center selected nodes on the canvas without scaling. Translates all nodes so their combined bounding box is centered. Supports horizontal-only or vertical-only centering.
@@ -550,6 +756,16 @@ Remove the layer mask from a raster node (fully reveal).
 | --- | --- | --- | --- |
 | `node_id` | string | yes |  |
 
+## `clear_preview`
+
+Clear cached playback chunks for this sequence and optional tick range. Active readers finish safely; document zones remain.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `expected_revision` | integer | no |  |
+| `range` | array<integer> | no |  |
+
 ## `clear_symbol_overrides`
 
 Clear all per-instance color overrides on a symbol instance node, reverting it to the master's fill and stroke. Supports undo.
@@ -581,6 +797,18 @@ Remove the path spine from a text node, reverting it to normal positioned text. 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `text_node_id` | string | yes | Text node ID (UUID or name) currently on a path. |
+
+## `close_gap`
+
+Close Gap (G-1): close the gap containing `at` — on just track_id when supplied, or on every unlocked track in the sequence when omitted — as ONE undo step either way. A no-op (no history entry) when there is nothing to close.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+| `track_id` | string | no | Restrict to one track. Omit to close the gap at `at` on every unlocked track in the sequence. |
 
 ## `collect_in_new_layer`
 
@@ -629,6 +857,26 @@ Copy fill, stroke, and/or opacity from one source node to one or more target nod
 | `copy_fill` | boolean | no | Copy fill. Default: true. |
 | `copy_opacity` | boolean | no | Copy opacity. Default: true. |
 | `copy_stroke` | boolean | no | Copy stroke. Default: true. |
+
+## `copy_grade`
+
+Copy one clip's grade (incl. LUT reference) onto N target clips as a single undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `source_clip_id` | string | yes |  |
+| `target_clip_ids` | array<string> | yes |  |
+
+## `copy_keyframes`
+
+K-B11: snapshot keyframe tracks from a target into a serializable clipboard payload (tracks + anchor). Optional `paths` filters which PropPaths to copy. Read-only — returns `{ clipboard }` for paste_keyframes.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `target` | enum (`clip_transform`, `clip_effect`) | yes |  |
+| `effect_index` | integer | no |  |
+| `paths` | array<string> | no | Optional PropPath filter; omit to copy every non-empty track. |
 
 ## `copy_nodes_to_clipboard`
 
@@ -717,6 +965,15 @@ For vertical charts, y is the baseline (bottom) and bars grow upward. For horizo
 | `layer_id` | string | no |  |
 | `width` | number | no | Chart width (default: 300) |
 
+## `create_bin`
+
+Create a media bin (folder), optionally nested under `parent`. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes |  |
+| `parent` | string | no |  |
+
 ## `create_character_style`
 
 Save a named character style to the document. Capture from a source text node or specify attributes explicitly. Styles can be applied to any text node with apply_character_style.
@@ -731,6 +988,16 @@ Save a named character style to the document. Capture from a source text node or
 | `letter_spacing` | number | no |  |
 | `line_height` | number | no | Multiplier e.g. 1.5 = 150%. |
 | `source_node_id` | string | no | Capture font/color from this text node (UUID or name). Explicit args override captured values. |
+
+## `create_clip_composition`
+
+Instantiate a per-clip node composition (D-06): a fresh ClipIn→Output graph bound to the clip (default), a deep-clone paste of an existing graph_id, or detach=true to revert the clip to its plain source. Returns the new graph_id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `detach` | boolean | no | Revert the clip to its plain source. |
+| `graph_id` | string | no | Paste a deep-clone of this existing graph. |
 
 ## `create_cross`
 
@@ -1043,6 +1310,16 @@ Create a scatter plot from X/Y data points. Points are auto-scaled to fit the pl
 | `layer_id` | string | no |  |
 | `width` | number | no | Plot width (default: 300) |
 
+## `create_sequence`
+
+Create a new timeline sequence (creates the timeline project itself, undoably, if this is the first video-mode action). Requires at least one SequenceFormat (aspect-ratio variant, CAP-012). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `formats` | array<object> | yes | At least one SequenceFormat (aspect-ratio variant). |
+| `frame_rate` | object | yes | {"num": 30, "den": 1} — a rational frame rate, e.g. 30000/1001 for 29.97 fps. |
+| `name` | string | yes |  |
+
 ## `create_shape`
 
 Create a primitive shape (rectangle, rounded_rect, ellipse, arc, polygon, star, line). For arc: x,y,width,height define the bounding box; arc_start_angle and arc_end_angle set the sweep in degrees (0=3 o'clock); arc_open=true for open arc, false for closed pie sector.
@@ -1122,6 +1399,19 @@ For vertical charts (default), x/y is the bottom-left corner and bars grow upwar
 | `layer_id` | string | no |  |
 | `series_names` | array<string> | no | Series names for node labeling |
 | `width` | number | no | Chart width (default: 300) |
+
+## `create_subclip`
+
+Create Subclip (26 §9 K-A8): add a zone-bounded pool entry that is a view of parent_asset_id over [in, out). Shares content_hash/proxy/source with the parent (no cache duplication). One undo step (AddAsset). Nested subclips are refused.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `parent_asset_id` | string | yes |  |
+| `in_seconds` | number | no |  |
+| `in_ticks` | integer | no | Source-range start on the parent. |
+| `name` | string | no | Optional label stored as a subclip: tag. |
+| `out_seconds` | number | no |  |
+| `out_ticks` | integer | no | Source-range end (exclusive) on the parent. |
 
 ## `create_sunburst`
 
@@ -1368,6 +1658,14 @@ Remove a named color swatch from the document palette. Does not alter existing n
 | --- | --- | --- | --- |
 | `name` | string | yes | Name of the swatch to delete. |
 
+## `delete_export_preset`
+
+Delete a custom export preset (app-level config — no document mutation, no undo step). Built-ins are read-only and refuse deletion with NotSupportedV1.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes |  |
+
 ## `delete_gradient_swatch`
 
 Delete a named gradient swatch from the document registry. Does not affect nodes that were already painted with this gradient.
@@ -1425,6 +1723,14 @@ Delete a named pattern from the registry. Does not affect nodes already filled w
 | --- | --- | --- | --- |
 | `name` | string | yes | Name of the pattern to delete. |
 
+## `delete_sequence`
+
+Delete a sequence. Fails if referenced by a NestedSequence clip elsewhere (cycle/dangling-ref guard). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+
 ## `delete_spot_color`
 
 Delete a named spot color from the document. Does not alter existing node fills.
@@ -1440,6 +1746,19 @@ Remove a named symbol from the registry. Existing instances are converted to sta
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `name` | string | yes | Symbol name to delete. |
+
+## `delete_transcript_range`
+
+Delete a half-open sequence-time interval from explicit A/V tracks and the caption track, frame-snapped outward. ripple=true closes the gap; false leaves a gap. Atomic with one undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `caption_track_id` | string | yes |  |
+| `end_ticks` | integer | yes |  |
+| `ripple` | boolean | yes |  |
+| `sequence_id` | string | yes |  |
+| `start_ticks` | integer | yes |  |
+| `target_track_ids` | array<string> | yes | All participating dialogue A/V and sync-lock track IDs. Locked participants reject the whole edit. No implicit tracks are added. |
 
 ## `delete_variable`
 
@@ -1470,6 +1789,14 @@ Delete a named workspace preset from the document.
 Clear the selection (deselect all nodes).
 
 _No parameters._
+
+## `detach_proxy`
+
+Clear an asset's proxy reference without deleting the file on disk (G-15A). Safe for Attached user-owned proxies; for Generated cache files prefer remove_proxy if cache cleanup is desired.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
 
 ## `detect_rhythms`
 
@@ -1559,6 +1886,103 @@ Use cases: repeating elements (stars, petals, grid cells), creating variations, 
 | `layer_id` | string | no | Target layer for the copies. Defaults to the source node's own layer. |
 | `offset` | object | no | Position shift applied per copy. Copy 1 shifts by 1×offset, copy 2 by 2×offset, etc. Default: {x: 10, y: 10}. |
 
+## `edit_transcript_word`
+
+Change a caption word's text only, retaining exact timing and style. One undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `caption_track_id` | string | yes |  |
+| `cue_id` | string | yes |  |
+| `sequence_id` | string | yes |  |
+| `text` | string | yes |  |
+| `word_index` | integer | yes |  |
+
+## `effect_favourite_list`
+
+List the user's favourited effect ids in their own order (26 §10 K-B4) — an ordering over the manifest catalogue, not a copy of it. Each entry carries `id`, the manifest `name`, and `available`: false means this build has no manifest for that id, so it is kept untouched (39 §2.2) and simply not offered. Read-only.
+
+_No parameters._
+
+## `effect_favourite_set`
+
+Star or unstar one effect id (app-level config — no document mutation, no undo step). Idempotent: setting the state it already has succeeds and rewrites nothing. Starring an id this build has no manifest for is refused as a typo (see list_effect_kinds); UNstarring one always works, so a library carried from a build with more effects can be pruned.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `favourite` | boolean | yes |  |
+| `id` | string | yes | Stable effect id from list_effect_kinds, e.g. "blur.gaussian". |
+
+## `effect_preset_apply`
+
+Apply a preset (built-in or user) to a scope (26 §10 K-B4). Effects are APPENDED to the existing stack in the preset's own order; a preset's grade REPLACES the scope's grade, and a preset with no grade leaves it alone. Use paste_attributes for wholesale replacement. Exactly ONE undo step regardless of how many effects the preset holds or how many clips it lands on — scope=clip accepts clip_ids for a multi-clip apply, and an unknown id refuses the whole call rather than half-applying.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes | Resolved across built-ins first, then user presets (see effect_preset_list). |
+| `scope` | enum (`clip`, `track`, `master`, `asset`) | yes |  |
+| `asset_id` | string | no | Required for scope=asset. |
+| `clip_id` | string | no | scope=clip, single target. |
+| `clip_ids` | array<string> | no | scope=clip, many targets — applied as ONE batch. Given instead of clip_id. |
+| `sequence_id` | string | no | scope=master; defaults to the active sequence. |
+| `track_id` | string | no | Required for scope=track. |
+
+## `effect_preset_delete`
+
+Delete a user effect preset (app-level config — no document mutation, no undo step). Built-ins are read-only and refuse deletion with NotSupportedV1.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes |  |
+
+## `effect_preset_list`
+
+List effect presets (26 §10 K-B4): the built-in catalogue first, then the user's own saved stacks from <config>/Photonic/effect_presets.json. Each entry carries `name`, `built_in`, `effect_ids`, `effect_count`, `has_grade`, `parameter_preset_for` (set when the preset is a single-effect parameter preset), a one-line `summary`, and `unresolvable_effect_ids` — ids this build has no manifest for, which still apply but land inert (39 §2.2), never dropped. Read-only; presets are app config, so nothing here appears in undo history.
+
+_No parameters._
+
+## `effect_preset_rename`
+
+Rename a user effect preset, keeping its position in the user's ordering (app-level config — no document mutation, no undo step). Refused with NotSupportedV1 if either `from` or `to` names a built-in; renaming onto an existing user preset replaces it.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `from` | string | yes |  |
+| `to` | string | yes |  |
+
+## `effect_preset_save`
+
+Save one scope's current effect stack AND its grade as a named preset (26 §10 K-B4). Addresses the scope exactly as effect_stack does (scope + clip_id/track_id/sequence_id/asset_id). This writes app config, NOT the document: there is no document mutation and no undo step. A built-in name is refused (NotSupportedV1); an existing user name is overwritten in place, keeping its position in the user's ordering. A scope with no effects and no grade is refused — there would be nothing to apply.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes | Preset name. Built-in names are read-only. |
+| `scope` | enum (`clip`, `track`, `master`, `asset`) | yes |  |
+| `asset_id` | string | no | Required for scope=asset. |
+| `clip_id` | string | no | Required for scope=clip. |
+| `sequence_id` | string | no | scope=master; defaults to the active sequence. |
+| `track_id` | string | no | Required for scope=track. |
+
+## `effect_stack`
+
+Edit any of the four video effect stacks (26 §10 K-B1/K-B2): a timeline `clip`, a whole `track`, the sequence `master`, or a bin `asset` (inherited by every instance of that media). Evaluation order is asset -> clip -> track -> master. `op=list` is read-only; `add`/`remove`/`reorder`/`set_param`/`set_grade` are each one undo step. The clip-only add_effect/remove_effect/reorder_effects/set_effect_param tools remain as shorthand for scope=clip.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `op` | enum (`list`, `add`, `remove`, `reorder`, `set_param`, `set_grade`) | yes |  |
+| `scope` | enum (`clip`, `track`, `master`, `asset`) | yes |  |
+| `asset_id` | string | no | Required for scope=asset. |
+| `clip_id` | string | no | Required for scope=clip. |
+| `effect_id` | string | no | op=add: stable manifest id (see list_effect_kinds), e.g. "blur.gaussian". |
+| `grade` | object | no | op=set_grade: a Grade object (07 §1), or null to clear. |
+| `index` | integer | no | op=add insert position (default: append); op=remove / op=set_param target index. |
+| `kind` | enum (`blur`, `deflicker`, `invert`, `chroma_key`, `luma_key`, `sharpen`, `glow`, `mask_shape_gen`) | no | op=add: legacy EffectKind tag, used only when effect_id is absent. |
+| `new_order` | array<integer> | no | op=reorder: a permutation of 0..len. |
+| `path` | string | no | op=set_param: a registry PropPath (e.g. "params.radius"), or the literal "enabled". |
+| `sequence_id` | string | no | scope=master; defaults to the active sequence. |
+| `track_id` | string | no | Required for scope=track. |
+| `value` | object | no | op=set_param: PropValue - {"t":"float","v":number} \| {"t":"vec2","v":[number,number]} \| {"t":"color","v":{"r":n,"g":n,"b":n,"a":n}} \| {"t":"bool","v":boolean} \| {"t":"enum","v":integer} |
+
 ## `enter_isolation_mode`
 
 Enter Isolation Mode for a group: select all direct children of the group, restricting further edits to those children. Equivalent to double-clicking a group in Illustrator. In the GUI, only children of the group are clickable until Escape is pressed.
@@ -1566,6 +1990,15 @@ Enter Isolation Mode for a group: select all direct children of the group, restr
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `group_id` | string | yes | The UUID of the group node to isolate. |
+
+## `execute_action`
+
+Run a tool by name with a params object. Same effect as tools/call. Use after search_actions.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes | Exact tool name from search_actions or tools/list. |
+| `arguments` | object | no | Tool arguments object. |
 
 ## `exit_isolation_mode`
 
@@ -1602,6 +2035,16 @@ Export one or more artboards to raster images — one image per artboard. Return
 Export the retained in-memory MCP audit log as a JSON array (oldest first). Argument summaries are bounded, and the formatted response is capped at 256 KiB; when the retained buffer does not fit, only the oldest entries that fit are returned.
 
 _No parameters._
+
+## `export_captions`
+
+Export a caption track to SRT/VTT/ASS (06 §7). Format inferred from the file extension when omitted. No document mutation.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `path` | string | yes |  |
+| `track_id` | string | yes |  |
+| `format` | enum (`srt`, `vtt`, `ass`) | no |  |
 
 ## `export_design_tokens`
 
@@ -1652,7 +2095,7 @@ Export the current canvas as a raster image (PNG, JPEG, WebP, GIF, or TIFF). Ret
 
 PNG is lossless with optional transparency. JPEG is lossy with configurable quality (1–100) and always has a white background. WebP is lossy with transparency support and configurable quality. TIFF is lossless with full RGBA support, suitable for print workflows. Use this to obtain a file-ready raster export without the GUI file menu.
 
-Optionally specify width/height to resize the output. Each supplied dimension is limited to 16384 pixels per side and a paired resize is limited to 67108864 pixels total. If omitted, the capture uses the current canvas dimensions.
+Optionally specify width/height to resize the output. If omitted, the capture uses the current canvas dimensions.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -1674,6 +2117,29 @@ Export specific nodes (or the current selection) as a clean, minimal SVG. Each n
 | `normalize` | enum (`tight`, `square`) | no | viewBox framing. 'tight' (default) = union bounding box; 'square' = uniform centered square so a set of icons frames identically. |
 | `pad` | number | no | Padding as a fraction of the square side when normalize='square' (e.g. 0.1 = 10%). Default 0. |
 | `precision` | integer | no | Decimal places for coordinates and path data (default: 4). Prevents 15-decimal path bloat. |
+
+## `export_sequence`
+
+Start an export job (02 §7; async — poll get_job_status, cancellable between frames). Renders the timeline as snapshotted at call time through a dedicated engine session and encodes via the ffmpeg sidecar. Range defaults to the sequence work range, else [0, content end). When the preset has an audio slot, sequence audio is mixed offline and muxed (K-0.7), with optional LoudnessTarget gain. Upscaling beyond the format size returns NotSupportedV1.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `out_path` | string | yes | Destination file path. Extension should match the preset container. |
+| `sequence_id` | string | yes |  |
+| `expected_revision` | integer | no | Optional revision precondition from get_timeline_snapshot. |
+| `format_index` | integer | no | Which SequenceFormat to export. Default: the active format. |
+| `overrides` | object | no | Width/height together; nearest-source-frame retiming for an explicit frame rate. |
+| `preset` | string | no | Preset name (see list_export_presets). Default "Web H.264". |
+| `range` | object | no | Half-open range; ticks > tc > seconds precedence per bound. |
+
+## `export_sequences`
+
+Export 1–8 outputs from one revision-pinned snapshot. Resolve every destination/preset before job admission; compatible outputs share evaluated frames in groups of at most four. Poll get_job_status or cancel_job. Each destination publishes atomically; a completed output remains if a later output fails or is cancelled. Full-quality originals and embedded vector content are preserved.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `expected_revision` | integer | yes |  |
+| `outputs` | array<object> | yes |  |
 
 ## `export_svg`
 
@@ -1702,6 +2168,25 @@ Export all nodes tagged via tag_node_for_export. SVG assets are returned inline;
 | --- | --- | --- | --- |
 | `filter` | string | no | Only export assets whose name contains this string. |
 
+## `extract_edit`
+
+Extract edit (Premiere '\''): remove clip content in `range` on track_id AND ripple everything after it left to close the gap (generalizes remove_clip's ripple flag to an arbitrary range). The track's content shrinks by the range width, as ONE undo step; a no-op (no history entry) if nothing overlaps the range.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `range` | object | yes | {"start_ticks"\|"start_tc"\|"start_seconds":...,"end_ticks"\|"end_tc"\|"end_seconds":...} — both bounds required, ticks > tc > seconds precedence per bound. |
+| `track_id` | string | yes |  |
+
+## `find_filler_words`
+
+Preview local exact-token filler matches (default um, uh, erm, er, hmm). No timeline mutation. Omit excluded matches when calling remove_filler_words.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `caption_track_id` | string | yes |  |
+| `sequence_id` | string | yes |  |
+| `lexicon` | array<string> | no |  |
+
 ## `find_nodes`
 
 Query nodes by tag, name, type, layer, visibility, or world-space region. All filters are optional and combine with AND. Empty call returns all nodes up to limit. Results are unordered. 'count' = nodes returned; check 'truncated' if limit was reached.
@@ -1717,6 +2202,12 @@ Query nodes by tag, name, type, layer, visibility, or world-space region. All fi
 | `tags` | array<string> | no | Node must have ALL these tags |
 | `tags_any` | array<string> | no | Node must have ANY of these tags |
 | `visible_only` | boolean | no | Exclude invisible nodes (default: false) |
+
+## `find_offline_media`
+
+List every media-pool asset whose file is not reachable, with its recorded content_hash and the number of timeline clips that would go offline with it. The inventory a relink starts from (26 K-C6).
+
+_No parameters._
 
 ## `find_replace_style`
 
@@ -1811,11 +2302,63 @@ Flip/mirror nodes horizontally or vertically around their bounding box center. P
 | `axis` | enum (`horizontal`, `vertical`) | yes | Flip axis |
 | `node_ids` | array<string> | no | Node IDs. Empty = use selection. |
 
+## `freeze_frame`
+
+Freeze Frame (26 §10 K-B14): hold the source frame visible at clip-relative `at_*` for the clip's whole timeline duration. Writes `source_in` to that source tick and sets speed to constant zero — not a new effect kind; the existing zero-rate SpeedMap path is the model. One undo step. Already-frozen at the same frame is a no-op (no history entry). Mid-clip freeze-then-resume is expressible via set_clip_speed with a zero-rate keyframed segment; this tool freezes the whole slot. Generators (solid/text/adjustment) accept the same verb (their source is time-invariant).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes | Clip to freeze. |
+| `at_seconds` | number | no | Clip-relative seconds of the frame to hold. |
+| `at_tc` | string | no | Clip-relative timecode of the frame to hold. |
+| `at_ticks` | integer | no | Clip-relative tick of the frame to hold. Precedence: at_ticks > at_tc > at_seconds. Omit for the first frame. |
+
+## `generate_proxies`
+
+Batch-generate editing proxies (02 §6; async job — poll get_job_status, cancellable). Transcodes each file-backed video asset to a half-res, all-intra H.264/MP4 proxy via the ffmpeg sidecar, stored in the sidecar cache dir keyed by content hash and attached to MediaAsset.proxy (status pending→ready). ForceProxy then decodes the proxy where present. Reuses a cached proxy unless force=true. Proxies are never required for correctness (CAP-014).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_ids` | array<string> | yes |  |
+| `force` | boolean | no |  |
+
+## `generate_voiceover`
+
+Synthesize speech and place it as an audio clip sized to the returned audio (CAP-011; async job — poll get_job_status). provider defaults to the configured hosted TTS (PHOTONIC_TTS_URL/PHOTONIC_TTS_TOKEN); pass provider="mock" for deterministic offline synthesis. also_caption adds word-level captions from the provider's alignment.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `text` | string | yes |  |
+| `track_id` | string | yes |  |
+| `also_caption` | boolean | no |  |
+| `caption_track_id` | string | no |  |
+| `provider` | enum (`hosted`, `mock`) | no |  |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no |  |
+| `start_ticks` | integer | no |  |
+| `voice` | string | no |  |
+
+## `get_action_schema`
+
+Get one complete tool definition by exact name, including inputSchema, outputSchema when available, and behavior annotations. No tool is executed.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes | Exact, case-sensitive tool name. |
+
 ## `get_artboard_margins`
 
 Return the current artboard safe-area margin values (top, right, bottom, left in document units). Read-only.
 
 _No parameters._
+
+## `get_audio_meters`
+
+Current/peak levels per track + master (09 §5). Live meters live inside the interactive audio mixer, which the headless MCP engine bridge does not run — returns NotSupportedV1.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
 
 ## `get_canvas_overview`
 
@@ -1824,6 +2367,22 @@ Return a compact spatial map of all visible nodes: bounding box, layer, kind, an
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `include_hidden` | boolean | no | When true, include hidden nodes in the overview. Default: false. |
+
+## `get_caption_track`
+
+Full cue + word + style dump for one caption track (folds list_caption_cues).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `track_id` | string | yes |  |
+
+## `get_clip`
+
+Full clip dump — timing, source, transform (incl. keyframe tracks), reframe overrides, effects, grade, composition ref, transitions, audio, speed.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
 
 ## `get_clipboard_history`
 
@@ -1880,6 +2439,40 @@ Capture the current document as a reusable template — preserving canvas size, 
 
 _No parameters._
 
+## `get_engine_status`
+
+Engine status snapshot (EngineStatus, 02 §1): playhead tick, playing flag, dropped-frame count, node-cache stats, audio xruns, snapshot doc revision, active sequence, and the most recent engine command error.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | no | Informational — the engine session is a per-process singleton (10 §2). |
+
+## `get_graph`
+
+Full node/edge/param dump for a graph, plus structural diagnostics (cycle / missing Output) and a compiles flag.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `graph_id` | string | yes |  |
+
+## `get_job_status`
+
+Poll an async job (export/probe/transcode — one registry, 10 §6). States: queued | running {progress, message} | done {result} | failed {error_code, message} | cancelled. Terminal jobs are retained 10 minutes, then evicted (JobNotFound).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `job_id` | string | yes |  |
+
+## `get_keyframes`
+
+Full PropertyTrack list (all keyframes) for a target.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `target` | enum (`clip_transform`, `clip_effect`) | yes |  |
+| `effect_index` | integer | no | Required when target=clip_effect. |
+
 ## `get_node`
 
 Get full details of a node by ID or name
@@ -1905,6 +2498,14 @@ Return the active OpenType feature tags on a text node. Read-only.
 | --- | --- | --- | --- |
 | `node_id` | string | yes | Text node ID or name. |
 
+## `get_preview_status`
+
+Read per-chunk preview state and aggregate cache pressure for a sequence.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+
 ## `get_raster_info`
 
 Read-only: report a raster node's dimensions, whether it has a layer mask, its source file, and a 16-bucket luma histogram.
@@ -1919,11 +2520,85 @@ Return the list of recently used fill and stroke colors for this document, order
 
 _No parameters._
 
+## `get_scopes`
+
+Waveform/vectorscope/histogram data for a clip at a tick (07 §5) — data, not an image (the UI/agent renders it). Renders the frame headlessly (requires a GPU adapter, else EngineUnavailable). Reads the K-E2 per-clip tap by default: the clip's own texture after its Grade, before the track fold and CaptionOverlay (03 §3.6), so a clip under a caption track or another video track is measured, not the composite. Returns full luma/RGB histograms, a down-sampled luma waveform, a 32x32 vectorscope grid, and `tap` naming the readback point actually used.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+| `format_index` | integer | no |  |
+| `tap` | enum (`clip`, `program`) | no | Readback point (K-E2). 'clip' (default) = the clip's post-Grade, pre-fold texture; 'program' = the folded sequence pre-CaptionOverlay. A 'clip' tap the frame does not contain falls back to 'program' and says so in `tap`/`tap_fallback_reason`. |
+
 ## `get_selection`
 
 Return the current selection — list of selected node IDs with name, kind, visibility, and lock state. Read-only.
 
 _No parameters._
+
+## `get_stabilization_status`
+
+Report a clip's D-12 stabilization state — motion source, lens profile, strength settings, crop mode, sync-anchor count, and whether an analysis exists — without running anything. Location-bearing detail is redacted: only file names are returned, never full paths.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+
+## `get_timeline_snapshot`
+
+Read a bounded, stably ordered sequence snapshot with revision, tracks, clip/source timing, asset IDs, formats and preview zones. Use next_page offset+expected_revision with the same scope. Rejects stale pagination. Pass revision to apply_video_edit_plan. Source end may precede start for reverse speed; source_extent covers ramps.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `end_ticks` | integer | no |  |
+| `expected_revision` | integer | no |  |
+| `include_effects` | boolean | no |  |
+| `limit` | integer | no |  |
+| `offset` | integer | no |  |
+| `start_ticks` | integer | no |  |
+| `track_ids` | array<string> | no |  |
+
+## `get_transcript`
+
+Get derived word-timed transcript tokens from an explicitly chosen sequence/caption track. Read-only; paginated (default 1000, max 10000). Continuation pages require expected_revision from the first page.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `caption_track_id` | string | yes |  |
+| `sequence_id` | string | yes |  |
+| `expected_revision` | integer | no |  |
+| `limit` | integer | no |  |
+| `offset` | integer | no |  |
+
+## `get_video_capabilities`
+
+Read implemented video editing, transcript, inspection and export capabilities and limits. GPU initialization is null until first render/status call; false indicates failed initialization. FFmpeg availability is probed locally. Obtain full schemas with get_action_schema.
+
+_No parameters._
+
+## `get_waveform`
+
+Decoded waveform peak-pyramid summary for an asset or clip's asset (09 §8), sidecar-cached by content hash (01 §9); built via the ffmpeg audio decoder on a cache miss. Returns per-channel [min, max, rms] peak buckets (not an image). Supply asset_id or clip_id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | no |  |
+| `clip_id` | string | no |  |
+| `resolution` | integer | no | Target peak buckets per channel, default 512. |
+
+## `grade_preset`
+
+Save the current clip grade as a named app-level preset, apply a preset to a clip, or list preset names. op: save (clip_id+name) | apply (clip_id+name) | list.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `op` | enum (`save`, `apply`, `list`) | yes |  |
+| `clip_id` | string | no |  |
+| `name` | string | no |  |
 
 ## `gradient_fill`
 
@@ -1965,6 +2640,16 @@ Useful for engraving style, technical drawing shading, woodcut effects, and deco
 | `spacing` | number | no | Spacing between lines (default: 5) |
 | `stroke_width` | number | no | Line width (default: 1) |
 
+## `import_captions`
+
+Import SRT/VTT/ASS subtitles onto an existing caption track (06 §7). Format inferred from the file extension when omitted.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `path` | string | yes |  |
+| `track_id` | string | yes |  |
+| `format` | enum (`srt`, `vtt`, `ass`) | no |  |
+
 ## `import_design_tokens`
 
 Counterpart to export_design_tokens: register named color swatches from a design-tokens payload so brand colors can be referenced by name (via apply_color_swatch) instead of hard-coded into every fill/gradient. Accepts CSS custom properties (:root { --brand-primary: #2f56cf }), flat or nested JSON, and Style Dictionary ({ "value": "#hex" }) — auto-detected. Hex values are normalized; existing swatches with the same name are updated. When the brand palette shifts, re-importing re-themes everything referencing those swatches.
@@ -1976,6 +2661,113 @@ Counterpart to export_design_tokens: register named color swatches from a design
 | `format` | enum (`auto`, `css`, `json`) | no | Parse hint (default: auto — CSS if it doesn't start with { or [, else JSON). |
 | `path` | string | no | Path to a tokens file to read. Provide this OR `content`. |
 | `prefix` | string | no | Optional prefix prepended to every imported swatch name (e.g. 'brand/'). |
+
+## `import_media`
+
+Register one or more files as MediaAsset(s) in the media pool. probe is always null at this phase (ffprobe integration is P3) — the result flags each asset probed:false. Content-hashes each file now (head+tail+len digest) as a relink identity. `bin` names a bin to file the imported asset(s) under, looked up by exact name and created (top-level) if it doesn't exist. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `paths` | array<string> | yes |  |
+| `bin` | string | no | Bin name to file the imported asset(s) under; created if it doesn't exist. |
+
+## `import_motion_metadata`
+
+Bind a gyro/IMU sidecar to a clip for D-12 stabilization. Accepts Gyroflow-compatible `.gcsv` or Photonic gyro JSON. The file is parsed immediately and rejected with a located error if malformed — an unknown axis convention or unit hard-fails rather than being guessed. Without `lens_profile_path` only rotation is corrected, not lens distortion. Call analyze_stabilization next. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `path` | string | yes | Path to a .gcsv or Photonic gyro JSON sidecar. |
+| `horizon_lock` | number | no | 0..1 gravity-referenced levelling. Requires accelerometer data in the motion source; has no effect without it. Default 0. |
+| `lens_profile_path` | string | no | Optional lens-calibration JSON (camera_matrix + 4 Kannala-Brandt distortion coefficients). Omit for rotation-only correction. |
+| `smoothness` | number | no | 0..1. 0 follows the original camera motion exactly; 1 is maximally smooth and demands the most crop. Default 0.5. |
+
+## `insert_adjustment_clip`
+
+Adjustment-layer clip (G-7): create a no-media ClipSource::Adjustment clip spanning [start, start+duration) on track_id — its effect stack/grade composites over every lower track beneath its span (engine side). Returns the new clip's id. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `duration_ticks` | integer | yes |  |
+| `track_id` | string | yes |  |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no |  |
+| `start_ticks` | integer | no |  |
+
+## `insert_clip`
+
+Insert a new clip on a track. Time args follow ticks > tc > seconds precedence (at_tc requires the track's sequence context, resolved automatically). Fails on overlap with an existing clip, non-positive duration, or a NestedSequence cycle. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `duration_ticks` | integer | yes | Always exact ticks — no dual-unit ambiguity. |
+| `source` | object | yes | ClipSource — {"kind":"asset","asset_id":...} \| {"kind":"vector","asset_id":...} \| {"kind":"nested_sequence","sequence_id":...} \| {"kind":"solid_color","color":"#rrggbb"} \| {"kind":"adjustment"} |
+| `track_id` | string | yes |  |
+| `name` | string | no |  |
+| `source_in_seconds` | number | no |  |
+| `source_in_tc` | string | no |  |
+| `source_in_ticks` | integer | no |  |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no | HH:MM:SS:FF or HH:MM:SS;FF |
+| `start_ticks` | integer | no |  |
+
+## `insert_edit`
+
+Insert edit (3-point, Premiere ','): open a gap of source's duration at `at` on track_id — splitting any clip straddling `at` and rippling every clip at/after `at` on that track right — then drop source into the gap. The track's content grows by the source duration, as ONE undo step. Time/source args mirror insert_clip (at_* plays start_*'s role). Returns the new clip's id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `duration_ticks` | integer | yes | Always exact ticks — no dual-unit ambiguity. |
+| `source` | object | yes | ClipSource — {"kind":"asset","asset_id":...} \| {"kind":"vector","asset_id":...} \| {"kind":"nested_sequence","sequence_id":...} \| {"kind":"solid_color","color":"#rrggbb"} \| {"kind":"adjustment"} |
+| `track_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no | HH:MM:SS:FF or HH:MM:SS;FF |
+| `at_ticks` | integer | no |  |
+| `name` | string | no |  |
+| `source_in_seconds` | number | no |  |
+| `source_in_tc` | string | no |  |
+| `source_in_ticks` | integer | no |  |
+
+## `insert_space`
+
+Insert Space (26 §9 K-A3): open empty timeline of `amount` (default 1s) at `at` on every unlocked track — later clips shift right. Sequence markers at/after the point shift with the space. One undo step. Locked tracks are skipped.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `amount_seconds` | number | no | Gap width in seconds (default 1.0 if neither amount_* supplied). |
+| `amount_ticks` | integer | no | Gap width in ticks. Prefer over amount_seconds. |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no | Sequence-relative insert point. Precedence: at_ticks > at_tc > at_seconds. |
+
+## `insert_text_clip`
+
+Title/text clip (G-12): create a ClipSource::Text title/graphics clip spanning [start, start+duration) on track_id. `style` patches CaptionStyle::default() using the same partial-style vocabulary as set_caption_style (font_family/font_size/weight/fill/position/max_width) — omit for the default style. Returns the new clip's id. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `duration_ticks` | integer | yes |  |
+| `text` | string | yes |  |
+| `track_id` | string | yes |  |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no |  |
+| `start_ticks` | integer | no |  |
+| `style` | object | no | Partial CaptionStyle patch: {"font_family":str,"font_size":number,"weight":int,"fill":"#rrggbb","position":[x,y],"max_width":number} — every field optional. |
+
+## `insert_title_template`
+
+Insert a vector title template onto the timeline as an embedded VectorDoc clip (05 §4b). The template library is not shipped in this build (P6) — returns NotSupportedV1.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `template` | string | yes |  |
+| `track_id` | string | yes |  |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no |  |
+| `start_ticks` | integer | no |  |
+| `text_overrides` | object | no |  |
 
 ## `inspect_node`
 
@@ -2061,6 +2853,24 @@ Returns the number of nodes moved. The operation is a single undoable step.
 | `x` | number | no | X coordinate of the layout origin. Defaults to the left edge of the current selection. |
 | `y` | number | no | Y coordinate of the layout origin. Defaults to the top edge of the current selection. |
 
+## `lift_edit`
+
+Lift edit (Premiere ';'): remove clip content in `range` on track_id, leaving a gap (no ripple). Timeline duration is unchanged. ONE undo step; a no-op (no history entry) if nothing overlaps the range.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `range` | object | yes | {"start_ticks"\|"start_tc"\|"start_seconds":...,"end_ticks"\|"end_tc"\|"end_seconds":...} — both bounds required, ticks > tc > seconds precedence per bound. |
+| `track_id` | string | yes |  |
+
+## `link_clips`
+
+Link two clips (e.g. a split A/V pair) into the same link group so a future move can carry them together. Reuses whichever clip's group already exists, or mints a fresh one. Both clips must be in the same sequence. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id_a` | string | yes |  |
+| `clip_id_b` | string | yes |  |
+
 ## `link_text_frames`
 
 Link two text nodes as a threaded text chain so that content overflow from the upstream frame flows into the downstream frame. Both nodes must be text nodes. Supports undo.
@@ -2108,13 +2918,19 @@ _No parameters._
 
 Return the most recent MCP tool calls recorded since the server started.
 
-Each entry includes: `id` (sequential), `timestamp` (ISO 8601), `tool_name`, `args` (a bounded structural summary), `result_summary` (first 200 chars of result text), `duration_ms`, and `is_error`. Responses are capped at a fixed byte budget.
+Each entry includes: `id` (sequential), `timestamp` (ISO 8601), `tool_name`, `args` (full arguments), `result_summary` (first 200 chars of result text), `duration_ms`, and `is_error`.
 
-Useful for multi-agent accountability: see what was called, by whom (if the calling agent passes an `author` in its args), and with which bounded parameters.
+Useful for multi-agent accountability: see exactly what was called, by whom (if the calling agent passes an `author` in its args), and with what parameters.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `limit` | integer | no | Maximum number of entries to return, newest first. Default: 50, maximum: 1000. |
+
+## `list_bins`
+
+List every media bin (folder) in the pool.
+
+_No parameters._
 
 ## `list_character_styles`
 
@@ -2127,6 +2943,25 @@ _No parameters._
 List all saved document checkpoints, including their IDs, names, and creation times. Use these IDs with diff_checkpoints or restore_checkpoint.
 
 _No parameters._
+
+## `list_clip_markers`
+
+List a clip's own markers. Each entry carries the clip-relative `at` plus the derived `sequence_tick`.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+
+## `list_clips`
+
+List clips, optionally filtered by track, sequence, and/or a [range_start_ticks, range_end_ticks) time range.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `range_end_ticks` | integer | no |  |
+| `range_start_ticks` | integer | no |  |
+| `sequence_id` | string | no |  |
+| `track_id` | string | no |  |
 
 ## `list_color_swatches`
 
@@ -2146,9 +2981,21 @@ List all dimension annotations in the document, including their IDs, node refere
 
 _No parameters._
 
+## `list_effect_kinds`
+
+Registry introspection sourced from the effect manifest catalogue (spec 30 §2.7). Returns `effect_kinds`: one entry per manifest with `id`, `version`, `name`, `category`, `arity`, the legacy `kind` tag, and a `params` table (each `{path, kind, default, range, animatable, ui, group, display}`) — lets an agent discover effects and their param ranges without guessing.
+
+_No parameters._
+
 ## `list_event_triggers`
 
 List all registered script event triggers in the document. Read-only.
+
+_No parameters._
+
+## `list_export_presets`
+
+List export presets: the built-in catalog (05 §3.5, read-only) plus user-saved custom presets. Each entry is the full ExportPreset serde shape plus a built_in flag — use it as the template for save_export_preset.
 
 _No parameters._
 
@@ -2190,6 +3037,28 @@ Return the most recent edit history entries from the undo stack, newest first. U
 | --- | --- | --- | --- |
 | `limit` | integer | no | Maximum entries to return. Default: 20. |
 
+## `list_marker_categories`
+
+List the project's marker categories (id, name, colour, glyph).
+
+_No parameters._
+
+## `list_markers`
+
+List a sequence's markers.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+
+## `list_media`
+
+List media-pool assets with probe/proxy status, content hash, and bin. `bin` filters to assets filed under the bin with that exact name.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `bin` | string | no |  |
+
 ## `list_paragraph_styles`
 
 List all named paragraph styles saved in the document.
@@ -2202,6 +3071,12 @@ List all named patterns in the document pattern registry, with their tile dimens
 
 _No parameters._
 
+## `list_sequences`
+
+List all sequences in the timeline project.
+
+_No parameters._
+
 ## `list_spot_colors`
 
 List all named spot colors defined in the document.
@@ -2211,6 +3086,12 @@ _No parameters._
 ## `list_symbols`
 
 List all named symbols defined in the document, including master node names and IDs.
+
+_No parameters._
+
+## `list_title_templates`
+
+List available vector title/lower-third templates (05 §4b). The shipped built-in library is a P6 deliverable not yet present in this build, so this returns an empty catalog.
 
 _No parameters._
 
@@ -2295,6 +3176,17 @@ Group two or more path nodes into a NON-DESTRUCTIVE live boolean. Unlike boolean
 | `operation` | enum (`union`, `intersect`, `subtract`, `exclude`, `divide`) | yes | The boolean operator to apply across the operands. |
 | `name` | string | no | Optional name for the live-boolean group. |
 
+## `match_frame`
+
+Match Frame (Premiere F, G-3): from clip_id, compute the source-media tick that lines up with timeline position `at` (which must fall within the clip's span). Read-only — no mutation, no undo step. Returns the matching source tick and the clip's asset id (null for generator/adjustment/text clips) so the caller can feed replace_clip_source/insert_edit/overwrite_edit.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+
 ## `measure_distance`
 
 Measure the distance between two points or two nodes. Returns distance, delta X/Y, and angle.
@@ -2332,6 +3224,15 @@ Measure a path's total arc length, anchor count, segment count, bounding box, an
 | --- | --- | --- | --- |
 | `node_id` | string | yes | Path node UUID or name |
 
+## `merge_caption_cues`
+
+Merge two cues on the same caption track into one (CaptionCmd::MergeCues).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `cue_id_a` | string | yes |  |
+| `cue_id_b` | string | yes |  |
+
 ## `merge_layers`
 
 Merge two or more layers into one. All nodes from source layers are moved into the target layer (the first layer among those selected in document stack order). Empty source layers are then removed. Optional target_name renames the surviving layer. Single undoable step.
@@ -2359,6 +3260,28 @@ Move an artboard together with all content/nodes inside it by (dx, dy), as one u
 | `artboard_id` | string | yes | UUID of the artboard to move (from list_artboards). |
 | `dx` | number | yes | Horizontal movement in document units. |
 | `dy` | number | yes | Vertical movement in document units. |
+
+## `move_clip`
+
+Move a clip to a new start position, optionally onto a different track of the same kind (`new_track_id`, cross-track move — the destination must have room, non-overlap enforced). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `new_start_seconds` | number | no |  |
+| `new_start_tc` | string | no |  |
+| `new_start_ticks` | integer | no |  |
+| `new_track_id` | string | no | Omit for a same-track move. Must be the same TrackKind (video/audio) as the clip's current track. |
+
+## `move_clips`
+
+Shift several clips along the timeline by one shared time delta and optional same-kind track_delta (lane index offset), preserving relative spacing, in a single undo step. Linked partners ride along automatically and are never moved twice. The move is refused as a whole if any clip would land on a clip outside the set, before zero, or off the lane list; collisions *within* the set are fine, since the set is displaced as a body.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_ids` | array<string> | yes | All must be in the same sequence. |
+| `delta_ticks` | integer | yes | Signed time offset applied to every clip. Negative moves earlier. |
+| `track_delta` | integer | no | Same-kind lane-index offset (0 = stay on track). Video and audio lists are separate. |
 
 ## `move_to_layer`
 
@@ -2401,6 +3324,33 @@ Convert the stroke on each selected path node into a new filled closed path that
 | `node_ids` | array<string> | yes | UUIDs of path nodes to outline. Each must be a path node with an enabled stroke. |
 | `keep_original` | boolean | no | Unused — reserved for future use. The original node is always retained with its stroke disabled. Default: false. |
 
+## `overwrite_edit`
+
+Overwrite edit (Premiere '.'): drop source at `at` on track_id, replacing whatever it covers — trimming partially-covered clips, removing fully-covered ones, splitting a clip that spans the region — with NO ripple, as ONE undo step. Timeline duration is unchanged unless source extends past the old end. Same args shape as insert_edit. Returns the new clip's id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `duration_ticks` | integer | yes | Always exact ticks — no dual-unit ambiguity. |
+| `source` | object | yes | ClipSource — {"kind":"asset","asset_id":...} \| {"kind":"vector","asset_id":...} \| {"kind":"nested_sequence","sequence_id":...} \| {"kind":"solid_color","color":"#rrggbb"} \| {"kind":"adjustment"} |
+| `track_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no | HH:MM:SS:FF or HH:MM:SS;FF |
+| `at_ticks` | integer | no |  |
+| `name` | string | no |  |
+| `source_in_seconds` | number | no |  |
+| `source_in_tc` | string | no |  |
+| `source_in_ticks` | integer | no |  |
+
+## `paste_attributes`
+
+Paste Attributes (26 §10 K-B15): copy one clip's LOOK onto other, already-existing clips — effect stack, grade, transform (pos/scale/rotation/anchor/opacity + its keyframes) and clip audio (gain/fades/channel map). Timing is never touched: start, duration, source, source_in, speed, transitions, composition and per-format reframe all stay as they are, so this is NOT a clip copy (use insert_clip to lay down a new clip). Pasting onto N clips is ONE undo step. Targets that already match are skipped and reported in `skipped`. Refused if the grade carries a Lut3d whose asset is not in this project, or if any target clip id is unknown (no partial paste).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `source_clip_id` | string | yes | The clip whose look is copied. |
+| `target_clip_ids` | array<string> | yes | Clips to stamp it onto; must be non-empty. May span tracks and sequences. |
+| `attributes` | array<enum (`effects`, `grade`, `transform`, `audio`)> | no | Families to transfer. Omit for all four; an empty array is refused. An unlisted family leaves the target's own value untouched (it is not reset). |
+
 ## `paste_from_history`
 
 Paste nodes from a clipboard history entry into the document.
@@ -2415,6 +3365,20 @@ An optional pixel offset shifts the pasted nodes relative to their original posi
 | `layer_id` | string | no | Target layer UUID. Defaults to the document's active layer. |
 | `offset_x` | number | no | Horizontal offset in pixels applied to pasted nodes. Default: 0. |
 | `offset_y` | number | no | Vertical offset in pixels applied to pasted nodes. Default: 0. |
+
+## `paste_keyframes`
+
+K-B11: paste a keyframe clipboard onto a target as ONE undo batch. `mapping` remaps source→dest paths (unmapped keep identity). `offset_ticks` adds to every keyframe time, or set `reanchor_ticks` so the clipboard anchor lands at that clip-relative tick.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `clipboard` | object | yes | KeyframeClipboard from copy_keyframes (tracks + anchor). |
+| `target` | enum (`clip_transform`, `clip_effect`) | yes |  |
+| `effect_index` | integer | no |  |
+| `mapping` | array<object> | no |  |
+| `offset_ticks` | integer | no | Added to every keyframe at; ignored if reanchor_ticks is set. |
+| `reanchor_ticks` | integer | no | Land clipboard.anchor at this clip-relative tick. |
 
 ## `pathfinder_crop`
 
@@ -2474,6 +3438,12 @@ Remove hidden portions of each selected path node by subtracting all paths above
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | yes | Two or more path node IDs to trim. |
 
+## `pause`
+
+Pause playback (EngineCmd::Pause). Session state only — no undo step. Returns the engine status snapshot including the paused playhead tick.
+
+_No parameters._
+
 ## `pin_object_guides`
 
 Create persistent ruler guides at the edges and/or center of selected nodes. Guides remain visible across editing sessions and serve as precision alignment references. Deduplicates — existing guides within 0.5 px are not duplicated.
@@ -2506,6 +3476,14 @@ Place an instance of a named symbol at the given position. The instance is a clo
 | `x` | number | no | X position (document units). Default: 0. |
 | `y` | number | no | Y position (document units). Default: 0. |
 
+## `play`
+
+Start playback on the video engine (EngineCmd::Play). Session state only — no undo step. Audio opens lazily; on machines with no audio device playback proceeds on a soft clock instead of failing. Returns the engine status snapshot.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | no | Sequence to activate before playing. Omit to keep the engine's current active sequence. |
+
 ## `play_action`
 
 Play a named action set, executing each recorded step in order. Optional substitutions replace node IDs or names from the recording with new values for the current run. Stops at first error.
@@ -2529,6 +3507,19 @@ Useful for:
 | `node_id` | string | yes | Path node UUID or name |
 | `t` | array<number> | yes | Position fractions along the path (0.0–1.0). Single value or array. |
 
+## `precision_trim`
+
+Apply roll, ripple or slip at an explicit adjacent cut with linked/sync-lock participants validated together. Same planner as the GUI precision editor. Use within apply_video_edit_plan for dry run, one undo and revision safety.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `delta_ticks` | integer | yes |  |
+| `incoming_clip_id` | string | yes |  |
+| `mode` | enum (`roll`, `ripple_outgoing`, `ripple_incoming`, `slip_outgoing`, `slip_incoming`) | yes |  |
+| `outgoing_clip_id` | string | yes |  |
+| `sequence_id` | string | yes |  |
+| `track_id` | string | yes |  |
+
 ## `preview_selection`
 
 Render the selection (or given nodes) at target display sizes over light AND dark backgrounds, returned as a single contact-sheet PNG (base64 in data.data_base64). Icons live or die at their real size and against their real surface — this closes that loop without round-tripping through an app. Rows = backgrounds, columns = sizes; each icon is centered in a square cell (aspect ratio preserved). Only the selected nodes are drawn (others hidden), so neighbors don't bleed in.
@@ -2539,6 +3530,14 @@ Render the selection (or given nodes) at target display sizes over light AND dar
 | `node_ids` | array<string> | no | Nodes to preview. If omitted or empty, uses the current selection. |
 | `pad` | number | no | Padding as a fraction of the icon's square size (default: 0.15). |
 | `sizes` | array<integer> | no | Target pixel sizes (default: [24, 32, 48]). |
+
+## `probe_media`
+
+Force (re-)probe an asset with ffprobe (async job — poll get_job_status). On completion refreshes MediaAsset.probe (duration/streams/colorimetry) and the xxh3 content_hash used for relinking. The probe field is engine-derived cache, not an undoable edit.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
 
 ## `proportional_move_anchor`
 
@@ -2635,6 +3634,39 @@ Move each node into its own newly created layer — the inverse of collect_in_ne
 | `node_ids` | array<string> | yes | IDs of nodes to release. Each top-level node goes into its own new layer. |
 | `name_prefix` | string | no | Prefix for new layer names. Layers are named '<prefix> 1', '<prefix> 2', … Default: 'Layer'. |
 
+## `relink_media`
+
+Repoint an offline (or any) asset to a new file path. The file must exist (AssetOffline otherwise). If the asset carries a content_hash and the new file's hash differs, the call is refused with HashMismatch unless allow_hash_mismatch is true — a relink to the wrong take is invisible until export. Accepting a byte change records the new hash and clears the stale probe in the same undo step (re-run probe_media). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+| `new_path` | string | yes |  |
+| `allow_hash_mismatch` | boolean | no | Bind the asset to a file whose bytes differ from its recorded content_hash. Default false. |
+
+## `relink_media_batch`
+
+Relink offline media in bulk by scanning a folder — the moved-project case (26 K-C6). Each asset is matched strongest-identity-first: content_hash (survives a rename), then exact filename, then case-insensitive filename; ties resolve to the lexicographically smallest path and are flagged ambiguous. Every relink is verified against the asset's content_hash and an entry whose bytes differ is reported under skipped_hash_mismatch and NOT committed unless allow_hash_mismatch is true (accepting one records the new hash and clears the stale probe). dry_run returns the same plan without touching the document. The whole batch commits as ONE undo step. The scan is depth- and count-capped; scan_truncated reports when it hit a cap, hashed_scan reports whether by-hash discovery was possible.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `search_dir` | string | yes | Folder to scan for replacement files. |
+| `allow_hash_mismatch` | boolean | no | Also commit entries whose bytes differ from the recorded content_hash. Default false. |
+| `asset_ids` | array<string> | no | Restrict to these assets; default is every offline asset. |
+| `dry_run` | boolean | no | Report the plan and change nothing. Default false. |
+| `recursive` | boolean | no | Walk subdirectories. Default true. |
+
+## `remove_all_spaces_after`
+
+Remove All Spaces After (26 §9 K-A3): pack every unlocked track from `at` onward so later clips are contiguous (no internal gaps). One undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+
 ## `remove_artboard`
 
 Delete an artboard by id. Refuses to remove the last remaining artboard (a document must keep at least one). If the removed artboard was active, the first remaining one becomes active. Get the artboard_id from list_artboards.
@@ -2643,6 +3675,14 @@ Delete an artboard by id. Refuses to remove the last remaining artboard (a docum
 | --- | --- | --- | --- |
 | `artboard_id` | string | yes | UUID of the artboard to remove (from list_artboards). |
 
+## `remove_asset`
+
+Remove an asset from the media pool. Not in the original 10-mcp-tools.md §3.1 catalog table — added to the P2 scope explicitly (ops::remove_asset already existed). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+
 ## `remove_background`
 
 Detect the subject of a raster layer with a local on-device matting model (U²-Net-p via ONNX Runtime; one-time ~5 MB download, then offline) and apply the result as a non-destructive foreground layer mask — the background is hidden, not erased, and the edit is undoable. Intersects with any existing mask.
@@ -2650,6 +3690,51 @@ Detect the subject of a raster layer with a local on-device matting model (U²-N
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `node_id` | string | yes | Raster node id or name |
+
+## `remove_bin`
+
+Remove a media bin. Assets/child bins referencing it are left untouched (a dangling ref reads as unfiled); re-adding restores the bin verbatim on undo. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `bin_id` | string | yes |  |
+
+## `remove_caption_track`
+
+Remove a caption track and all its cues. STRUCTURAL: the committed core has no undoable caption-track removal (tracks are created/removed as side effects of bulk cue insertion, 06 §3.6), so this schedules a history checkpoint but is not a fine-grained undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `track_id` | string | yes |  |
+
+## `remove_clip`
+
+Remove a clip. ripple=true also shifts every later clip on the track left by the removed clip's duration (one undo step). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `ripple` | boolean | no | Default false. |
+
+## `remove_clip_marker`
+
+Remove a clip-scoped marker. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `marker_id` | string | yes |  |
+
+## `remove_clips_after`
+
+Remove All Clips After (26 §9 K-A3): delete every clip on every unlocked track whose start is at or after `at`. One undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
 
 ## `remove_constraint`
 
@@ -2666,6 +3751,15 @@ Remove a dimension annotation by its ID. Use list_dimensions to find the ID.
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `id` | string | yes | UUID of the dimension annotation to remove. |
+
+## `remove_effect`
+
+Remove one effect from a clip's stack by index. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `effect_index` | integer | yes |  |
 
 ## `remove_event_trigger`
 
@@ -2692,6 +3786,36 @@ Remove the fill from selected nodes (set to none/transparent).
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | no | Node IDs. Empty = use selection. |
 
+## `remove_filler_words`
+
+Remove chosen matches returned by find_filler_words, rejecting stale previews. Merges ranges and applies right to left across explicit A/V and caption tracks; one undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `caption_track_id` | string | yes |  |
+| `matches` | array<object> | yes |  |
+| `ripple` | boolean | yes |  |
+| `sequence_id` | string | yes |  |
+| `target_track_ids` | array<string> | yes | All participating dialogue A/V and sync-lock track IDs. Locked participants reject the whole edit. No implicit tracks are added. |
+
+## `remove_graph_edge`
+
+Remove the edge at `edge_index` in the graph's edge list (see get_graph for indices).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `edge_index` | integer | yes |  |
+| `graph_id` | string | yes |  |
+
+## `remove_graph_node`
+
+Remove a node and its incident edges from a graph (undoable).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `graph_id` | string | yes |  |
+| `node_id` | string | yes |  |
+
 ## `remove_guide`
 
 Remove a specific ruler guide by its UUID. Returns an error if the guide is locked.
@@ -2700,6 +3824,58 @@ Remove a specific ruler guide by its UUID. Returns an error if the guide is lock
 | --- | --- | --- | --- |
 | `guide_id` | string | yes | UUID of the guide to remove. Obtain from list_guides. |
 
+## `remove_keyframe`
+
+Remove the keyframe at exactly `at_*` on a target's PropertyTrack. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `path` | string | yes |  |
+| `target` | enum (`clip_transform`, `clip_effect`) | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+| `effect_index` | integer | no |  |
+
+## `remove_marker`
+
+Remove a sequence marker by id. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `marker_id` | string | yes |  |
+
+## `remove_marker_category`
+
+Remove a marker category, reassigning every marker that referenced it to `reassign_to` (or clearing the reference when omitted) in the same undo step. Markers are never silently remapped. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `category_id` | string | yes |  |
+| `reassign_to` | string | no | Another category id; omit to clear the reference instead. |
+
+## `remove_proxy`
+
+Detach the proxy from each asset. Generated (cache-owned) proxy files are deleted; Attached user-owned proxy files are never deleted (G-15A). Assets then decode originals regardless of ProxyMode until regenerated (see generate_proxies) or re-attached.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_ids` | array<string> | yes |  |
+
+## `remove_space`
+
+Remove Space (26 §9 K-A3): close up to `amount` of pure gap at `at` across unlocked tracks (later clips shift left). Refuses when a clip covers `at` or the shared free gap is shorter than amount. One undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `amount_seconds` | number | no | Default 1.0s when amount_* omitted. |
+| `amount_ticks` | integer | no |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+
 ## `remove_stroke`
 
 Remove the stroke from selected nodes (set to none).
@@ -2707,6 +3883,64 @@ Remove the stroke from selected nodes (set to none).
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | no | Node IDs. Empty = use selection. |
+
+## `remove_track`
+
+Remove a track (and every clip on it) by id. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `track_id` | string | yes |  |
+
+## `render_frame_at`
+
+Compile + evaluate the frame graph at one tick, headlessly, and return the image (10 §4 — the visual-feedback-loop tool). output_format `png` (default) is 8-bit sRGB for display; `raw_rgba16f` returns base64 linear premultiplied f16 pixels — byte-deterministic, the golden-frame comparison basis. COST WARNINGS: quality "full" on an uncached 4K composite can far exceed the preview eval budget — default to quality "preview" for iterative loops and "full" only for final verification frames; cold seeks pay a DECODE cost (up to ~150 ms per uncached GOP, more for originals) before any GPU work, so a loop scrubbing far-apart ticks is decode-dominated; repeated calls at nearby ticks mostly hit the node-result cache. Each call is independent (no held playback state).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `quality` | enum (`preview`, `full`) | yes | preview = proxy-eligible sources and Draft processing (960px long edge); full = originals processed at full sequence resolution. |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no | Convenience; sub-tick rounding possible. |
+| `at_tc` | string | no | HH:MM:SS:FF or HH:MM:SS;FF. |
+| `at_ticks` | integer | no | Exact tick (highest precedence); snapped down to the frame start. |
+| `format_index` | integer | no | Which SequenceFormat (aspect variant). Default: the active format. Applied per-call only — the document's active format is untouched. |
+| `output_format` | enum (`png`, `raw_rgba16f`) | no | Default png. |
+| `scale` | number | no | Output scale. PNG thumbnails shrink on the GPU before readback; raw pixels use deterministic CPU box downscale. |
+
+## `render_frames_at`
+
+Render 1–12 ticks from one sequence/revision as a contact sheet or individual PNGs. GPU downscale limits transfer cost; frames carry time, revision, quality and tile rectangles. Rejects edits during the batch; max 16 MiB of encoded images. Full quality processes originals before reducing for inspection.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `at_ticks` | array<integer> | yes |  |
+| `sequence_id` | string | yes |  |
+| `columns` | integer | no |  |
+| `contact_sheet` | boolean | no |  |
+| `expected_revision` | integer | no |  |
+| `format_index` | integer | no |  |
+| `max_long_edge` | integer | no |  |
+| `quality` | enum (`preview`, `full`) | no |  |
+
+## `render_preview`
+
+Render marked zones (or explicit tick range) into bounded background playback cache. Defaults to Full resolution, original sources, intra H.264. Optional explicit ProRes/Lossless profile preserves alpha; Half scales playback only. Playback takes priority. Poll get_preview_status; export and exact inspection always evaluate originals.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `expected_revision` | integer | no |  |
+| `profile` | object | no |  |
+| `range` | array<integer> | no |  |
+
+## `reorder_effects`
+
+Reorder a clip's effect stack — new_order is a permutation of 0..effects.len(). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `new_order` | array<integer> | yes |  |
 
 ## `reorder_layers`
 
@@ -2725,6 +3959,27 @@ Change the z-order (stacking position) of a node within its layer. Use send_to_b
 | `node_id` | string | yes | ID of the node to reorder |
 | `operation` | enum (`send_to_back`, `bring_to_front`, `send_backward`, `bring_forward`, `move_above`, `move_below`) | yes | send_to_back = lowest z; bring_to_front = highest z; move_above/move_below require relative_id |
 | `relative_id` | string | no | Required for move_above / move_below — the reference node |
+
+## `reorder_track`
+
+Move a track to a new index within its own lane (video tracks reorder among video tracks, audio among audio). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `new_index` | integer | yes |  |
+| `track_id` | string | yes |  |
+
+## `replace_clip_source`
+
+Replace With Clip (Premiere, G-5): swap a clip's source in place — start/duration/effects/transitions/grade untouched. A shorter new source is held to the slot (sampled from new_source_in for the slot's length by the engine). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `new_source` | object | yes | ClipSource — {"kind":"asset","asset_id":...} \| {"kind":"vector","asset_id":...} \| {"kind":"nested_sequence","sequence_id":...} \| {"kind":"solid_color","color":"#rrggbb"} \| {"kind":"adjustment"} |
+| `new_source_in_seconds` | number | no | Offset into the new source to sample from. Omit to keep the clip's existing source_in. Precedence: ticks > tc > seconds. |
+| `new_source_in_tc` | string | no |  |
+| `new_source_in_ticks` | integer | no |  |
 
 ## `resize_canvas`
 
@@ -2786,6 +4041,26 @@ Reverse the winding direction of one or more path nodes. For open paths this fli
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | yes | IDs of path nodes to reverse |
 
+## `ripple_edit`
+
+Ripple-trim one edge of a clip by delta_ticks and shift every later clip on the track to close/open the resulting gap, as ONE undo step. edge=in trims the in-point (source_in advances, speed-scaled); edge=out trims the out-point. Distinct from remove_clip's ripple flag (which deletes the clip).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `delta_ticks` | integer | yes |  |
+| `edge` | enum (`in`, `out`) | yes |  |
+
+## `roll_edit`
+
+Roll the shared edge between two adjacent clips on the same track — one clip's out point and the other's in point move together by delta_ticks, total span unchanged. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id_a` | string | yes |  |
+| `clip_id_b` | string | yes |  |
+| `delta_ticks` | integer | yes | Positive = later. |
+
 ## `rotate_copies`
 
 Create N evenly-spaced rotational copies of a node around a center point, producing a radial symmetry arrangement. The original node is counted in the total — count=6 means the original plus 5 copies at 60° increments. Optionally wraps all copies in a Group. Useful for mandalas, snowflakes, icons, and any N-fold symmetric composition.
@@ -2846,6 +4121,15 @@ Save the current in-memory document in Photonic's native .photon format, includi
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `path` | string | no | Optional destination path for save-as. Required when the document has no current path. |
+
+## `save_export_preset`
+
+Create or overwrite a custom export preset (app-level config, 05 §3.6 — no document mutation, no undo step). Built-in preset names are refused (NotSupportedV1). The preset object is validated (alpha allow-list etc.) before persisting.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `name` | string | yes |  |
+| `preset` | object | yes | Full ExportPreset object in its serde shape — copy one from list_export_presets and edit. |
 
 ## `save_gradient_swatch`
 
@@ -2911,6 +4195,32 @@ Capture the current canvas as a PNG for visual inspection
 
 _No parameters._
 
+## `search_actions`
+
+Search the MCP tool catalog by keywords (name/description). Returns ranked actions with complete input/output schemas and available behavior annotations. Use get_action_schema for exact-name lookup and execute_action to run a hit.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `query` | string | yes | Keywords, e.g. "split clip" or "export". |
+| `limit` | integer | no | Max hits (default 15, max 50). |
+
+## `seed_marker_categories`
+
+Seed the default marker categories (Marker/Cut/Note/Todo/Chapter/Bookmarks) as ONE undo step. No-op if the project already has categories.
+
+_No parameters._
+
+## `seek`
+
+Move the engine playhead (EngineCmd::Seek). Session state only — no undo step. Time precedence: at_ticks > at_tc > at_seconds. The engine presents the exact frame-start tick at/before the target.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `at_seconds` | number | no | Convenience; sub-tick rounding possible, not authoritative. |
+| `at_tc` | string | no | HH:MM:SS:FF or HH:MM:SS;FF, resolved against the sequence frame rate. |
+| `at_ticks` | integer | no | Exact tick (highest precedence). |
+
 ## `select_all`
 
 Select all nodes in the document, or all nodes on a specific layer.
@@ -2967,6 +4277,15 @@ Make an artboard the active one. The active artboard is the default target for a
 | --- | --- | --- | --- |
 | `artboard_id` | string | yes | UUID of the artboard to activate (from list_artboards). |
 
+## `set_active_format`
+
+Switch a sequence's active aspect-ratio variant by index. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `format_index` | integer | yes |  |
+| `sequence_id` | string | yes |  |
+
 ## `set_active_layer`
 
 Set the active layer. New nodes created without an explicit layer_id will be placed on the active layer.
@@ -2974,6 +4293,14 @@ Set the active layer. New nodes created without an explicit layer_id will be pla
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `layer_id` | string | yes | Layer UUID or name |
+
+## `set_active_sequence`
+
+Set (or clear, if omitted/null) the project's active sequence. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string \| null | no |  |
 
 ## `set_artboard_margins`
 
@@ -2985,6 +4312,24 @@ Set the artboard safe-area margins (top, right, bottom, left) in document units.
 | `left` | number | no | Left margin in document units. Default: unchanged. |
 | `right` | number | no | Right margin in document units. Default: unchanged. |
 | `top` | number | no | Top margin in document units. Default: unchanged. |
+
+## `set_asset_bin`
+
+Move an asset into a bin (or to the pool root, by omitting/nulling bin_id). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+| `bin_id` | string \| null | no |  |
+
+## `set_asset_tags`
+
+K-C2: replace free-form tags on a media asset, upserting each name into the project TagId registry and assigning MediaAsset.tag_ids. Empty tags clears. ONE undo batch.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+| `tags` | array<string> | no | Replacement tag names; empty clears. |
 
 ## `set_blend_mode`
 
@@ -3004,6 +4349,52 @@ Assign a path node (child of the group) as the blend spine for a group node. The
 | `group_id` | string | yes | UUID or name of the group node to configure as a blend. |
 | `path_id` | string | yes | UUID or name of the path node to use as the blend spine. |
 
+## `set_caption_cue`
+
+Create a cue (omit cue_id) or edit one (pass cue_id: timing via RetimeCue, text/words via SetCueText, one undo step). `words` (explicit per-word timing) beats `text` (distributed proportionally). position_override is only honored on creation in v1.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `track_id` | string | yes |  |
+| `cue_id` | string | no | Omit to create a new cue. |
+| `end_seconds` | number | no |  |
+| `end_tc` | string | no |  |
+| `end_ticks` | integer | no |  |
+| `position_override` | array<number> | no | Normalized [x, y]. |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no |  |
+| `start_ticks` | integer | no |  |
+| `text` | string | no |  |
+| `words` | array<object> | no | [{text, start_ticks\|start_tc\|start_seconds, end_*}] |
+
+## `set_caption_style`
+
+Set the track-default style (track_id), a cue override (cue_id), or a word override (cue_id + word_index). Supplied style fields merge onto the current effective style (01 §7 cascade word→cue→track); `clear` removes a cue/word override.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clear` | boolean | no |  |
+| `cue_id` | string | no |  |
+| `style` | object | no | {font_family?, font_size?, weight?, fill? (#hex), position? [x,y], max_width?} |
+| `track_id` | string | no |  |
+| `word_index` | integer | no |  |
+
+## `set_caption_word`
+
+Edit one word's text and/or timing (CAP-010), committed as a SetCueText over the cue's word list.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `cue_id` | string | yes |  |
+| `word_index` | integer | yes |  |
+| `end_seconds` | number | no |  |
+| `end_tc` | string | no |  |
+| `end_ticks` | integer | no |  |
+| `start_seconds` | number | no |  |
+| `start_tc` | string | no |  |
+| `start_ticks` | integer | no |  |
+| `text` | string | no |  |
+
 ## `set_character_metrics`
 
 Set advanced node-level character metrics on a text node: baseline shift and super/subscript position. baseline_shift is in document units (positive raises text above the baseline, negative lowers it). script_position is 'normal', 'superscript' (renders smaller and raised), or 'subscript' (renders smaller and lowered). Both fields are optional — pass only those you want to change. Applies to the whole node (per-character ranges are not yet supported). Supports undo.
@@ -3013,6 +4404,42 @@ Set advanced node-level character metrics on a text node: baseline shift and sup
 | `node_id` | string | yes | Text node ID or name. |
 | `baseline_shift` | number | no | Baseline shift in document units (positive = up). Default: unchanged. |
 | `script_position` | enum (`normal`, `superscript`, `subscript`) | no | Script position. Default: unchanged. |
+
+## `set_clip_audio`
+
+Per-clip audio (01 §5): gain trim, fades, channel map. A fade_*_ticks of 0 clears that fade; a positive value sets it. Auto-initializes the clip's ClipAudio container if absent.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `channel_map` | enum (`as_source`, `mono_downmix`, `stereo_lr`, `channel_swap`) | no |  |
+| `fade_in_ticks` | integer | no | 0 clears; >0 sets. |
+| `fade_out_ticks` | integer | no |  |
+| `fade_shape` | enum (`linear`, `equal_power`, `log`, `s_curve`) | no |  |
+| `gain_db` | number | no |  |
+
+## `set_clip_prop`
+
+Universal clip-property setter — name, base transform (pos/scale/rotation/anchor/opacity), per-format reframe override, enabled, color_label — only supplied fields change. Speed and transitions have dedicated tools (set_clip_speed/set_transition). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `color_label` | integer \| null | no | Organizational swatch-palette index. null clears the label; omit the field entirely to leave it unchanged. |
+| `enabled` | boolean | no |  |
+| `name` | string | no |  |
+| `reframe` | object | no | {"format_index":N,"transform":{...}\|null} — null clears the override for that format index. |
+| `transform` | object | no | Full base-transform replace: {"x":0,"y":0,"scale_x":1,"scale_y":1,"rotation":0,"anchor_space":"center_offset","anchor_x":0,"anchor_y":0,"opacity":1}. anchor_space is optional (center_offset default) or absolute for legacy output-pixel pivots. |
+
+## `set_clip_speed`
+
+Set a clip's playback speed — supply exactly one of `ratio` (SpeedMap::Constant, an exact rational) or `keys` (SpeedMap::Keyframed, a variable-speed ramp, G-11). Each key has clip-relative time, ratio, and optional outgoing interpolation: {kind:hold|linear|bezier,out_handle:[x,y],in_handle:[x,y]}. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `keys` | array<object> | no | Keyframed ramp control points, clip-relative. Mutually exclusive with ratio. |
+| `ratio` | object | no | Constant speed. {"num":int,"den":uint} — e.g. {"num":2,"den":1} for 2x, {"num":-1,"den":1} for reverse. Mutually exclusive with keys. |
 
 ## `set_constraint`
 
@@ -3049,6 +4476,29 @@ Set the document resolution (DPI) — the honored physical-size property on expo
 | --- | --- | --- | --- |
 | `dpi` | number | yes | Dots per inch. Common print value: 300. |
 
+## `set_effect_param`
+
+Set one static (non-keyframed) param under effects[effect_index].params — path is a registry PropPath (e.g. "params.radius"), or the literal path "enabled" to toggle the effect itself. Use set_keyframe for animated params. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `effect_index` | integer | yes |  |
+| `path` | string | yes |  |
+| `value` | object | yes | PropValue — {"t":"float","v":number} \| {"t":"vec2","v":[number,number]} \| {"t":"color","v":{"r":n,"g":n,"b":n,"a":n}} \| {"t":"bool","v":boolean} \| {"t":"enum","v":integer} |
+
+## `set_effect_zone`
+
+Set or clear an effect zone (26 §10 K-B3): half-open clip-relative [start_ticks, end_ticks). Outside the zone the effect is folded out of the graph at that tick (same as disabled). Pass clear=true to remove the zone. One undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `effect_index` | integer | yes |  |
+| `clear` | boolean | no | When true, remove the zone (whole-clip effect). |
+| `end_ticks` | integer | no | Clip-relative zone end (exclusive). |
+| `start_ticks` | integer | no | Clip-relative zone start (inclusive). |
+
 ## `set_font_style`
 
 Set the font style (normal, italic, or oblique) on a text node. Italic uses a true italic face if the font provides one; oblique synthesizes slant. Supports undo.
@@ -3067,6 +4517,42 @@ Set the font weight (100–900) on a text node. Common values: 400 = Regular, 70
 | `node_id` | string | yes | Text node ID (UUID or name). |
 | `weight` | integer | yes | Font weight (100=Thin, 400=Regular, 700=Bold, 900=Black). |
 
+## `set_grade`
+
+Replace or clear a clip's color grade (07 §1). `grade` is a full Grade object {ops:[...], bypass}; omit or pass null to clear.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `grade` | object \| null | no | Full Grade serde shape; null clears. |
+
+## `set_graph_node_param`
+
+Set one PropPath under a node's params (08 §6.4). value is a PropValue, e.g. {"t":"float","v":12.0}.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `graph_id` | string | yes |  |
+| `node_id` | string | yes |  |
+| `path` | string | yes |  |
+| `value` | object | yes |  |
+
+## `set_keyframe`
+
+Upsert one keyframe on a PropertyTrack (creates the track if absent), creating animation. target=clip_transform needs only clip_id; target=clip_effect also needs effect_index. P2 scope: clip transform + clip-effect params only (grade/audio/graph-node targets land with their domains). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `interp` | object | yes | {"kind":"hold"} \| {"kind":"linear"} \| {"kind":"bezier","out_handle":[x,y],"in_handle":[x,y]} |
+| `path` | string | yes | Registry PropPath, e.g. "transform.x" or "params.radius". |
+| `target` | enum (`clip_transform`, `clip_effect`) | yes |  |
+| `value` | object | yes | PropValue — {"t":"float","v":number} \| {"t":"vec2","v":[number,number]} \| {"t":"color","v":{...}} \| {"t":"bool","v":boolean} \| {"t":"enum","v":integer} |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+| `effect_index` | integer | no | Required when target=clip_effect. |
+
 ## `set_layer_mask`
 
 Attach a non-destructive layer mask to a raster node, built from a selection spec (rect/ellipse/polygon/wand/color_range, with feather/invert/grow/contract). The mask gates the node's compositing without altering its pixels.
@@ -3084,6 +4570,45 @@ Lock or unlock nodes. Locked nodes cannot be selected or modified in the GUI. Om
 | --- | --- | --- | --- |
 | `locked` | boolean | no | Set locked. Omit to toggle. |
 | `node_ids` | array<string> | no | Node IDs. Empty = use selection. |
+
+## `set_loop_range`
+
+Set or clear the playback loop range (EngineCmd::SetLoop). Session state only — no undo step. Omit/null `range` to clear. Each bound follows the ticks > tc > seconds precedence.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `range` | object \| null | no | {start_ticks\|start_tc\|start_seconds, end_ticks\|end_tc\|end_seconds}; null clears the loop. |
+
+## `set_marker`
+
+Universal marker editor — position, duration (0 = point, > 0 = ranged), name, note, colour, category. Only supplied fields change. Pass clip_id to edit a clip-scoped marker instead of a sequence marker. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `marker_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+| `category_id` | string | no |  |
+| `clear_category` | boolean | no | Clear the category reference (category_id is then ignored). |
+| `clip_id` | string | no | Omit for a sequence marker; supply to edit that clip's own marker. |
+| `color` | string | no | #rrggbb / #rrggbbaa, or "" to clear the override and use the category colour. |
+| `duration_seconds` | number | no |  |
+| `duration_ticks` | integer | no |  |
+| `end_tc` | string | no |  |
+| `name` | string | no |  |
+| `note` | string | no |  |
+
+## `set_master_bus`
+
+Sequence master bus level and export loudness normalization (09 §4/§6.5). loudness: streaming (-14 LUFS) | broadcast (-23 LUFS) | none.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `loudness` | enum (`streaming`, `broadcast`, `none`) | no |  |
+| `volume_db` | number | no |  |
 
 ## `set_node_prompt`
 
@@ -3162,6 +4687,32 @@ Set paragraph-level text options on a text node: spacing before paragraphs, spac
 | `spacing_after` | number | no | Space after each paragraph in document units. Default: unchanged. |
 | `spacing_before` | number | no | Space before each paragraph in document units. Default: unchanged. |
 
+## `set_preview_zones`
+
+Replace undoable preview zones; frame-snaps outward and merges overlaps. Empty clears all zones. Cache files are not document state. Use apply_video_edit_plan for dry-run/revision/retry safety.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `zones` | array<object> | yes |  |
+
+## `set_project_graph`
+
+Set the project graph to an existing arena graph (graph_id), clear it (clear=true), or create a fresh empty project graph (omit both). Spliced after the active-sequence output (02 §2). Returns graph_id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clear` | boolean | no |  |
+| `graph_id` | string | no |  |
+
+## `set_proxy_mode`
+
+Set the session proxy policy (02 §6): auto | force_proxy | force_original. Session state, not document state — no undo step. NOTE: proxy generation has not landed; all modes currently decode originals (the flag still selects preview/full compile quality for cache-hash purposes).
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `mode` | enum (`auto`, `force_proxy`, `force_original`) | yes |  |
+
 ## `set_selection`
 
 Set the active selection to specific node IDs. Replaces current selection unless additive=true. Empty node_ids clears selection.
@@ -3170,6 +4721,29 @@ Set the active selection to specific node IDs. Replaces current selection unless
 | --- | --- | --- | --- |
 | `additive` | boolean | no | Add to existing selection (default: false = replace) |
 | `node_ids` | array<string> | no | Node IDs to select |
+
+## `set_sequence_format`
+
+Add, update, or remove a SequenceFormat (aspect-ratio variant) on a sequence. op=add requires `format`; op=update requires `format_index` and `format`; op=remove requires `format_index` (refused if it's the sequence's last format). Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `op` | enum (`add`, `update`, `remove`) | yes |  |
+| `sequence_id` | string | yes |  |
+| `format` | object | no | {"name":str,"width":int,"height":int} — required for add/update. |
+| `format_index` | integer | no | Required for update/remove. |
+
+## `set_stabilization`
+
+Update an existing D-12 stabilization recipe; only supplied fields change. Any change clears the prior analysis, since the corrections were computed for the old settings — re-run analyze_stabilization afterwards. Out-of-range values are rejected, not clamped. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `crop_mode` | enum (`static_safe`, `dynamic`, `transparent_edges`) | no | static_safe: one fixed zoom sized for the worst frame. dynamic: tracks the requirement, smoothed. transparent_edges: no zoom, uncovered pixels left transparent. |
+| `horizon_lock` | number | no | 0..1. Needs accelerometer data. |
+| `max_zoom` | number | no | >= 1.0. Ceiling on how far the crop solver may zoom to hide edges the correction swings out of frame. |
+| `smoothness` | number | no | 0..1. |
 
 ## `set_symbol_override`
 
@@ -3227,6 +4801,40 @@ Place a text node along a path spine (Type on a Path). The text flows along the 
 | `text_node_id` | string | yes | Text node ID (UUID or name) to place on the path. |
 | `offset` | number | no | Start offset along the path in document units. Default: 0.0. |
 
+## `set_track_audio`
+
+Per-track fader/pan/mute/solo (09 §4). Auto-initializes the track's TrackAudio container if absent.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `track_id` | string | yes |  |
+| `muted` | boolean | no |  |
+| `pan` | number | no | -1 (L)..1 (R). |
+| `solo` | boolean | no |  |
+| `volume_db` | number | no | -inf..+12, default 0. |
+
+## `set_track_prop`
+
+Universal track-property setter — name/enabled/locked/height_px, only supplied fields change. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `track_id` | string | yes |  |
+| `enabled` | boolean | no |  |
+| `height_px` | number | no |  |
+| `locked` | boolean | no |  |
+| `name` | string | no |  |
+
+## `set_transition`
+
+Add, replace, or remove (transition=null) a clip's in or out transition. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `edge` | enum (`in`, `out`) | yes |  |
+| `transition` | object \| null | no | {"kind":"cross_dissolve"\|"dip_to_black"\|"dip_to_color"\|"wipe"\|"push","duration_ticks":int,"params":{"curve":"linear"\|"ease_in"\|"ease_out"\|"ease_in_out","color":"#rrggbb"?,"direction":"left"\|"right"\|"up"\|"down","softness":number}} |
+
 ## `set_variable_value`
 
 Update the value of an existing document variable. Use apply_variables to propagate the change to all bound text nodes.
@@ -3245,6 +4853,15 @@ Show or hide nodes. Omit `visible` to toggle current state. Hidden nodes are not
 | `node_ids` | array<string> | no | Node IDs. Empty = use selection. |
 | `visible` | boolean | no | Set visible. Omit to toggle. |
 
+## `set_work_range`
+
+Set (or clear, by omitting `range`) a sequence's preview/export in/out work range. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `sequence_id` | string | yes |  |
+| `range` | object \| null | no | null/omitted clears the work range. |
+
 ## `simplify_path`
 
 Reduce the anchor-point count of a path using Ramer-Douglas-Peucker simplification. Bézier curves are first sampled to line segments, then redundant points are removed. Supports dry_run to preview the reduction without applying. The result is a polygonal path with fewer vertices.
@@ -3254,6 +4871,24 @@ Reduce the anchor-point count of a path using Ramer-Douglas-Peucker simplificati
 | `node_id` | string | yes | UUID of the path node to simplify |
 | `tolerance` | number | yes | RDP tolerance in document coordinates. Larger values remove more points. Typical: 0.5–5.0 for screen work, 0.1–1.0 for precise technical illustration. |
 | `dry_run` | boolean | no | If true, return before/after point counts without modifying the document. Default false. |
+
+## `slide_clip`
+
+Slide a clip over its neighbors by delta_ticks — the clip moves, its immediate neighbors trim to absorb the change, total span unchanged. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `delta_ticks` | integer | yes |  |
+
+## `slip_clip`
+
+Shift a clip's source in/out (source_in) by delta_ticks without moving it on the timeline. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `delta_ticks` | integer | yes |  |
 
 ## `smooth_path`
 
@@ -3272,6 +4907,28 @@ Round the position (translation) of one or more nodes to the nearest integer coo
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `node_ids` | array<string> | yes | IDs of nodes to snap to integer pixel coordinates |
+
+## `split_caption_cue`
+
+Split a cue at a tick — between the two words straddling it (CaptionCmd::SplitCue). Returns the new cue id.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `cue_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
+
+## `split_clip`
+
+Split a clip into two at an exact tick, strictly inside the clip's span. Returns the new (right-hand) clip's id. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `at_seconds` | number | no |  |
+| `at_tc` | string | no |  |
+| `at_ticks` | integer | no |  |
 
 ## `split_into_grid`
 
@@ -3299,6 +4956,14 @@ Spray multiple instances of a named symbol scattered around a center point using
 | `y` | number | yes | Center Y coordinate of the spray area. |
 | `spread` | number | no | Scatter radius in document units. Default: 100. |
 
+## `step`
+
+Single-frame step (CAP-004): pauses, then snaps the playhead exactly ±frames frame-starts and evaluates that tick. Session state only — no undo step.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `frames` | integer | yes | Signed frame count: +1 next frame, -1 previous. |
+
 ## `stipple_fill`
 
 Fill a path shape with randomly placed dots (stipple effect). Uses rejection sampling to place dots inside the path boundary.
@@ -3314,6 +4979,12 @@ Dot color defaults to the path's solid fill color. Deterministic seed ensures re
 | `count` | integer | no | Number of dots (default: 200) |
 | `dot_radius` | number | no | Dot radius in document units (default: 1.5) |
 | `seed` | integer | no | Random seed for reproducibility (default: 42) |
+
+## `stop_source_audition`
+
+Stop source audition and release its audio output without editing the document.
+
+_No parameters._
 
 ## `style_transfer`
 
@@ -3358,6 +5029,16 @@ Batch add or remove tags on nodes. Tags are arbitrary strings used for querying 
 | `node_ids` | array<string> | no | Node IDs. Empty = use selection. |
 | `remove` | array<string> | no | Tags to remove |
 
+## `transcode_media`
+
+Transcode an asset to an editing-friendly intermediate via ffmpeg (async job — poll get_job_status; cancellable). Distinct from proxies: a user-picked codec, not the fixed proxy profile. The output file is NOT auto-imported; call import_media on the returned output_path if wanted.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `asset_id` | string | yes |  |
+| `preset` | enum (`prores_proxy`, `prores_lt`, `dnxhr_lb`, `h264_high`) | yes |  |
+| `out_path` | string | no | Default: <source stem>.<preset>.<mov\|mp4> next to the source. |
+
 ## `transform_copies`
 
 Create N copies of a node with cumulative transform offsets. Each copy has the previous copy's transform plus the specified translation, rotation, and scale increments.
@@ -3389,6 +5070,18 @@ Geometric op on a raster node's pixels. op ∈ {crop(x,y,width,height), resize(w
 | `node_id` | string | yes |  |
 | `op` | string | yes | Operation name (see description) |
 | `params` | object | no |  |
+
+## `trim_clip`
+
+Trim a clip's in or out edge to an exact position. edge=in adjusts start+source_in and shortens/lengthens duration, keeping the out point fixed; edge=out changes only duration. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
+| `edge` | enum (`in`, `out`) | yes |  |
+| `new_seconds` | number | no |  |
+| `new_tc` | string | no |  |
+| `new_ticks` | integer | no |  |
 
 ## `twirl_path`
 
@@ -3435,6 +5128,14 @@ Dissolve a group node, returning its children to the layer at the group's former
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
 | `group_id` | string | yes | ID of the group node to dissolve |
+
+## `unlink_clips`
+
+Remove a clip from its link group — a no-op if it wasn't linked. Only the named clip leaves the group; its former partners stay linked to each other. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `clip_id` | string | yes |  |
 
 ## `unlink_text_frames`
 
@@ -3483,6 +5184,17 @@ Update mutable metadata on a layer: rename it, change visibility, lock/unlock, s
 | `opacity` | number | no | Layer opacity 0.0–1.0; the layer composites as a unit at this opacity. |
 | `print` | boolean | no | Include the layer in export/print output. false = visible on canvas but excluded from exports. |
 | `visible` | boolean | no | Show or hide the layer. |
+
+## `update_marker_category`
+
+Rename / recolour / re-glyph a marker category in place; its id and every reference to it are preserved. Supports undo.
+
+| Parameter | Type | Required | Description |
+| --- | --- | --- | --- |
+| `category_id` | string | yes |  |
+| `color` | string | no | #rrggbb or #rrggbbaa. |
+| `glyph` | enum (`diamond`, `circle`, `square`, `triangle`, `flag`, `bar`) | no |  |
+| `name` | string | no |  |
 
 ## `update_node`
 

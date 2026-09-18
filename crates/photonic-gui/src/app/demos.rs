@@ -57,7 +57,7 @@ pub(crate) fn gui_create_radar_chart_demo(
         };
         pn.stroke = Stroke::solid(Color::new(0.7, 0.7, 0.75, 1.0), 0.75);
         let node = SceneNode::new(
-            &format!("Grid Ring {ring}"),
+            format!("Grid Ring {ring}"),
             layer_id,
             SceneNodeKind::Path(pn),
         );
@@ -84,11 +84,7 @@ pub(crate) fn gui_create_radar_chart_demo(
             ..Default::default()
         };
         pn.stroke = Stroke::solid(Color::new(0.7, 0.7, 0.75, 1.0), 0.75);
-        let node = SceneNode::new(
-            &format!("Axis {}", i + 1),
-            layer_id,
-            SceneNodeKind::Path(pn),
-        );
+        let node = SceneNode::new(format!("Axis {}", i + 1), layer_id, SceneNodeKind::Path(pn));
         child_ids.push(node.id);
         history.execute(
             Command::AddNode {
@@ -455,7 +451,7 @@ pub(crate) fn gui_create_truchet_tiling_demo(
                 pn.stroke = Stroke::solid(tile_color, sw);
             }
 
-            let node = SceneNode::new(&format!("t{row}_{col}"), layer_id, SceneNodeKind::Path(pn));
+            let node = SceneNode::new(format!("t{row}_{col}"), layer_id, SceneNodeKind::Path(pn));
             let nid = node.id;
             history.execute(
                 Command::AddNode {

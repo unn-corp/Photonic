@@ -1,6 +1,33 @@
 use super::*;
 
 impl PhotonicRenderer {
+    /// Grow the persistent document vertex/index buffers to hold at least
+    /// `vbytes`/`ibytes`, by doubling (03 §2.3). Called from `update()` (a `&mut`
+    /// context) before `record_document_pass` writes them, so the render pass
+    /// itself only needs `&self` + `queue.write_buffer`.
+    pub(crate) fn ensure_doc_buffers(&mut self, vbytes: u64, ibytes: u64) {
+        if vbytes > self.doc_vbuf_cap {
+            let cap = vbytes.max(self.doc_vbuf_cap * 2);
+            self.doc_vbuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("doc_vbuf"),
+                size: cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.doc_vbuf_cap = cap;
+        }
+        if ibytes > self.doc_ibuf_cap {
+            let cap = ibytes.max(self.doc_ibuf_cap * 2);
+            self.doc_ibuf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("doc_ibuf"),
+                size: cap,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.doc_ibuf_cap = cap;
+        }
+    }
+
     /// Record the document render pass into an existing command encoder.
     ///
     /// `msaa_view` is the 4× multisampled render target; `resolve_view` is the
@@ -15,20 +42,21 @@ impl PhotonicRenderer {
         clear: wgpu::Color,
     ) {
         if !vertices.is_empty() {
-            let vbuf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("vbuf"),
-                    contents: bytemuck::cast_slice(vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-            let ibuf = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("ibuf"),
-                    contents: bytemuck::cast_slice(indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                });
+            // Persistent, growable buffers (03 §2.3): `update()` sized them to fit
+            // this frame's geometry, so upload in place rather than allocating a
+            // fresh buffer every frame. The caller's exact slice lands at offset 0,
+            // reproducing the previous `create_buffer_init(slice)` layout byte for
+            // byte (the effects path's `&indices[skip..]` sub-slice included).
+            let vbytes = std::mem::size_of_val(vertices) as u64;
+            let ibytes = std::mem::size_of_val(indices) as u64;
+            debug_assert!(
+                vbytes <= self.doc_vbuf_cap && ibytes <= self.doc_ibuf_cap,
+                "doc buffers must be grown via ensure_doc_buffers() before recording the pass"
+            );
+            self.queue
+                .write_buffer(&self.doc_vbuf, 0, bytemuck::cast_slice(vertices));
+            self.queue
+                .write_buffer(&self.doc_ibuf, 0, bytemuck::cast_slice(indices));
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fill_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -44,8 +72,8 @@ impl PhotonicRenderer {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            pass.set_vertex_buffer(0, vbuf.slice(..));
-            pass.set_index_buffer(ibuf.slice(..), wgpu::IndexFormat::Uint32);
+            pass.set_vertex_buffer(0, self.doc_vbuf.slice(0..vbytes));
+            pass.set_index_buffer(self.doc_ibuf.slice(0..ibytes), wgpu::IndexFormat::Uint32);
             draw_segments(
                 &mut pass,
                 &self.draw_segments,

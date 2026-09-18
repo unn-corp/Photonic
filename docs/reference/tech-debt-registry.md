@@ -229,6 +229,8 @@ Requires changing `send_message`'s call signature or initialization to accept/fe
 
 **Resolution (TD-014):** Deleted `photonic_tools()` entirely. Added `fetch_mcp_tools()` which calls `tools/list` on the local MCP server at startup of each `send_message` call using the same `reqwest::blocking` client already used by `call_mcp_tool`. Renames `inputSchema` → `input_schema` for Anthropic API compatibility. If the MCP server is unreachable, `send_message` returns an error immediately. Committed on 2026-03-23.
 
+**Superseded 2026-07-20:** `claude_client.rs` was deleted outright. It had no `mod claude_client;` declaration in `photonic-app/src/main.rs`, so it was never part of any build — the in-app chat panel it belonged to does not exist, and nothing referenced `send_message`/`fetch_mcp_tools`. The tool-surface drift this entry describes was therefore unreachable in shipped binaries. Recover from git history if the chat panel is ever revived.
+
 ---
 
 ### TD-010: GUI and MCP Maintain Separate CommandHistory Instances (Split Undo) *(solved)*
@@ -375,3 +377,61 @@ Adding a version field requires a decision about what "version 1" means and when
 **Resolution (TD-013):** Added `pub const CURRENT_FORMAT_VERSION: u32 = 1` to `document.rs`. Added `format_version: u32` as the first field of `Document` with `#[serde(default = "default_format_version")]` (defaults to 1 for files that predate the field). `Document::new()` sets `format_version: CURRENT_FORMAT_VERSION`. `from_json` now rejects files with `format_version > CURRENT_FORMAT_VERSION` via `serde::de::Error::custom`, keeping the existing signature unchanged — no callers updated. Committed on 2026-03-23.
 
 ---
+
+### TD-017: Live Canvas Blends in Gamma Space While Export Blends in Linear — Stale #145 "Pixel-Identical" Claim
+
+**Type:** Correctness / Documentation drift
+**Severity:** Medium
+**Effort:** Days (full fix is the P7 color-unification work; comment fix is minutes)
+**Area:** Rendering (photonic-render)
+**Affected Files:**
+- `crates/photonic-render/src/pipeline.rs:10-13` (stale claim)
+- `crates/photonic-render/src/renderer/mod.rs:300`, `:322` (live fill pipelines target `surface_format`)
+- `crates/photonic-render/src/headless.rs:23` (`FORMAT = Rgba8UnormSrgb`)
+
+**Description:**
+`pipeline.rs:10-13` claims the windowed document pass targets `PhotonicRenderer::scene_format` (sRGB), "which is what makes on-canvas rendering and exported output pixel-identical (issue #145)." That symbol does not exist — the live renderer's fill pipelines target the window `surface_format`, which is deliberately non-sRGB (`renderer/mod.rs:250`, chosen so egui doesn't double-gamma-correct). Consequence: live-canvas fixed-function blending (Multiply/Screen/Darken/Lighten and partial-alpha src-over) runs in gamma space while headless/export blends in linear — live separable blends likely already diverge from export by the usual ~1-2% midtone delta, contradicting the comment. Discovered during video-editor P1 S4 (`docs/specs/video-editor/03-render-color-pipeline.md`); S4's live isolation pass deliberately follows the same live=gamma convention (option B decision) for internal consistency.
+
+**Recommended Approach:**
+Short term: fix the stale comment to describe reality. Long term: the video module's P7 color-unification phase (`03-render-color-pipeline.md` §4.3) is the scheduled home for deciding whether the live canvas moves to linear intermediates + explicit OETF blit; do not unify piecemeal before then.
+
+**Why Not Auto-Fixed:**
+The comment fix is trivial but the underlying divergence is load-bearing color behavior on the primary editing surface with no automated pixel test for the windowed path; changing it belongs to the planned P7 work with proper golden coverage.
+
+### TD-018: Text Nodes Render as Nothing in ALL Headless Output (Export + MCP render) *(solved)*
+
+**Type:** Correctness (user-facing)
+**Severity:** High
+**Effort:** Days
+**Area:** Rendering (photonic-render)
+**Affected Files:**
+- `crates/photonic-render/src/compositor.rs:185` (`SceneNodeKind::Text(_) => {}` explicit no-op)
+- `crates/photonic-render/src/headless.rs` (zero glyphon/text wiring on the GPU headless path)
+
+**Description:**
+Discovered during video-editor P1 golden-corpus expansion (e964e75): text renders only in the interactive windowed renderer (glyphon pass). Both headless paths — the CPU compositor and the headless GPU path behind `render_rgba_with_opts` — silently drop every `Text` node. Consequence: PNG/JPEG/WebP/GIF/TIFF export and MCP `screenshot`-class/`render_frame_at`-class output lose all text today. The committed `text_basic` and `text_on_path` golden references are (correctly, per current behavior) blank — they act as change detectors that must be re-blessed when this is fixed. Blocks the video module's AS-1 vector-title export (Tier A rasterization uses `render_rgba_with_opts`) — must land before video P3/P4.
+
+**Recommended Approach:**
+Add a text rasterization path usable off the GUI thread: either drive glyphon against the headless device (preferred — same pixels as canvas), or a CPU glyph rasterizer (swash/ab_glyph) into the CPU compositor. Wire into both `composite_document` and the headless GPU pass; re-bless the two text golden cases; extend the corpus with a styled-text case.
+
+**Why Not Auto-Fixed:**
+Cross-cutting rendering work with font-stack implications; needs its own story + review, scheduled as a pre-P3 story in the video execution plan.
+
+### TD-019: Windowed-Only Rendering Features — Headless Export Silently Drops Them
+
+**Type:** Correctness (user-facing)
+**Severity:** Medium
+**Effort:** Weeks (sum of parts)
+**Area:** Rendering (photonic-render)
+**Affected Files:** `crates/photonic-render/src/headless.rs`, `compositor.rs` vs `renderer/mod.rs`
+
+**Description:**
+Same class as TD-018, found in the same sweep: variable-width strokes (`width_profile_id`), text-on-path (`path_spine_id`), fixed-field glows (`outer_glow`/`inner_glow`/`gaussian_glow`), and arrowheads (`arrowhead_start`/`arrowhead_end`) are wired only in the interactive renderer — zero references in headless paths, so exports drop them. Additionally `dash_array` has no rendering implementation anywhere (windowed included — dashed strokes draw solid), and `GroupNode::clip_children`/`clip_node_id` is data-model-only. Golden cases `variable_width_stroke`, `stroke_arrowheads`, `effect_glow_stack`, `text_on_path` are committed as forward-guards with doc comments citing this gap.
+
+**Recommended Approach:**
+Fix per-feature alongside TD-018's headless text work where they share plumbing; `dash_array` is a tessellator feature (lyon supports dashing via path iteration) independent of headless.
+
+**Why Not Auto-Fixed:**
+Each is a distinct feature implementation, not a wiring one-liner; needs prioritization against video-module phases.
+
+**Resolution (TD-018):** Fixed in 8b2806e — `headless_text.rs` drives the canvas's glyphon pipeline against the headless device; CPU-compositor output is wrapped with the identical glyphon pass so both export paths produce the same text pixels. `text_basic` re-blessed (renders), new `text_styled` golden case added; `text_on_path` remains a TD-019 forward-guard. Committed 2026-07-07.

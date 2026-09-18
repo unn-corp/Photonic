@@ -299,10 +299,8 @@ pub(crate) fn nearest_anchor_screen(
         let (cx, cy) = transform.apply(local_pt.x, local_pt.y);
         let (sx, sy) = view.canvas_to_screen(cx, cy);
         let dist = ((sx - cursor_sx).powi(2) + (sy - cursor_sy).powi(2)).sqrt();
-        if dist < threshold_px {
-            if best.map_or(true, |(_, d)| dist < d) {
-                best = Some((idx, dist));
-            }
+        if dist < threshold_px && best.is_none_or(|(_, d)| dist < d) {
+            best = Some((idx, dist));
         }
     }
     best.map(|(idx, _)| idx)
@@ -358,7 +356,7 @@ pub(crate) fn ds_find_handle(
             let (kind, hp) = h;
             let (hsx, hsy) = local_to_screen(&node.transform, view, hp);
             let d = ((hsx - csx).powi(2) + (hsy - csy).powi(2)).sqrt();
-            if d < threshold_px && best.map_or(true, |(_, _, bd)| d < bd) {
+            if d < threshold_px && best.is_none_or(|(_, _, bd)| d < bd) {
                 best = Some((i, kind, d));
             }
         }
@@ -422,7 +420,7 @@ pub(crate) fn ds_find_corner_widget(
             let (wsx, wsy) =
                 ds_corner_widget_screen(&node.transform, view, *prev, *curr, *next, inset_px);
             let d = ((wsx - csx).powi(2) + (wsy - csy).powi(2)).sqrt();
-            if d < threshold_px && best.map_or(true, |(_, bd)| d < bd) {
+            if d < threshold_px && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
         }
@@ -449,7 +447,7 @@ pub(crate) fn ds_find_corner_widget(
 /// Single-anchor behaviour is identical to before (the outgoing handle of the
 /// selected anchor lives on the next element, which sees `j-1` selected).
 pub(crate) fn bez_move_anchors(bez: &BezPath, selected: &[usize], dx: f64, dy: f64) -> BezPath {
-    let els: Vec<PathEl> = bez.elements().iter().copied().collect();
+    let els: Vec<PathEl> = bez.elements().to_vec();
     let sel_set: std::collections::HashSet<usize> = selected.iter().copied().collect();
     let shift = |p: Point| Point::new(p.x + dx, p.y + dy);
 

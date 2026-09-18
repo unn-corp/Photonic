@@ -159,7 +159,7 @@ impl PhotonicApp {
         let mut cmds: Vec<Command> = Vec::new();
         for (seq, nid) in resolved.iter().enumerate() {
             if let Some((old_layer_id, old_index)) = doc.node_layer_and_index(nid) {
-                let new_layer = Layer::new(&format!("Layer {}", seq + 1));
+                let new_layer = Layer::new(format!("Layer {}", seq + 1));
                 let new_layer_id = new_layer.id;
                 cmds.push(Command::AddLayer { layer: new_layer });
                 cmds.push(Command::MoveNodeToLayer {

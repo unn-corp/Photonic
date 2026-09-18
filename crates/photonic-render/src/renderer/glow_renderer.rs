@@ -118,6 +118,10 @@ impl PhotonicRenderer {
             }
 
             // ── Pass C: vertical blur  glow_tex_b → surface (additive) ──────────
+            // Uses the ADDITIVE blur pipeline so the glow brightens the scene
+            // without erasing the fill (this module's contract, top of file).
+            // (Pass B writes an intermediate over a cleared target, where the
+            // blend is a no-op, so it keeps the premultiplied pipeline.)
             {
                 let bg = make_blur_bg(&self.glow_tex_b_view, sigma, false);
                 let mut pass = frame
@@ -136,7 +140,7 @@ impl PhotonicRenderer {
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });
-                pass.set_pipeline(&self.blur_pipeline_h);
+                pass.set_pipeline(&self.blur_pipeline_v);
                 pass.set_bind_group(0, &bg, &[]);
                 pass.draw(0..6, 0..1);
             }

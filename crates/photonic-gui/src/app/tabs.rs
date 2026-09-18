@@ -48,6 +48,10 @@ impl PhotonicApp {
             dirty: false,
             recovery_path: None,
             last_saved_node,
+            mode: AppMode::default(),
+            timeline_view: TimelineView::default(),
+            playhead: Tick::default(),
+            timeline_selection: Vec::new(),
         });
         self.active_tab = 0;
     }
@@ -79,6 +83,10 @@ impl PhotonicApp {
             dirty: false,
             recovery_path: None,
             last_saved_node,
+            mode: AppMode::default(),
+            timeline_view: TimelineView::default(),
+            playhead: Tick::default(),
+            timeline_selection: Vec::new(),
         });
         self.switch_tab(idx, doc, history, view);
         // Fit the newly-activated document to the viewport next canvas pass.
@@ -104,6 +112,10 @@ impl PhotonicApp {
         std::mem::swap(view, &mut self.tabs[a].view);
         self.tabs[a].current_file = self.current_file.take();
         self.tabs[a].selected_id = self.selected_id.take();
+        self.tabs[a].mode = self.mode;
+        self.tabs[a].timeline_view = self.timeline_view;
+        self.tabs[a].playhead = self.playhead;
+        self.tabs[a].timeline_selection = std::mem::take(&mut self.timeline_selection);
         // Activate the target: its parked engine state moves into the live params;
         // the scratch placeholder lands in the target's now-active slot.
         std::mem::swap(doc, &mut self.tabs[target].document);
@@ -111,6 +123,10 @@ impl PhotonicApp {
         std::mem::swap(view, &mut self.tabs[target].view);
         self.current_file = self.tabs[target].current_file.take();
         self.selected_id = self.tabs[target].selected_id.take();
+        self.mode = self.tabs[target].mode;
+        self.timeline_view = self.tabs[target].timeline_view;
+        self.playhead = self.tabs[target].playhead;
+        self.timeline_selection = std::mem::take(&mut self.tabs[target].timeline_selection);
         self.active_tab = target;
         // A different document is now live — drop any transient per-doc UI state
         // that referenced the old selection.

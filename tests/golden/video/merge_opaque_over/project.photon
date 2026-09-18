@@ -1,0 +1,156 @@
+{
+  "media": {
+    "assets": {}
+  },
+  "sequences": {
+    "00000000-0000-0000-0000-0000001e8480": {
+      "id": "00000000-0000-0000-0000-0000001e8480",
+      "name": "merge_opaque_over",
+      "frame_rate": {
+        "num": 30,
+        "den": 1
+      },
+      "formats": [
+        {
+          "name": "16:9",
+          "width": 64,
+          "height": 64
+        }
+      ],
+      "active_format": 0,
+      "video_tracks": [
+        {
+          "id": "00000000-0000-0000-0000-0000001e848a",
+          "name": "V1",
+          "kind": "video",
+          "clips": [
+            {
+              "id": "00000000-0000-0000-0000-0000001e8494",
+              "name": "",
+              "start": 0,
+              "duration": 1411200000,
+              "source": {
+                "source": "solid_color",
+                "color": {
+                  "r": 0.85,
+                  "g": 0.1,
+                  "b": 0.1,
+                  "a": 1.0
+                }
+              },
+              "source_in": 0,
+              "speed": {
+                "speed": "constant",
+                "num": 1,
+                "den": 1
+              },
+              "transform": {
+                "base": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "scale_x": 1.0,
+                  "scale_y": 1.0,
+                  "rotation": 0.0,
+                  "anchor_x": 0.0,
+                  "anchor_y": 0.0,
+                  "opacity": 1.0
+                }
+              },
+              "enabled": true
+            }
+          ],
+          "enabled": true,
+          "locked": false,
+          "height_px": 64.0
+        },
+        {
+          "id": "00000000-0000-0000-0000-0000001e848b",
+          "name": "V2",
+          "kind": "video",
+          "clips": [
+            {
+              "id": "00000000-0000-0000-0000-0000001e8495",
+              "name": "",
+              "start": 0,
+              "duration": 1411200000,
+              "source": {
+                "source": "solid_color",
+                "color": {
+                  "r": 0.1,
+                  "g": 0.2,
+                  "b": 0.85,
+                  "a": 1.0
+                }
+              },
+              "source_in": 0,
+              "speed": {
+                "speed": "constant",
+                "num": 1,
+                "den": 1
+              },
+              "transform": {
+                "base": {
+                  "x": 0.0,
+                  "y": 0.0,
+                  "scale_x": 1.0,
+                  "scale_y": 1.0,
+                  "rotation": 0.0,
+                  "anchor_x": 0.0,
+                  "anchor_y": 0.0,
+                  "opacity": 1.0
+                }
+              },
+              "enabled": true
+            }
+          ],
+          "enabled": true,
+          "locked": false,
+          "height_px": 64.0
+        }
+      ],
+      "audio_master": {
+        "params": {
+          "base": {
+            "volume_db": 0.0
+          }
+        },
+        "fx_chain": [
+          {
+            "kind": "limiter",
+            "enabled": true,
+            "params": {
+              "base": [
+                [
+                  "params.ceiling_db",
+                  {
+                    "t": "float",
+                    "v": -1.0
+                  }
+                ],
+                [
+                  "params.release_ms",
+                  {
+                    "t": "float",
+                    "v": 50.0
+                  }
+                ]
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "sequence_order": [
+    "00000000-0000-0000-0000-0000001e8480"
+  ],
+  "active_sequence": "00000000-0000-0000-0000-0000001e8480",
+  "settings": {
+    "generate_proxies": false,
+    "default_frame_rate": {
+      "num": 30,
+      "den": 1
+    },
+    "audio_sample_rate": 48000
+  }
+}

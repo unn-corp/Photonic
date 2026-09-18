@@ -1195,11 +1195,9 @@ pub async fn check_style_continuity(
 
         match &node.kind {
             SceneNodeKind::Path(p) => {
-                if check_fill {
-                    if p.fill.enabled {
-                        if let FillKind::Solid(c) = &p.fill.kind {
-                            fill_bucket.push((c.to_hex(), nid.clone(), nname.clone()));
-                        }
+                if check_fill && p.fill.enabled {
+                    if let FillKind::Solid(c) = &p.fill.kind {
+                        fill_bucket.push((c.to_hex(), nid.clone(), nname.clone()));
                     }
                 }
                 if check_stroke && p.stroke.enabled {
@@ -1212,11 +1210,9 @@ pub async fn check_style_continuity(
                 }
             }
             SceneNodeKind::Text(t) => {
-                if check_fill {
-                    if t.fill.enabled {
-                        if let FillKind::Solid(c) = &t.fill.kind {
-                            fill_bucket.push((c.to_hex(), nid.clone(), nname.clone()));
-                        }
+                if check_fill && t.fill.enabled {
+                    if let FillKind::Solid(c) = &t.fill.kind {
+                        fill_bucket.push((c.to_hex(), nid.clone(), nname.clone()));
                     }
                 }
                 if check_stroke && t.stroke.enabled {
@@ -2181,7 +2177,7 @@ pub async fn flatten_transparency(state: &AppState, args: FlattenTransparencyArg
 
     /// Premultiply a fill's own opacity and the node's opacity into color alphas.
     fn bake_fill(fill: &Fill, node_opacity: f32) -> Fill {
-        let combined = (fill.opacity as f32) * node_opacity;
+        let combined = fill.opacity * node_opacity;
         let kind = match &fill.kind {
             FillKind::Solid(c) => FillKind::Solid(photonic_core::color::Color {
                 r: c.r,

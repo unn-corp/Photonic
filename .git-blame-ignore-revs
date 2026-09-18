@@ -1,0 +1,4 @@
+# Bulk reformats — ignore in `git blame` (git config blame.ignoreRevsFile .git-blame-ignore-revs)
+
+# style: rustfmt the tree to match the blocking CI gate
+199ffd78a1d2cfcecbdae047740849ae5ab482e7

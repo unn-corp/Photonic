@@ -2484,7 +2484,7 @@ pub async fn apply_grid_layout(state: &AppState, args: ApplyGridLayoutArgs) -> T
 
     // Compute column widths and row heights
     let n = children.len();
-    let rows = (n + cols - 1) / cols;
+    let rows = n.div_ceil(cols);
 
     let col_width: f64 = children.iter().map(|c| c.w).fold(0.0_f64, f64::max);
     let row_height: f64 = children.iter().map(|c| c.h).fold(0.0_f64, f64::max);
@@ -2657,8 +2657,13 @@ mod tests {
             document_path: Arc::new(StdMutex::new(None)),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
+            path_policy: photonic_core::PathPolicy::test_default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),
             clipboard_ring: Arc::new(crate::handlers::clipboard::new_clipboard_ring()),
+            video_engine: Arc::new(crate::handlers::video_jobs::VideoEngineHandle::new()),
+            video_jobs: Arc::new(StdMutex::new(
+                crate::handlers::video_jobs::JobRegistry::new(),
+            )),
         }
     }
 

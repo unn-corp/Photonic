@@ -1,0 +1,92 @@
+{
+  "format_version": 2,
+  "id": "d609ee76-9da1-48f3-b464-3710b0bc9cf4",
+  "name": "raster-placement",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "e04ef809-34cc-4492-b1ab-ae631bcc7dc8"
+  ],
+  "layers": {
+    "e04ef809-34cc-4492-b1ab-ae631bcc7dc8": {
+      "id": "e04ef809-34cc-4492-b1ab-ae631bcc7dc8",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "8483bdc5-1449-476b-9c2b-2b6174ba0d5e"
+      ]
+    }
+  },
+  "nodes": {
+    "8483bdc5-1449-476b-9c2b-2b6174ba0d5e": {
+      "id": "8483bdc5-1449-476b-9c2b-2b6174ba0d5e",
+      "name": "raster",
+      "layer_id": "e04ef809-34cc-4492-b1ab-ae631bcc7dc8",
+      "kind": {
+        "type": "raster",
+        "image": {
+          "width": 32,
+          "height": 32,
+          "png": "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAoklEQVR4Ae3AA6AkWZbG8f937o3IzKdyS2Oubdu2bdu2bdu2bWmMnpZKr54yMyLu+Xa3anqmhztr1a/6szH/fQj+exH89yL470Xw34vgvxfBfy+C/14E/70I/nsR/Pci+O9F8N+L4L8XwX8vgv9eBP+9CP57Efz3IvjvRfDfi+C/F8F/L4L/XgT/vQj+exH89yL470Xw34vgvxfBfy+C/178I3C7AsFBdaf1AAAAAElFTkSuQmCC"
+        }
+      },
+      "transform": {
+        "matrix": [
+          2.0,
+          0.0,
+          0.0,
+          2.0,
+          40.0,
+          40.0
+        ]
+      }
+    }
+  },
+  "active_layer_id": "e04ef809-34cc-4492-b1ab-ae631bcc7dc8",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "b0087903-a2b5-4a0d-9993-30795ecae7fb",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "b0087903-a2b5-4a0d-9993-30795ecae7fb",
+  "photon_format": 1
+}

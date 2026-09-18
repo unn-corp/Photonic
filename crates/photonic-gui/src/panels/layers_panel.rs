@@ -341,7 +341,7 @@ pub fn draw_layers_panel(
             ui.label(
                 RichText::new("LAYERS")
                     .small()
-                    .color(Color32::from_rgb(80, 80, 110)),
+                    .color(crate::theme::section_header_color(ui)),
             );
             ui.add_space(2.0);
             egui::ScrollArea::vertical()

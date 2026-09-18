@@ -1,0 +1,163 @@
+{
+  "format_version": 2,
+  "id": "f2d0732f-8883-43e6-930b-cecb1531b55d",
+  "name": "strokes-basic",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "b294eb99-b3f7-4b79-9b97-f57c38aa9b46"
+  ],
+  "layers": {
+    "b294eb99-b3f7-4b79-9b97-f57c38aa9b46": {
+      "id": "b294eb99-b3f7-4b79-9b97-f57c38aa9b46",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "231aa0fb-ca2a-4c96-a356-79d791fa4d29",
+        "4a007a67-9c1e-41a9-9e64-03f203c94ed8"
+      ]
+    }
+  },
+  "nodes": {
+    "231aa0fb-ca2a-4c96-a356-79d791fa4d29": {
+      "id": "231aa0fb-ca2a-4c96-a356-79d791fa4d29",
+      "name": "line-round",
+      "layer_id": "b294eb99-b3f7-4b79-9b97-f57c38aa9b46",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,20 L100,20"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 0.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.1,
+            "g": 0.6,
+            "b": 0.3,
+            "a": 1.0
+          },
+          "width": 6.0,
+          "opacity": 1.0,
+          "line_cap": "round",
+          "line_join": "round",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": true,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    },
+    "4a007a67-9c1e-41a9-9e64-03f203c94ed8": {
+      "id": "4a007a67-9c1e-41a9-9e64-03f203c94ed8",
+      "name": "line-dashed",
+      "layer_id": "b294eb99-b3f7-4b79-9b97-f57c38aa9b46",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,60 L100,100"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 0.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.6,
+            "g": 0.2,
+            "b": 0.7,
+            "a": 1.0
+          },
+          "width": 4.0,
+          "opacity": 1.0,
+          "line_cap": "square",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [
+            8.0,
+            4.0
+          ],
+          "dash_offset": 0.0,
+          "enabled": true,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "b294eb99-b3f7-4b79-9b97-f57c38aa9b46",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "000007b8-b62c-4450-8d13-619a8e11b748",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "000007b8-b62c-4450-8d13-619a8e11b748",
+  "photon_format": 1
+}

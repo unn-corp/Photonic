@@ -7,7 +7,7 @@ pub(crate) fn default_checker_tile() -> photonic_core::RasterImage {
     let mut img = photonic_core::RasterImage::new(n, n);
     for y in 0..n {
         for x in 0..n {
-            let on = ((x / cell) + (y / cell)) % 2 == 0;
+            let on = ((x / cell) + (y / cell)).is_multiple_of(2);
             let rgba = if on {
                 [40, 40, 48, 255]
             } else {
@@ -186,27 +186,25 @@ pub(crate) fn draw_stroke_editor(
             }
             // Add/remove pair buttons
             ui.horizontal(|ui| {
-                if pair_count < 3 {
-                    if ui
+                if pair_count < 3
+                    && ui
                         .small_button("+ Pair")
                         .on_hover_text("Add a dash/gap pair")
                         .clicked()
-                    {
-                        new_stroke.dash_array.extend_from_slice(&[8.0, 4.0]);
-                        changed = true;
-                    }
+                {
+                    new_stroke.dash_array.extend_from_slice(&[8.0, 4.0]);
+                    changed = true;
                 }
-                if pair_count > 1 {
-                    if ui
+                if pair_count > 1
+                    && ui
                         .small_button("− Pair")
                         .on_hover_text("Remove the last dash/gap pair")
                         .clicked()
-                    {
-                        new_stroke
-                            .dash_array
-                            .truncate(new_stroke.dash_array.len().saturating_sub(2));
-                        changed = true;
-                    }
+                {
+                    new_stroke
+                        .dash_array
+                        .truncate(new_stroke.dash_array.len().saturating_sub(2));
+                    changed = true;
                 }
             });
             // Dash offset

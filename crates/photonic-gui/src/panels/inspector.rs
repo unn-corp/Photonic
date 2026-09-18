@@ -963,8 +963,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                                 .button("Apply Shear")
                                 .on_hover_text("Apply the shear transform around the node's centre")
                                 .clicked()
-                            {
-                                if *shear_x != 0.0 || *shear_y != 0.0 {
+                                && (*shear_x != 0.0 || *shear_y != 0.0) {
                                     let mut node_ids = vec![nid];
                                     node_ids
                                         .extend(selected_ids.iter().copied().filter(|&i| i != nid));
@@ -976,7 +975,6 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                                     *shear_x = 0.0;
                                     *shear_y = 0.0;
                                 }
-                            }
                             if ui
                                 .button("Reset")
                                 .on_hover_text("Clear shear values")
@@ -1043,7 +1041,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             // Radial Copies
             if matches("Radial Copies") {
                 thread_local! {
-                    static RADIAL_COUNT: std::cell::RefCell<usize> = std::cell::RefCell::new(6);
+                    static RADIAL_COUNT: std::cell::RefCell<usize> = const { std::cell::RefCell::new(6) };
                 }
                 RADIAL_COUNT.with(|v| {
                     let mut count = *v.borrow();
@@ -1232,7 +1230,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                         ui.label(RichText::new("Select a path node from the scene by entering its ID or name:").weak().small());
                         // Use a thread_local for the input string to avoid extra params
                         thread_local! {
-                            static SPINE_INPUT: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+                            static SPINE_INPUT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
                         }
                         SPINE_INPUT.with(|s| {
                             let mut val = s.borrow().clone();
@@ -1246,7 +1244,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                             {
                                 let path_str = SPINE_INPUT.with(|s| s.borrow().clone());
                                 if !path_str.is_empty() {
-                                    if let Some(path_id) = uuid::Uuid::parse_str(&path_str).ok() {
+                                    if let Ok(path_id) = uuid::Uuid::parse_str(&path_str) {
                                         action = Some(PanelAction::SetBlendSpine { group_id: gid, path_id });
                                     }
                                 }
@@ -1368,7 +1366,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             ui.label(
                 RichText::new("Typography")
                     .small()
-                    .color(Color32::from_rgb(80, 80, 110)),
+                    .color(crate::theme::section_header_color(ui)),
             );
             ui.add_space(2.0);
         }
@@ -1419,7 +1417,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                         // Tab Stops panel
                         ui.collapsing("Tab Stops", |ui| {
                             thread_local! {
-                                static TAB_STOP_INPUT: std::cell::RefCell<f64> = std::cell::RefCell::new(50.0);
+                                static TAB_STOP_INPUT: std::cell::RefCell<f64> = const { std::cell::RefCell::new(50.0) };
                             }
                             let current_stops = tn.tab_stops.clone();
                             if current_stops.is_empty() {
@@ -1444,11 +1442,10 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                                     }
                                 });
                             });
-                            if !current_stops.is_empty() {
-                                if ui.small_button("Clear All").on_hover_text("Remove all custom tab stops").clicked() {
+                            if !current_stops.is_empty()
+                                && ui.small_button("Clear All").on_hover_text("Remove all custom tab stops").clicked() {
                                     action = Some(PanelAction::ClearTabStops { node_id: text_nid });
                                 }
-                            }
                         });
                         if ui.button("Find / Replace…")
                             .on_hover_text("Search and replace text content across text nodes")
@@ -1676,7 +1673,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                         } else {
                             // Look for a path in the current selection to pair with
                             let path_node_id: Option<NodeId> = doc.selection.ids()
-                                .find(|&&sid| sid != text_nid && doc.nodes.get(&sid).map_or(false, |n| matches!(n.kind, SceneNodeKind::Path(_))))
+                                .find(|&&sid| sid != text_nid && doc.nodes.get(&sid).is_some_and(|n| matches!(n.kind, SceneNodeKind::Path(_))))
                                 .copied();
                             if let Some(pid) = path_node_id {
                                 let path_name = doc.nodes.get(&pid).map(|n| n.name.clone()).unwrap_or_default();
@@ -1721,7 +1718,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                             }
                         } else {
                             let area_node_id: Option<NodeId> = doc.selection.ids()
-                                .find(|&&sid| sid != text_nid && doc.nodes.get(&sid).map_or(false, |n| matches!(n.kind, SceneNodeKind::Path(_))))
+                                .find(|&&sid| sid != text_nid && doc.nodes.get(&sid).is_some_and(|n| matches!(n.kind, SceneNodeKind::Path(_))))
                                 .copied();
                             if let Some(aid) = area_node_id {
                                 let area_name = doc.nodes.get(&aid).map(|n| n.name.clone()).unwrap_or_default();
@@ -1841,7 +1838,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                                 .ids()
                                 .find(|&&sid| {
                                     sid != text_nid
-                                        && doc.nodes.get(&sid).map_or(false, |n| {
+                                        && doc.nodes.get(&sid).is_some_and(|n| {
                                             matches!(n.kind, SceneNodeKind::Text(_))
                                         })
                                 })
@@ -2485,7 +2482,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                     let (rect, resp) =
                         ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::click());
                     ui.painter().rect_filled(rect, 2.0, c32);
-                    let is_editing = edit.as_ref().map_or(false, |e| e.original == rgba);
+                    let is_editing = edit.as_ref().is_some_and(|e| e.original == rgba);
                     if resp.hovered() || is_editing {
                         ui.painter().rect_stroke(
                             rect,
@@ -2515,7 +2512,7 @@ pub(crate) fn draw_selected_node(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                                     }
                                     _ => None,
                                 };
-                                solid.map_or(false, |fc| fc.to_hex() == c.to_hex())
+                                solid.is_some_and(|fc| fc.to_hex() == c.to_hex())
                             })
                             .map(|n| n.id)
                             .collect();
@@ -2686,8 +2683,8 @@ pub(crate) fn draw_symbol_overrides(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                     ui.label(RichText::new(format!("Fill: {}  Stroke: {}", fill_disp, stroke_disp)).small());
                     ui.separator();
                     thread_local! {
-                        static FILL_HEX: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
-                        static STROKE_HEX: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+                        static FILL_HEX: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+                        static STROKE_HEX: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
                     }
                     ui.horizontal(|ui| {
                         ui.label("Fill:");
@@ -2720,14 +2717,13 @@ pub(crate) fn draw_symbol_overrides(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                                 });
                             }
                         }
-                        if node.symbol_fill_override.is_some() || node.symbol_stroke_override.is_some() {
-                            if ui.button("Clear Override")
+                        if (node.symbol_fill_override.is_some() || node.symbol_stroke_override.is_some())
+                            && ui.button("Clear Override")
                                 .on_hover_text("Reset this instance to master fill/stroke")
                                 .clicked()
                             {
                                 action = Some(PanelAction::ClearSymbolOverrides { node_id: nid });
                             }
-                        }
                     });
                 });
             ui.add_space(2.0);

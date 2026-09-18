@@ -1,0 +1,11 @@
+# Golden case: grade_curve
+# Authored by tests/gen_video_golden.rs (11 §1.1). Bless PNGs with
+# PHOTONIC_BLESS_GOLDEN=1 cargo test -p photonic-video --test golden_frames.
+notes = "quadrant pattern through a non-identity Curves master curve"
+format_index = 0
+doc_generation = 1
+
+[[frames]]
+n = 0
+name = "curve"
+

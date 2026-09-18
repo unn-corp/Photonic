@@ -140,7 +140,7 @@ pub fn bez_move_anchors_weighted(
     dx: f64,
     dy: f64,
 ) -> BezPath {
-    let els: Vec<PathEl> = bez.elements().iter().copied().collect();
+    let els: Vec<PathEl> = bez.elements().to_vec();
     let w_of = |j: usize| weights.get(&j).copied().unwrap_or(0.0);
     let shift = |p: Point, w: f64| Point::new(p.x + w * dx, p.y + w * dy);
 

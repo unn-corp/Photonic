@@ -1,0 +1,3 @@
+doc.md:4
+  spec-source: x.rs::E
+  actual:      A, B  (x.rs:1)

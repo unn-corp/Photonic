@@ -187,7 +187,7 @@ pub async fn create_line_chart(state: &AppState, args: CreateLineChartArgs) -> T
             };
             pn.stroke = Stroke::none();
             let node = SceneNode::new(
-                &format!("Series {} Area", si + 1),
+                format!("Series {} Area", si + 1),
                 layer_id,
                 SceneNodeKind::Path(pn),
             );
@@ -211,7 +211,7 @@ pub async fn create_line_chart(state: &AppState, args: CreateLineChartArgs) -> T
             ..Default::default()
         };
         let node = SceneNode::new(
-            &format!("Series {}", si + 1),
+            format!("Series {}", si + 1),
             layer_id,
             SceneNodeKind::Path(pn),
         );
@@ -830,7 +830,7 @@ pub async fn create_radar_chart(state: &AppState, args: CreateRadarChartArgs) ->
         };
         pn.stroke = Stroke::solid(Color::new(0.7, 0.7, 0.75, 1.0), 0.75);
         let node = SceneNode::new(
-            &format!("Grid Ring {ring}"),
+            format!("Grid Ring {ring}"),
             layer_id,
             SceneNodeKind::Path(pn),
         );
@@ -862,7 +862,7 @@ pub async fn create_radar_chart(state: &AppState, args: CreateRadarChartArgs) ->
             .get(i)
             .cloned()
             .unwrap_or_else(|| format!("Axis {}", i + 1));
-        let node = SceneNode::new(&format!("Axis {label}"), layer_id, SceneNodeKind::Path(pn));
+        let node = SceneNode::new(format!("Axis {label}"), layer_id, SceneNodeKind::Path(pn));
         child_ids.push(node.id);
         history.execute_discrete(
             Command::AddNode {

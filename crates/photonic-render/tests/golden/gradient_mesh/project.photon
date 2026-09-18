@@ -1,0 +1,150 @@
+{
+  "format_version": 2,
+  "id": "c728a319-dadc-4881-a843-eb5e7c8d8ce2",
+  "name": "gradient-mesh",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "4bb5161e-6fae-4b8e-9b7f-624c1954b07b"
+  ],
+  "layers": {
+    "4bb5161e-6fae-4b8e-9b7f-624c1954b07b": {
+      "id": "4bb5161e-6fae-4b8e-9b7f-624c1954b07b",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "07d80e0d-4fe4-47c3-b712-2d4631d70e7b"
+      ]
+    }
+  },
+  "nodes": {
+    "07d80e0d-4fe4-47c3-b712-2d4631d70e7b": {
+      "id": "07d80e0d-4fe4-47c3-b712-2d4631d70e7b",
+      "name": "mesh-rect",
+      "layer_id": "4bb5161e-6fae-4b8e-9b7f-624c1954b07b",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,10 L110,10 L110,110 L10,110 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "mesh_gradient",
+            "rows": 2,
+            "cols": 2,
+            "x_lines": [
+              0.0,
+              0.5,
+              1.0
+            ],
+            "y_lines": [
+              0.0,
+              0.5,
+              1.0
+            ],
+            "cell_colors": [
+              {
+                "r": 1.0,
+                "g": 0.2,
+                "b": 0.2,
+                "a": 1.0
+              },
+              {
+                "r": 0.2,
+                "g": 1.0,
+                "b": 0.2,
+                "a": 1.0
+              },
+              {
+                "r": 0.2,
+                "g": 0.2,
+                "b": 1.0,
+                "a": 1.0
+              },
+              {
+                "r": 1.0,
+                "g": 1.0,
+                "b": 0.2,
+                "a": 1.0
+              }
+            ],
+            "blend": 1.0,
+            "units": "object_bounding_box"
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "4bb5161e-6fae-4b8e-9b7f-624c1954b07b",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "715615cb-0af0-451e-8d91-0eb74309a291",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "715615cb-0af0-451e-8d91-0eb74309a291",
+  "photon_format": 1
+}

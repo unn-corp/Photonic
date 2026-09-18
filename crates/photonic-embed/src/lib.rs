@@ -44,7 +44,7 @@ impl Embedder {
     /// Embed a batch of texts into L2-normalized 384-dim vectors.
     pub fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         let docs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        Ok(self.model.embed(docs, None)?)
+        self.model.embed(docs, None)
     }
 }
 

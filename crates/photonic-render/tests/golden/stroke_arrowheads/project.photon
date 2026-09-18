@@ -1,0 +1,117 @@
+{
+  "format_version": 2,
+  "id": "4d20002b-a365-423f-a8b1-348cd47e63e7",
+  "name": "stroke-arrowheads",
+  "width": 120.0,
+  "height": 80.0,
+  "layer_order": [
+    "5ac857ec-48e5-4669-86bf-5b7666bb4d34"
+  ],
+  "layers": {
+    "5ac857ec-48e5-4669-86bf-5b7666bb4d34": {
+      "id": "5ac857ec-48e5-4669-86bf-5b7666bb4d34",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "8a692f9b-3a1b-4b2a-a7e9-2c60ceb785bb"
+      ]
+    }
+  },
+  "nodes": {
+    "8a692f9b-3a1b-4b2a-a7e9-2c60ceb785bb": {
+      "id": "8a692f9b-3a1b-4b2a-a7e9-2c60ceb785bb",
+      "name": "arrow-line",
+      "layer_id": "5ac857ec-48e5-4669-86bf-5b7666bb4d34",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M15,40 L105,40"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 0.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.15,
+            "g": 0.15,
+            "b": 0.15,
+            "a": 1.0
+          },
+          "width": 4.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [
+            10.0,
+            5.0
+          ],
+          "dash_offset": 0.0,
+          "enabled": true,
+          "align": "center",
+          "dash_corner_alignment": true,
+          "arrowhead_start": "open_arrow",
+          "arrowhead_end": "filled_arrow",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "5ac857ec-48e5-4669-86bf-5b7666bb4d34",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "cba2fab4-11e1-4aac-9b4a-ca03d15a3deb",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 80.0
+    }
+  ],
+  "active_artboard": "cba2fab4-11e1-4aac-9b4a-ca03d15a3deb",
+  "photon_format": 1
+}

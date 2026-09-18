@@ -1,0 +1,131 @@
+{
+  "format_version": 2,
+  "id": "e438511f-68a5-4860-9c4e-5f4a30c5b6e1",
+  "name": "effect-shadow-feather",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "2078f3e6-2a5f-46df-9c06-b10c95982914"
+  ],
+  "layers": {
+    "2078f3e6-2a5f-46df-9c06-b10c95982914": {
+      "id": "2078f3e6-2a5f-46df-9c06-b10c95982914",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "6b30cf2d-1999-4235-b2a2-7399acc94db8"
+      ]
+    }
+  },
+  "nodes": {
+    "6b30cf2d-1999-4235-b2a2-7399acc94db8": {
+      "id": "6b30cf2d-1999-4235-b2a2-7399acc94db8",
+      "name": "soft-shape",
+      "layer_id": "2078f3e6-2a5f-46df-9c06-b10c95982914",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M30,30 L80,30 L80,80 L30,80 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "solid",
+            "r": 0.8,
+            "g": 0.2,
+            "b": 0.2,
+            "a": 1.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      },
+      "drop_shadow": {
+        "color": {
+          "r": 0.0,
+          "g": 0.0,
+          "b": 0.0,
+          "a": 1.0
+        },
+        "opacity": 0.5,
+        "dx": 6.0,
+        "dy": 6.0,
+        "blur": 8.0,
+        "enabled": true
+      },
+      "feather": {
+        "radius": 5.0,
+        "enabled": true
+      }
+    }
+  },
+  "active_layer_id": "2078f3e6-2a5f-46df-9c06-b10c95982914",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "7cebc304-9c88-4d8f-82f3-6c3b52c2001f",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "7cebc304-9c88-4d8f-82f3-6c3b52c2001f",
+  "photon_format": 1
+}

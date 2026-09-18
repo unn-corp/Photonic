@@ -454,33 +454,33 @@ pub async fn sample_color_at(state: &AppState, args: SampleColorAtArgs) -> ToolR
                         }));
                     }
                 }
-                SceneNodeKind::Raster(rn) if !rn.is_adjustment_layer() => {
-                    if local.x >= 0.0
+                SceneNodeKind::Raster(rn)
+                    if !rn.is_adjustment_layer()
+                        && local.x >= 0.0
                         && local.y >= 0.0
                         && local.x < rn.image.width as f64
-                        && local.y < rn.image.height as f64
-                    {
-                        let rgba = rn.image.pixel(local.x as u32, local.y as u32);
-                        let cov = rn
-                            .mask
-                            .as_ref()
-                            .map(|m| m.coverage(local.x as u32, local.y as u32))
-                            .unwrap_or(1.0);
-                        // Skip transparent/masked pixels so sampling falls through.
-                        if (rgba[3] as f32 / 255.0) * cov * node.opacity > 0.0 {
-                            let hex = format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2]);
-                            return ToolResult::text(format!(
-                                "Sampled '{}': color={} (raster pixel)",
-                                node.name, hex
-                            ))
-                            .with_data(serde_json::json!({
-                                "node_id": nid,
-                                "node_name": node.name,
-                                "fill_color": hex,
-                                "stroke_color": null,
-                                "opacity": node.opacity,
-                            }));
-                        }
+                        && local.y < rn.image.height as f64 =>
+                {
+                    let rgba = rn.image.pixel(local.x as u32, local.y as u32);
+                    let cov = rn
+                        .mask
+                        .as_ref()
+                        .map(|m| m.coverage(local.x as u32, local.y as u32))
+                        .unwrap_or(1.0);
+                    // Skip transparent/masked pixels so sampling falls through.
+                    if (rgba[3] as f32 / 255.0) * cov * node.opacity > 0.0 {
+                        let hex = format!("#{:02X}{:02X}{:02X}", rgba[0], rgba[1], rgba[2]);
+                        return ToolResult::text(format!(
+                            "Sampled '{}': color={} (raster pixel)",
+                            node.name, hex
+                        ))
+                        .with_data(serde_json::json!({
+                            "node_id": nid,
+                            "node_name": node.name,
+                            "fill_color": hex,
+                            "stroke_color": null,
+                            "opacity": node.opacity,
+                        }));
                     }
                 }
                 _ => {}
@@ -1066,7 +1066,7 @@ pub async fn hatch_fill(state: &AppState, args: HatchFillArgs) -> ToolResult {
         };
 
         let hatch_node = SceneNode::new(
-            &format!("{} Hatch", node.name),
+            format!("{} Hatch", node.name),
             layer_id,
             SceneNodeKind::Path(hatch_pn),
         );
@@ -1202,7 +1202,7 @@ pub async fn stipple_fill(state: &AppState, args: StippleFillArgs) -> ToolResult
         dot_pn.stroke = Stroke::none();
 
         let dot_node = SceneNode::new(
-            &format!("{} Stipple", node.name),
+            format!("{} Stipple", node.name),
             layer_id,
             SceneNodeKind::Path(dot_pn),
         );
@@ -1361,36 +1361,33 @@ pub async fn invert_colors(state: &AppState, args: InvertColorsArgs) -> ToolResu
         let mut new_node = node.clone();
         let mut modified = false;
 
-        match &mut new_node.kind {
-            SceneNodeKind::Path(path) => {
-                match &mut path.fill.kind {
-                    FillKind::Solid(c) => *c = c.invert(),
-                    FillKind::Gradient(g) => {
-                        for stop in &mut g.stops {
-                            stop.color = stop.color.invert();
-                        }
+        if let SceneNodeKind::Path(path) = &mut new_node.kind {
+            match &mut path.fill.kind {
+                FillKind::Solid(c) => *c = c.invert(),
+                FillKind::Gradient(g) => {
+                    for stop in &mut g.stops {
+                        stop.color = stop.color.invert();
                     }
-                    FillKind::FluidGradient(fg) => {
-                        for pt in &mut fg.points {
-                            pt.color = pt.color.invert();
-                        }
-                    }
-                    FillKind::MeshGradient(mg) => {
-                        for c in &mut mg.cell_colors {
-                            *c = c.invert();
-                        }
-                    }
-                    FillKind::Pattern(p) => {
-                        p.tile.map_rgb(|[r, g, b]| [1.0 - r, 1.0 - g, 1.0 - b]);
-                    }
-                    FillKind::None => {}
                 }
-                if path.stroke.enabled {
-                    path.stroke.color = path.stroke.color.invert();
+                FillKind::FluidGradient(fg) => {
+                    for pt in &mut fg.points {
+                        pt.color = pt.color.invert();
+                    }
                 }
-                modified = true;
+                FillKind::MeshGradient(mg) => {
+                    for c in &mut mg.cell_colors {
+                        *c = c.invert();
+                    }
+                }
+                FillKind::Pattern(p) => {
+                    p.tile.map_rgb(|[r, g, b]| [1.0 - r, 1.0 - g, 1.0 - b]);
+                }
+                FillKind::None => {}
             }
-            _ => {}
+            if path.stroke.enabled {
+                path.stroke.color = path.stroke.color.invert();
+            }
+            modified = true;
         }
 
         if modified {
@@ -1557,39 +1554,36 @@ pub async fn convert_to_grayscale(state: &AppState, args: ConvertToGrayscaleArgs
         let mut new_node = node.clone();
         let mut modified = false;
 
-        match &mut new_node.kind {
-            SceneNodeKind::Path(path) => {
-                match &mut path.fill.kind {
-                    FillKind::Solid(c) => *c = c.to_grayscale(),
-                    FillKind::Gradient(g) => {
-                        for stop in &mut g.stops {
-                            stop.color = stop.color.to_grayscale();
-                        }
+        if let SceneNodeKind::Path(path) = &mut new_node.kind {
+            match &mut path.fill.kind {
+                FillKind::Solid(c) => *c = c.to_grayscale(),
+                FillKind::Gradient(g) => {
+                    for stop in &mut g.stops {
+                        stop.color = stop.color.to_grayscale();
                     }
-                    FillKind::FluidGradient(fg) => {
-                        for pt in &mut fg.points {
-                            pt.color = pt.color.to_grayscale();
-                        }
-                    }
-                    FillKind::MeshGradient(mg) => {
-                        for c in &mut mg.cell_colors {
-                            *c = c.to_grayscale();
-                        }
-                    }
-                    FillKind::Pattern(p) => {
-                        p.tile.map_rgb(|rgb| {
-                            let l = photonic_core::raster::image::luma(rgb);
-                            [l, l, l]
-                        });
-                    }
-                    FillKind::None => {}
                 }
-                if path.stroke.enabled {
-                    path.stroke.color = path.stroke.color.to_grayscale();
+                FillKind::FluidGradient(fg) => {
+                    for pt in &mut fg.points {
+                        pt.color = pt.color.to_grayscale();
+                    }
                 }
-                modified = true;
+                FillKind::MeshGradient(mg) => {
+                    for c in &mut mg.cell_colors {
+                        *c = c.to_grayscale();
+                    }
+                }
+                FillKind::Pattern(p) => {
+                    p.tile.map_rgb(|rgb| {
+                        let l = photonic_core::raster::image::luma(rgb);
+                        [l, l, l]
+                    });
+                }
+                FillKind::None => {}
             }
-            _ => {}
+            if path.stroke.enabled {
+                path.stroke.color = path.stroke.color.to_grayscale();
+            }
+            modified = true;
         }
 
         if modified {

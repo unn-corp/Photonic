@@ -4,15 +4,18 @@ use crate::{
     node::{NodeId, SceneNode},
 };
 use serde::{Deserialize, Serialize};
+use smallvec::{smallvec, SmallVec};
 use uuid::Uuid;
 
 mod branches;
 mod checkpoints;
 mod coalescing;
+#[cfg(test)]
+mod revision_contract;
 mod stacks;
 mod tree;
 
-pub use tree::{HistoryGraphNode, HistoryTree};
+pub use tree::{HistoryEntryKind, HistoryGraphNode, HistoryTree};
 
 #[cfg(test)]
 mod tests {
@@ -2158,6 +2161,125 @@ mod tests {
         assert_eq!(doc.nodes[&rid].name, "renamed");
         assert!(px_ok(&doc), "pixels lost on redo of meta edit");
     }
+
+    // ── SetWorkspaces ────────────────────────────────────────────────────────
+
+    fn ws(name: &str, q: &str) -> crate::Workspace {
+        crate::Workspace {
+            name: name.to_string(),
+            search_query: q.to_string(),
+        }
+    }
+
+    fn set_ws(h: &mut CommandHistory, doc: &mut Document, new: Vec<crate::Workspace>) {
+        let old = doc.workspaces.clone();
+        h.execute(Command::SetWorkspaces { old, new }, doc);
+    }
+
+    /// `Document.workspaces` is persisted, so save/delete must be undoable —
+    /// SPEC's "every document mutation, without exception, is undoable". Before
+    /// `SetWorkspaces` both call sites mutated the vec in place and left no
+    /// history entry at all, so undo silently skipped past them.
+    #[test]
+    fn workspace_save_and_delete_round_trip_through_history() {
+        let mut doc = make_doc();
+        let mut h = CommandHistory::new(200);
+        assert!(doc.workspaces.is_empty());
+
+        // Save two.
+        set_ws(&mut h, &mut doc, vec![ws("Draft", "fill")]);
+        set_ws(
+            &mut h,
+            &mut doc,
+            vec![ws("Draft", "fill"), ws("Final", "text")],
+        );
+        assert_eq!(doc.workspaces.len(), 2);
+
+        // Delete the first.
+        set_ws(&mut h, &mut doc, vec![ws("Final", "text")]);
+        assert_eq!(doc.workspaces, vec![ws("Final", "text")]);
+
+        // Undo walks back through every step.
+        h.undo(&mut doc);
+        assert_eq!(
+            doc.workspaces,
+            vec![ws("Draft", "fill"), ws("Final", "text")],
+            "undo of a delete must restore the workspace"
+        );
+        h.undo(&mut doc);
+        assert_eq!(doc.workspaces, vec![ws("Draft", "fill")]);
+        h.undo(&mut doc);
+        assert!(
+            doc.workspaces.is_empty(),
+            "undo of the first save must leave no workspaces"
+        );
+
+        // And redo replays them.
+        h.redo(&mut doc);
+        assert_eq!(doc.workspaces, vec![ws("Draft", "fill")]);
+        h.redo(&mut doc);
+        h.redo(&mut doc);
+        assert_eq!(doc.workspaces, vec![ws("Final", "text")]);
+    }
+
+    /// Re-saving an existing name edits it in place rather than duplicating,
+    /// and that edit is undoable too.
+    #[test]
+    fn workspace_resave_updates_query_and_is_undoable() {
+        let mut doc = make_doc();
+        let mut h = CommandHistory::new(200);
+
+        set_ws(&mut h, &mut doc, vec![ws("Draft", "fill")]);
+        set_ws(&mut h, &mut doc, vec![ws("Draft", "stroke")]);
+        assert_eq!(doc.workspaces, vec![ws("Draft", "stroke")]);
+
+        h.undo(&mut doc);
+        assert_eq!(
+            doc.workspaces,
+            vec![ws("Draft", "fill")],
+            "undo must restore the previous search query"
+        );
+    }
+
+    /// The undo stack has to say *which* workspace step it is, or a user cannot
+    /// tell three "Update workspaces" entries apart.
+    #[test]
+    fn workspace_step_descriptions_name_the_action() {
+        let save = Command::SetWorkspaces {
+            old: vec![],
+            new: vec![ws("A", "")],
+        };
+        let delete = Command::SetWorkspaces {
+            old: vec![ws("A", "")],
+            new: vec![],
+        };
+        let update = Command::SetWorkspaces {
+            old: vec![ws("A", "x")],
+            new: vec![ws("A", "y")],
+        };
+        assert_eq!(save.description(), "Save workspace");
+        assert_eq!(delete.description(), "Delete workspace");
+        assert_eq!(update.description(), "Update workspace");
+    }
+
+    /// Workspace edits are discrete clicks, not a drag, so two of them must
+    /// stay two undo steps. Coalescing is bounded only by pointer-down/up, so
+    /// an accidental merge here would swallow an independent save.
+    #[test]
+    fn workspace_edits_do_not_coalesce() {
+        let a = Command::SetWorkspaces {
+            old: vec![],
+            new: vec![ws("A", "")],
+        };
+        let b = Command::SetWorkspaces {
+            old: vec![ws("A", "")],
+            new: vec![ws("A", ""), ws("B", "")],
+        };
+        assert!(
+            Command::coalesce(&a, &b).is_none(),
+            "two workspace edits must remain two undo steps"
+        );
+    }
 }
 
 /// A reversible command that can be applied to a Document.
@@ -2354,6 +2476,19 @@ pub enum Command {
         new: Vec<crate::Artboard>,
     },
 
+    /// Replace the entire workspace-preset list (save/rename/delete of a named
+    /// properties-panel filter). Stores old and new for self-contained undo,
+    /// exactly like [`Command::SetArtboards`].
+    ///
+    /// `Document.workspaces` is persisted in the `.photon` file, so mutating it
+    /// without a command violated SPEC's "every document mutation, without
+    /// exception, is undoable" — saving or deleting a workspace was silently
+    /// unundoable and left no history entry.
+    SetWorkspaces {
+        old: Vec<crate::Workspace>,
+        new: Vec<crate::Workspace>,
+    },
+
     /// Replace the persisted document state in one self-contained undo step.
     ///
     /// This is the deliberate fallback for integrations that make arbitrary
@@ -2379,6 +2514,11 @@ pub enum Command {
         new_width: f64,
         new_height: f64,
     },
+
+    /// A video-editor timeline edit (01 §10). All timeline commands nest under
+    /// this single arm; `TimelineCmd` owns their apply/inverse/coalesce, so the
+    /// history layer pays the multi-touch-point friction exactly once.
+    Timeline(crate::timeline::TimelineCmd),
 }
 
 /// Produce an informative label for an `UpdateNode` edit by diffing the node's
@@ -2532,7 +2672,69 @@ impl Command {
                         .sum::<u64>()
             }
             Command::Batch(cmds) => BASE + cmds.iter().map(|c| c.mem_estimate()).sum::<u64>(),
+            Command::Timeline(t) => BASE + t.mem_estimate(),
             _ => BASE,
+        }
+    }
+
+    /// The node id(s) this command reads/writes, straight from the fields it
+    /// already carries for `apply`/`inverse` — no document lookup needed. Used
+    /// by [`CommandHistory::changes_since`] (03 §2.1) to tell a renderer cache
+    /// which nodes a revision range actually touched. Document-level commands
+    /// (layer ops, guides, artboards, canvas resize) touch no specific node and
+    /// return empty.
+    pub fn affected_nodes(&self) -> SmallVec<[NodeId; 4]> {
+        match self {
+            Command::AddNode { node, .. } => smallvec![node.id],
+            Command::RemoveNode { node_id } => smallvec![*node_id],
+            Command::UpdateNode { new, .. } => smallvec![new.id],
+            Command::UpdateRasterRegion { node_id, .. } => smallvec![*node_id],
+            Command::UpdateRasterMeta { new, .. } => smallvec![new.id],
+            Command::AddSubtree { nodes, .. } => nodes.iter().map(|n| n.id).collect(),
+            Command::RemoveSubtree { nodes, .. } => nodes.iter().map(|n| n.id).collect(),
+            Command::AddLayer { .. } => SmallVec::new(),
+            Command::RemoveLayer { .. } => SmallVec::new(),
+            Command::ReorderLayers { .. } => SmallVec::new(),
+            Command::SetActiveLayer { .. } => SmallVec::new(),
+            Command::Batch(cmds) => cmds.iter().flat_map(|c| c.affected_nodes()).collect(),
+            Command::ReorderNode { node_id, .. } => smallvec![*node_id],
+            Command::GroupNodes {
+                group, children, ..
+            } => {
+                let mut ids: SmallVec<[NodeId; 4]> = smallvec![group.id];
+                ids.extend(children.iter().copied());
+                ids
+            }
+            Command::UngroupNodes {
+                group, children, ..
+            } => {
+                let mut ids: SmallVec<[NodeId; 4]> = smallvec![group.id];
+                ids.extend(children.iter().copied());
+                ids
+            }
+            Command::RemoveLayerFull { layer } => layer.node_ids.iter().copied().collect(),
+            Command::RemoveNodeFull { node } => smallvec![node.id],
+            Command::UpdateLayer { .. } => SmallVec::new(),
+            Command::ReplaceLayer { .. } => SmallVec::new(),
+            Command::MoveNodeToLayer { node_id, .. } => smallvec![*node_id],
+            Command::ReparentNode { node_id, .. } => smallvec![*node_id],
+            Command::SetGuides { .. } => SmallVec::new(),
+            Command::SetArtboards { .. } => SmallVec::new(),
+            Command::SetWorkspaces { .. } => SmallVec::new(),
+            // A whole-document swap is not "no nodes changed" — every node on
+            // either side is suspect, so report the union rather than an empty
+            // set, which `changes_since` would otherwise trust as "nothing to
+            // invalidate".
+            Command::ReplaceDocument { old, new, .. } => {
+                old.nodes.keys().chain(new.nodes.keys()).copied().collect()
+            }
+            Command::SetWidthProfiles { .. } => SmallVec::new(),
+            Command::ResizeCanvas { .. } => SmallVec::new(),
+            // Timeline commands mutate `doc.timeline`, not the `SceneNode` graph
+            // (03 §2.1's `changes_since` tracks SceneNode-cache invalidation),
+            // so they touch no `NodeId`. The engine watches `doc_generation`
+            // (02 §1) for timeline changes on its own separate path.
+            Command::Timeline(_) => SmallVec::new(),
         }
     }
 
@@ -2596,6 +2798,14 @@ impl Command {
             Command::ReparentNode { .. } => "Reparent node".to_string(),
             Command::SetGuides { .. } => "Update guides".to_string(),
             Command::SetArtboards { .. } => "Update artboards".to_string(),
+            // Save/delete/rename are all one list swap, so name the step from
+            // the delta — an undo stack reading "Update workspaces" three times
+            // tells the user nothing about which step to go back to.
+            Command::SetWorkspaces { old, new } => match new.len().cmp(&old.len()) {
+                std::cmp::Ordering::Greater => "Save workspace".to_string(),
+                std::cmp::Ordering::Less => "Delete workspace".to_string(),
+                std::cmp::Ordering::Equal => "Update workspace".to_string(),
+            },
             Command::ReplaceDocument { description, .. } => description.clone(),
             Command::SetWidthProfiles { .. } => "Edit width profile".to_string(),
             Command::ResizeCanvas {
@@ -2623,6 +2833,7 @@ impl Command {
                         None => "Batch".to_string(),
                     })
             }
+            Command::Timeline(t) => t.description(),
         }
     }
 
@@ -2911,11 +3122,15 @@ impl Command {
                 doc.guides = new.clone();
             }
 
+            Command::SetWorkspaces { new, .. } => {
+                doc.workspaces = new.clone();
+            }
+
             Command::SetArtboards { new, .. } => {
                 doc.artboards = new.clone();
                 if doc
                     .active_artboard
-                    .map_or(true, |id| !doc.artboards.iter().any(|a| a.id == id))
+                    .is_none_or(|id| !doc.artboards.iter().any(|a| a.id == id))
                 {
                     doc.active_artboard = doc.artboards.first().map(|a| a.id);
                 }
@@ -2937,6 +3152,8 @@ impl Command {
                 doc.width = *new_width;
                 doc.height = *new_height;
             }
+
+            Command::Timeline(t) => t.apply(doc),
         }
     }
 
@@ -2957,6 +3174,11 @@ impl Command {
     /// - `SetWidthProfiles`, `SetGuides`, `SetArtboards`, `ResizeCanvas`: whole-
     ///   document value replacements — keep `old` from the anchor, `new` from the
     ///   incoming.
+    ///
+    /// `SetWorkspaces` is deliberately **absent**: it is also a whole-list swap,
+    /// but it is produced by discrete button clicks rather than a drag, and
+    /// coalescing is bounded only by pointer-down/pointer-up. Merging it would
+    /// collapse two independent saves into one undo step.
     ///
     /// Everything else (adds, removes, reorders, grouping, layer moves, batches,
     /// mismatched variants, different node ids) returns `None`.
@@ -3019,6 +3241,9 @@ impl Command {
                 new_width: *new_width,
                 new_height: *new_height,
             }),
+            (Command::Timeline(a), Command::Timeline(b)) => {
+                crate::timeline::TimelineCmd::coalesce(a, b).map(Command::Timeline)
+            }
             _ => None,
         }
     }
@@ -3228,6 +3453,11 @@ impl Command {
                 new: old.clone(),
             }),
 
+            Command::SetWorkspaces { old, new } => Some(Command::SetWorkspaces {
+                old: new.clone(),
+                new: old.clone(),
+            }),
+
             Command::ReplaceDocument {
                 old,
                 new,
@@ -3254,6 +3484,8 @@ impl Command {
                 new_width: *old_width,
                 new_height: *old_height,
             }),
+
+            Command::Timeline(t) => t.inverse(doc).map(Command::Timeline),
         }
     }
 }
@@ -3435,6 +3667,15 @@ pub struct CommandHistory {
     /// changes cheaply without re-serializing the whole document each frame.
     /// Never reset, so it cannot collide across document replacements.
     revision: u64,
+    /// Ring of the last [`CommandHistory::REVISION_RING_CAPACITY`] revisions'
+    /// affected-node sets, oldest first — one entry per `execute`/`undo`/`redo`
+    /// (03 §2.1). Backs [`changes_since`](CommandHistory::changes_since); a
+    /// document-wide event (restore/reset) clears it instead of pushing an
+    /// entry, since "which nodes changed" isn't meaningful for a whole-document
+    /// swap — the empty ring then forces `overflowed = true` for any query that
+    /// spans it. Transient runtime state, deliberately excluded from
+    /// [`HistorySnapshot`] like `revision` itself.
+    revision_ring: std::collections::VecDeque<(u64, SmallVec<[NodeId; 4]>)>,
     /// A pointer gesture is open (set by [`begin_coalescing`]): mergeable
     /// same-target edits streamed through [`execute`] fold into the current
     /// gesture's anchor undo entry instead of pushing a new step, so one
@@ -3458,6 +3699,22 @@ impl Default for CommandHistory {
     fn default() -> Self {
         Self::new(200)
     }
+}
+
+/// Result of [`CommandHistory::changes_since`] (03 §2.1): which nodes changed
+/// between a caller-remembered revision and now, or a signal that the answer
+/// can't be known and everything must be treated as changed.
+#[derive(Debug, Clone)]
+pub struct ChangeSummary {
+    /// The revision this summary was computed against (`CommandHistory::revision()`
+    /// at call time).
+    pub revision: u64,
+    /// Union of `affected_nodes()` across every recorded command since `from`.
+    /// Meaningless (and left empty) when `overflowed` is true.
+    pub touched: std::collections::HashSet<NodeId>,
+    /// `true` when `from` predates the retained ring, so `touched` is
+    /// incomplete — the caller must invalidate everything rather than trust it.
+    pub overflowed: bool,
 }
 
 /// Recursively collect the `old` side of any `UpdateNode` command in `cmd`

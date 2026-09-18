@@ -2,16 +2,16 @@ use crate::{
     canvas::CanvasView,
     headless::ExportBackground,
     pipeline::{
-        blend_mode_index, coalesce_segments, create_blur_bgl, create_blur_pipeline,
-        create_blur_pipeline_with_blend, create_camera_bind_group_layout, create_composite_bgl,
-        create_composite_pipeline, create_fill_pipeline, create_fill_pipeline_with_blend,
-        draw_segments, separable_blend_state, BlurBlend, BlurParams, CameraUniform,
-        CompositeParams, DrawSegment, Vertex, SEPARABLE_BLEND_MODES,
+        blend_mode_index, coalesce_segments, create_blit_bgl, create_blit_pipeline,
+        create_blur_bgl, create_blur_pipeline, create_blur_pipeline_with_blend,
+        create_camera_bind_group_layout, create_composite_bgl, create_composite_pipeline,
+        create_fill_pipeline, create_fill_pipeline_with_blend, draw_segments,
+        separable_blend_state, BlurBlend, BlurParams, CameraUniform, CompositeParams, DrawSegment,
+        Vertex, SEPARABLE_BLEND_MODES,
     },
-    tessellator::{
-        adaptive_tolerance, tessellate_fill, tessellate_stroke, tessellate_stroke_variable,
-    },
+    tessellator::{adaptive_tolerance, tessellate_fill},
 };
+use anyhow::{anyhow, Result};
 use glyphon::{
     Attrs, Buffer, Cache, Color as GlyphonColor, FontSystem, Metrics, Resolution, Shaping,
     Style as GlyphonStyle, SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -20,11 +20,13 @@ use glyphon::{
 use image::{ImageBuffer, Rgba};
 use photonic_core::{
     document::Document,
+    history::CommandHistory,
     layer::BlendMode,
-    node::SceneNodeKind,
+    node::{NodeId, SceneNodeKind},
     path::PathData,
     style::{FillKind, StrokeAlign},
 };
+use std::cell::RefCell;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
@@ -37,7 +39,10 @@ mod effects_renderer;
 mod frame_manager;
 mod glow_renderer;
 mod scene_renderer;
+mod tess_cache;
 mod text_renderer;
+
+use tess_cache::{hash_svg, TessCache};
 
 // ─── Background colour (deep violet-dark canvas surround) ─────────────────────
 // Linear values for sRGB target #0D0D14 (r:13 g:13 b:20).
@@ -47,7 +52,74 @@ pub(crate) const BG: wgpu::Color = wgpu::Color {
     b: 0.005,
     a: 1.0,
 };
+/// [`BG`] as the **swapchain** expects it.
+///
+/// `BG` is a linear-light value, correct for the sRGB scene target where the
+/// hardware re-encodes on write. The surface is a plain `*Unorm` view (see
+/// `choose_surface_config`), so a clear written there lands raw — feeding it
+/// `BG` would paint near-black instead of the window fill. These are the same
+/// colour, sRGB-encoded: `#07070B`, matching the dark theme's `window_fill`.
+pub(crate) const SURFACE_BG: wgpu::Color = wgpu::Color {
+    r: 7.0 / 255.0,
+    g: 7.0 / 255.0,
+    b: 11.0 / 255.0,
+    a: 1.0,
+};
 const MSAA_SAMPLES: u32 = 4;
+
+fn adapter_rank(device_type: wgpu::DeviceType) -> u8 {
+    match device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::VirtualGpu => 2,
+        wgpu::DeviceType::Cpu => 3,
+        wgpu::DeviceType::Other => 4,
+    }
+}
+
+fn choose_surface_config(
+    caps: &wgpu::SurfaceCapabilities,
+    width: u32,
+    height: u32,
+) -> Result<wgpu::SurfaceConfiguration> {
+    let Some(surface_format) = caps
+        .formats
+        .iter()
+        .find(|format| {
+            matches!(
+                format,
+                wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+            )
+        })
+        .copied()
+        .or_else(|| caps.formats.first().copied())
+    else {
+        return Err(anyhow!("surface has no compatible texture formats"));
+    };
+    let Some(present_mode) = caps
+        .present_modes
+        .iter()
+        .copied()
+        .find(|mode| *mode == wgpu::PresentMode::Fifo)
+        .or_else(|| caps.present_modes.first().copied())
+    else {
+        return Err(anyhow!("surface has no compatible presentation modes"));
+    };
+    let Some(alpha_mode) = caps.alpha_modes.first().copied() else {
+        return Err(anyhow!("surface has no compatible alpha modes"));
+    };
+
+    Ok(wgpu::SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: surface_format,
+        width,
+        height,
+        present_mode,
+        alpha_mode,
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    })
+}
 
 // ─── Frame handle ─────────────────────────────────────────────────────────────
 
@@ -76,7 +148,32 @@ pub struct PhotonicRenderer {
     pub(crate) device: Arc<wgpu::Device>,
     pub(crate) queue: Arc<wgpu::Queue>,
     pub(crate) surface_config: wgpu::SurfaceConfiguration,
+    /// The swapchain *presentation* format only. It is a non-sRGB `*Unorm`
+    /// surface (see `choose_surface_config`), so writing document pixels raw
+    /// into it would blend in the wrong space (audit A-1). The document pass
+    /// therefore targets [`scene_format`](Self::scene_format), not this.
     pub(crate) surface_format: wgpu::TextureFormat,
+    /// The colour encoding the document fill/blend pass renders in — always
+    /// [`pipeline::SCENE_FORMAT`](crate::pipeline::SCENE_FORMAT)
+    /// (`Rgba8UnormSrgb`), independent of the presentation `surface_format`.
+    /// An sRGB target makes fixed-function blending decode→blend→re-encode in
+    /// linear light (03 §4.5.1), so on-canvas rendering matches the headless
+    /// export path (`headless::FORMAT`, the same sRGB format). Read back via
+    /// [`scene_format`](Self::scene_format); guarded sRGB by the invariant test.
+    pub(crate) scene_format: wgpu::TextureFormat,
+    /// Physical-pixel `(x, y, w, h)` the document is allowed to present into,
+    /// or `None` for the whole surface (the default, and what headless/offscreen
+    /// renderers use).
+    ///
+    /// The document pass covers the entire window, but the GUI only *shows* a
+    /// slice of it: egui's panels paint over the rest. That was fine while the
+    /// panels tiled the window edge-to-edge, and wrong once the rails and
+    /// drawers became floating cards with deliberate gaps between them — the
+    /// document (a white artboard, most of the time) showed through those gaps
+    /// as a bright bar beside the canvas. Clipping the present to the canvas
+    /// viewport leaves the gaps on the clear colour, which is the window fill
+    /// they are meant to show.
+    pub(crate) canvas_scissor: Option<(u32, u32, u32, u32)>,
 
     pub(crate) fill_pipeline: wgpu::RenderPipeline,
     /// One fill-pipeline variant per separable blend mode (Multiply/Screen/
@@ -89,8 +186,33 @@ pub struct PhotonicRenderer {
     pub(crate) msaa_texture: wgpu::Texture,
     pub(crate) msaa_view: wgpu::TextureView,
 
+    /// The offscreen document target (03 §4.5.4, audit A-1). The document
+    /// fill/blend/composite pass resolves here at [`scene_format`](Self::scene_format)
+    /// (`Rgba8UnormSrgb`), so on-canvas blending runs in linear light exactly as
+    /// the headless export path does — never in the swapchain's non-sRGB
+    /// presentation format. `begin_frame` then blits this into the surface view
+    /// (see [`blit_scene_to_surface`](Self::blit_scene_to_surface)). Sized to the
+    /// surface, recreated in `resize` alongside the MSAA/glow targets.
+    pub(crate) scene_tex: wgpu::Texture,
+    pub(crate) scene_view: wgpu::TextureView,
+    /// Full-screen present pipeline that samples [`scene_view`](Self::scene_tex)
+    /// (hardware sRGB-decode on sample) and writes the sRGB-encoded pixel into the
+    /// non-sRGB `surface_format` view — the A-1 blit (03 §4.5.4). Built against
+    /// `surface_format` (the presentation format), not `scene_format`.
+    pub(crate) blit_pipeline: wgpu::RenderPipeline,
+    pub(crate) blit_bgl: wgpu::BindGroupLayout,
+    pub(crate) blit_sampler: wgpu::Sampler,
+
     pub view: CanvasView,
     document: Arc<Mutex<Document>>,
+    /// Read-only handle to the shared undo history, used purely as a change
+    /// signal: `revision()` drives the per-frame skip and `changes_since` the
+    /// cache-invalidation policy (03 §2.2). Polled with `try_lock` and never
+    /// blocked on — a contended lock falls back to a full rebuild. `None` for
+    /// the offscreen/export renderers, which have no document history to poll
+    /// and therefore never take the frame-skip (the content-addressed
+    /// tessellation memo still applies, so this costs nothing but correctness).
+    history: Option<Arc<Mutex<CommandHistory>>>,
     pub(crate) capture_rx: std::sync::mpsc::Receiver<oneshot::Sender<Vec<u8>>>,
 
     pub(crate) width: u32,
@@ -103,6 +225,30 @@ pub struct PhotonicRenderer {
     /// `record_document_pass` to issue one draw call per contiguous run.
     pub(crate) draw_segments: Vec<DrawSegment>,
     cached_segments: Vec<DrawSegment>,
+
+    // ── Dirty tracking + persistent buffers (03 §2.2 / §2.3) ───────────────────
+    /// Content-addressed memo of the three `tessellate_*` functions, so an
+    /// unchanged path is triangulated at most once and reused across frames.
+    tess_cache: TessCache,
+    /// `CommandHistory::revision()` observed at the last geometry build. When it
+    /// and the view are unchanged, the whole build is skipped (§2.2 step 1).
+    last_revision: Option<u64>,
+    /// Bit pattern of `(view.zoom, view.pan_x, view.pan_y)` at the last build.
+    /// Vertices are document-space (pan/zoom live in the camera uniform), but
+    /// glyph screen positions and Gaussian-glow sigma are view-derived, so the
+    /// frame-skip is gated on the view being unchanged too.
+    last_view: Option<(u64, u64, u64)>,
+    /// Persistent, growable document vertex/index buffers (03 §2.3). Replace the
+    /// per-frame `create_buffer_init` in `record_document_pass`; grown by
+    /// doubling and re-uploaded in place with `queue.write_buffer`.
+    doc_vbuf: wgpu::Buffer,
+    doc_vbuf_cap: u64,
+    doc_ibuf: wgpu::Buffer,
+    doc_ibuf_cap: u64,
+    /// Instrumentation for the last `build_geometry`: (distinct nodes
+    /// re-tessellated, total `tessellate_*` calls). Zero on a frame-skip.
+    last_tess_nodes: u32,
+    last_tess_calls: u32,
 
     // ── Text rendering (glyphon) ───────────────────────────────────────────────
     pub(crate) font_system: FontSystem,
@@ -165,6 +311,16 @@ pub struct PhotonicRenderer {
     /// on-canvas frame); `Some(Transparent)` suppresses the white board quads and
     /// clears the scene to alpha 0 instead of the surround colour.
     pub(crate) export_bg: Option<ExportBackground>,
+
+    /// Shared GPU-health handle (37 §1.3). The device-loss callback installed in
+    /// [`assemble`](Self::assemble) flips this to `Lost`, and `begin_frame` marks
+    /// it lost on a terminal surface error. Cloned out via [`gpu_health`](Self::gpu_health)
+    /// so photonic-video and the app shell observe the same machine.
+    pub(crate) gpu_health: crate::gpu_state::GpuHealth,
+    /// Capability floor result for the adapter that backs this renderer (37 §1.2).
+    /// Empty (floor met) for offscreen/export renderers, which never present video.
+    /// The windowed [`new`](Self::new) constructor fills it from the selected adapter.
+    capability_report: crate::capability::CapabilityReport,
 }
 
 /// One layer's contiguous geometry range in the frame's shared index buffer,
@@ -232,61 +388,75 @@ impl PhotonicRenderer {
     pub async fn new(
         window: Arc<Window>,
         document: Arc<Mutex<Document>>,
+        history: Arc<Mutex<CommandHistory>>,
         capture_rx: std::sync::mpsc::Receiver<oneshot::Sender<Vec<u8>>>,
-    ) -> Self {
+    ) -> Result<Self> {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
 
+        let backends = wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all());
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            backends,
             ..Default::default()
         });
 
         let surface = instance
             .create_surface(window)
-            .expect("Failed to create wgpu surface");
+            .map_err(|error| anyhow!("failed to create wgpu surface: {error}"))?;
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("No suitable GPU adapter found");
-
-        let (device, queue) = Self::request_device(&adapter).await;
-        let (device, queue) = (Arc::new(device), Arc::new(queue));
-
-        let caps = surface.get_capabilities(&adapter);
-        // Prefer a non-sRGB linear format so egui doesn't double-gamma-correct.
-        // Bgra8Unorm / Rgba8Unorm are the formats egui explicitly recommends.
-        let surface_format = caps
-            .formats
-            .iter()
-            .find(|f| {
-                matches!(
-                    f,
-                    wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm
+        let mut adapters = instance.enumerate_adapters(backends);
+        adapters.sort_by_key(|adapter| adapter_rank(adapter.get_info().device_type));
+        let mut selected = None;
+        for adapter in adapters {
+            let info = adapter.get_info();
+            let caps = surface.get_capabilities(&adapter);
+            if caps.formats.is_empty()
+                || caps.present_modes.is_empty()
+                || caps.alpha_modes.is_empty()
+            {
+                tracing::warn!(adapter = %info.name, ?info.backend, "Skipping adapter with incompatible surface capabilities");
+                continue;
+            }
+            match adapter
+                .request_device(
+                    &wgpu::DeviceDescriptor {
+                        label: Some("photonic_device"),
+                        required_features: wgpu::Features::empty(),
+                        required_limits: wgpu::Limits::default(),
+                        memory_hints: Default::default(),
+                    },
+                    None,
                 )
-            })
-            .copied()
-            .unwrap_or(caps.formats[0]);
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::AutoVsync,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+                .await
+            {
+                Ok((device, queue)) => {
+                    // Capability floor (37 §1.2): evaluated on the *selected*
+                    // adapter while it is still in scope. We do NOT reject the
+                    // adapter here — vector mode must run below the floor; only
+                    // video mode is gated (in photonic-gui), off this report.
+                    let capability = crate::capability::check_capability_floor(&adapter);
+                    selected = Some((info, caps, device, queue, capability));
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(adapter = %info.name, ?info.backend, %error, "Unable to create device; trying next adapter")
+                }
+            }
+        }
+        let Some((adapter_info, caps, device, queue, capability)) = selected else {
+            return Err(anyhow!("no GPU adapter could create a device compatible with this window (backends: {backends:?})"));
         };
+        let (device, queue) = (Arc::new(device), Arc::new(queue));
+        let surface_config = choose_surface_config(&caps, width, height)?;
+        let surface_format = surface_config.format;
+        tracing::info!(adapter = %adapter_info.name, ?adapter_info.backend, ?adapter_info.device_type, ?surface_format, ?surface_config.present_mode, "Selected GPU adapter and surface configuration");
+        if !capability.meets_floor() {
+            tracing::warn!(reason = %capability.reason(), "GPU below the video-mode capability floor; vector mode only");
+        }
         surface.configure(&device, &surface_config);
 
-        Self::assemble(
+        let mut renderer = Self::assemble(
             device,
             queue,
             Some(surface),
@@ -295,8 +465,11 @@ impl PhotonicRenderer {
             width,
             height,
             document,
+            Some(history),
             capture_rx,
-        )
+        );
+        renderer.capability_report = capability;
+        Ok(renderer)
     }
 
     /// Construct a **windowless** renderer that draws only to offscreen textures
@@ -350,6 +523,7 @@ impl PhotonicRenderer {
             width,
             height,
             document,
+            None,
             capture_rx,
         ))
     }
@@ -397,6 +571,7 @@ impl PhotonicRenderer {
             width,
             height,
             document,
+            None,
             capture_rx,
         )
     }
@@ -429,6 +604,7 @@ impl PhotonicRenderer {
         width: u32,
         height: u32,
         document: Arc<Mutex<Document>>,
+        history: Option<Arc<Mutex<CommandHistory>>>,
         capture_rx: std::sync::mpsc::Receiver<oneshot::Sender<Vec<u8>>>,
     ) -> Self {
         // Camera bind group
@@ -454,8 +630,32 @@ impl PhotonicRenderer {
             tracing::error!("wgpu uncaptured error: {:?}", e);
         }));
 
-        let fill_pipeline =
-            create_fill_pipeline(&device, surface_format, &camera_bgl, MSAA_SAMPLES);
+        // Device-loss detection (37 §1.3). A driver-triggered loss (`Unknown` —
+        // a TDR, a driver reset, an eGPU unplug) flips the shared health machine
+        // to `Lost` so the engine/app can pause, drop GPU caches and rebuild. Our
+        // own teardown reasons (`Destroyed`/`Dropped` on device drop, plus the
+        // `ReplacedCallback`/`DeviceInvalid` bookkeeping reasons) MUST NOT trip
+        // recovery — they are not real losses.
+        let gpu_health = crate::gpu_state::GpuHealth::new();
+        {
+            let health = gpu_health.clone();
+            device.set_device_lost_callback(move |reason, msg| {
+                if matches!(reason, wgpu::DeviceLostReason::Unknown) {
+                    health.mark_lost();
+                    tracing::error!(?reason, %msg, "wgpu device lost");
+                } else {
+                    tracing::debug!(?reason, %msg, "wgpu device lost callback (teardown)");
+                }
+            });
+        }
+
+        // The document fill/blend/composite pass renders in the sRGB scene format
+        // (03 §4.5.4, audit A-1), independent of the non-sRGB presentation
+        // `surface_format`, so fixed-function + shader blending run in linear light
+        // and the canvas matches the headless export path by construction.
+        let scene_format = crate::pipeline::SCENE_FORMAT;
+
+        let fill_pipeline = create_fill_pipeline(&device, scene_format, &camera_bgl, MSAA_SAMPLES);
         // One pipeline variant per separable blend mode, sharing the fill shader.
         let blend_pipelines: Vec<(BlendMode, wgpu::RenderPipeline)> = SEPARABLE_BLEND_MODES
             .iter()
@@ -465,7 +665,7 @@ impl PhotonicRenderer {
                         mode,
                         create_fill_pipeline_with_blend(
                             &device,
-                            surface_format,
+                            scene_format,
                             &camera_bgl,
                             MSAA_SAMPLES,
                             blend,
@@ -474,15 +674,20 @@ impl PhotonicRenderer {
                 })
             })
             .collect();
-        let (msaa_texture, msaa_view) = create_msaa_texture(&device, surface_format, width, height);
+        let (msaa_texture, msaa_view) = create_msaa_texture(&device, scene_format, width, height);
 
         let blur_bgl = create_blur_bgl(&device);
-        let fill_pipeline_1spp = create_fill_pipeline(&device, surface_format, &camera_bgl, 1);
-        let blur_pipeline_h = create_blur_pipeline(&device, surface_format, &blur_bgl, false);
+        let fill_pipeline_1spp = create_fill_pipeline(&device, scene_format, &camera_bgl, 1);
+        let blur_pipeline_h = create_blur_pipeline(&device, scene_format, &blur_bgl, false);
+        // The gaussian-glow present pass (glow_renderer.rs Pass C) blends its blur
+        // directly into the swapchain frame, so this ONE pipeline must target the
+        // non-sRGB `surface_format`; every other document-pass resource is
+        // `scene_format`. (Its input glow texture is `scene_format`; sampling
+        // hardware-decodes it, so the additive glow blend still reads linear.)
         let blur_pipeline_v = create_blur_pipeline(&device, surface_format, &blur_bgl, true);
         let blur_pipeline_alpha = create_blur_pipeline_with_blend(
             &device,
-            surface_format,
+            scene_format,
             &blur_bgl,
             BlurBlend::StraightAlpha,
         );
@@ -495,11 +700,24 @@ impl PhotonicRenderer {
             ..Default::default()
         });
         let (glow_tex_a, glow_tex_a_view, glow_tex_b, glow_tex_b_view) =
-            create_glow_textures(&device, surface_format, width, height);
+            create_glow_textures(&device, scene_format, width, height);
+
+        // Offscreen document target + present (blit) pipeline (03 §4.5.4).
+        let (scene_tex, scene_view) = create_scene_texture(&device, scene_format, width, height);
+        let blit_bgl = create_blit_bgl(&device);
+        let blit_pipeline = create_blit_pipeline(&device, surface_format, &blit_bgl);
+        let blit_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("blit_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
 
         // Per-layer compositing (#226): shader + a filtering sampler.
         let composite_bgl = create_composite_bgl(&device);
-        let composite_pipeline = create_composite_pipeline(&device, surface_format, &composite_bgl);
+        let composite_pipeline = create_composite_pipeline(&device, scene_format, &composite_bgl);
         let composite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("composite_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -525,11 +743,13 @@ impl PhotonicRenderer {
         // to the sRGB render target instead of linearizing them (its default
         // `Accurate` mode). This makes interactive text colour match the vector fill
         // pipeline, which passes sRGB through unmodified (see pipeline.rs `fs_main`).
+        // The capture-path text pass paints into the sRGB scene target (capture.rs),
+        // so the atlas must match `scene_format`, not the presentation surface.
         let mut text_atlas = TextAtlas::with_color_mode(
             &device,
             &queue,
             &text_glyph_cache,
-            surface_format,
+            scene_format,
             glyphon::ColorMode::Web,
         );
         let text_renderer = TextRenderer::new(
@@ -539,20 +759,44 @@ impl PhotonicRenderer {
             None,
         );
 
+        // Persistent document geometry buffers (03 §2.3). Start with a small
+        // non-zero capacity; the first `build_geometry` grows them to fit.
+        const INITIAL_BUF_CAP: u64 = 64 * 1024;
+        let doc_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("doc_vbuf"),
+            size: INITIAL_BUF_CAP,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let doc_ibuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("doc_ibuf"),
+            size: INITIAL_BUF_CAP,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         Self {
             surface,
             device,
             queue,
             surface_config,
             surface_format,
+            scene_format,
+            canvas_scissor: None,
             fill_pipeline,
             blend_pipelines,
             camera_buffer,
             camera_bind_group,
             msaa_texture,
             msaa_view,
+            scene_tex,
+            scene_view,
+            blit_pipeline,
+            blit_bgl,
+            blit_sampler,
             view,
             document,
+            history,
             capture_rx,
             width,
             height,
@@ -560,6 +804,15 @@ impl PhotonicRenderer {
             cached_indices: Vec::new(),
             draw_segments: Vec::new(),
             cached_segments: Vec::new(),
+            tess_cache: TessCache::default(),
+            last_revision: None,
+            last_view: None,
+            doc_vbuf,
+            doc_vbuf_cap: INITIAL_BUF_CAP,
+            doc_ibuf,
+            doc_ibuf_cap: INITIAL_BUF_CAP,
+            last_tess_nodes: 0,
+            last_tess_calls: 0,
             font_system,
             swash_cache,
             text_glyph_cache,
@@ -586,7 +839,22 @@ impl PhotonicRenderer {
             layer_runs: Vec::new(),
             artboard_idx_end: 0,
             export_bg: None,
+            gpu_health,
+            capability_report: crate::capability::CapabilityReport::default(),
         }
+    }
+
+    /// A cheaply-cloned handle to this renderer's GPU-health machine (37 §1.3),
+    /// so photonic-video and the app shell observe the same device-loss state.
+    pub fn gpu_health(&self) -> crate::gpu_state::GpuHealth {
+        self.gpu_health.clone()
+    }
+
+    /// The capability-floor report for the adapter backing this renderer (37 §1.2).
+    /// Consulted by the app shell to refuse video mode below the floor while
+    /// keeping vector mode alive.
+    pub fn capability_report(&self) -> &crate::capability::CapabilityReport {
+        &self.capability_report
     }
 
     /// Clear colour for the scene background pass. The normal editor frame clears
@@ -598,6 +866,18 @@ impl PhotonicRenderer {
             Some(ExportBackground::Transparent) => wgpu::Color::TRANSPARENT,
             _ => BG,
         }
+    }
+
+    /// Restrict presentation of the document to `rect` in physical pixels
+    /// (`(x, y, w, h)`), or `None` for the whole surface.
+    ///
+    /// See [`canvas_scissor`](Self::canvas_scissor). The host sets this each
+    /// frame from the GUI's canvas viewport; anything outside stays on the clear
+    /// colour so the floating panel cards read against the window fill instead
+    /// of against the artboard.
+    pub fn set_canvas_scissor(&mut self, rect: Option<(u32, u32, u32, u32)>) {
+        // A zero-area scissor is invalid in wgpu; treat it as "nothing to show".
+        self.canvas_scissor = rect.filter(|&(_, _, w, h)| w > 0 && h > 0);
     }
 
     // ── Public accessors ──────────────────────────────────────────────────────
@@ -626,6 +906,16 @@ impl PhotonicRenderer {
         self.surface_format
     }
 
+    /// The colour encoding the document fill/blend pass renders in — always the
+    /// sRGB [`pipeline::SCENE_FORMAT`](crate::pipeline::SCENE_FORMAT), never the
+    /// non-sRGB presentation [`surface_format`](Self::surface_format). Exposed so
+    /// tests can pin the invariant that the document pass stays sRGB (linear-light
+    /// blending, 03 §4.5.1) rather than silently regressing to the swapchain's
+    /// non-sRGB format.
+    pub fn scene_format(&self) -> wgpu::TextureFormat {
+        self.scene_format
+    }
+
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -652,7 +942,7 @@ impl PhotonicRenderer {
     /// Convenience: full render loop without an egui overlay.
     pub fn render(&mut self) {
         let (verts, idxs) = self.update(); // already &mut self
-        if let Some(frame) = self.begin_frame(&verts, &idxs) {
+        if let Ok(Some(frame)) = self.begin_frame(&verts, &idxs) {
             self.finish_frame(frame);
         }
         self.service_captures(&verts, &idxs);
@@ -668,8 +958,53 @@ impl PhotonicRenderer {
     /// that outlived its session), we return the cached geometry from the previous
     /// frame instead of blocking indefinitely.
     fn build_geometry(&mut self) -> (Vec<Vertex>, Vec<u32>) {
+        // ── Dirty-tracking gate (03 §2.2) ─────────────────────────────────────
+        // Vertices are document-space (pan/zoom live in the camera uniform), but
+        // glyph screen positions and Gaussian-glow sigma are view-derived, so the
+        // whole-frame skip is gated on both the revision and the view.
+        let view_key = (
+            self.view.zoom.to_bits(),
+            self.view.pan_x.to_bits(),
+            self.view.pan_y.to_bits(),
+        );
+        // Poll the history revision without ever blocking the render loop. A
+        // contended lock leaves `revision = None`, forcing a full rebuild — the
+        // content-addressed tessellation memo keeps that correct and cheap
+        // (unchanged geometry still hits), only the frame-skip is unavailable.
+        let (revision, overflowed) = match self.history.as_ref().and_then(|h| h.try_lock().ok()) {
+            Some(h) => {
+                let rev = h.revision();
+                let overflowed = match self.last_revision {
+                    // A command ran: if the change ring can't attribute it to a
+                    // node set, invalidate everything (§2.2 step 2).
+                    Some(last) if rev != last => h.changes_since(last).overflowed,
+                    // No baseline (first build / post-contention): rebuild all.
+                    None => true,
+                    _ => false,
+                };
+                (Some(rev), overflowed)
+            }
+            // No history handle (offscreen/export) or a contended lock: skip the
+            // frame-skip entirely and rebuild, which is always correct.
+            None => (None, false),
+        };
+        // One integer + one tuple compare for the common idle case (§2.2 step 1):
+        // nothing changed and the view is unchanged, so reuse every cached range.
+        if let (Some(rev), Some(last)) = (revision, self.last_revision) {
+            if rev == last && self.last_view == Some(view_key) {
+                self.draw_segments = self.cached_segments.clone();
+                self.last_tess_nodes = 0;
+                self.last_tess_calls = 0;
+                return (self.cached_vertices.clone(), self.cached_indices.clone());
+            }
+        }
+        let clear_cache = overflowed;
+
         // ── Read phase: clone what we need, release doc lock immediately ──────
         struct NodeSnapshot {
+            /// Document node id (pre-symbol-resolution), used only to attribute
+            /// tessellation work to a node for the perf instrumentation.
+            node_id: NodeId,
             matrix: [f64; 6],
             fill_enabled: bool,
             fill_kind: FillKind,
@@ -870,6 +1205,7 @@ impl PhotonicRenderer {
                         let sc = &path_node.stroke;
                         let stroke_alpha = sc.color.a * sc.opacity * node.opacity;
                         nodes.push(NodeSnapshot {
+                            node_id: orig_id,
                             matrix: node.transform.matrix,
                             fill_enabled: path_node.fill.enabled,
                             fill_kind: path_node.fill.kind.clone(),
@@ -1089,35 +1425,53 @@ impl PhotonicRenderer {
             }
         }
 
+        // Take the tessellation memo out of `self` so the append_* closures can
+        // share it via interior mutability without each borrowing `&mut self`
+        // (03 §2.2). `clear_cache` (a ring overflow / lost baseline) drops the
+        // whole memo; otherwise content-addressing invalidates only what changed.
+        let mut tess_owned = std::mem::take(&mut self.tess_cache);
+        if clear_cache {
+            tess_owned = TessCache::default();
+        }
+        tess_owned.begin_frame();
+        let tess = RefCell::new(tess_owned);
+
         // Helpers for appending tessellated meshes to the vertex/index buffers.
-        // Defined as closures to keep the loop body readable.
-        let append_fill = |node: &NodeSnapshot, verts: &mut Vec<Vertex>, idxs: &mut Vec<u32>| {
+        // Defined as closures to keep the loop body readable. Each fetches its
+        // mesh from the memo (`svg_hash` = the node's resolved-path hash, cached
+        // once per node) instead of tessellating inline.
+        let append_fill = |node: &NodeSnapshot,
+                           svg_hash: u64,
+                           verts: &mut Vec<Vertex>,
+                           idxs: &mut Vec<u32>| {
             if !node.fill_enabled || node.fill_is_none {
                 return;
             }
-            // Object-blur / feather replace the sharp fill with a blurred copy in
-            // the effects layer — suppress the crisp fill here.
+            // Object-blur / feather replace the sharp fill with a blurred copy
+            // in the effects layer — suppress the crisp fill here.
             if node.soft_edge.is_some() {
                 return;
             }
             let [a, b, c, d, e, f] = node.matrix;
             let opacity = node.fill_opacity * node.node_opacity;
-            let mesh = tessellate_fill(
-                &node.path_data,
-                node.is_compound,
-                adaptive_tolerance(self.view.zoom, &node.matrix),
-            );
-            if mesh.is_empty() {
+            let mesh_arc =
+                tess.borrow_mut()
+                    .fill(node.node_id, &node.path_data, svg_hash, node.is_compound);
+            if mesh_arc.is_empty() {
                 return;
             }
             // Non-linear fills (radial/fluid/mesh/pattern) sample per vertex, so
-            // refine the coarse fill triangulation for a smooth result.
-            let mesh = if node.fill_kind.is_nonlinear() {
-                let (lx, ly, lxx, lyy) = local_bounds(&mesh.vertices);
+            // refine the coarse fill triangulation for a smooth result. The
+            // coarse mesh is the cached one; refinement is per-frame (it depends
+            // on the fill kind, not just the path).
+            let refined;
+            let mesh: &crate::tessellator::Mesh = if node.fill_kind.is_nonlinear() {
+                let (lx, ly, lxx, lyy) = local_bounds(&mesh_arc.vertices);
                 let maxdim = ((lxx - lx).max(lyy - ly)) as f32;
-                crate::tessellator::refine_mesh(&mesh, (maxdim / 48.0).max(1.0))
+                refined = crate::tessellator::refine_mesh(&mesh_arc, (maxdim / 48.0).max(1.0));
+                &refined
             } else {
-                mesh
+                &mesh_arc
             };
             // Object-space gradients resolve against the fill's bbox so they
             // track the object. Rotation-following gradients resolve in the
@@ -1218,7 +1572,9 @@ impl PhotonicRenderer {
         // Render N layered strokes to approximate a Gaussian glow.
         // Drawing order: largest (faintest) first so smaller brighter layers overwrite near the edge.
         const GLOW_STEPS: usize = 10;
-        let append_glow = |path_data: &photonic_core::path::PathData,
+        let append_glow = |node_id: NodeId,
+                           path_data: &photonic_core::path::PathData,
+                           svg_hash: u64,
                            matrix: &[f64; 6],
                            glow: &[f32; 6],
                            join: photonic_core::style::LineJoin,
@@ -1234,13 +1590,14 @@ impl PhotonicRenderer {
                 let gaussian = (-4.5 * t * t).exp();
                 let step_alpha = (go * gaussian * ga).min(1.0);
                 let color = [gr, gg, gb, step_alpha];
-                let mesh = tessellate_stroke(
+                let mesh = tess.borrow_mut().stroke(
+                    node_id,
                     path_data,
+                    svg_hash,
                     width,
                     photonic_core::style::LineCap::Round,
                     join,
                     4.0,
-                    adaptive_tolerance(self.view.zoom, matrix),
                 );
                 if mesh.is_empty() {
                     continue;
@@ -1260,66 +1617,71 @@ impl PhotonicRenderer {
             }
         };
 
-        let append_stroke =
-            |node: &NodeSnapshot, width: f32, verts: &mut Vec<Vertex>, idxs: &mut Vec<u32>| {
-                if !node.stroke_enabled {
-                    return;
-                }
-                let [a, b, c, d, e, f] = node.matrix;
-                // Non-scaling stroke: a stroke's width is an absolute property,
-                // not part of the geometry, so it must NOT grow/shrink when the
-                // object's transform is scaled (Illustrator with "Scale Strokes
-                // & Effects" off). The mesh is built in local space and then
-                // multiplied by `matrix`, so pre-divide the width by the
-                // transform's uniform scale `sqrt(|det|)` to cancel it. This is
-                // a no-op for unscaled or purely-rotated/translated objects
-                // (det == 1) and leaves view zoom untouched.
-                let obj_scale = (a * d - b * c).abs().sqrt().max(1e-6);
-                let width = width / obj_scale as f32;
-                let mesh = match &node.stroke_widths {
-                    // Variable-width profile: scale samples by the same factor the
-                    // caller applies to the uniform width (stroke-align doubling),
-                    // then build a filled ribbon outline.
-                    Some(widths) if node.stroke_width > 0.0 => {
-                        let scale = (width / node.stroke_width) as f64;
-                        let scaled: Vec<f64> = widths.iter().map(|w| w * scale).collect();
-                        tessellate_stroke_variable(
-                            &node.path_data,
-                            &scaled,
-                            adaptive_tolerance(self.view.zoom, &node.matrix) as f64,
-                        )
-                    }
-                    _ => tessellate_stroke(
+        let append_stroke = |node: &NodeSnapshot,
+                             svg_hash: u64,
+                             width: f32,
+                             verts: &mut Vec<Vertex>,
+                             idxs: &mut Vec<u32>| {
+            if !node.stroke_enabled {
+                return;
+            }
+            let [a, b, c, d, e, f] = node.matrix;
+            // Non-scaling stroke: a stroke's width is an absolute property,
+            // not part of the geometry, so it must NOT grow/shrink when the
+            // object's transform is scaled (Illustrator with "Scale Strokes
+            // & Effects" off). The mesh is built in local space and then
+            // multiplied by `matrix`, so pre-divide the width by the
+            // transform's uniform scale `sqrt(|det|)` to cancel it. This is
+            // a no-op for unscaled or purely-rotated/translated objects
+            // (det == 1) and leaves view zoom untouched.
+            let obj_scale = (a * d - b * c).abs().sqrt().max(1e-6);
+            let width = width / obj_scale as f32;
+            let mesh = match &node.stroke_widths {
+                // Variable-width profile: scale samples by the same factor the
+                // caller applies to the uniform width (stroke-align doubling),
+                // then build a filled ribbon outline.
+                Some(widths) if node.stroke_width > 0.0 => {
+                    let scale = (width / node.stroke_width) as f64;
+                    let scaled: Vec<f64> = widths.iter().map(|w| w * scale).collect();
+                    tess.borrow_mut().stroke_variable(
+                        node.node_id,
                         &node.path_data,
-                        width,
-                        node.stroke_cap,
-                        node.stroke_join,
-                        node.stroke_miter,
-                        adaptive_tolerance(self.view.zoom, &node.matrix),
-                    ),
-                };
-                if mesh.is_empty() {
-                    return;
+                        svg_hash,
+                        &scaled,
+                    )
                 }
-                let base = verts.len() as u32;
-                for pos in &mesh.vertices {
-                    let x = a * pos[0] as f64 + c * pos[1] as f64 + e;
-                    let y = b * pos[0] as f64 + d * pos[1] as f64 + f;
-                    // Gradient/pattern stroke paint (#201): sample per vertex,
-                    // exactly like the fill path. `None` = flat stroke color.
-                    let color = match &node.stroke_paint {
-                        Some(kind) => kind.sample_at(x, y, node.stroke_paint_opacity),
-                        None => node.stroke_color,
-                    };
-                    verts.push(Vertex {
-                        position: [x as f32, y as f32],
-                        color,
-                    });
-                }
-                for &i in &mesh.indices {
-                    idxs.push(base + i);
-                }
+                _ => tess.borrow_mut().stroke(
+                    node.node_id,
+                    &node.path_data,
+                    svg_hash,
+                    width,
+                    node.stroke_cap,
+                    node.stroke_join,
+                    node.stroke_miter,
+                ),
             };
+            if mesh.is_empty() {
+                return;
+            }
+            let base = verts.len() as u32;
+            for pos in &mesh.vertices {
+                let x = a * pos[0] as f64 + c * pos[1] as f64 + e;
+                let y = b * pos[0] as f64 + d * pos[1] as f64 + f;
+                // Gradient/pattern stroke paint (#201): sample per vertex,
+                // exactly like the fill path. `None` = flat stroke color.
+                let color = match &node.stroke_paint {
+                    Some(kind) => kind.sample_at(x, y, node.stroke_paint_opacity),
+                    None => node.stroke_color,
+                };
+                verts.push(Vertex {
+                    position: [x as f32, y as f32],
+                    color,
+                });
+            }
+            for &i in &mesh.indices {
+                idxs.push(base + i);
+            }
+        };
 
         // ── Arrowhead helper ──────────────────────────────────────────────────
         // Appends a filled triangular or open-V arrowhead at the given world-space
@@ -1476,15 +1838,14 @@ impl PhotonicRenderer {
         // Build a blurred-silhouette effect job: tessellate the fill, transform
         // by the node matrix (+ offset), flat-colour it, tag with a blur radius.
         let make_blur_job = |node: &NodeSnapshot,
+                             svg_hash: u64,
                              offset: (f64, f64),
                              color: [f32; 4],
                              radius_doc: f64|
          -> Option<BlurJob> {
-            let mesh = tessellate_fill(
-                &node.path_data,
-                node.is_compound,
-                adaptive_tolerance(self.view.zoom, &node.matrix),
-            );
+            let mesh =
+                tess.borrow_mut()
+                    .fill(node.node_id, &node.path_data, svg_hash, node.is_compound);
             if mesh.is_empty() {
                 return None;
             }
@@ -1501,7 +1862,7 @@ impl PhotonicRenderer {
             }
             Some(BlurJob {
                 verts: jverts,
-                idxs: mesh.indices,
+                idxs: mesh.indices.clone(),
                 radius_doc,
                 layer_ordinal: node.layer_ordinal,
             })
@@ -1532,6 +1893,9 @@ impl PhotonicRenderer {
 
         for node in &nodes {
             let seg_start = idxs.len() as u32;
+            // Hash the resolved path once per node; every fill/stroke/glow fetch
+            // for this node reuses it as the cache-key prefix (03 §2.2).
+            let svg_hash = hash_svg(node.path_data.as_svg());
 
             // Close the previous layer's run at this layer boundary.
             if cur_ord != Some(node.layer_ordinal) {
@@ -1547,6 +1911,7 @@ impl PhotonicRenderer {
                 let alpha = (sa * opacity).min(1.0);
                 if let Some(job) = make_blur_job(
                     node,
+                    svg_hash,
                     (dx as f64, dy as f64),
                     [sr, sg, sb, alpha],
                     blur as f64,
@@ -1559,7 +1924,9 @@ impl PhotonicRenderer {
             // The sharp fill is suppressed in append_fill; this blurred copy
             // replaces it. (Gradient/image interior blur is a follow-up.)
             if let Some(([r, g, b, a], radius)) = node.soft_edge {
-                if let Some(job) = make_blur_job(node, (0.0, 0.0), [r, g, b, a], radius as f64) {
+                if let Some(job) =
+                    make_blur_job(node, svg_hash, (0.0, 0.0), [r, g, b, a], radius as f64)
+                {
                     blur_jobs.push(job);
                 }
             }
@@ -1567,7 +1934,9 @@ impl PhotonicRenderer {
             // ── Outer glow: behind fill so fill clips the inward half ─────────
             if let Some((ref og, og_join)) = node.outer_glow {
                 append_glow(
+                    node.node_id,
                     &node.path_data,
+                    svg_hash,
                     &node.matrix,
                     og,
                     og_join,
@@ -1581,59 +1950,77 @@ impl PhotonicRenderer {
                 // The fill paints over the inner half of the stroke, leaving only
                 // the outer half visible.
                 StrokeAlign::Outside => {
-                    append_stroke(node, node.stroke_width * 2.0, &mut verts, &mut idxs);
-                    append_fill(node, &mut verts, &mut idxs);
+                    append_stroke(
+                        node,
+                        svg_hash,
+                        node.stroke_width * 2.0,
+                        &mut verts,
+                        &mut idxs,
+                    );
+                    append_fill(node, svg_hash, &mut verts, &mut idxs);
                     // Inner glow: render after fill, then re-clip with fill
                     if let Some((ref ig, ig_join)) = node.inner_glow {
                         append_glow(
+                            node.node_id,
                             &node.path_data,
+                            svg_hash,
                             &node.matrix,
                             ig,
                             ig_join,
                             &mut verts,
                             &mut idxs,
                         );
-                        append_fill(node, &mut verts, &mut idxs);
+                        append_fill(node, svg_hash, &mut verts, &mut idxs);
                     }
                 }
                 // Center: fill first, then stroke centred on the path edge.
                 StrokeAlign::Center => {
-                    append_fill(node, &mut verts, &mut idxs);
+                    append_fill(node, svg_hash, &mut verts, &mut idxs);
                     // Inner glow: rendered over fill, re-clipped before stroke
                     if let Some((ref ig, ig_join)) = node.inner_glow {
                         append_glow(
+                            node.node_id,
                             &node.path_data,
+                            svg_hash,
                             &node.matrix,
                             ig,
                             ig_join,
                             &mut verts,
                             &mut idxs,
                         );
-                        append_fill(node, &mut verts, &mut idxs);
+                        append_fill(node, svg_hash, &mut verts, &mut idxs);
                     }
-                    append_stroke(node, node.stroke_width, &mut verts, &mut idxs);
+                    append_stroke(node, svg_hash, node.stroke_width, &mut verts, &mut idxs);
                 }
                 // Inside: fill, then doubled-width stroke, then fill again.
                 // The second fill paints over the outer half of the stroke, leaving
                 // only the inner half visible.
                 StrokeAlign::Inside => {
-                    append_fill(node, &mut verts, &mut idxs);
+                    append_fill(node, svg_hash, &mut verts, &mut idxs);
                     // Inner glow: before the inside stroke
                     if let Some((ref ig, ig_join)) = node.inner_glow {
                         append_glow(
+                            node.node_id,
                             &node.path_data,
+                            svg_hash,
                             &node.matrix,
                             ig,
                             ig_join,
                             &mut verts,
                             &mut idxs,
                         );
-                        append_fill(node, &mut verts, &mut idxs);
+                        append_fill(node, svg_hash, &mut verts, &mut idxs);
                     }
-                    append_stroke(node, node.stroke_width * 2.0, &mut verts, &mut idxs);
+                    append_stroke(
+                        node,
+                        svg_hash,
+                        node.stroke_width * 2.0,
+                        &mut verts,
+                        &mut idxs,
+                    );
                     // Re-draw fill to clip the outer half of the stroke.
                     if node.stroke_enabled {
-                        append_fill(node, &mut verts, &mut idxs);
+                        append_fill(node, svg_hash, &mut verts, &mut idxs);
                     }
                 }
             }
@@ -1647,10 +2034,11 @@ impl PhotonicRenderer {
                 if rgba[3] <= 0.0 {
                     continue;
                 }
-                let mesh = tessellate_fill(
+                let mesh = tess.borrow_mut().fill(
+                    node.node_id,
                     &node.path_data,
+                    svg_hash,
                     node.is_compound,
-                    adaptive_tolerance(self.view.zoom, &node.matrix),
                 );
                 if mesh.is_empty() {
                     continue;
@@ -1677,13 +2065,14 @@ impl PhotonicRenderer {
                 }
                 let [a, b, c, d, e, f] = node.matrix;
                 let obj_scale = (a * d - b * c).abs().sqrt().max(1e-6);
-                let mesh = tessellate_stroke(
+                let mesh = tess.borrow_mut().stroke(
+                    node.node_id,
                     &node.path_data,
+                    svg_hash,
                     (width as f64 / obj_scale) as f32,
                     photonic_core::style::LineCap::Butt,
                     photonic_core::style::LineJoin::Miter,
                     4.0,
-                    adaptive_tolerance(self.view.zoom, &node.matrix),
                 );
                 if mesh.is_empty() {
                     continue;
@@ -1759,10 +2148,11 @@ impl PhotonicRenderer {
             // ── Gaussian glow job ─────────────────────────────────────────────
             if let Some(([gr, gg, gb, ga], radius_doc)) = node.gaussian_glow {
                 let [a, b, c, d, e, f] = node.matrix;
-                let mesh = tessellate_fill(
+                let mesh = tess.borrow_mut().fill(
+                    node.node_id,
                     &node.path_data,
+                    svg_hash,
                     node.is_compound,
-                    adaptive_tolerance(self.view.zoom, &node.matrix),
                 );
                 if !mesh.is_empty() {
                     let glow_color = [gr, gg, gb, ga];
@@ -1778,7 +2168,7 @@ impl PhotonicRenderer {
                     let sigma_px = (radius_doc as f64 * self.view.zoom) as f32;
                     self.pending_gaussian_glows.push(GaussianGlowJob {
                         verts: gverts,
-                        idxs: mesh.indices,
+                        idxs: mesh.indices.clone(),
                         sigma_px,
                     });
                 }
@@ -1844,6 +2234,21 @@ impl PhotonicRenderer {
         self.layer_runs = layer_runs;
         self.artboard_idx_end = artboard_idx_end;
 
+        // Reclaim the tessellation memo: evict entries not used this frame, record
+        // the perf instrumentation, and record the revision/view baseline so the
+        // next frame's skip check has something to compare against. No closure is
+        // executing here, so the runtime borrow is uncontended.
+        {
+            let mut cache = tess.borrow_mut();
+            cache.sweep();
+            let (nodes_retess, calls) = cache.stats();
+            self.last_tess_nodes = nodes_retess;
+            self.last_tess_calls = calls;
+            self.tess_cache = std::mem::take(&mut cache);
+        }
+        self.last_revision = revision;
+        self.last_view = Some(view_key);
+
         // Update cache for next frame (used when lock is contended).
         self.cached_vertices = verts.clone();
         self.cached_indices = idxs.clone();
@@ -1851,6 +2256,103 @@ impl PhotonicRenderer {
         self.cached_segments = segments;
 
         (verts, idxs)
+    }
+
+    /// `(distinct_nodes_re_tessellated, tessellate_calls)` for the most recent
+    /// `build_geometry` — zero on an idle frame-skip. Used by the render-perf
+    /// statement and tests (03 §2.2).
+    pub fn last_frame_tess_stats(&self) -> (u32, u32) {
+        (self.last_tess_nodes, self.last_tess_calls)
+    }
+}
+
+#[cfg(test)]
+mod surface_config_tests {
+    use super::*;
+
+    fn caps(present_modes: Vec<wgpu::PresentMode>) -> wgpu::SurfaceCapabilities {
+        wgpu::SurfaceCapabilities {
+            formats: vec![
+                wgpu::TextureFormat::Rgba8UnormSrgb,
+                wgpu::TextureFormat::Bgra8Unorm,
+            ],
+            present_modes,
+            alpha_modes: vec![wgpu::CompositeAlphaMode::Opaque],
+            usages: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        }
+    }
+
+    #[test]
+    fn surface_configuration_prefers_an_advertised_fifo_mode_and_linear_format() {
+        let config = choose_surface_config(
+            &caps(vec![wgpu::PresentMode::Immediate, wgpu::PresentMode::Fifo]),
+            640,
+            480,
+        )
+        .expect("compatible caps");
+
+        assert_eq!(config.present_mode, wgpu::PresentMode::Fifo);
+        assert_eq!(config.format, wgpu::TextureFormat::Bgra8Unorm);
+    }
+
+    #[test]
+    fn surface_configuration_rejects_an_adapter_without_present_modes() {
+        let error = choose_surface_config(&caps(vec![]), 640, 480).expect_err("no present mode");
+        assert!(error.to_string().contains("presentation modes"));
+    }
+
+    #[test]
+    fn adapter_fallback_order_prefers_hardware() {
+        assert!(
+            adapter_rank(wgpu::DeviceType::DiscreteGpu)
+                < adapter_rank(wgpu::DeviceType::IntegratedGpu)
+        );
+        assert!(
+            adapter_rank(wgpu::DeviceType::IntegratedGpu) < adapter_rank(wgpu::DeviceType::Cpu)
+        );
+    }
+}
+
+#[cfg(test)]
+mod scene_format_tests {
+    use super::*;
+
+    /// Build a windowless renderer, or `None` on a machine without a GPU adapter
+    /// (headless CI) so the test skips cleanly — the same convention as the
+    /// offscreen capture tests (`capture.rs`'s `offscreen`).
+    fn try_offscreen() -> Option<PhotonicRenderer> {
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let doc = Document::new("scene_fmt", 8.0, 8.0);
+        pollster::block_on(PhotonicRenderer::new_offscreen(
+            8,
+            8,
+            Arc::new(Mutex::new(doc)),
+            rx,
+        ))
+    }
+
+    /// The document fill/blend pass MUST render in an sRGB format so blending runs
+    /// in linear light (03 §4.5.1). This replaces `pipeline.rs`'s vacuous
+    /// `windowed_scene_format_derivation_is_srgb` (which asserted a property of
+    /// `TextureFormat::add_srgb_suffix()`, a stdlib function the crate never
+    /// calls, and so guarded nothing): it pins the *renderer's* exposed scene
+    /// format, failing if a future change ever points the document pass back at
+    /// the non-sRGB presentation surface format.
+    #[test]
+    fn offscreen_document_target_is_srgb() {
+        let Some(r) = try_offscreen() else {
+            eprintln!("no GPU adapter — skipping scene_format invariant test");
+            return;
+        };
+        assert_eq!(
+            r.scene_format(),
+            crate::pipeline::SCENE_FORMAT,
+            "document pass must target pipeline::SCENE_FORMAT",
+        );
+        assert!(
+            r.scene_format().is_srgb(),
+            "scene_format must be sRGB so document blending runs in linear light",
+        );
     }
 }
 
@@ -1876,6 +2378,35 @@ pub(crate) fn create_msaa_texture(
         dimension: wgpu::TextureDimension::D2,
         format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+/// The offscreen document target (03 §4.5.4). Single-sample sRGB `scene_format`,
+/// usable as a render-pass resolve target, a sampled source (for the blit) and a
+/// readback source.
+pub(crate) fn create_scene_texture(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("scene_texture"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());

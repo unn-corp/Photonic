@@ -1,3 +1,7 @@
+// CLI color parsing preserves the established NaN behavior; command argument
+// lists mirror the public CLI surface. Keep both choices self-checking.
+#![expect(clippy::manual_clamp, clippy::too_many_arguments)]
+
 mod args;
 #[cfg(test)]
 #[allow(dead_code)]
@@ -7,25 +11,22 @@ mod mcp_proxy;
 mod repl;
 mod script;
 
-const MCP_SECRET_ENV: &str = "PHOTONIC_MCP_SECRET";
-const MCP_SECRET_ENV_PLACEHOLDER: &str = "${PHOTONIC_MCP_SECRET}";
-
 use anyhow::Result;
 use args::Args;
 use clap::Parser;
 use egui_wgpu::ScreenDescriptor;
-use photonic_core::{document::Document, history::CommandHistory, AuditLog, PHOTON_FILE_EXTENSION};
+use photonic_core::{document::Document, history::CommandHistory, AuditLog};
 use photonic_gui::{NativeClipboardPaste, PhotonicApp};
 use photonic_mcp::server::AppState;
 use photonic_mcp::{McpServer, McpServerConfig, MCP_SECRET_HEADER};
 use photonic_render::PhotonicRenderer;
 use repl::LuaRepl;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, Mutex};
-use tracing::info;
+use tracing::{error, info};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 #[cfg(target_os = "linux")]
 use winit::platform::x11::EventLoopBuilderExtX11;
@@ -43,30 +44,8 @@ use winit::{
 fn native_project_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(PHOTON_FILE_EXTENSION))
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("photon"))
         .then(|| path.to_path_buf())
-}
-
-fn read_svg_file(path: &std::path::Path) -> Result<String> {
-    let max_bytes = photonic_core::MAX_SVG_INPUT_BYTES as u64;
-    if std::fs::metadata(path)?.len() > max_bytes {
-        anyhow::bail!(
-            "SVG file exceeds the {}-byte import limit",
-            photonic_core::MAX_SVG_INPUT_BYTES
-        );
-    }
-
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > photonic_core::MAX_SVG_INPUT_BYTES {
-        anyhow::bail!(
-            "SVG file exceeds the {}-byte import limit",
-            photonic_core::MAX_SVG_INPUT_BYTES
-        );
-    }
-    String::from_utf8(bytes).map_err(Into::into)
 }
 
 /// Detect a paste shortcut before egui consumes the keyboard event. egui-winit
@@ -156,7 +135,11 @@ fn looks_like_svg_clipboard_text(text: &str) -> bool {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mcp_secret = configured_mcp_secret(args.mcp_secret.clone());
+    let cli_secret = args
+        .mcp_secret
+        .clone()
+        .or_else(|| std::env::var("PHOTONIC_MCP_SECRET").ok())
+        .or_else(|| photonic_mcp::auth::read_token().ok());
 
     // ── CLI client mode: a subcommand was given ───────────────────────────────
     if let Some(command) = args.command {
@@ -164,7 +147,7 @@ fn main() -> Result<()> {
             .with(fmt::layer())
             .with(EnvFilter::new("warn"))
             .init();
-        return cli::run(&args.server, mcp_secret.as_deref(), command);
+        return cli::run(&args.server, cli_secret.as_deref(), command);
     }
 
     // ── Server / GUI mode: full logging ──────────────────────────────────────
@@ -233,6 +216,7 @@ fn main() -> Result<()> {
     // Loaded document plus any persistent history embedded in a `.photon` file
     // (so a double-clicked or CLI-opened project restores its undo history too).
     let (document, loaded_history) = if let Some(path) = &args.file {
+        let content = std::fs::read_to_string(path)?;
         // Detect format by extension: `.svg` is imported, everything else is
         // treated as a Photonic file (`.photon`). Previously every file argument
         // was parsed as JSON, so opening an SVG via the CLI/file argument failed.
@@ -240,11 +224,6 @@ fn main() -> Result<()> {
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("svg"));
-        let content = if is_svg {
-            read_svg_file(path)?
-        } else {
-            std::fs::read_to_string(path)?
-        };
         if is_svg && !content.trim_start().starts_with('{') {
             let doc = photonic_core::import_svg(&content)
                 .map_err(|e| anyhow::anyhow!("failed to import SVG '{}': {e}", path.display()))?;
@@ -282,15 +261,58 @@ fn main() -> Result<()> {
         args.file.as_deref().and_then(native_project_path),
     ));
 
+    let secret = cli_secret.or_else(|| {
+        // Generate a session token when not pinned (28 §4 / MCP local profile).
+        let tok = photonic_mcp::auth::generate_token();
+        match photonic_mcp::auth::write_token(&tok) {
+            Ok(path) => tracing::info!("MCP session token written to {}", path.display()),
+            Err(e) => tracing::warn!("could not write MCP token file: {e}"),
+        }
+        Some(tok)
+    });
     let mcp_config = McpServerConfig {
         port: args.mcp_port,
-        secret: mcp_secret,
+        secret,
+        protocol_mode: args.mcp_protocol,
     };
+
+    // ── Stdio MCP (MCPB / Inspector) ──────────────────────────────────────────
+    if args.mcp_stdio {
+        info!("Running MCP on stdio (Content-Length framing)");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            // Large match in dispatch_tool_inner + schema_gen need more than
+            // the default ~2 MiB worker stack (else search_actions / full list overflow).
+            .thread_stack_size(8 * 1024 * 1024)
+            .enable_all()
+            .build()?;
+        let mcp_server = McpServer::new(
+            Arc::clone(&document_arc),
+            Arc::clone(&history_arc),
+            capture_tx,
+            mcp_config,
+            Arc::new(AtomicBool::new(true)),
+            audit_log,
+        )
+        .with_document_path(Arc::clone(&mcp_document_path));
+        rt.block_on(photonic_mcp::stdio::run_stdio(mcp_server.state))?;
+        return Ok(());
+    }
 
     // ── Headless mode ─────────────────────────────────────────────────────────
     if args.headless {
+        // Video engine: no wiring needed here — `McpServer`'s `AppState` owns
+        // a lazy headless `VideoEngine` (own adapter, created on the first
+        // engine-backed tool call; see photonic-mcp's `VideoEngineHandle`).
+        // GUI mode instead shares the winit renderer's device via
+        // `EngineBridge::from_renderer` (see `resumed`). Unifying the GUI
+        // process's MCP engine with the GUI's shared-device engine is a
+        // follow-up seam (two engines in one process work, but pay double GPU
+        // memory for the same media).
         info!("Running in headless mode (MCP server only)");
         let rt = tokio::runtime::Builder::new_multi_thread()
+            // Large match in dispatch_tool_inner + schema_gen need more than
+            // the default ~2 MiB worker stack (else search_actions / full list overflow).
+            .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()?;
         let mcp_server = McpServer::new(
@@ -306,11 +328,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ── GUI mode: MCP server on background thread, winit on main thread ───────
-    // The server runs on a detached thread; if it fails to bind (e.g. the port is
-    // held by another instance) the thread exits and `mcp_running` stays false.
-    // The GUI can then request a re-spawn via `mcp_restart_requested` (#170), which
-    // the winit host polls each frame — so keep clones of the spawn ingredients.
+    // ── GUI mode: winit on the main thread; MCP starts after GPU initialization ─
     let mcp_running = Arc::new(AtomicBool::new(false));
     let mcp_restart_requested = Arc::new(AtomicBool::new(false));
     let mcp_state = spawn_mcp_server(
@@ -353,14 +371,14 @@ fn main() -> Result<()> {
         initial_file: args.file.clone(),
         audit_log,
         window_state: WindowState::load(),
+        startup_error: None,
     };
 
     event_loop.run_app(&mut app)?;
-
-    // Guarantee a full process exit once the window closes — the MCP server runs
-    // on a detached background thread, so terminate the whole process (and that
-    // thread) deterministically rather than relying on unwind order.
-    std::process::exit(0);
+    if let Some(error) = app.startup_error {
+        return Err(anyhow::anyhow!(error));
+    }
+    Ok(())
 }
 
 // ─── Claude streaming events ─────────────────────────────────────────────────
@@ -417,6 +435,8 @@ struct PhotonicWinitApp {
     audit_log: Arc<std::sync::Mutex<AuditLog>>,
     /// Last normal bounds and maximized state, persisted between launches.
     window_state: WindowState,
+    /// Renderer initialization failure reported after the event loop exits.
+    startup_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -521,6 +541,9 @@ fn spawn_mcp_server(
     let state = server.state.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
+            // Large match in dispatch_tool_inner + schema_gen need more than
+            // the default ~2 MiB worker stack (else search_actions / full list overflow).
+            .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()
             .expect("tokio runtime");
@@ -620,6 +643,14 @@ impl PhotonicWinitApp {
 }
 
 impl ApplicationHandler for PhotonicWinitApp {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
+            if let Some(state) = &self.state {
+                state.window.request_redraw();
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -629,19 +660,28 @@ impl ApplicationHandler for PhotonicWinitApp {
         #[allow(unused_mut)]
         let mut attrs = WindowAttributes::default()
             .with_title("Photonic")
-            .with_inner_size(PhysicalSize::new(
-                self.window_state.width.clamp(320, 16_384),
-                self.window_state.height.clamp(240, 16_384),
-            ))
             .with_maximized(self.window_state.maximized)
             .with_window_icon(window_icon);
-        if self.window_state.position_is_visible(event_loop) {
-            attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(
-                self.window_state.x,
-                self.window_state.y,
+        // Only pin an explicit inner size / position when NOT opening maximized.
+        // Setting both `with_inner_size` and `with_maximized(true)` gives the
+        // compositor two conflicting targets (the saved normal size vs. the
+        // maximized size); on multi-monitor + fractional-scaling KWin that
+        // conflict can oscillate forever (endless resize/relayout). A maximized
+        // window derives its size from the output, so the saved bounds are only
+        // needed for the un-maximized (restore) case.
+        if !self.window_state.maximized {
+            attrs = attrs.with_inner_size(PhysicalSize::new(
+                self.window_state.width.clamp(320, 16_384),
+                self.window_state.height.clamp(240, 16_384),
             ));
-        } else if let Some(primary_monitor) = event_loop.primary_monitor() {
-            attrs = attrs.with_position(primary_monitor.position());
+            if self.window_state.position_is_visible(event_loop) {
+                attrs = attrs.with_position(winit::dpi::PhysicalPosition::new(
+                    self.window_state.x,
+                    self.window_state.y,
+                ));
+            } else if let Some(primary_monitor) = event_loop.primary_monitor() {
+                attrs = attrs.with_position(primary_monitor.position());
+            }
         }
         // On Linux the compositor (esp. Wayland/KWin) ignores the embedded .ico
         // for the titlebar/taskbar icon and instead maps the window to a desktop
@@ -662,11 +702,21 @@ impl ApplicationHandler for PhotonicWinitApp {
 
         let capture_rx = self.capture_rx.take().expect("capture_rx already consumed");
 
-        let renderer = pollster::block_on(PhotonicRenderer::new(
+        let renderer = match pollster::block_on(PhotonicRenderer::new(
             Arc::clone(&window),
             Arc::clone(&self.document),
+            Arc::clone(&self.history),
             capture_rx,
-        ));
+        )) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                let message = format!("GPU renderer initialization failed: {error}");
+                error!("{message}");
+                self.startup_error = Some(message);
+                event_loop.exit();
+                return;
+            }
+        };
 
         // Share the windowed renderer's GPU device/queue with the MCP export path
         // so `export_artboards`/`export_raster` render on the SAME GPU context. A
@@ -686,10 +736,10 @@ impl ApplicationHandler for PhotonicWinitApp {
         // ── egui setup ───────────────────────────────────────────────────────
         let egui_ctx = egui::Context::default();
         egui_ctx.set_visuals(photonic_gui::build_dark_theme());
-        egui_ctx.style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(6.0, 4.0);
-            s.spacing.button_padding = egui::vec2(8.0, 3.0);
-        });
+        // Spacing (incl. the 24px WCAG SC 2.5.8 hit-target floor, 41 §5 R-9)
+        // persists across theme switches: `set_visuals` replaces only
+        // `Style::visuals`, leaving `Style::spacing` intact.
+        egui_ctx.style_mut(photonic_gui::theme::apply_spacing);
 
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
@@ -727,6 +777,14 @@ impl ApplicationHandler for PhotonicWinitApp {
         };
         gui.audit.log = Some(Arc::clone(&self.audit_log));
         gui.mcp_restart_requested = Some(Arc::clone(&self.mcp_restart_requested));
+
+        // ── Video engine (video-editor 02 §1) ─────────────────────────────────
+        // One engine per process, sharing the winit renderer's wgpu device and
+        // queue so `EngineFrame` textures can be sampled by the egui pass
+        // directly (03 §5). The bridge owns the engine thread; dropping the
+        // GUI shuts it down and joins.
+        gui.engine = Some(photonic_gui::EngineBridge::from_renderer(&renderer));
+        info!("Video engine session opened (shared wgpu device)");
 
         self.state = Some(RenderState {
             window,
@@ -788,6 +846,11 @@ impl ApplicationHandler for PhotonicWinitApp {
             }
             WindowEvent::Resized(PhysicalSize { width, height }) => {
                 state.renderer.resize(width, height);
+                // The canvas-clip rect the GUI last reported belongs to the old
+                // window size. Drop it rather than clip the document with it —
+                // an unclipped frame just lets the artboard reach a few pixels
+                // it shouldn't; a wrongly clipped one blanks most of the canvas.
+                state.renderer.set_canvas_scissor(None);
                 self.window_state.update_normal_bounds(&state.window);
                 state.window.request_redraw();
             }
@@ -795,7 +858,14 @@ impl ApplicationHandler for PhotonicWinitApp {
                 self.window_state.update_normal_bounds(&state.window);
             }
             WindowEvent::RedrawRequested => {
-                self.render_frame();
+                let repaint_after = match self.render_frame() {
+                    Ok(repaint_after) => repaint_after,
+                    Err(error) => {
+                        error!(%error, "GPU surface failed; closing Photonic cleanly");
+                        event_loop.exit();
+                        return;
+                    }
+                };
                 // A deferred quit (unsaved-changes prompt) may have been confirmed
                 // by the GUI this frame — finalize window state + prefs and exit.
                 let exit_window = self.state.as_ref().and_then(|s| {
@@ -816,9 +886,19 @@ impl ApplicationHandler for PhotonicWinitApp {
                     event_loop.exit();
                     return;
                 }
-                if let Some(s) = &self.state {
-                    s.window.request_redraw();
-                }
+                // Do not wake at a fixed 60 Hz when the editor is idle. egui
+                // reports the earliest requested repaint for animations,
+                // playback, and delayed UI work. `ResumeTimeReached` above
+                // turns that deadline into the next native redraw, while input
+                // and window events still request an immediate repaint.
+                //
+                // This is especially important on Wayland: a permanent timer
+                // keeps the compositor and GPU busy even with a static window
+                // and magnifies any layout/cache feedback into needless work.
+                event_loop.set_control_flow(match repaint_after {
+                    Some(delay) => ControlFlow::WaitUntil(Instant::now() + delay),
+                    None => ControlFlow::Wait,
+                });
             }
             _ => {
                 if response.repaint {
@@ -830,12 +910,17 @@ impl ApplicationHandler for PhotonicWinitApp {
 }
 
 impl PhotonicWinitApp {
-    fn render_frame(&mut self) {
+    /// Render one frame and return egui's next requested repaint deadline.
+    /// `None` means there is no outstanding UI/playback work, so the native
+    /// event loop may sleep until real input or a window event arrives.
+    fn render_frame(&mut self) -> Result<Option<Duration>> {
         // Honor a pending MCP restart request from the GUI modal (#170) before we
         // take a mutable borrow of `self.state` for the frame.
         self.maybe_restart_mcp();
         let mcp_document_path = Arc::clone(&self.mcp_document_path);
-        let Some(state) = &mut self.state else { return };
+        let Some(state) = &mut self.state else {
+            return Ok(None);
+        };
 
         // Keep GUI File → Save and MCP save_document pointed at the same native
         // file. MCP writes are picked up before drawing; GUI path changes are
@@ -848,12 +933,23 @@ impl PhotonicWinitApp {
         let gui_path_before = state.gui.current_file.clone();
 
         // 1. Build document geometry + push camera
+        //
+        // Clip the document present to the canvas viewport the GUI reported last
+        // frame. The document pass covers the whole window; egui's panels used to
+        // hide all of it that isn't canvas, but the rails and drawers are floating
+        // cards now and the gaps between them let the (usually white) artboard
+        // show through as a bright bar. One frame of lag is harmless — on the very
+        // first frame, and for a frame after a resize, the scissor is simply the
+        // previous viewport.
+        state
+            .renderer
+            .set_canvas_scissor(state.gui.canvas_viewport_px());
         let (verts, idxs) = state.renderer.update();
 
         // 2. Acquire surface frame
-        let mut frame = match state.renderer.begin_frame(&verts, &idxs) {
-            Some(f) => f,
-            None => return,
+        let mut frame = match state.renderer.begin_frame(&verts, &idxs)? {
+            Some(frame) => frame,
+            None => return Ok(None),
         };
 
         // 2b. Render text nodes over the document (before egui).
@@ -861,6 +957,17 @@ impl PhotonicWinitApp {
 
         // 2c. Render Gaussian glow effects (GPU blur passes, additive composite).
         state.renderer.render_gaussian_glow_pass(&mut frame);
+
+        // 2d. Present the newest video EngineFrame (03 §5) into its egui
+        // native texture BEFORE the egui pass runs, so the monitor paints the
+        // current frame this very frame. No-op when nothing new was published.
+        if let Some(bridge) = state.gui.engine.as_mut() {
+            bridge.present_latest(
+                state.renderer.device(),
+                state.renderer.queue(),
+                &mut state.egui_renderer,
+            );
+        }
 
         // 3. Run egui (doc lock is held only for the duration of this closure)
         let raw_input = state.egui_state.take_egui_input(&state.window);
@@ -890,12 +997,17 @@ impl PhotonicWinitApp {
                         &mut view,
                         &mut state.renderer,
                         mcp_ok,
-                        &mut *hist,
+                        &mut hist,
                     );
                     state.renderer.view = view;
                 }
             }
         });
+        let repaint_after = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|output| output.repaint_delay)
+            .filter(|delay| *delay != Duration::MAX);
         // doc lock released here ↑
 
         Self::poll_mcp_operation_result(&mut self.mcp_result_rx, &mut state.gui);
@@ -1081,10 +1193,11 @@ impl PhotonicWinitApp {
             use std::sync::atomic::{AtomicU64, Ordering};
             static FRAME: AtomicU64 = AtomicU64::new(0);
             let n = FRAME.fetch_add(1, Ordering::Relaxed);
-            if n % 600 == 0 {
+            if n.is_multiple_of(600) {
                 tracing::info!("render loop alive — frame {}", n);
             }
         }
+        Ok(repaint_after)
     }
 }
 
@@ -1119,8 +1232,7 @@ fn register_file_association() {
     };
 
     // .photon → ProgID
-    let extension_key = format!(".{PHOTON_FILE_EXTENSION}");
-    if let Ok((ext, _)) = classes.create_subkey(&extension_key) {
+    if let Ok((ext, _)) = classes.create_subkey(".photon") {
         let _ = ext.set_value("", &"PhotonicDocument");
     }
 
@@ -1149,10 +1261,7 @@ fn register_file_association() {
         );
     }
 
-    tracing::info!(
-        "file assoc: .{} registered → PhotonicDocument",
-        PHOTON_FILE_EXTENSION
-    );
+    tracing::info!("file assoc: .photon registered → PhotonicDocument");
 }
 
 #[cfg(not(windows))]
@@ -1219,28 +1328,12 @@ Skip intermediate screenshots unless you need visual feedback to proceed."
         .to_string()
 }
 
-fn configured_mcp_secret(explicit: Option<String>) -> Option<String> {
-    let secret = match explicit {
-        Some(secret) if secret == MCP_SECRET_ENV_PLACEHOLDER => std::env::var(MCP_SECRET_ENV).ok(),
-        Some(secret) => Some(secret),
-        None => std::env::var(MCP_SECRET_ENV).ok(),
-    }?;
-
-    (secret != MCP_SECRET_ENV_PLACEHOLDER).then_some(secret)
-}
-
 /// Register the Photonic MCP server in the user's Claude `~/.claude.json` so it
 /// is always available when `claude` runs.
 ///
 /// Uses the HTTP transport — Claude Code connects directly to the already-running
 /// Photonic MCP HTTP server on the configured port. No proxy subprocess needed.
 fn write_mcp_config(port: u16, secret: Option<&str>) {
-    let Some(secret) = secret.filter(|secret| !secret.trim().is_empty()) else {
-        tracing::warn!(
-            "Skipping Claude MCP registration because no non-empty MCP secret is configured"
-        );
-        return;
-    };
     let server_entry = mcp_server_entry(port, secret);
 
     let Some(path) = claude_settings_path() else {
@@ -1256,12 +1349,15 @@ fn write_mcp_config(port: u16, secret: Option<&str>) {
     }
 }
 
-fn mcp_server_entry(port: u16, secret: &str) -> serde_json::Value {
-    serde_json::json!({
+fn mcp_server_entry(port: u16, secret: Option<&str>) -> serde_json::Value {
+    let mut server_entry = serde_json::json!({
         "type": "http",
-        "url": format!("http://127.0.0.1:{port}/mcp"),
-        "headers": { MCP_SECRET_HEADER: secret }
-    })
+        "url": format!("http://127.0.0.1:{port}/mcp")
+    });
+    if let Some(secret) = secret {
+        server_entry["headers"] = serde_json::json!({ MCP_SECRET_HEADER: secret });
+    }
+    server_entry
 }
 
 /// Add Photonic's MCP entry to one Claude configuration file.
@@ -1313,16 +1409,36 @@ fn write_mcp_config_at(
 }
 
 fn write_private_claude_settings(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
+    use std::io::Write;
+
+    if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Stage the complete private payload before replacing the live settings
-    // file, so a failed write or replacement leaves the existing file intact.
-    photonic_core::write_atomic_file_with_mode(path, contents, 0o600)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        options.mode(0o600);
+        let mut file = options.open(path)?;
+        // `mode` only applies to newly-created files. Tighten an existing file
+        // before writing a secret so a permissive prior mode has no exposure
+        // window while the new contents are being written.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(contents)?;
+        file.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Windows user-profile files inherit the profile directory's ACL.
+        let mut file = options.open(path)?;
+        file.write_all(contents)?;
+        file.sync_all()
+    }
 }
 
 /// Return the path to Claude Code's `~/.claude.json`.
@@ -1584,7 +1700,7 @@ mod mcp_config_tests {
 
     #[test]
     fn write_mcp_config_uses_the_configured_port() {
-        let entry = mcp_server_entry(9000, "top-secret");
+        let entry = mcp_server_entry(9000, Some("top-secret"));
         assert_eq!(entry["url"], "http://127.0.0.1:9000/mcp");
         assert_eq!(entry["headers"]["x-mcp-secret"], "top-secret");
     }
@@ -1596,8 +1712,8 @@ mod mcp_config_tests {
         let original = b"{ not valid JSON\n";
         fs::write(&path, original).expect("write malformed config");
 
-        let error = write_mcp_config_at(&path, mcp_server_entry(7842, "test-secret"))
-            .expect_err("malformed config");
+        let error =
+            write_mcp_config_at(&path, mcp_server_entry(7842, None)).expect_err("malformed config");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(fs::read(&path).expect("read config"), original);
@@ -1614,7 +1730,7 @@ mod mcp_config_tests {
         });
         fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
 
-        let entry = mcp_server_entry(9123, "test-secret");
+        let entry = mcp_server_entry(9123, Some("test-secret"));
         write_mcp_config_at(&path, entry.clone()).expect("update valid config");
 
         let updated: serde_json::Value =
@@ -1635,7 +1751,7 @@ mod mcp_config_tests {
         let original = br#"{"mcpServers":[]}"#;
         fs::write(&path, original).expect("write malformed config");
 
-        let error = write_mcp_config_at(&path, mcp_server_entry(7842, "test-secret"))
+        let error = write_mcp_config_at(&path, mcp_server_entry(7842, None))
             .expect_err("malformed structure");
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1670,27 +1786,5 @@ mod mcp_config_tests {
         assert_eq!(std::fs::read(&path).unwrap(), br#"{"secret":"private"}"#);
 
         std::fs::remove_dir_all(directory).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod file_lifecycle_tests {
-    use super::native_project_path;
-    use photonic_core::PHOTON_FILE_EXTENSION;
-    use std::path::Path;
-
-    #[test]
-    fn native_project_path_matches_the_canonical_extension() {
-        assert_eq!(PHOTON_FILE_EXTENSION, "photon");
-        assert_eq!(
-            native_project_path(Path::new("project.photon")),
-            Some(Path::new("project.photon").to_path_buf())
-        );
-        assert_eq!(
-            native_project_path(Path::new("PROJECT.PHOTON")),
-            Some(Path::new("PROJECT.PHOTON").to_path_buf())
-        );
-        assert_eq!(native_project_path(Path::new("project.photonic")), None);
-        assert_eq!(native_project_path(Path::new("artwork.svg")), None);
     }
 }

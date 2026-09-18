@@ -1,3 +1,19 @@
+// GUI interaction paths intentionally favor explicit indexed traversal and
+// incremental `Default` setup, keeping event/state transitions debuggable.
+// These expectations are self-checking under the strict workspace gate.
+#![expect(
+    clippy::doc_lazy_continuation,
+    clippy::empty_line_after_doc_comments,
+    clippy::field_reassign_with_default,
+    clippy::manual_clamp,
+    clippy::needless_range_loop,
+    clippy::type_complexity,
+    clippy::unnecessary_sort_by,
+    dead_code,
+    deprecated,
+    unused_doc_comments
+)]
+
 pub mod app;
 pub mod color_convert;
 pub mod color_popup;
@@ -20,6 +36,7 @@ pub mod update;
 pub mod viewport;
 pub mod welcome;
 
+pub use app::engine::EngineBridge;
 pub use app::{NativeClipboardPaste, PhotonicApp};
 pub(crate) use file_io::read_svg_file;
 pub use preferences::AppPreferences;

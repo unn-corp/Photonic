@@ -1,0 +1,3 @@
+doc.md:1
+  spec-assert: const CURRENT_FORMAT_VERSION == 3
+  actual:      4  (crates/photonic-core/src/document.rs:110)

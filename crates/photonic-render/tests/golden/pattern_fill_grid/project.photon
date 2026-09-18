@@ -1,0 +1,123 @@
+{
+  "format_version": 2,
+  "id": "1731de8f-08d8-45ac-aa00-7a4b0e22fe7e",
+  "name": "pattern-fill-grid",
+  "width": 120.0,
+  "height": 120.0,
+  "layer_order": [
+    "98a5388d-a8e3-4810-8be7-8d5461bf2c48"
+  ],
+  "layers": {
+    "98a5388d-a8e3-4810-8be7-8d5461bf2c48": {
+      "id": "98a5388d-a8e3-4810-8be7-8d5461bf2c48",
+      "name": "Layer 1",
+      "visible": true,
+      "locked": false,
+      "opacity": 1.0,
+      "blend_mode": "normal",
+      "color": null,
+      "is_template": false,
+      "print": true,
+      "lock_transparency": false,
+      "lock_pixels": false,
+      "lock_position": false,
+      "node_ids": [
+        "e27463db-4346-4c7b-9517-15c05ae164da"
+      ]
+    }
+  },
+  "nodes": {
+    "e27463db-4346-4c7b-9517-15c05ae164da": {
+      "id": "e27463db-4346-4c7b-9517-15c05ae164da",
+      "name": "patterned-rect",
+      "layer_id": "98a5388d-a8e3-4810-8be7-8d5461bf2c48",
+      "kind": {
+        "type": "path",
+        "path_data": {
+          "svg": "M10,10 L110,10 L110,110 L10,110 Z"
+        },
+        "fill": {
+          "kind": {
+            "type": "pattern",
+            "tile": {
+              "width": 8,
+              "height": 8,
+              "png": "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAY0lEQVR4Ae3AA6AkWZbG8f937o3IzKdyS2Oubdu2bdu2bdu2bWmMnpZKr54yMyLu+Xa3anqmhztr1a/aNg/wmMc8hgcgeOEIXjiCFw49+tGPNg/w+Mc/ngcgeOEIXjiCF45/BG/8CIWpjYqCAAAAAElFTkSuQmCC"
+            },
+            "tile_type": "grid",
+            "scale": 1.0,
+            "rotation": 0.0,
+            "offset": [
+              0.0,
+              0.0
+            ],
+            "spacing": 0.0
+          },
+          "opacity": 1.0,
+          "enabled": true
+        },
+        "stroke": {
+          "color": {
+            "r": 0.0,
+            "g": 0.0,
+            "b": 0.0,
+            "a": 1.0
+          },
+          "width": 1.0,
+          "opacity": 1.0,
+          "line_cap": "butt",
+          "line_join": "miter",
+          "miter_limit": 4.0,
+          "dash_array": [],
+          "dash_offset": 0.0,
+          "enabled": false,
+          "align": "center",
+          "dash_corner_alignment": false,
+          "arrowhead_start": "none",
+          "arrowhead_end": "none",
+          "width_profile_id": null,
+          "paint": null
+        },
+        "is_compound": false
+      }
+    }
+  },
+  "active_layer_id": "98a5388d-a8e3-4810-8be7-8d5461bf2c48",
+  "annotations": {},
+  "guides": [],
+  "recent_colors": [],
+  "export_profiles": [],
+  "character_styles": [],
+  "paragraph_styles": [],
+  "color_swatches": [],
+  "variables": [],
+  "symbols": [],
+  "gradient_swatches": [],
+  "spot_colors": [],
+  "graphic_styles": [],
+  "width_profiles": [],
+  "patterns": [],
+  "constraints": [],
+  "grammar_rules": [],
+  "action_sets": [],
+  "bleed_mm": 0.0,
+  "slug_mm": 0.0,
+  "margin_top": 0.0,
+  "margin_right": 0.0,
+  "margin_bottom": 0.0,
+  "margin_left": 0.0,
+  "event_triggers": [],
+  "workspaces": [],
+  "artboards": [
+    {
+      "id": "7032e597-6651-4515-a4ce-f51c6d883526",
+      "name": "Artboard 1",
+      "x": 0.0,
+      "y": 0.0,
+      "width": 120.0,
+      "height": 120.0
+    }
+  ],
+  "active_artboard": "7032e597-6651-4515-a4ce-f51c6d883526",
+  "photon_format": 1
+}

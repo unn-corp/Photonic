@@ -367,6 +367,7 @@ pub fn outline_document_text(doc: &Document, font_system: &mut FontSystem) -> Do
         };
         let text = text.clone(); // clone to release the borrow on node
 
+        let mut on_path = false;
         let path_data = if let Some(spine_id) = text.path_spine_id {
             // Text-on-path: use the existing on-path layout
             let spine = clone.nodes.get(&spine_id).and_then(|n| match &n.kind {
@@ -387,6 +388,7 @@ pub fn outline_document_text(doc: &Document, font_system: &mut FontSystem) -> Do
                     path_offset: text.path_offset,
                 };
                 let glyph_paths = layout_text_on_path(font_system, &params, &spine_path);
+                on_path = true;
                 if glyph_paths.is_empty() {
                     PathData::new()
                 } else {
@@ -419,6 +421,14 @@ pub fn outline_document_text(doc: &Document, font_system: &mut FontSystem) -> Do
         // Swap the node's kind in place (all other fields stay identical).
         if let Some(node) = clone.nodes.get_mut(&id) {
             node.kind = SceneNodeKind::Path(path_node);
+            // Text-on-path glyphs come out of `layout_text_on_path` already in
+            // absolute document space (they follow the spine, which carries its
+            // own transform). Keeping the text node's transform would apply it a
+            // second time — the windowed renderer pushes these glyphs without it,
+            // so exports must too or on-canvas and PNG/PDF disagree.
+            if on_path {
+                node.transform = Default::default();
+            }
         }
     }
 
@@ -707,8 +717,8 @@ mod tests {
 
     /// ACCEPT CRITERION: export a doc with a text node through `outline_document_text`
     /// + `export_pdf`, write the result to /tmp/photonic_outline_test.pdf, then run
-    /// `pdffonts` on it.  The font table MUST be empty (zero rows) — the PDF contains
-    /// no embedded/referenced fonts; all glyphs are present as vector path operators.
+    ///   `pdffonts` on it.  The font table MUST be empty (zero rows) — the PDF contains
+    ///   no embedded/referenced fonts; all glyphs are present as vector path operators.
     ///
     /// Also verifies the PDF is non-trivial (> 512 bytes) so we know real paths exist.
     ///
@@ -768,6 +778,119 @@ mod tests {
             data_lines.len() <= 2,
             "PDF should have ZERO fonts but pdffonts reports {} data lines:\n{stdout}",
             data_lines.len()
+        );
+    }
+
+    /// Build a doc with a text node bound to an arch spine, and give the TEXT
+    /// node a non-identity transform — the exact shape that regressed. Returns
+    /// (doc, text_id, spine_id).
+    fn make_doc_with_text_on_path(translate: (f64, f64)) -> (Document, NodeId, NodeId) {
+        use photonic_core::{node::PathNode, path::PathData, transform::Transform};
+
+        let mut doc = Document::new("test", 160.0, 100.0);
+        let layer_id = doc
+            .active_layer_id
+            .expect("Document::new always creates a default layer");
+
+        // Arch from (10,90) up over (80,20) and back down to (150,90).
+        let spine_data =
+            PathData::from_svg("M10,90 C10,51.34 41.34,20 80,20 C118.66,20 150,51.34 150,90")
+                .expect("spine path must parse");
+        let spine = SceneNode::new(
+            "spine",
+            layer_id,
+            SceneNodeKind::Path(PathNode {
+                path_data: spine_data,
+                fill: Default::default(),
+                stroke: Default::default(),
+                is_compound: false,
+            }),
+        );
+        let spine_id = spine.id;
+
+        let mut text_node = TextNode::new("On A Path");
+        text_node.font_family = "sans-serif".to_string();
+        text_node.font_size = 16.0;
+        text_node.path_spine_id = Some(spine_id);
+        text_node.path_offset = 0.0;
+        let mut text = SceneNode::new("path-text", layer_id, SceneNodeKind::Text(text_node));
+        text.transform = Transform::translate(translate.0, translate.1);
+        let text_id = text.id;
+
+        if let Some(layer) = doc.layers.get_mut(&layer_id) {
+            layer.node_ids.push(spine_id);
+            layer.node_ids.push(text_id);
+        }
+        doc.nodes.insert(spine_id, spine);
+        doc.nodes.insert(text_id, text);
+        (doc, text_id, spine_id)
+    }
+
+    /// REGRESSION: `layout_text_on_path` already returns glyphs in absolute
+    /// document space (they follow the spine, which carries its own transform),
+    /// so the outlined node must NOT keep the text node's transform — applying
+    /// it a second time shifts every glyph. The windowed renderer pushes these
+    /// glyphs without the transform, so exports that keep it disagree with the
+    /// canvas (on-screen correct, PNG/PDF offset).
+    #[test]
+    fn text_on_path_outline_does_not_reapply_node_transform() {
+        let mut fs = FontSystem::new();
+        // A translate big enough to push glyphs off a 100-unit-tall canvas.
+        let (doc, text_id, _spine_id) = make_doc_with_text_on_path((20.0, 60.0));
+        let outlined = outline_document_text(&doc, &mut fs);
+
+        let node = outlined.nodes.get(&text_id).expect("node must survive");
+        let SceneNodeKind::Path(path) = &node.kind else {
+            panic!("text node should be outlined into a Path");
+        };
+        if path.path_data.is_empty() {
+            eprintln!("no system font available — skipping text-on-path assertions");
+            return;
+        }
+
+        assert_eq!(
+            node.transform.matrix,
+            photonic_core::transform::Transform::default().matrix,
+            "on-path glyphs are already absolute; keeping the text node's \
+             transform double-applies it (got {:?})",
+            node.transform.matrix
+        );
+
+        // With the transform correctly dropped the glyphs stay on the canvas.
+        let bb = path
+            .path_data
+            .bounding_box()
+            .expect("glyphs must have a bbox");
+        assert!(
+            bb.y1 <= doc.height,
+            "glyphs run off the bottom of the {}-unit canvas (max_y={}) — the \
+             node transform was re-applied",
+            doc.height,
+            bb.y1
+        );
+        assert!(
+            bb.x0 >= -5.0 && bb.x1 <= doc.width,
+            "glyphs outside canvas: {bb:?}"
+        );
+    }
+
+    /// Guard the other half of the fix: FLAT text still needs its transform,
+    /// so the identity reset must apply only to the on-path branch.
+    #[test]
+    fn flat_text_outline_keeps_node_transform() {
+        use photonic_core::transform::Transform;
+
+        let mut fs = FontSystem::new();
+        let (mut doc, node_id) = make_doc_with_text("Hi");
+        doc.nodes.get_mut(&node_id).unwrap().transform = Transform::translate(20.0, 60.0);
+
+        let outlined = outline_document_text(&doc, &mut fs);
+        let node = outlined.nodes.get(&node_id).expect("node must survive");
+
+        assert_eq!(
+            node.transform.matrix,
+            Transform::translate(20.0, 60.0).matrix,
+            "flat text is laid out in local space and still needs its transform"
         );
     }
 }

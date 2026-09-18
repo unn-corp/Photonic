@@ -229,10 +229,10 @@ mod tests {
         let t = CmykTransform::default_fogra39().unwrap();
         let [c, m, y, k] = t.rgb_to_cmyk([1.0, 0.0, 0.0]);
         // All channels in valid range.
-        assert!(c >= 0.0 && c <= 1.0, "C out of range: {c}");
-        assert!(m >= 0.0 && m <= 1.0, "M out of range: {m}");
-        assert!(y >= 0.0 && y <= 1.0, "Y out of range: {y}");
-        assert!(k >= 0.0 && k <= 1.0, "K out of range: {k}");
+        assert!((0.0..=1.0).contains(&c), "C out of range: {c}");
+        assert!((0.0..=1.0).contains(&m), "M out of range: {m}");
+        assert!((0.0..=1.0).contains(&y), "Y out of range: {y}");
+        assert!((0.0..=1.0).contains(&k), "K out of range: {k}");
         // Red in FOGRA39: C low (<0.15), M high (>0.5), Y high (>0.5).
         assert!(c < 0.15, "Red should have low C, got {c}");
         assert!(m > 0.5, "Red should have high M, got {m}");

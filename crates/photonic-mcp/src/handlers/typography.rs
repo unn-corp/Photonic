@@ -119,11 +119,9 @@ pub async fn create_character_style(
                     if style.line_height.is_none() {
                         style.line_height = Some(t.line_height);
                     }
-                    if style.fill_hex.is_none() {
-                        if t.fill.enabled {
-                            if let FillKind::Solid(c) = &t.fill.kind {
-                                style.fill_hex = Some(c.to_hex());
-                            }
+                    if style.fill_hex.is_none() && t.fill.enabled {
+                        if let FillKind::Solid(c) = &t.fill.kind {
+                            style.fill_hex = Some(c.to_hex());
                         }
                     }
                 }

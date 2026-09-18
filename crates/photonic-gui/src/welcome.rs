@@ -37,7 +37,7 @@ const BG_ELEVATED: Color32 = Color32::from_rgb(19, 19, 31);
 const BG_WIDGET: Color32 = Color32::from_rgb(26, 26, 40);
 const BORDER: Color32 = Color32::from_rgb(30, 30, 50);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(232, 232, 242);
-const TEXT_MUTED: Color32 = Color32::from_rgb(122, 122, 154);
+const TEXT_MUTED: Color32 = Color32::from_rgb(138, 138, 168); // #8A8AA8 secondary (WCAG AA)
 
 // Canvas size presets, grouped by use-case: (group, &[(label, width, height)]).
 // Dimensions are in pixels (paper sizes at 96 DPI, photo/poster noted per group).
@@ -310,8 +310,22 @@ pub struct NewDocumentSpec {
     pub history_max_mb: f64,
 }
 
+/// Minimal parameters for a new video timeline project (video-editor-module
+/// `04-ui-mode-timeline.md` §1.2 Welcome-action entry point) — the video-mode
+/// counterpart of [`NewDocumentSpec`].
+#[derive(Debug, Clone)]
+pub struct VideoProjectSpec {
+    pub name: String,
+    pub width: f64,
+    pub height: f64,
+    pub frame_rate: photonic_core::timeline::FrameRate,
+}
+
 pub enum WelcomeAction {
     CreateNew(NewDocumentSpec),
+    /// Video-mode counterpart of `CreateNew` (04 §1.2). No UI produces this
+    /// yet — the video-mode new-project flow is P2/mode-switch-story work.
+    CreateNewVideo(VideoProjectSpec),
     OpenFile(PathBuf),
     OpenBrowse,
     /// Prompt for a folder to add as a disk-search root.
@@ -835,6 +849,12 @@ pub struct WelcomeState {
     disk_scanned: bool,
 }
 
+impl Default for WelcomeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WelcomeState {
     pub fn new() -> Self {
         Self {
@@ -900,6 +920,14 @@ impl WelcomeState {
                     if i.key_pressed(Key::O) {
                         next_view = Some(WelcomeView::Open);
                     }
+                    if i.key_pressed(Key::V) {
+                        action = Some(WelcomeAction::CreateNewVideo(VideoProjectSpec {
+                            name: "Untitled".to_string(),
+                            width: 1920.0,
+                            height: 1080.0,
+                            frame_rate: photonic_core::timeline::FrameRate::FPS_30,
+                        }));
+                    }
                 }
                 _ => {
                     if i.key_pressed(Key::Escape) {
@@ -923,7 +951,7 @@ impl WelcomeState {
 
                 match self.view {
                     WelcomeView::Hub => {
-                        self.draw_hub(ui, ctx, elapsed, &mut next_view);
+                        self.draw_hub(ui, ctx, elapsed, &mut action, &mut next_view);
                     }
                     WelcomeView::NewCanvas => {
                         self.draw_new(ui, ctx, &mut action, &mut next_view);
@@ -948,6 +976,7 @@ impl WelcomeState {
         ui: &mut egui::Ui,
         ctx: &egui::Context,
         elapsed: f32,
+        action: &mut Option<WelcomeAction>,
         next_view: &mut Option<WelcomeView>,
     ) {
         // Staggered reveal: each element fades + drifts up off one shared clock.
@@ -955,6 +984,7 @@ impl WelcomeState {
         let r_sub = reveal(elapsed, 0.10, 0.55);
         let r_card1 = reveal(elapsed, 0.20, 0.55);
         let r_card2 = reveal(elapsed, 0.28, 0.55);
+        let r_card3 = reveal(elapsed, 0.36, 0.55);
 
         let avail = ui.available_height();
         ui.add_space(avail * 0.11);
@@ -1028,7 +1058,7 @@ impl WelcomeState {
         };
 
         ui.vertical_centered(|ui| {
-            ui.set_max_width(card_w * 2.0 + gap);
+            ui.set_max_width(card_w * 3.0 + gap * 2.0);
             ui.horizontal(|ui| {
                 if hero_card(
                     ui,
@@ -1055,6 +1085,30 @@ impl WelcomeState {
                 ) {
                     *next_view = Some(WelcomeView::Open);
                 }
+                ui.add_space(gap);
+                // Video-mode entry point (video-editor-module
+                // 04-ui-mode-timeline.md §1.2 Welcome-action entry). Fires
+                // `WelcomeAction::CreateNewVideo` directly with a sensible
+                // default (1920x1080/30fps) rather than routing through a
+                // sizing sub-view — a full new-video-project form is
+                // 05-import-export.md's territory, not this mode-switch story.
+                if hero_card(
+                    ui,
+                    ctx,
+                    "hub_new_video",
+                    Vec2::new(card_w, card_h),
+                    ph::FILM_STRIP,
+                    "New Video Project",
+                    "Start a video timeline",
+                    r_card3,
+                ) {
+                    *action = Some(WelcomeAction::CreateNewVideo(VideoProjectSpec {
+                        name: "Untitled".to_string(),
+                        width: 1920.0,
+                        height: 1080.0,
+                        frame_rate: photonic_core::timeline::FrameRate::FPS_30,
+                    }));
+                }
             });
         });
 
@@ -1064,7 +1118,7 @@ impl WelcomeState {
             ui.scope(|ui| {
                 ui.set_opacity(r_card2 * 0.8);
                 ui.label(
-                    RichText::new("N  new canvas      O  open")
+                    RichText::new("N  new canvas      O  open      V  new video")
                         .size(11.0)
                         .color(TEXT_MUTED),
                 );
