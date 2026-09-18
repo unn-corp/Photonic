@@ -702,7 +702,10 @@ mod tests {
                 dependencies: Vec::new(),
             })
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // The full Windows suite exercises the same software GPU immediately
+        // before this worker test, so queue startup can exceed 30 seconds on a
+        // hosted runner even though standalone rendering takes about a second.
+        let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) { 120 } else { 30 });
         let chunk = loop {
             if let Some(chunk) = cache.lookup(&signature) {
                 break chunk;

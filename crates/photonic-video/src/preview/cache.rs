@@ -509,7 +509,12 @@ impl PreviewCache {
         let mut file = std::fs::File::create(&manifest_path)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        std::fs::File::open(&staging.path)?.sync_all()?;
+        // FlushFileBuffers requires a writable handle on Windows. Opening the
+        // completed media read-only makes `sync_all` fail with access denied.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&staging.path)?
+            .sync_all()?;
         drop(file);
         let destination = self.directory(staging.signature.key);
         if let Some(parent) = destination.parent() {
