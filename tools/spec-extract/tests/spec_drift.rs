@@ -111,8 +111,8 @@ fn each_historical_drift_is_caught() {
         let (code, stdout) = run(&index, &case, &case);
         assert_eq!(code, 1, "{}: expected drift exit 1", case.display());
         assert_eq!(
-            stdout.replace('\\', "/"),
-            expected.replace('\\', "/"),
+            stdout.replace("\r\n", "\n").replace('\\', "/"),
+            expected.replace("\r\n", "\n").replace('\\', "/"),
             "{}: checker output must match expected.txt byte-for-byte",
             case.display()
         );
@@ -157,7 +157,9 @@ fn anchored_blocks_are_compared_structurally() {
             .output()
             .expect("run check-spec-drift.py");
         let code = out.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&out.stdout).replace('\\', "/");
+        let stdout = String::from_utf8_lossy(&out.stdout)
+            .replace("\r\n", "\n")
+            .replace('\\', "/");
         let stderr = String::from_utf8_lossy(&out.stderr);
         if expected.trim().is_empty() {
             assert_eq!(
@@ -175,7 +177,7 @@ fn anchored_blocks_are_compared_structurally() {
             );
             assert_eq!(
                 stdout,
-                expected.replace('\\', "/"),
+                expected.replace("\r\n", "\n").replace('\\', "/"),
                 "{name}: checker output must match expected.txt byte-for-byte"
             );
         }
@@ -234,6 +236,7 @@ fn acceptance_index_enforces_covers() {
     for (name, should_pass) in expect {
         let case = root.join(name);
         let out = Command::new("python3")
+            .env("PYTHONUTF8", "1")
             .arg(gen_acceptance())
             .arg("--check")
             .arg("--docs")
