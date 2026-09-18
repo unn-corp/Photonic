@@ -263,6 +263,7 @@ fn acceptance_index_generation_is_deterministic() {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/acceptance/covered-with-test");
     let run = || {
         let out = Command::new("python3")
+            .env("PYTHONUTF8", "1")
             .arg(gen_acceptance())
             .arg("--docs")
             .arg(case.join("docs"))
