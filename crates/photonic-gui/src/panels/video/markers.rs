@@ -38,9 +38,6 @@ use photonic_core::timeline::{
 };
 use photonic_core::Color;
 
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A); // `secondary`
-const WARN: Color32 = Color32::from_rgb(0xE0, 0x9B, 0x3C);
-
 // ── Pure list model (unit-tested below; no egui) ────────────────────────────
 
 /// Which scopes the list shows.
@@ -284,15 +281,21 @@ fn category_delete_target_id() -> egui::Id {
 /// Left-rail Markers drawer.
 pub(crate) fn draw_markers(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let Some(project) = ctx.doc.timeline.as_ref() else {
-        ui.label(RichText::new("No video project yet.").color(MUTED));
+        ui.label(
+            RichText::new("No video project yet.").color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
     let Some(seq_id) = project.active_sequence else {
-        ui.label(RichText::new("No active sequence.").color(MUTED));
+        ui.label(
+            RichText::new("No active sequence.").color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
     let Some(seq) = project.sequences.get(&seq_id) else {
-        ui.label(RichText::new("No active sequence.").color(MUTED));
+        ui.label(
+            RichText::new("No active sequence.").color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
     let playhead = ctx.video.playhead;
@@ -352,7 +355,7 @@ pub(crate) fn draw_markers(ui: &mut Ui, ctx: &mut PropPanelCtx) {
             if rows.len() == 1 { "" } else { "s" }
         ))
         .small()
-        .color(MUTED),
+        .color(crate::theme::section_header_color(ui)),
     );
 
     if rows.is_empty() {
@@ -361,7 +364,7 @@ pub(crate) fn draw_markers(ui: &mut Ui, ctx: &mut PropPanelCtx) {
                 "No markers match. Double-click the ruler, or use \"Add at playhead\" above.",
             )
             .small()
-            .color(MUTED),
+            .color(crate::theme::section_header_color(ui)),
         );
     }
 
@@ -481,7 +484,7 @@ fn draw_row(
         .color
         .or(cat.map(|c| c.color))
         .map(to_col32)
-        .unwrap_or(MUTED);
+        .unwrap_or(crate::theme::section_header_color(ui));
     let at_playhead =
         playhead >= row.timeline_at && playhead < row.timeline_end().max(row.timeline_at + Tick(1));
 
@@ -510,7 +513,7 @@ fn draw_row(
                         RichText::new(format!("→ {}", timecode(seq, row.timeline_end())))
                             .monospace()
                             .small()
-                            .color(MUTED),
+                            .color(crate::theme::section_header_color(ui)),
                     );
                 }
                 if row.is_clip_scoped() {
@@ -518,7 +521,7 @@ fn draw_row(
                     ui.label(
                         RichText::new(format!("{} {name}", ph::FILM_STRIP))
                             .small()
-                            .color(MUTED),
+                            .color(crate::theme::section_header_color(ui)),
                     )
                     .on_hover_text("A clip marker — clip-relative, and it travels with the clip.");
                 }
@@ -526,7 +529,7 @@ fn draw_row(
                     ui.label(
                         RichText::new(format!("{} unresolved category", ph::WARNING))
                             .small()
-                            .color(WARN),
+                            .color(ui.visuals().warn_fg_color),
                     )
                     .on_hover_text(
                         "This marker names a category this project does not have. \
@@ -684,13 +687,17 @@ fn draft_text(ui: &mut Ui, m: &Marker, field: &str, current: &str, hint: &str) -
 }
 
 fn draw_category_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, project: &TimelineProject) {
-    ui.label(RichText::new("CATEGORIES").small().color(MUTED));
+    ui.label(
+        RichText::new("CATEGORIES")
+            .small()
+            .color(crate::theme::section_header_color(ui)),
+    );
 
     if project.marker_categories.is_empty() {
         ui.label(
             RichText::new("This project has no marker categories yet.")
                 .small()
-                .color(MUTED),
+                .color(crate::theme::section_header_color(ui)),
         );
         if ui
             .button(format!("{} Add the default set", ph::SPARKLE))
@@ -762,8 +769,12 @@ fn draw_category_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, project: &TimelineP
 
             let used = project.markers_in_category(c.id).len();
             if used > 0 {
-                ui.label(RichText::new(format!("{used}")).small().color(MUTED))
-                    .on_hover_text(format!("{used} marker(s) use this category"));
+                ui.label(
+                    RichText::new(format!("{used}"))
+                        .small()
+                        .color(crate::theme::section_header_color(ui)),
+                )
+                .on_hover_text(format!("{used} marker(s) use this category"));
             }
             if ui
                 .button(RichText::new(ph::TRASH))

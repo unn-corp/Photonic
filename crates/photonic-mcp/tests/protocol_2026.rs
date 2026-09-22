@@ -126,6 +126,10 @@ async fn tools_list_has_result_type() {
         .collect();
     assert!(names.contains(&"search_actions"), "{names:?}");
     assert!(names.contains(&"execute_action"), "{names:?}");
+    assert!(names.contains(&"get_video_capabilities"), "{names:?}");
+    assert!(names.contains(&"render_frames_at"), "{names:?}");
+    // The plan schema embeds all allowed edit schemas; keep it on demand.
+    assert!(!names.contains(&"apply_video_edit_plan"), "{names:?}");
 }
 
 #[tokio::test]

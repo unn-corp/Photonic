@@ -414,6 +414,8 @@ pub struct EngineStatus {
     /// sampled from the mixer feeder's `StereoMeter` each status publish.
     /// `None` when no feeder is running (paused / no audio device).
     pub master_level: Option<MasterMeterSnapshot>,
+    /// Live post-fader levels keyed by timeline audio track. Empty when stopped.
+    pub track_levels: HashMap<photonic_core::timeline::TrackId, MasterMeterSnapshot>,
     /// K-E1: latest master-bus spectrum in dBFS (downsampled to 64 bins).
     /// `None` when the mixer feeder is not running.
     pub spectrum_db: Option<Vec<f32>>,
@@ -503,6 +505,12 @@ pub struct MasterMeterSnapshot {
     pub rms: [f32; 2],
 }
 
+/// Shared taps published once per feeder, sampled without locking audio rendering.
+pub(crate) struct LiveAudioMeters {
+    pub(crate) output: Arc<crate::audio::mixer::StereoMeter>,
+    tracks: HashMap<photonic_core::timeline::TrackId, Arc<crate::audio::mixer::StereoMeter>>,
+}
+
 impl Default for EngineStatus {
     fn default() -> Self {
         EngineStatus {
@@ -529,6 +537,7 @@ impl Default for EngineStatus {
             buffering: false,
             export: None,
             master_level: None,
+            track_levels: HashMap::new(),
             spectrum_db: None,
             graph_latency_samples: 0,
             scope_tap: ScopeTapPoint::Program,
@@ -1091,7 +1100,7 @@ struct EngineThread {
     /// Monotonic per-session export counter, stamped onto each snapshot.
     export_job_counter: u64,
     /// Live master-bus meter handle published by the mixer feeder (G-4).
-    master_meter: Arc<ArcSwapOption<crate::audio::mixer::StereoMeter>>,
+    master_meter: Arc<ArcSwapOption<LiveAudioMeters>>,
     /// K-E1: latest master-bus spectrum (dB) from the mixer feeder.
     spectrum_db: Arc<ArcSwapOption<Vec<f32>>>,
     /// Live graph latency samples published by the mixer feeder (31 §3).
@@ -1773,6 +1782,7 @@ impl EngineThread {
             }
             self.media
                 .set_shared_document(published.value.document.clone(), published.value.revision);
+            self.refresh_audio_snapshot();
             self.refresh_preview_snapshot();
             self.controller.request_present();
             return;
@@ -1803,8 +1813,15 @@ impl EngineThread {
             self.lut_cache.warm(p);
         }
         self.snapshot = snap;
+        self.refresh_audio_snapshot();
         self.refresh_preview_snapshot();
         self.controller.request_present();
+    }
+
+    fn refresh_audio_snapshot(&self) {
+        if let (Some(feeder), Some(project)) = (&self.feeder, &self.snapshot) {
+            feeder.set_project(project.clone());
+        }
     }
 
     fn immutable_render_snapshot(&self) -> RenderSnapshot {
@@ -2746,10 +2763,21 @@ impl EngineThread {
             .as_ref()
             .and_then(|p| self.effective_sequence(p));
         let export = self.export_progress.load_full();
-        let master_level = self.master_meter.load_full().map(|m| MasterMeterSnapshot {
+        let live_meters = self.master_meter.load_full();
+        let snapshot = |m: &crate::audio::mixer::StereoMeter| MasterMeterSnapshot {
             peak: m.peak(),
             rms: m.rms(),
-        });
+        };
+        let master_level = live_meters.as_ref().map(|m| snapshot(&m.output));
+        let track_levels = live_meters
+            .as_ref()
+            .map(|m| {
+                m.tracks
+                    .iter()
+                    .map(|(id, meter)| (*id, snapshot(meter)))
+                    .collect()
+            })
+            .unwrap_or_default();
         let spectrum_db = self.spectrum_db.load_full().map(|v| (*v).clone());
         let graph_latency_samples = self.graph_latency.load(Ordering::Relaxed);
         // Cheap signature: skip Arc allocation when the GUI-visible fields are
@@ -2857,6 +2885,7 @@ impl EngineThread {
             buffering: self.buffering,
             export: export.as_ref().map(|e| (**e).clone()),
             master_level,
+            track_levels,
             spectrum_db,
             graph_latency_samples,
             scope_tap: self.scope_tap,
@@ -4099,12 +4128,16 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 
 /// Handle to the mixer worker thread; dropping stops + joins it.
 pub(crate) struct AudioFeeder {
+    project: Arc<ArcSwap<TimelineProject>>,
     stop: Arc<AtomicBool>,
     prefill: Arc<AtomicU8>,
     join: Option<JoinHandle<()>>,
 }
 
 impl AudioFeeder {
+    fn set_project(&self, project: Arc<TimelineProject>) {
+        self.project.store(project);
+    }
     /// 0 preparing, 1 first bounded block ready, 2 source decode failed.
     pub(crate) fn prefill_state(&self) -> u8 {
         self.prefill.load(Ordering::Acquire)
@@ -4134,7 +4167,7 @@ pub(crate) fn spawn_audio_feeder(
     sample_rate: u32,
     producer: RingProducer,
     tools: Option<FfmpegTools>,
-    master_meter: Arc<ArcSwapOption<crate::audio::mixer::StereoMeter>>,
+    master_meter: Arc<ArcSwapOption<LiveAudioMeters>>,
     spectrum_db: Arc<ArcSwapOption<Vec<f32>>>,
     graph_latency: Arc<std::sync::atomic::AtomicU32>,
 ) -> AudioFeeder {
@@ -4159,7 +4192,7 @@ pub(crate) fn spawn_source_audio_feeder(
     sample_rate: u32,
     producer: RingProducer,
     tools: Option<FfmpegTools>,
-    master_meter: Arc<ArcSwapOption<crate::audio::mixer::StereoMeter>>,
+    master_meter: Arc<ArcSwapOption<LiveAudioMeters>>,
     spectrum_db: Arc<ArcSwapOption<Vec<f32>>>,
     graph_latency: Arc<std::sync::atomic::AtomicU32>,
     end: Tick,
@@ -4185,11 +4218,13 @@ fn spawn_audio_feeder_inner(
     sample_rate: u32,
     producer: RingProducer,
     tools: Option<FfmpegTools>,
-    master_meter: Arc<ArcSwapOption<crate::audio::mixer::StereoMeter>>,
+    master_meter: Arc<ArcSwapOption<LiveAudioMeters>>,
     spectrum_db: Arc<ArcSwapOption<Vec<f32>>>,
     graph_latency: Arc<std::sync::atomic::AtomicU32>,
     output_end: Option<Tick>,
 ) -> AudioFeeder {
+    let project = Arc::new(ArcSwap::from(project));
+    let worker_project = project.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_flag = Arc::clone(&stop);
     let prefill = Arc::new(AtomicU8::new(0));
@@ -4198,7 +4233,7 @@ fn spawn_audio_feeder_inner(
         .name("photonic-video-mixer".into())
         .spawn(move || {
             feeder_main(
-                project,
+                worker_project,
                 sequence,
                 start,
                 sample_rate,
@@ -4214,6 +4249,7 @@ fn spawn_audio_feeder_inner(
         })
         .expect("spawn photonic-video mixer thread");
     AudioFeeder {
+        project,
         stop,
         prefill,
         join: Some(join),
@@ -4221,14 +4257,14 @@ fn spawn_audio_feeder_inner(
 }
 
 fn feeder_main(
-    project: Arc<TimelineProject>,
+    project_input: Arc<ArcSwap<TimelineProject>>,
     sequence: SequenceId,
     start: Tick,
     sample_rate: u32,
     mut producer: RingProducer,
     tools: Option<FfmpegTools>,
     stop: Arc<AtomicBool>,
-    master_meter: Arc<ArcSwapOption<crate::audio::mixer::StereoMeter>>,
+    master_meter: Arc<ArcSwapOption<LiveAudioMeters>>,
     spectrum_db: Arc<ArcSwapOption<Vec<f32>>>,
     graph_latency: Arc<std::sync::atomic::AtomicU32>,
     output_end: Option<Tick>,
@@ -4240,22 +4276,6 @@ fn feeder_main(
     let mut out = vec![0f32; BLOCK_FRAMES * CHANNELS];
     let mut t = start;
 
-    let Some(seq) = project.sequences.get(&sequence) else {
-        // No sequence: keep the ring fed with silence so the callback (and
-        // master clock) run smoothly.
-        while !stop.load(Ordering::Relaxed) {
-            if output_end.is_some_and(|end| t >= end) {
-                break;
-            }
-            if producer.is_full() {
-                std::thread::sleep(Duration::from_millis(2));
-                continue;
-            }
-            producer.push_block(&out);
-        }
-        return;
-    };
-
     let mut mixer = Mixer::new(sample_rate);
     if output_end.is_some() {
         mixer.set_declick(crate::audio::mixer::DeclickConfig {
@@ -4263,8 +4283,7 @@ fn feeder_main(
             ..Default::default()
         });
     }
-    // G-4: publish the live output meter so EngineStatus can sample it.
-    master_meter.store(Some(mixer.output_meter()));
+    let mut last_project: Option<Arc<TimelineProject>> = None;
     let default_clip_audio = ClipAudio::new();
     // Persistent per-clip PCM sidecars: opened when a clip becomes audible
     // (seeked to its mapped source position), read sequentially block after
@@ -4278,6 +4297,61 @@ fn feeder_main(
         if producer.is_full() {
             std::thread::sleep(Duration::from_millis(2));
             continue;
+        }
+
+        let project = project_input.load_full();
+        let Some(seq) = project.sequences.get(&sequence) else {
+            out.fill(0.0);
+            master_meter.store(None);
+            producer.push_block(&out);
+            t = t + block_ticks;
+            continue;
+        };
+        if last_project
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, &project))
+        {
+            // Preserve decoders for mixer-only edits; reopen when a clip's
+            // media mapping changes so playback uses the new source position.
+            if let Some(previous) = last_project
+                .as_ref()
+                .and_then(|p| p.sequences.get(&sequence))
+            {
+                pcm.retain(|id, _| {
+                    let old = previous
+                        .audio_tracks
+                        .iter()
+                        .flat_map(|t| &t.clips)
+                        .find(|c| c.id == *id);
+                    let new = seq
+                        .audio_tracks
+                        .iter()
+                        .flat_map(|t| &t.clips)
+                        .find(|c| c.id == *id);
+                    match (old, new) {
+                        (Some(old), Some(new)) => {
+                            old.source == new.source
+                                && old.source_in == new.source_in
+                                && old.start == new.start
+                                && old.speed == new.speed
+                                && old.audio.as_ref().map(|a| (a.offset, a.stream))
+                                    == new.audio.as_ref().map(|a| (a.offset, a.stream))
+                        }
+                        _ => false,
+                    }
+                });
+            }
+            let tracks = seq
+                .audio_tracks
+                .iter()
+                .filter(|track| track.enabled && track.audio.is_some())
+                .map(|track| (track.id, mixer.track_post_fader_meter(track.id)))
+                .collect();
+            master_meter.store(Some(Arc::new(LiveAudioMeters {
+                output: mixer.output_meter(),
+                tracks,
+            })));
+            last_project = Some(project.clone());
         }
 
         // Which clips sound at t? Audio tracks only in P3 — video-clip
@@ -4436,6 +4510,88 @@ fn feeder_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_feeder_applies_mixer_edits_and_publishes_track_levels_without_device() {
+        use photonic_core::timeline::{AssetKind, MediaAsset, MediaProbe};
+        let Some(tools) = crate::media::ffmpeg_locate::locate_for_test() else {
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("photonic-mixer-{}.wav", AssetId::new()));
+        let samples: Vec<i16> = (0..48_000 * 20)
+            .map(|i| ((i as f64 * std::f64::consts::TAU * 440.0 / 48_000.0).sin() * 8192.0) as i16)
+            .collect();
+        std::fs::write(
+            &path,
+            crate::captions::wav::write_pcm16_wav(48_000, 1, &samples),
+        )
+        .unwrap();
+        let mut asset = MediaAsset::from_file(AssetKind::Audio, path.clone());
+        asset.probe = Some(MediaProbe::basic(Tick::from_seconds(20), "wav", "pcm"));
+        let plan = crate::source_audition::plan_source_audition(
+            &asset,
+            (Tick::ZERO, Tick::from_seconds(20)),
+        )
+        .unwrap();
+        let track = plan.project.sequences[&plan.sequence].audio_tracks[0].id;
+        let meters = Arc::new(ArcSwapOption::empty());
+        let (producer, mut consumer, _) = audio_ring();
+        let feeder = spawn_audio_feeder(
+            plan.project.clone(),
+            plan.sequence,
+            Tick::ZERO,
+            48_000,
+            producer,
+            Some(tools),
+            meters.clone(),
+            Arc::new(ArcSwapOption::empty()),
+            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+        );
+        let mut block = vec![0.0; BLOCK_FRAMES * CHANNELS];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            consumer.fill(&mut block);
+            if meters
+                .load_full()
+                .is_some_and(|m| m.output.peak()[0] > 0.05 && m.tracks[&track].peak()[0] > 0.05)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "real PCM must reach both meter taps"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut updated = (*plan.project).clone();
+        updated
+            .sequences
+            .get_mut(&plan.sequence)
+            .unwrap()
+            .audio_tracks[0]
+            .audio
+            .as_mut()
+            .unwrap()
+            .mute = true;
+        feeder.set_project(Arc::new(updated));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            consumer.fill(&mut block);
+            if meters
+                .load_full()
+                .is_some_and(|m| m.output.peak()[0] < 0.00001 && m.tracks[&track].peak()[0] > 0.05)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mute must update the running feeder while pre-mute track meters remain live"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(feeder);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn upload_cache_evicts_only_the_coldest_frame() {

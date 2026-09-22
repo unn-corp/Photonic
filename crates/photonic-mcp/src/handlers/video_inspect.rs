@@ -140,9 +140,9 @@ pub async fn get_timeline_snapshot(state: &AppState, args: GetTimelineSnapshotAr
 
 pub fn tool_schemas() -> Vec<Value> {
     vec![crate::schema_gen::tool_definition("get_video_capabilities",
-        "Read implemented video editing, transcript, inspection and export capabilities and limits. GPU initialization is null until first render/status call; false indicates failed initialization. FFmpeg availability is probed locally. Obtain full schemas with get_action_schema.",
+        "Read implemented video editing, transcript, title, inspection and export capabilities, limits, and recommended tool workflows. GPU initialization is null until first render/status call; false indicates failed initialization. FFmpeg availability is probed locally. Obtain full schemas with get_action_schema.",
         json!({"type":"object","properties":{},"additionalProperties":false}),
-        json!({"type":"object","properties":{"contract_version":{"type":"integer"},"engine_initialized":{"type":["boolean","null"]},"ffmpeg_available":{"type":"boolean"},"editing":{"type":"object"},"inspection":{"type":"object"},"transcript":{"type":"object"},"export":{"type":"object"},"jobs":{"type":"object"},"discovery":{"type":"object"}},"required":["contract_version","engine_initialized","ffmpeg_available","editing","inspection","transcript","export","jobs","discovery"]}),crate::schema_gen::ToolBehavior::ExternalRead),crate::schema_gen::tool_definition("render_frames_at",
+        json!({"type":"object","properties":{"contract_version":{"type":"integer"},"engine_initialized":{"type":["boolean","null"]},"ffmpeg_available":{"type":"boolean"},"editing":{"type":"object"},"inspection":{"type":"object"},"transcript":{"type":"object"},"export":{"type":"object"},"jobs":{"type":"object"},"titles":{"type":"object"},"discovery":{"type":"object"}},"required":["contract_version","engine_initialized","ffmpeg_available","editing","inspection","transcript","export","jobs","titles","discovery"]}),crate::schema_gen::ToolBehavior::ExternalRead),crate::schema_gen::tool_definition("render_frames_at",
         "Render 1–12 ticks from one sequence/revision as a contact sheet or individual PNGs. GPU downscale limits transfer cost; frames carry time, revision, quality and tile rectangles. Rejects edits during the batch; max 16 MiB of encoded images. Full quality processes originals before reducing for inspection.",
         json!({"type":"object","properties":{
             "sequence_id":{"type":"string","format":"uuid"},"at_ticks":{"type":"array","minItems":1,"maxItems":12,"items":{"type":"integer","minimum":0}},
@@ -360,6 +360,10 @@ pub async fn get_video_capabilities(state: &AppState) -> ToolResult {
         "previews":{"chunked_playback":true,"zone_edits":true,"max_zones":128,"default_quality":"full","default_codec":"intra_h264","export_reuse":false},
         "source":{"audition":true,"requires_probe":true,"audio_requires_output_device":true},
         "jobs":{"max_active":super::video_jobs::MAX_ACTIVE_JOBS,"capacity_error":"JobCapacityExceeded"},
-        "discovery":{"exact_schema_tool":"get_action_schema","search_tool":"search_actions"}
+        "titles":{"catalog_tool":"list_title_templates","insert_tool":"insert_title_template","kind":"text","template_ids":photonic_core::timeline::title_presets::TITLE_PRESETS.iter().map(|preset|preset.id).collect::<Vec<_>>()},
+        "discovery":{"exact_schema_tool":"get_action_schema","search_tool":"search_actions",
+            "recommended_workflow":["get_timeline_snapshot","apply_video_edit_plan","render_frames_at"],
+            "edit_plan_hint":"Fetch apply_video_edit_plan with get_action_schema. Validate with dry_run, then commit using expected_revision and a unique request_id. Inspect the result with render_frames_at.",
+            "title_workflow":["list_title_templates","insert_title_template"]}
     }))
 }

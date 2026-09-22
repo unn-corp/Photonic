@@ -224,6 +224,11 @@ fn map_edit_error(e: EditError) -> ToolResult {
         EditError::NoClip(id) => ToolResult::error(format!("clip {id} not found")),
         EditError::NoAsset(id) => ToolResult::error(format!("asset {id} not found")),
         EditError::Overlap => ToolResult::error("edit would overlap another clip on the track"),
+        EditError::TrackLocked => err_code("TrackLocked", "Unlock the target track before editing"),
+        EditError::ApplicabilityDenied => err_code(
+            "ApplicabilityDenied",
+            "This edit is not supported by the target track or clip",
+        ),
         EditError::NonPositiveDuration => {
             err_code("TickOutOfRange", "resulting clip duration must be > 0")
         }
@@ -410,10 +415,15 @@ pub async fn set_sequence_format(state: &AppState, args: SetSequenceFormatArgs) 
                     "cannot remove the last format — a sequence needs at least one",
                 );
             }
-            let Some(format) = seq.formats.get(idx).cloned() else {
-                return ToolResult::error(format!("format_index {idx} out of range"));
+            let commands = match ops::remove_sequence_format(project, args.sequence_id, idx) {
+                Ok(commands) => commands,
+                Err(error) => return map_edit_error(error),
             };
-            FormatOp::Remove { index: idx, format }
+            history.execute_discrete(
+                Command::Batch(commands.into_iter().map(Command::Timeline).collect()),
+                &mut doc,
+            );
+            return ToolResult::text("Sequence format removed");
         }
     };
     let cmd = ops::set_sequence_format(args.sequence_id, op);
@@ -4030,7 +4040,7 @@ pub async fn import_media(state: &AppState, args: ImportMediaArgs) -> ToolResult
     history.execute_discrete(Command::Batch(cmds), &mut doc);
 
     ToolResult::text(format!(
-        "Imported {} asset(s) — probing lands in P3 (ffprobe integration)",
+        "Imported {} asset(s). Call probe_media for each asset_id before source audition or editing that requires media metadata.",
         created.len()
     ))
     .with_data(json!({ "assets": created }))
@@ -8351,6 +8361,12 @@ pub async fn get_audio_meters(state: &AppState, args: GetAudioMetersArgs) -> Too
         );
     };
     let status = bridge.session().status();
+    if status.active_sequence != Some(args.sequence_id) || status.source_audition.is_some() {
+        return err_code(
+            "NotSupportedV1",
+            "audio meters are unavailable for this sequence; start its timeline playback",
+        );
+    }
     match status.master_level {
         Some(m) => ToolResult::text("master meter").with_data(json!({
             "sequence_id": args.sequence_id,
@@ -8358,6 +8374,7 @@ pub async fn get_audio_meters(state: &AppState, args: GetAudioMetersArgs) -> Too
             "rms": m.rms,
             "graph_latency_samples": status.graph_latency_samples,
             "source": "mixer_output",
+            "tracks": status.track_levels.iter().map(|(id, level)| json!({ "track_id": id, "peak": level.peak, "rms": level.rms, "tap": "post_fader_pre_mute" })).collect::<Vec<_>>(),
         })),
         None => err_code(
             "NotSupportedV1",
@@ -8484,22 +8501,105 @@ pub async fn get_waveform(state: &AppState, args: GetWaveformArgs) -> ToolResult
 // ─── Title templates (05 §4b) ────────────────────────────────────────────────
 
 pub async fn list_title_templates(_state: &AppState, _args: ListTitleTemplatesArgs) -> ToolResult {
-    tracing::debug!("tool: list_title_templates");
-    // The shipped vector title-template library (05 §4b, ~8–10 built-ins) is a
-    // P6 deliverable not yet committed to this repo; no registry exists to read.
-    ToolResult::text("no title templates available (the shipped library lands in P6)")
-        .with_data(json!({ "templates": [] }))
+    let templates: Vec<_> = photonic_core::timeline::title_presets::TITLE_PRESETS
+        .iter()
+        .map(|preset| {
+            json!({"id":preset.id,"name":preset.name,"description":preset.description,
+            "kind":"text","duration_ticks":Tick::from_seconds(preset.duration_secs).0,
+            "text_fields":["text"],"sample_text":preset.sample_text,"style":(preset.style)()})
+        })
+        .collect();
+    ToolResult::text("Starter title templates shared with the Titles drawer")
+        .with_data(json!({"templates":templates}))
 }
 
-pub async fn insert_title_template(
-    _state: &AppState,
-    _args: InsertTitleTemplateArgs,
-) -> ToolResult {
-    tracing::debug!("tool: insert_title_template");
-    err_code(
-        "NotSupportedV1",
-        "the vector title-template library is not shipped in this build (05 §4b, P6) — nothing to insert",
-    )
+pub async fn insert_title_template(state: &AppState, args: InsertTitleTemplateArgs) -> ToolResult {
+    let Some(preset) = photonic_core::timeline::title_presets::TITLE_PRESETS
+        .iter()
+        .find(|preset| preset.id == args.template)
+    else {
+        return err_code(
+            "UnknownTemplate",
+            "Use an id returned by list_title_templates",
+        );
+    };
+    if args
+        .text_overrides
+        .as_ref()
+        .is_some_and(|fields| fields.keys().any(|key| key != "text"))
+    {
+        return err_code(
+            "InvalidArguments",
+            "Starter titles accept only the text override field",
+        );
+    }
+    let time_count = usize::from(args.start_ticks.is_some())
+        + usize::from(args.start_tc.is_some())
+        + usize::from(args.start_seconds.is_some());
+    if time_count > 1
+        || args.start_seconds.is_some_and(|seconds| {
+            !seconds.is_finite()
+                || seconds < 0.0
+                || seconds >= i64::MAX as f64 / TICKS_PER_SECOND as f64
+        })
+    {
+        return err_code(
+            "InvalidArguments",
+            "Supply at most one nonnegative start time",
+        );
+    }
+    let mut doc = state.document.lock().await;
+    let mut history = state.history.lock().await;
+    let Some(project) = doc.timeline.as_ref() else {
+        return err_code("NoProject", "No timeline project");
+    };
+    let Some(seq_id) = locate_track(project, args.track_id) else {
+        return err_code("NoTrack", "Requested track does not exist");
+    };
+    let Some(sequence) = project.sequences.get(&seq_id) else {
+        return err_code("NoSequence", "Requested sequence does not exist");
+    };
+    let start = if time_count == 0 {
+        Tick::ZERO
+    } else {
+        match resolve_tick(
+            args.start_ticks,
+            args.start_tc.as_deref(),
+            args.start_seconds,
+            Some(sequence.frame_rate),
+        ) {
+            Ok(start) => start,
+            Err(error) => return error,
+        }
+    };
+    let duration = Tick::from_seconds(preset.duration_secs);
+    if start.0 < 0 || start.0.checked_add(duration.0).is_none() {
+        return err_code(
+            "TickOutOfRange",
+            "Title range must be nonnegative and fit in timeline ticks",
+        );
+    }
+    let text = args
+        .text_overrides
+        .as_ref()
+        .and_then(|fields| fields.get("text"))
+        .map(String::as_str)
+        .unwrap_or(preset.sample_text);
+    let content = photonic_core::timeline::TextClipContent {
+        text: text.into(),
+        style: (preset.style)(),
+    };
+    match ops::add_text_clip(project, seq_id, args.track_id, start, duration, content) {
+        Ok(command) => {
+            let clip_id = match &command {
+                TimelineCmd::InsertClip { clip, .. } => clip.id,
+                _ => return err_code("InternalError", "Title insertion did not produce a clip"),
+            };
+            history.execute_discrete(Command::Timeline(command), &mut doc);
+            ToolResult::text("Inserted title").with_data(json!({"clip_id":clip_id,"template":preset.id,"sequence_id":seq_id,"track_id":args.track_id,"start_ticks":start.0,"duration_ticks":duration.0}))
+        }
+        Err(error) => map_edit_error(error),
+    }
 }
 
 // ── D-12 gyro stabilization (22 §6.5) ───────────────────────────────────────
@@ -12906,6 +13006,75 @@ mod tests {
 
     // ── Node-graph family E2E (10 §9.1) ──────────────────────────────────────
     #[tokio::test]
+    async fn locked_clip_insert_and_remove_leave_document_and_history_unchanged() {
+        let state = test_state();
+        let (_, track_id) = create_seq_and_track(&state, "video").await;
+        let clip_id = insert_solid_clip(&state, &track_id, 0, 1000).await;
+        let r = call(
+            &state,
+            "set_track_prop",
+            json!({"track_id": track_id, "locked": true}),
+        )
+        .await;
+        assert_ne!(r.is_error, Some(true));
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for (tool, args) in [
+            (
+                "insert_clip",
+                json!({"track_id":track_id,"start_ticks":2000,"duration_ticks":1000,"source":{"kind":"solid_color","color":"#00ff00"}}),
+            ),
+            ("remove_clip", json!({"clip_id":clip_id})),
+        ] {
+            let result = call(&state, tool, args).await;
+            assert_eq!(data(&result)["error_code"], json!("TrackLocked"));
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_clip_composition_edits_leave_document_and_history_unchanged() {
+        let state = test_state();
+        let (_, track_id) = create_seq_and_track(&state, "video").await;
+        let clip_id = insert_solid_clip(&state, &track_id, 0, 1000).await;
+        let created = call(
+            &state,
+            "create_clip_composition",
+            json!({"clip_id": clip_id}),
+        )
+        .await;
+        assert_ne!(created.is_error, Some(true));
+        let graph_id = data(&created)["graph_id"].clone();
+        let locked = call(
+            &state,
+            "set_track_prop",
+            json!({"track_id": track_id, "locked": true}),
+        )
+        .await;
+        assert_ne!(locked.is_error, Some(true));
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for args in [
+            json!({"clip_id": clip_id}),
+            json!({"clip_id": clip_id, "detach": true}),
+            json!({"clip_id": clip_id, "graph_id": graph_id}),
+        ] {
+            let result = call(&state, "create_clip_composition", args).await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(data(&result)["error_code"], json!("TrackLocked"));
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn family_graph() {
         let state = test_state();
         let (_, track_id) = create_seq_and_track(&state, "video").await;
@@ -13044,9 +13213,9 @@ mod tests {
         assert_eq!(r.is_error, Some(true), "solid-color clip has no waveform");
     }
 
-    // ── Title templates: empty catalog + NotSupportedV1 insert (05 §4b) ──────
+    // ── Shared starter title templates ──────────────────────────────────────
     #[tokio::test]
-    async fn title_templates_are_flagged_p6() {
+    async fn title_templates_share_presets_and_insert_text() {
         let state = test_state();
         let (_, track_id) = create_seq_and_track(&state, "video").await;
 
@@ -13058,7 +13227,7 @@ mod tests {
                 .cloned()
                 .unwrap_or_default()
                 .len(),
-            0
+            3
         );
 
         let r = call(
@@ -13067,6 +13236,138 @@ mod tests {
             json!({ "template": "lower_third", "track_id": track_id, "start_ticks": 0 }),
         )
         .await;
-        assert_eq!(data(&r)["error_code"], json!("NotSupportedV1"));
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let doc = state.document.lock().await;
+        let project = doc.timeline.as_ref().unwrap();
+        let sequence = project.sequences.values().next().unwrap();
+        let clip = &sequence.video_tracks[0].clips[0];
+        assert!(
+            matches!(&clip.source, ClipSource::Text { content } if content.text == "Name Here\nRole / Title")
+        );
+        assert_eq!(clip.duration, Tick::from_seconds(5));
+    }
+    #[tokio::test]
+    async fn title_templates_validate_before_mutation_and_undo() {
+        let state = test_state();
+        let (_, track_id) = create_seq_and_track(&state, "video").await;
+        for args in [
+            json!({"template":"missing","track_id":track_id}),
+            json!({"template":"lower_third","track_id":track_id,"start_ticks":-1}),
+            json!({"template":"lower_third","track_id":track_id,"start_ticks":0,"start_seconds":1}),
+            json!({"template":"lower_third","track_id":track_id,"text_overrides":{"unknown":"value"}}),
+            json!({"template":"lower_third","track_id":track_id,"start_ticks":i64::MAX}),
+        ] {
+            let before = state.history.lock().await.revision();
+            let result = call(&state, "insert_title_template", args).await;
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(state.history.lock().await.revision(), before);
+        }
+        let result = call(&state,"insert_title_template",json!({"template":"centered_title","track_id":track_id,"text_overrides":{"text":"Our film"}})).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let before = state.history.lock().await.revision();
+        let overlap = call(
+            &state,
+            "insert_title_template",
+            json!({"template":"lower_third","track_id":track_id}),
+        )
+        .await;
+        assert_eq!(overlap.is_error, Some(true));
+        assert_eq!(state.history.lock().await.revision(), before);
+        {
+            let doc = state.document.lock().await;
+            let clip = &doc
+                .timeline
+                .as_ref()
+                .unwrap()
+                .sequences
+                .values()
+                .next()
+                .unwrap()
+                .video_tracks[0]
+                .clips[0];
+            assert!(
+                matches!(&clip.source,ClipSource::Text {content} if content.text == "Our film")
+            );
+        }
+        let undo = call(&state, "undo", json!({})).await;
+        assert_ne!(undo.is_error, Some(true), "{undo:?}");
+        let doc = state.document.lock().await;
+        assert!(doc
+            .timeline
+            .as_ref()
+            .unwrap()
+            .sequences
+            .values()
+            .next()
+            .unwrap()
+            .video_tracks[0]
+            .clips
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn title_templates_reject_locked_and_audio_tracks() {
+        let state = test_state();
+        let (_, track_id) = create_seq_and_track(&state, "audio").await;
+        let result = call(
+            &state,
+            "insert_title_template",
+            json!({"template":"lower_third","track_id":track_id}),
+        )
+        .await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        let (_, track_id) = create_seq_and_track(&state, "video").await;
+        {
+            let mut doc = state.document.lock().await;
+            for sequence in doc.timeline.as_mut().unwrap().sequences.values_mut() {
+                for track in &mut sequence.video_tracks {
+                    track.locked = true;
+                }
+            }
+        }
+        let result = call(
+            &state,
+            "insert_title_template",
+            json!({"template":"lower_third","track_id":track_id}),
+        )
+        .await;
+        assert_eq!(data(&result)["error_code"], json!("TrackLocked"));
+    }
+
+    #[tokio::test]
+    async fn title_templates_work_in_atomic_edit_plans() {
+        let state = test_state();
+        let (sequence_id, track_id) = create_seq_and_track(&state, "video").await;
+        let revision = state.history.lock().await.revision();
+        let mut args = json!({"sequence_id":sequence_id,"expected_revision":revision,"request_id":"title-plan","dry_run":true,
+            "operations":[{"tool":"insert_title_template","arguments":{"template":"caption_card","track_id":track_id}}]});
+        let preview = call(&state, "apply_video_edit_plan", args.clone()).await;
+        assert_ne!(preview.is_error, Some(true), "{preview:?}");
+        assert_eq!(state.history.lock().await.revision(), revision);
+        args["dry_run"] = json!(false);
+        let commit = call(&state, "apply_video_edit_plan", args.clone()).await;
+        assert_ne!(commit.is_error, Some(true), "{commit:?}");
+        assert_eq!(data(&commit)["undo_steps"], 1);
+        let retry = call(&state, "apply_video_edit_plan", args).await;
+        assert_eq!(data(&retry)["replayed"], true);
+    }
+
+    #[tokio::test]
+    async fn capabilities_name_resolvable_video_workflows() {
+        let state = test_state();
+        let result = call(&state, "get_video_capabilities", json!({})).await;
+        let payload = data(&result);
+        for workflow in ["recommended_workflow", "title_workflow"] {
+            for name in payload["discovery"][workflow].as_array().unwrap() {
+                assert!(
+                    crate::catalog::tool_schema(name.as_str().unwrap()).is_some(),
+                    "{name}"
+                );
+            }
+        }
+        assert_eq!(
+            payload["titles"]["template_ids"].as_array().unwrap().len(),
+            3
+        );
     }
 }

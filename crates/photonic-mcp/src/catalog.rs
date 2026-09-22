@@ -23,6 +23,7 @@ pub fn promoted_tool_names() -> &'static [&'static str] {
         "split_clip",
         "get_video_capabilities",
         "get_timeline_snapshot",
+        "render_frames_at",
         "get_engine_status",
         "render_frame_at",
         "export_sequence",

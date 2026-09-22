@@ -1522,15 +1522,8 @@ impl PhotonicApp {
         self.draw_video_coach_marks(ctx, doc);
     }
 
-    /// Aspect/frame bar above the monitor (CAP-012): one-click preset chips to
-    /// switch the sequence between 16:9 / 9:16 / 1:1 / 4:5 / 4:3 / 21:9, the
-    /// active one highlighted. Clicking a preset activates it (or adds+activates
-    /// it if the sequence doesn't have it yet), undoably — so reframing the
-    /// whole edit for a different platform is a single, discoverable click.
-    /// Also hosts the "Fit clips" auto-reframe button (14 §9/CAP-012,
-    /// `app/reframe.rs::fit_clips_to_active_format`) — the CapCut "Auto
-    /// reframe" affordance that center-fills the selected clip(s) (or every
-    /// clip if none are selected) for whichever format is active above.
+    /// Choose an existing output format, add a preset/custom size, or remove an
+    /// inactive format. Preview controls stay separate from output dimensions.
     fn draw_format_bar(
         &mut self,
         ui: &mut egui::Ui,
@@ -1541,10 +1534,11 @@ impl PhotonicApp {
         let Some(seq_id) = doc.timeline.as_ref().and_then(|p| p.active_sequence) else {
             return;
         };
-        let (cur_w, cur_h) = {
-            let f = active_format(doc);
-            (f.width, f.height)
+        let Some(sequence) = doc.timeline.as_ref().and_then(|p| p.sequences.get(&seq_id)) else {
+            return;
         };
+        let formats = sequence.formats.clone();
+        let active = sequence.active_format;
         // Snapshot before entering the `FnOnce` ui closure below, which
         // already needs to reborrow `doc`/`history` mutably.
         let selection = self.timeline_selection.clone();
@@ -1553,27 +1547,49 @@ impl PhotonicApp {
                 ui.add_space(4.0);
                 ui.label(egui::RichText::new(format!("{} Frame", ph::CROP)).weak());
                 ui.separator();
-                let mut clicked: Option<(&str, u32, u32)> = None;
-                for &(name, w, h) in super::timeline::ops_bridge::ASPECT_PRESETS {
-                    let active = w == cur_w && h == cur_h;
-                    // Proposal 213: social-friendly labels for common deliverables.
-                    let label = match name {
-                        "9:16" => "Social 9:16",
-                        "16:9" => "Social 16:9",
-                        "1:1" => "1:1",
-                        other => other,
-                    };
-                    if ui
-                        .selectable_label(active, label)
-                        .on_hover_text(format!("Switch sequence to {name} ({w}×{h})"))
-                        .clicked()
-                    {
-                        clicked = Some((name, w, h));
+                egui::ComboBox::from_id_salt(("sequence_format", seq_id))
+                    .width(155.0)
+                    .truncate()
+                    .selected_text(formats.get(active).map(|f| format!("{} · {}×{}", f.name, f.width, f.height)).unwrap_or_default())
+                    .show_ui(ui, |ui| {
+                        for (index, format) in formats.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(index == active, format!("{} · {}×{}", format.name, format.width, format.height)).clicked() {
+                                    super::timeline::ops_bridge::activate_format(history, doc, seq_id, index);
+                                    ui.close_menu();
+                                }
+                                if ui.add_enabled(formats.len() > 1 && index != active, egui::Button::new("Remove").small())
+                                    .on_disabled_hover_text("Keep at least one format; select another format before removing the active one.").clicked() {
+                                    super::timeline::ops_bridge::remove_format(history, doc, seq_id, index);
+                                    ui.close_menu();
+                                }
+                            });
+                        }
+                    });
+                ui.menu_button("+ Format", |ui| {
+                    for &(name, width, height) in super::timeline::ops_bridge::ASPECT_PRESETS {
+                        if ui.button(format!("{name} · {width}×{height}")).clicked() {
+                            super::timeline::ops_bridge::switch_to_aspect(history, doc, seq_id, name, width, height);
+                            ui.close_menu();
+                        }
                     }
-                }
-                if let Some((name, w, h)) = clicked {
-                    super::timeline::ops_bridge::switch_to_aspect(history, doc, seq_id, name, w, h);
-                }
+                    ui.separator();
+                    let id = ui.id().with(("custom_format", seq_id));
+                    let mut custom = ui.data(|data| data.get_temp::<(String, u32, u32)>(id))
+                        .unwrap_or_else(|| ("Custom".into(), 1920, 1080));
+                    ui.label("Custom format");
+                    ui.text_edit_singleline(&mut custom.0);
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut custom.1).range(1..=16384).prefix("W "));
+                        ui.add(egui::DragValue::new(&mut custom.2).range(1..=16384).prefix("H "));
+                    });
+                    let valid = !custom.0.trim().is_empty() && (1..=16384).contains(&custom.1) && (1..=16384).contains(&custom.2);
+                    if ui.add_enabled(valid, egui::Button::new("Add and activate")).clicked() {
+                        super::timeline::ops_bridge::switch_to_aspect(history, doc, seq_id, custom.0.trim(), custom.1, custom.2);
+                        ui.close_menu();
+                    }
+                    ui.data_mut(|data| data.insert_temp(id, custom));
+                });
 
                 ui.separator();
                 if ui

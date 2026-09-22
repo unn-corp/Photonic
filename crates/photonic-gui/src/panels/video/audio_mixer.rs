@@ -1,49 +1,6 @@
-//! `RightDrawerGroup::AudioMixer` panel (04 §4.1) — channel strips per audio
-//! track + a master strip: vertical dB fader, equal-power pan knob, dual
-//! peak/RMS meter with clip LED, mute/solo (solo-safe), a per-strip `AudioFxUnit`
-//! rack with kind-specific editors, and expandable automation lanes, plus a
-//! prominent stereo (L/R) peak+RMS master-bus output meter with clip LEDs
-//! (Gap M-7, [`master_output_meter`]). Normative UI: 09 §8 + 13 §11. Interior
-//! owned by 09-audio-mixer.md.
-//!
-//! ## Wiring seam (reported, not silently faked)
-//!
-//! This panel is a **right-rail** drawer, dispatched from `app/mod.rs` as
-//! `draw_audio_mixer(ui, &mut VideoPanelUi)` (built by `video_panel_ui()`).
-//! [`VideoPanelUi`] threads only *session* state — it carries **no**
-//! `&mut Document` (the `Sequence.audio_tracks` list + `MasterBus` + every
-//! `AudioFxUnit`), **no** `&mut CommandHistory` (to record undoable
-//! [`AudioCmd`]s), and **no** engine handle. Changing this function's signature
-//! to add them would require editing the `app/mod.rs` dispatch call site, which
-//! is out of this story's territory and would break `cargo build --workspace` if
-//! left uncommitted. Two further layers are missing beneath the GUI:
-//!
-//! 1. `EngineSession`/`EngineStatus` (02 §1) do **not** surface `audio::mixer`'s
-//!    `StereoMeter` taps to the GUI — `get_audio_meters` (10 §3.12 / 13 §11.6)
-//!    does not exist yet, so live fader/master meters cannot be polled. This
-//!    also covers Gap M-7 (the master-bus output meter, [`master_output_meter`]):
-//!    it is built prominent/stereo/peak+RMS/clip-LED per spec and reads the
-//!    best-available value (the panned, ballistics-smoothed synthetic level
-//!    already driving every other meter here), but the real tap it wants —
-//!    `Mixer::output_meter()`'s `Arc<StereoMeter>`, sampled post
-//!    `MasterBusParams.volume_db` — is unreachable for the same reason: no
-//!    engine handle reaches this function.
-//! 2. `audio::mixer`'s `fx_chain` is *an inert pass-through* (see that module's
-//!    doc + `audio/dsp/mod.rs`): the DSP units in `audio/dsp` are not connected
-//!    into the mixer graph, so added fx are not audible yet (the audio-dsp-wiring
-//!    concern this story was told to consume + report).
-//!
-//! Until that seam is closed the strips render against a **local preview model**
-//! held in egui temp memory, clearly banner-labelled, and meters show a
-//! *simulated* idle signal so the widgets are reviewable by the later
-//! visual-feedback pass. **Every mutation is nevertheless expressed as a real
-//! [`AudioCmd`]** and routed through the single [`commit`] sink — the exact,
-//! one-line swap point: when `doc`/`history` are threaded in, [`commit`]'s body
-//! becomes `history.execute_discrete(Command::Timeline(TimelineCmd::AudioEdit(
-//! cmd)), doc)` and the model is sourced from `sequence.audio_tracks`, with no
-//! change to any widget. The one real session field this panel *does* own,
-//! [`VideoPanelUi::mixer_expanded_tracks`], is wired live (per-strip automation
-//! disclosure).
+//! Timeline audio mixer: undoable track/master controls and live playback meters.
+//! Session memory stores only meter ballistics and editor disclosure; audio settings
+//! are refreshed from the active sequence every frame.
 
 use std::collections::HashSet;
 
@@ -55,6 +12,9 @@ use photonic_core::timeline::{
 };
 
 use super::VideoPanelUi;
+use photonic_core::timeline::{Sequence, TimelineCmd, TrackSettings};
+use photonic_core::{Command, CommandHistory, Document};
+use photonic_video::session::EngineStatus;
 
 // ── Scale constants (09 §2/§8) ──────────────────────────────────────────────
 
@@ -118,6 +78,7 @@ fn meter_color(frac: f32) -> Color32 {
 /// Solo-safe mute/solo resolution (09 §4). Input: one `(mute, solo)` per strip
 /// in track order. Any solo active ⇒ only soloed *and* un-muted strips are
 /// audible (mute wins over solo); no solo ⇒ ordinary mute-only gating.
+#[cfg(test)]
 fn resolve_audible(strips: &[(bool, bool)]) -> Vec<bool> {
     let any_solo = strips.iter().any(|&(_, solo)| solo);
     strips
@@ -153,8 +114,7 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
 
 /// Linear amplitude gain → dB, floored so a near-zero gain (e.g. a hard-panned
 /// channel's opposite side) doesn't produce `-inf`/NaN through `log10`. Used
-/// to split a mono synthetic level across L/R by the real equal-power pan
-/// gain (09 §4) when driving the master output meter's stereo image.
+/// to display the engine's independent peak and RMS amplitude samples.
 fn lin_to_db(gain: f32) -> f32 {
     20.0 * gain.max(1e-6).log10()
 }
@@ -224,6 +184,7 @@ struct StereoMeterState {
 }
 
 impl StereoMeterState {
+    #[cfg(test)]
     fn update(&mut self, level_l_db: f32, level_r_db: f32, dt: f32) {
         self.l.update(level_l_db, dt);
         self.r.update(level_r_db, dt);
@@ -248,7 +209,7 @@ impl StereoMeterState {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Preview model (egui temp memory) — real core types, local until the seam.
+// Frame working copy and retained meter state.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone)]
@@ -267,16 +228,17 @@ enum FxSel {
 }
 
 #[derive(Clone)]
-struct PreviewMixer {
+struct MixerModel {
     strips: Vec<MixerStrip>,
     master: MasterBus,
     master_meter: StereoMeterState,
     open_fx: Option<FxSel>,
 }
 
-impl PreviewMixer {
+impl MixerModel {
     /// The canonical AS-2 trio (09 §9): Dialogue, Music (ducked by Dialogue),
     /// SFX + a master bus (seeded with its default Limiter, 09 §6.5).
+    #[cfg(test)]
     fn demo() -> Self {
         let dialogue = MixerStrip {
             track: TrackId::new(),
@@ -304,7 +266,7 @@ impl PreviewMixer {
             audio: sfx_audio,
             meter: MeterState::default(),
         };
-        PreviewMixer {
+        MixerModel {
             strips: vec![dialogue, music, sfx],
             master: MasterBus::new(),
             master_meter: StereoMeterState::default(),
@@ -313,15 +275,9 @@ impl PreviewMixer {
     }
 }
 
-/// The single mutation sink. Today it applies `cmd` to the in-panel preview
-/// model; when the right-rail dispatch threads `&mut Document` + `&mut
-/// CommandHistory` (see module seam note), this body becomes
-/// `history.execute_discrete(Command::Timeline(TimelineCmd::AudioEdit(cmd)),
-/// doc)` and the model is read back from `sequence.audio_tracks` — no widget
-/// changes. Kept a distinct fn so the swap is one edit and so the op→state
-/// application is unit-testable against the real [`AudioCmd`] vocabulary.
-fn commit(model: &mut PreviewMixer, cmd: AudioCmd) {
-    let find = |m: &mut PreviewMixer, t: TrackId| m.strips.iter_mut().position(|s| s.track == t);
+/// Apply widget commands to this frame's working copy before recording its diff.
+fn commit(model: &mut MixerModel, cmd: AudioCmd) {
+    let find = |m: &mut MixerModel, t: TrackId| m.strips.iter_mut().position(|s| s.track == t);
     match cmd {
         AudioCmd::SetTrackAudioProp { track, new, .. } => {
             if let Some(i) = find(model, track) {
@@ -359,12 +315,12 @@ fn commit(model: &mut PreviewMixer, cmd: AudioCmd) {
         }
         // Clip/fade/channel-map/loudness/ducking ops are surfaced by other
         // panels (clip overlays, export dialog) or not yet driven from this
-        // strip UI; ignored by the preview sink.
+        // strip UI; ignored by this frame's working copy.
         _ => {}
     }
 }
 
-fn fx_chain_mut(model: &mut PreviewMixer, owner: FxOwner) -> Option<&mut Vec<AudioFxUnit>> {
+fn fx_chain_mut(model: &mut MixerModel, owner: FxOwner) -> Option<&mut Vec<AudioFxUnit>> {
     match owner {
         FxOwner::Track(t) => model
             .strips
@@ -379,68 +335,82 @@ fn fx_chain_mut(model: &mut PreviewMixer, owner: FxOwner) -> Option<&mut Vec<Aud
 // Panel entry
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Right-rail Audio Mixer drawer. Called directly from `app/mod.rs`'s
-/// right-drawer match (no `PropPanelCtx`).
-pub(crate) fn draw_audio_mixer(ui: &mut Ui, vid: &mut VideoPanelUi) {
-    let id = ui.id().with("audio_mixer_preview");
-    let mut model: PreviewMixer = ui
-        .data_mut(|d| d.get_temp::<PreviewMixer>(id))
-        .unwrap_or_else(PreviewMixer::demo);
-
-    // Header + honest, tint-only seam banner (13 §11.7 / DESIGN "tint, never
-    // fill"): live tracks/meters/fx are pending the doc/history/engine seam.
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("Audio Mixer").strong());
-    });
-    ui.label(
-        egui::RichText::new(
-            "Preview — strips not yet bound to timeline audio tracks; meters simulated (wiring seam).",
-        )
-        .small()
-        .color(ui.visuals().warn_fg_color),
-    );
-    ui.add_space(4.0);
-
+/// Render actual sequence tracks and commit changes through document history.
+pub(crate) fn draw_audio_mixer(
+    ui: &mut Ui,
+    vid: &mut VideoPanelUi,
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    status: Option<&EngineStatus>,
+) {
+    let Some(sequence) = doc
+        .timeline
+        .as_ref()
+        .and_then(|p| p.active_sequence.and_then(|id| p.sequences.get(&id)))
+    else {
+        ui.label("Create a sequence to mix its audio.");
+        return;
+    };
+    let id = ui.id().with(("audio_mixer", sequence.id));
+    let mut model = ui
+        .data_mut(|d| d.get_temp::<MixerModel>(id))
+        .unwrap_or_else(|| MixerModel {
+            strips: Vec::new(),
+            master: sequence.audio_master.clone(),
+            master_meter: StereoMeterState::default(),
+            open_fx: None,
+        });
+    model.sync(sequence);
     let dt = ui.input(|i| i.stable_dt).min(0.1);
-    let t = ui.input(|i| i.time) as f32;
-
-    // Ballistics pass (before draw): non-audible strips fall to the floor, which
-    // exercises `resolve_audible` live, not just in tests.
-    let flags: Vec<(bool, bool)> = model
+    let status =
+        status.filter(|s| s.active_sequence == Some(sequence.id) && s.source_audition.is_none());
+    let master_level = status.and_then(|s| s.master_level);
+    ui.label(egui::RichText::new("Audio Mixer").strong());
+    if master_level.is_none() {
+        ui.weak("Meters idle — start playback to monitor audio.");
+    }
+    if model.strips.is_empty() {
+        ui.label("Add an audio track to start mixing.");
+    }
+    for strip in &mut model.strips {
+        let sample = status
+            .and_then(|s| s.track_levels.get(&strip.track))
+            .copied()
+            .unwrap_or_default();
+        strip.meter.sample(
+            sample.peak[0].max(sample.peak[1]),
+            sample.rms[0].max(sample.rms[1]),
+            dt,
+        );
+    }
+    let sample = master_level.unwrap_or_default();
+    model
+        .master_meter
+        .l
+        .sample(sample.peak[0], sample.rms[0], dt);
+    model
+        .master_meter
+        .r
+        .sample(sample.peak[1], sample.rms[1], dt);
+    if master_level.is_some()
+        || model.master_meter.peak_db() > FLOOR_DB as f32
+        || model
+            .strips
+            .iter()
+            .any(|s| s.meter.peak_db > FLOOR_DB as f32)
+    {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(33));
+    }
+    let flags: Vec<_> = model
         .strips
         .iter()
         .map(|s| (s.audio.mute, s.audio.solo))
         .collect();
-    let audible = resolve_audible(&flags);
-    let mut master_l = FLOOR_DB as f32;
-    let mut master_r = FLOOR_DB as f32;
-    for (i, s) in model.strips.iter_mut().enumerate() {
-        let lvl = if audible[i] {
-            synthetic_level_db(i as f32, t, s.audio.params.base.volume_db)
-        } else {
-            FLOOR_DB as f32
-        };
-        s.meter.update(lvl, dt);
-        // Split the (still-synthetic) level across L/R by each strip's real
-        // equal-power pan gain (09 §4), so the master output meter's stereo
-        // image at least tracks live pan/mute/solo control state honestly —
-        // only the per-block level number itself is simulated (module doc's
-        // wiring-seam note).
-        let (gain_l, gain_r) = pan_law(s.audio.params.base.pan);
-        master_l = master_l.max(lvl + lin_to_db(gain_l));
-        master_r = master_r.max(lvl + lin_to_db(gain_r));
-    }
-    let headroom = model.master.params.base.volume_db as f32 + 2.0;
-    let master_l = (master_l + headroom).min(CEIL_DB as f32);
-    let master_r = (master_r + headroom).min(CEIL_DB as f32);
-    model.master_meter.update(master_l, master_r, dt);
-    // Keep meters animating while the drawer is visible.
-    ui.ctx().request_repaint();
-
     let any_solo = flags.iter().any(|&(_, solo)| solo);
     let mut pending: Vec<AudioCmd> = Vec::new();
 
-    let PreviewMixer {
+    let MixerModel {
         strips,
         master,
         master_meter,
@@ -468,15 +438,124 @@ pub(crate) fn draw_audio_mixer(ui: &mut Ui, vid: &mut VideoPanelUi) {
     for cmd in pending {
         commit(&mut model, cmd);
     }
+    let commands = mixer_commands(sequence, &model);
+    if !commands.is_empty() {
+        let command = if commands.len() == 1 {
+            commands.into_iter().next().unwrap()
+        } else {
+            Command::Batch(commands)
+        };
+        history.execute(command, doc);
+    }
     ui.data_mut(|d| d.insert_temp(id, model));
 }
 
-/// A deterministic, clearly-simulated idle level (dB) so the meter ballistics,
-/// gradient, and clip LED are visible for review. Replaced by real
-/// `get_audio_meters` polling when the engine-meter seam lands.
-fn synthetic_level_db(seed: f32, t: f32, fader_db: f64) -> f32 {
-    let wobble = (t * 2.3 + seed * 1.7).sin() * 4.0 + (t * 6.1 + seed).sin() * 2.0;
-    ((fader_db as f32) - 9.0 + wobble).clamp(FLOOR_DB as f32, 6.0)
+impl MixerModel {
+    fn sync(&mut self, sequence: &Sequence) {
+        let mut old = std::mem::take(&mut self.strips);
+        let ids: Vec<_> = old.iter().map(|s| s.track).collect();
+        self.strips = sequence
+            .audio_tracks
+            .iter()
+            .filter_map(|track| {
+                let audio = track.audio.as_ref()?;
+                let meter = old
+                    .iter_mut()
+                    .find(|s| s.track == track.id)
+                    .map(|s| std::mem::take(&mut s.meter))
+                    .unwrap_or_default();
+                Some(MixerStrip {
+                    track: track.id,
+                    name: track.name.clone(),
+                    audio: audio.clone(),
+                    meter,
+                })
+            })
+            .collect();
+        if ids != self.strips.iter().map(|s| s.track).collect::<Vec<_>>() {
+            self.open_fx = None;
+        }
+        self.master = sequence.audio_master.clone();
+    }
+}
+
+impl MeterState {
+    fn sample(&mut self, peak: f32, rms: f32, dt: f32) {
+        self.update(lin_to_db(peak), dt);
+        self.rms_db = lin_to_db(rms).max(FLOOR_DB as f32);
+    }
+}
+
+fn mixer_commands(sequence: &Sequence, model: &MixerModel) -> Vec<Command> {
+    let mut cmds = Vec::new();
+    for strip in &model.strips {
+        let Some(track) = sequence.audio_tracks.iter().find(|t| t.id == strip.track) else {
+            continue;
+        };
+        let Some(old_audio) = track.audio.as_ref() else {
+            continue;
+        };
+        if old_audio.fx_chain != strip.audio.fx_chain {
+            let old = TrackSettings::of(track);
+            let mut new = old.clone();
+            new.audio = Some(strip.audio.clone());
+            cmds.push(Command::Timeline(TimelineCmd::SetTrackProp {
+                seq: sequence.id,
+                track: track.id,
+                old: Box::new(old),
+                new: Box::new(new),
+            }));
+        } else {
+            if old_audio.params.base != strip.audio.params.base {
+                cmds.push(Command::Timeline(TimelineCmd::AudioEdit(
+                    AudioCmd::SetTrackAudioProp {
+                        track: track.id,
+                        old: old_audio.params.base,
+                        new: strip.audio.params.base,
+                    },
+                )));
+            }
+            if (old_audio.mute, old_audio.solo) != (strip.audio.mute, strip.audio.solo) {
+                cmds.push(Command::Timeline(TimelineCmd::AudioEdit(
+                    AudioCmd::SetTrackMuteSolo {
+                        track: track.id,
+                        old: (old_audio.mute, old_audio.solo),
+                        new: (strip.audio.mute, strip.audio.solo),
+                    },
+                )));
+            }
+        }
+    }
+
+    if sequence.audio_master.params.base != model.master.params.base {
+        cmds.push(Command::Timeline(TimelineCmd::AudioEdit(
+            AudioCmd::SetMasterBusProp {
+                old: sequence.audio_master.params.base,
+                new: model.master.params.base,
+            },
+        )));
+    }
+    if sequence.audio_master.fx_chain != model.master.fx_chain {
+        for (index, unit) in sequence.audio_master.fx_chain.iter().enumerate().rev() {
+            cmds.push(Command::Timeline(TimelineCmd::AudioEdit(
+                AudioCmd::RemoveAudioFx {
+                    owner: FxOwner::Master,
+                    index,
+                    unit: unit.clone(),
+                },
+            )));
+        }
+        for (index, unit) in model.master.fx_chain.iter().enumerate() {
+            cmds.push(Command::Timeline(TimelineCmd::AudioEdit(
+                AudioCmd::AddAudioFx {
+                    owner: FxOwner::Master,
+                    index,
+                    unit: unit.clone(),
+                },
+            )));
+        }
+    }
+    cmds
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -847,22 +926,6 @@ fn draw_meter_sized(ui: &mut Ui, meter: &mut MeterState, height: f32) {
 /// (`MASTER_METER_H`, two bars) than the single per-track strip meters so the
 /// final mix level reads at a glance without hunting.
 ///
-/// ## Reading this against the real engine
-///
-/// The engine-side equivalent is `audio::mixer::Mixer::output_meter()`
-/// (`photonic-video`): a lock-free `Arc<StereoMeter>` sampled post
-/// `MasterBusParams.volume_db` — the exact "Output" tap this widget wants.
-/// It is not reachable here: `draw_audio_mixer(ui, &mut VideoPanelUi)` is
-/// called with no engine handle (see this module's top doc, "Wiring seam"),
-/// and `EngineSession`/`EngineStatus` don't surface any `StereoMeter` to the
-/// GUI yet regardless (`get_audio_meters` doesn't exist, 10 §3.12 / 13
-/// §11.6). So this renders the best-available value: the same honestly
-/// simulated-and-labelled ballistics pass already driving every other meter
-/// in this file (`draw_audio_mixer`'s per-frame update, panned per-strip by
-/// real pan-law gain — see its call site). Swapping to
-/// `mixer.output_meter().peak()`/`.rms()` once that seam closes is a
-/// same-shape `[f32; 2]`-per-frame feed into [`StereoMeterState::update`];
-/// no widget change.
 fn master_output_meter(ui: &mut Ui, meter: &mut StereoMeterState) {
     ui.vertical_centered(|ui| {
         ui.label(
@@ -1277,6 +1340,74 @@ mod tests {
     }
 
     #[test]
+    fn timeline_mixer_edits_persist_and_undo_with_fx_parameters() {
+        use photonic_core::timeline::{FrameRate, TimelineProject, Track, TrackKind};
+        let mut sequence = Sequence::new("Mix", FrameRate::FPS_30, 1920, 1080);
+        let mut track = Track::new(TrackKind::Audio, "Actual dialogue");
+        track
+            .audio
+            .as_mut()
+            .unwrap()
+            .fx_chain
+            .push(AudioFxUnit::new(AudioFxKind::Eq));
+        sequence.audio_tracks.push(track);
+        let mut model = MixerModel::demo();
+        model.sync(&sequence);
+        assert_eq!(model.strips.len(), 1);
+        assert_eq!(model.strips[0].name, "Actual dialogue");
+        assert!(mixer_commands(&sequence, &model).is_empty());
+        model.strips[0].audio.params.base.volume_db = -12.0;
+        model.strips[0].audio.params.base.pan = 0.4;
+        model.strips[0].audio.solo = true;
+        model.strips[0].audio.fx_chain[0].enabled = false;
+        model.strips[0].audio.fx_chain[0]
+            .params
+            .base
+            .set("params.band1.gain_db", PropValue::Float(3.0));
+        model.master.params.base.volume_db = -3.0;
+        model.master.fx_chain[0].enabled = false;
+        let commands = mixer_commands(&sequence, &model);
+        let sid = sequence.id;
+        let mut project = TimelineProject::new();
+        project.insert_sequence(sequence);
+        let mut doc = Document::new("Mixer", 1920.0, 1080.0);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::new(100);
+        history.execute_discrete(Command::Batch(commands), &mut doc);
+        let edited = &doc.timeline.as_ref().unwrap().sequences[&sid];
+        assert_eq!(
+            edited.audio_tracks[0].audio.as_ref(),
+            Some(&model.strips[0].audio)
+        );
+        assert_eq!(edited.audio_master, model.master);
+        let serialized = serde_json::to_string(&doc).unwrap();
+        let reloaded: Document = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            reloaded.timeline.as_ref().unwrap().sequences[&sid].audio_master,
+            model.master
+        );
+        history.undo(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        model.sync(&doc.timeline.as_ref().unwrap().sequences[&sid]);
+        assert_eq!(model.strips[0].audio.params.base.volume_db, 0.0);
+    }
+
+    #[test]
+    fn live_meter_uses_independent_peak_and_rms_samples() {
+        let mut meter = MeterState::default();
+        meter.sample(1.0, 0.1, 0.016);
+        assert!(approx(meter.peak_db, 0.0));
+        assert!(approx(meter.rms_db, -20.0));
+        assert!(meter.clip);
+        for _ in 0..100 {
+            meter.sample(0.0, 0.0, 0.1);
+        }
+        assert!(meter.peak_db <= FLOOR_DB as f32);
+        assert_eq!(meter.rms_db, FLOOR_DB as f32);
+    }
+
+    #[test]
     fn pan_law_matches_spec() {
         // 09 §4: hard-left/right, and -3dB (0.707) each at center.
         let (l, r) = pan_law(-1.0);
@@ -1403,7 +1534,7 @@ mod tests {
 
     #[test]
     fn commit_applies_real_audio_cmds() {
-        let mut m = PreviewMixer::demo();
+        let mut m = MixerModel::demo();
         let t0 = m.strips[0].track;
 
         // Fader op.
@@ -1447,7 +1578,7 @@ mod tests {
 
     #[test]
     fn commit_add_remove_reorder_fx() {
-        let mut m = PreviewMixer::demo();
+        let mut m = MixerModel::demo();
         let t0 = m.strips[0].track;
         assert_eq!(m.strips[0].audio.fx_chain.len(), 0);
 
@@ -1491,7 +1622,7 @@ mod tests {
 
     #[test]
     fn master_seeds_limiter_and_reorder_ignores_bad_permutation() {
-        let mut m = PreviewMixer::demo();
+        let mut m = MixerModel::demo();
         assert!(m
             .master
             .fx_chain

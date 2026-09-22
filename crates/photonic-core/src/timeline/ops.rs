@@ -912,6 +912,67 @@ pub fn add_format(id: SequenceId, format: SequenceFormat) -> TimelineCmd {
     }
 }
 
+/// Remove a format while preserving the active format and reframe associations.
+/// Commit the returned commands as one undo step; inverse order restores the
+/// format before restoring indices that refer to it.
+pub fn remove_sequence_format(
+    p: &TimelineProject,
+    id: SequenceId,
+    index: usize,
+) -> Result<Vec<TimelineCmd>, EditError> {
+    let sequence = seq(p, id)?;
+    let format = sequence
+        .formats
+        .get(index)
+        .ok_or(EditError::IndexOutOfRange)?;
+    if sequence.formats.len() <= 1 {
+        return Err(EditError::IndexOutOfRange);
+    }
+    let active = if sequence.active_format > index {
+        sequence.active_format - 1
+    } else {
+        sequence.active_format.min(sequence.formats.len() - 2)
+    };
+    let mut commands = Vec::new();
+    if active != sequence.active_format {
+        commands.push(set_active_format(p, id, active)?);
+    }
+    for track in sequence.tracks() {
+        for clip in &track.clips {
+            if !clip.reframe.keys().any(|key| *key >= index) {
+                continue;
+            }
+            let mut new = clip.clone();
+            new.reframe = clip
+                .reframe
+                .iter()
+                .filter_map(|(key, value)| {
+                    if *key == index {
+                        None
+                    } else {
+                        Some((if *key > index { key - 1 } else { *key }, *value))
+                    }
+                })
+                .collect();
+            // This only reindexes format metadata, including on locked tracks.
+            commands.push(TimelineCmd::SetClipProp {
+                seq: id,
+                track: track.id,
+                old: Box::new(clip.clone()),
+                new: Box::new(new),
+            });
+        }
+    }
+    commands.push(set_sequence_format(
+        id,
+        FormatOp::Remove {
+            index,
+            format: format.clone(),
+        },
+    ));
+    Ok(commands)
+}
+
 pub fn add_track(
     p: &TimelineProject,
     id: SequenceId,
@@ -1015,6 +1076,9 @@ pub fn insert_clip(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     if c.duration.0 <= 0 {
         return Err(EditError::NonPositiveDuration);
     }
@@ -1085,6 +1149,13 @@ pub fn add_text_clip(
     duration: Tick,
     content: TextClipContent,
 ) -> Result<TimelineCmd, EditError> {
+    let target = track(seq(p, id)?, track_id)?;
+    if target.locked {
+        return Err(EditError::TrackLocked);
+    }
+    if !matches!(target.kind, TrackKind::Video | TrackKind::Text) {
+        return Err(EditError::ApplicabilityDenied);
+    }
     let mut clip = Clip::new(ClipSource::Text { content }, start, duration);
     if let ClipSource::Text { content } = &clip.source {
         clip.name = content.text.clone();
@@ -1100,6 +1171,9 @@ pub fn remove_clip(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     Ok(TimelineCmd::RemoveClip {
         seq: id,
@@ -3406,6 +3480,9 @@ pub fn create_clip_composition(
 ) -> Result<Vec<TimelineCmd>, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     if matches!(c.source, ClipSource::Adjustment) {
         return Err(EditError::CompositionOnAdjustment);
@@ -3435,6 +3512,9 @@ pub fn detach_clip_composition(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     Ok(TimelineCmd::SetClipComposition {
         seq: id,
@@ -3460,6 +3540,9 @@ pub fn paste_clip_composition(
         .ok_or(EditError::NoGraph(source_graph))?;
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     if matches!(c.source, ClipSource::Adjustment) {
         return Err(EditError::CompositionOnAdjustment);
@@ -4002,6 +4085,7 @@ pub fn assign_asset_bin(
 /// and remove those folded clips. The primary's `source`/`source_in` are
 /// unchanged (they already equal angle 0). Any `angle_clips` entry that names
 /// the primary itself is skipped (a clip can't be its own extra angle).
+/// Repeated angle entries are folded once; all affected tracks must be unlocked.
 /// Returns a batch (`SetClipProp` for the primary + one `RemoveClip` per folded
 /// clip) for the caller to wrap in one undo step.
 pub fn create_multicam_group(
@@ -4020,11 +4104,16 @@ pub fn create_multicam_group(
         primary.source_in,
     )];
     let mut removes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for (tk, cid) in angle_clips {
-        if *cid == primary_clip {
+        if *cid == primary_clip || !seen.insert((*tk, *cid)) {
             continue; // the primary is already angle 0
         }
-        let c = clip(track(s, *tk)?, *cid)?;
+        let angle_track = track(s, *tk)?;
+        if angle_track.locked {
+            return Err(EditError::TrackLocked);
+        }
+        let c = clip(angle_track, *cid)?;
         angles.push(MulticamAngle::new(
             c.name.clone(),
             c.source.clone(),
@@ -6893,6 +6982,97 @@ mod tests {
     }
 
     // ── Multicam (17 §G-20) ───────────────────────────────────────────────
+
+    #[test]
+    fn insert_and_remove_clip_reject_locked_tracks() {
+        let (mut doc, seq_id, track_id, clip_id) = fixture();
+        let p = doc.timeline.as_mut().unwrap();
+        p.sequences.get_mut(&seq_id).unwrap().video_tracks[0].locked = true;
+        let new_clip = Clip::new(ClipSource::Adjustment, Tick(200), Tick(100));
+        assert_eq!(
+            insert_clip(p, seq_id, track_id, new_clip).unwrap_err(),
+            EditError::TrackLocked
+        );
+        assert_eq!(
+            remove_clip(p, seq_id, track_id, clip_id).unwrap_err(),
+            EditError::TrackLocked
+        );
+    }
+
+    #[test]
+    fn composition_edits_reject_locked_tracks() {
+        let (mut doc, seq_id, track_id, clip_id) = fixture();
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks[0]
+            .clips[0]
+            .source = ClipSource::Asset {
+            asset: AssetId::new(),
+        };
+        let cmds =
+            create_clip_composition(doc.timeline.as_ref().unwrap(), seq_id, track_id, clip_id)
+                .unwrap();
+        let mut grouped = apply_batch(&doc, &cmds);
+        let graph = find_clip(&grouped, seq_id, track_id, clip_id)
+            .composition
+            .unwrap();
+        let p = grouped.timeline.as_mut().unwrap();
+        p.sequences.get_mut(&seq_id).unwrap().video_tracks[0].locked = true;
+        assert_eq!(
+            create_clip_composition(p, seq_id, track_id, clip_id).unwrap_err(),
+            EditError::TrackLocked
+        );
+        assert_eq!(
+            detach_clip_composition(p, seq_id, track_id, clip_id).unwrap_err(),
+            EditError::TrackLocked
+        );
+        assert_eq!(
+            paste_clip_composition(p, graph, seq_id, track_id, clip_id).unwrap_err(),
+            EditError::TrackLocked
+        );
+    }
+
+    #[test]
+    fn multicam_duplicate_angles_are_folded_once_and_undo_cleanly() {
+        let (mut doc, seq_id, track_id, primary) = fixture();
+        let alternate = add_audio_clip(&mut doc, seq_id);
+        let cmds = create_multicam_group(
+            doc.timeline.as_ref().unwrap(),
+            seq_id,
+            track_id,
+            primary,
+            &[alternate, alternate, (track_id, primary)],
+        )
+        .unwrap();
+        let out = apply_batch(&doc, &cmds);
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(
+            find_clip(&out, seq_id, track_id, primary)
+                .multicam
+                .as_ref()
+                .unwrap()
+                .angles
+                .len(),
+            2
+        );
+        assert_batch_undo_roundtrip(&doc, &cmds);
+    }
+
+    #[test]
+    fn multicam_rejects_locked_alternate_track() {
+        let (mut doc, seq_id, track_id, primary) = fixture();
+        let alternate = add_audio_clip(&mut doc, seq_id);
+        let p = doc.timeline.as_mut().unwrap();
+        p.sequences.get_mut(&seq_id).unwrap().audio_tracks[0].locked = true;
+        assert_eq!(
+            create_multicam_group(p, seq_id, track_id, primary, &[alternate]).unwrap_err(),
+            EditError::TrackLocked
+        );
+    }
 
     #[test]
     fn create_multicam_group_folds_angles_and_is_undo_idempotent() {

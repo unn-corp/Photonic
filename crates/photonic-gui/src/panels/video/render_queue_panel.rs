@@ -4,12 +4,8 @@
 //! Jobs are frozen against later edits at submission; this panel only
 //! inspects status.
 
-use egui::{Color32, RichText};
+use egui::RichText;
 use photonic_video::export::{QueueJobStatus, RenderQueue};
-
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A);
-const ACCENT: Color32 = Color32::from_rgb(0x6E, 0x56, 0xCF);
-const ERROR: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71);
 
 /// Floating "Render Queue" window. `open` is session state on PhotonicApp.
 pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queue: &RenderQueue) {
@@ -28,7 +24,7 @@ pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queu
             if jobs.is_empty() {
                 ui.label(
                     RichText::new("No export jobs queued.")
-                        .color(MUTED)
+                        .color(crate::theme::section_header_color(ui))
                         .italics(),
                 );
                 ui.label(
@@ -37,14 +33,14 @@ pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queu
                          land here while single-job exports use the engine path.",
                     )
                     .small()
-                    .color(MUTED),
+                    .color(crate::theme::section_header_color(ui)),
                 );
                 return;
             }
             ui.label(
                 RichText::new(format!("{} job(s)", jobs.len()))
                     .small()
-                    .color(MUTED),
+                    .color(crate::theme::section_header_color(ui)),
             );
             ui.separator();
             egui::ScrollArea::vertical().show(ui, |ui| {
@@ -70,7 +66,11 @@ pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queu
                         });
                         match &job.status {
                             QueueJobStatus::Queued => {
-                                ui.label(RichText::new("Queued").color(MUTED).small());
+                                ui.label(
+                                    RichText::new("Queued")
+                                        .color(crate::theme::section_header_color(ui))
+                                        .small(),
+                                );
                             }
                             QueueJobStatus::Running { frame, total, fps } => {
                                 let p = if *total > 0 {
@@ -82,7 +82,7 @@ pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queu
                                 ui.label(
                                     RichText::new(format!("Frame {frame}/{total} · {fps:.1} fps"))
                                         .small()
-                                        .color(MUTED),
+                                        .color(crate::theme::section_header_color(ui)),
                                 );
                                 // Keep the panel live while jobs run.
                                 ui.ctx().request_repaint();
@@ -90,15 +90,22 @@ pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queu
                             QueueJobStatus::Done { out_path } => {
                                 ui.label(
                                     RichText::new(format!("Done — {}", out_path.display()))
-                                        .color(ACCENT)
+                                        .color(ui.visuals().hyperlink_color)
                                         .small(),
                                 );
                             }
                             QueueJobStatus::Failed { message } => {
-                                ui.colored_label(ERROR, format!("Failed: {message}"));
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    format!("Failed: {message}"),
+                                );
                             }
                             QueueJobStatus::Cancelled => {
-                                ui.label(RichText::new("Cancelled").color(MUTED).small());
+                                ui.label(
+                                    RichText::new("Cancelled")
+                                        .color(crate::theme::section_header_color(ui))
+                                        .small(),
+                                );
                             }
                         }
                     });
