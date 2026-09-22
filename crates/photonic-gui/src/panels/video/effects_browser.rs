@@ -19,14 +19,11 @@
 use super::effect_presets;
 use crate::panels::PanelAction;
 use crate::panels::PropPanelCtx;
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 use photonic_core::timeline::effect_preset::EffectPreset;
 use photonic_core::timeline::{
     manifest, ops, ClipEffect, EffectCategory, EffectId, EffectKind, EffectManifest, MANIFESTS,
 };
-
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A); // `secondary`
-const SECTION: Color32 = Color32::from_rgb(0x50, 0x50, 0x6E); // section-header dim-muted
 
 /// Drag payload for an effects-browser row → drop target (consumed today by
 /// `clip_inspector.rs`'s effects-stack section; a future timeline-lane drop
@@ -64,14 +61,16 @@ fn category_title(cat: EffectCategory) -> &'static str {
 /// Left-rail Effects Browser drawer.
 pub(crate) fn draw_effects_browser(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let Some(project) = ctx.doc.timeline.as_ref() else {
-        ui.label(RichText::new("No video project yet.").color(MUTED));
+        ui.label(
+            RichText::new("No video project yet.").color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
     let selection: Vec<_> = ctx.video.selection.to_vec();
     if selection.is_empty() {
         ui.label(
             RichText::new("Select a clip to apply effects to it.")
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
         );
     }
@@ -79,7 +78,7 @@ pub(crate) fn draw_effects_browser(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     ui.label(
         RichText::new(format!("{} effects", MANIFESTS.len()))
             .small()
-            .color(MUTED),
+            .color(crate::theme::section_header_color(ui)),
     );
 
     let mut action: Option<PanelAction> = None;
@@ -220,12 +219,8 @@ fn draw_favourites_section(
     }
 }
 
-/// A small, muted section heading (mirrors `tools_panel.rs`'s `section_header`
-/// idiom — DESIGN.md's `#50506E` "dim-muted" section-header token, 13 §6.5).
 fn section_header(ui: &mut Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).small().color(SECTION));
-    ui.add_space(2.0);
+    crate::theme::section_header(ui, text);
 }
 
 fn draw_row(

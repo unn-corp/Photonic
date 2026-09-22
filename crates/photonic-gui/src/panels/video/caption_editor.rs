@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 use egui_phosphor::regular as ph;
 
 use photonic_core::timeline::{
@@ -1101,7 +1101,7 @@ fn draw_auto_caption(
     });
 
     if let Some(err) = ui.data(|d| d.get_temp::<String>(error_id)) {
-        ui.colored_label(Color32::from_rgb(248, 113, 113), err);
+        ui.colored_label(ui.visuals().error_fg_color, err);
     }
 
     if let Some(rx) = ui.data(|d| d.get_temp::<AutoCaptionRx>(job_key)) {
@@ -1247,7 +1247,7 @@ fn draw_tts_panel(ui: &mut Ui, ctx: &mut PropPanelCtx, seq_id: SequenceId, seq: 
         ui.ctx().request_repaint();
     }
     if let Some(err) = ui.data(|d| d.get_temp::<String>(error_id)) {
-        ui.colored_label(Color32::from_rgb(248, 113, 113), err);
+        ui.colored_label(ui.visuals().error_fg_color, err);
     }
 
     if let Some(rx) = ui.data(|d| d.get_temp::<TtsRx>(job_key)) {

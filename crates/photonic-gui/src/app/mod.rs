@@ -3499,7 +3499,7 @@ impl PhotonicApp {
                 });
             });
 
-        // ── Adaptive hotbar (always-on second top row) ───────────────────────
+        // ── Adaptive vector hotbar ───────────────────────
         self.draw_hotbar(ctx, doc);
 
         // Close drawer on Escape
@@ -3615,9 +3615,10 @@ impl PhotonicApp {
         // when the context returns) via `effective_open` — no state churn.
         let node_sel_count = doc.selection.node_ids.len();
         let clip_sel_count = self.timeline_selection.len();
-        let effective_open = self
-            .open_drawer
-            .filter(|g| g.has_content(node_sel_count, clip_sel_count));
+        let effective_open = self.open_drawer.filter(|g| {
+            DrawerGroup::all_for_mode(self.mode).contains(g)
+                && g.has_content(node_sel_count, clip_sel_count)
+        });
         // ── Rail / drawer card layout ─────────────────────────────────────────
         // Shared knobs for the floating rail + drawer "cards". Both use the same
         // corner radius, border, and vertical float; the rail stays flush with
@@ -3766,9 +3767,10 @@ impl PhotonicApp {
         // `animate_bool_with_time_and_easing` requests repaint while in flight.
         // Reduced-motion makes the transition instant.
         // Recompute after the rail click so opening/closing animates this frame.
-        let effective_open = self
-            .open_drawer
-            .filter(|g| g.has_content(node_sel_count, clip_sel_count));
+        let effective_open = self.open_drawer.filter(|g| {
+            DrawerGroup::all_for_mode(self.mode).contains(g)
+                && g.has_content(node_sel_count, clip_sel_count)
+        });
         let drawer_open = effective_open.is_some();
         let anim_time = if self.prefs.reduced_motion { 0.0 } else { 0.18 };
         let t = ctx.animate_bool_with_time_and_easing(
@@ -3994,7 +3996,9 @@ impl PhotonicApp {
             });
 
         // ── Right animated drawer (mirror of the left drawer) ─────────────────
-        let right_open = self.open_right_drawer;
+        let right_open = self
+            .open_right_drawer
+            .filter(|group| RightDrawerGroup::all_for_mode(self.mode).contains(group));
         let right_drawer_open = right_open.is_some();
         let r_anim = if self.prefs.reduced_motion { 0.0 } else { 0.18 };
         let rt = ctx.animate_bool_with_time_and_easing(
@@ -4172,8 +4176,15 @@ impl PhotonicApp {
                 .min_height(240.0)
                 .default_pos(ctx.screen_rect().center() - egui::vec2(310.0, 230.0))
                 .show(ctx, |ui| {
+                    let status = self.engine.as_ref().map(|engine| engine.status());
                     let mut vid = self.video_panel_ui();
-                    panels::video::audio_mixer::draw_audio_mixer(ui, &mut vid);
+                    panels::video::audio_mixer::draw_audio_mixer(
+                        ui,
+                        &mut vid,
+                        doc,
+                        history,
+                        status.as_deref(),
+                    );
                 });
             self.audio_mixer_window_open = open;
         }

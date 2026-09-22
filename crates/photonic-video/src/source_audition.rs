@@ -119,7 +119,7 @@ pub struct SourceAudition {
     controller: PlaybackController,
     audio: AudioEngine,
     feeder: Option<AudioFeeder>,
-    meter: Arc<ArcSwapOption<StereoMeter>>,
+    meter: Arc<ArcSwapOption<crate::session::LiveAudioMeters>>,
     has_audio: bool,
 }
 
@@ -207,7 +207,7 @@ impl SourceAudition {
     }
 
     pub fn meter(&self) -> Option<Arc<StereoMeter>> {
-        self.meter.load_full()
+        self.meter.load_full().map(|m| m.output.clone())
     }
 
     pub fn stop(&mut self) {

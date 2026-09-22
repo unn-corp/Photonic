@@ -10,15 +10,12 @@
 //!
 //! Called from `app/timeline/mod.rs` above the mini-toolbar.
 
-use egui::{Color32, RichText, Sense, Ui};
+use egui::{RichText, Sense, Ui};
 use photonic_core::document::Document;
 use photonic_core::history::CommandHistory;
 use photonic_core::timeline::{ops, SequenceId};
 
 use crate::app::timeline::ops_bridge;
-
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A);
-const ACCENT: Color32 = Color32::from_rgb(0x6C, 0x8C, 0xFF);
 
 /// Keep `open_tabs` consistent with the document: drop deleted sequences,
 /// ensure the active sequence is pinned open, seed with the sole/active
@@ -117,7 +114,7 @@ pub(crate) fn draw_seq_tabs(
             r,
             RichText::new(format!("↑ {crumb_text}"))
                 .small()
-                .color(MUTED),
+                .color(crate::theme::section_header_color(ui)),
         )
         .on_hover_text("Click to pop nested sequence breadcrumb")
         .clicked()
@@ -156,7 +153,10 @@ pub(crate) fn draw_seq_tabs(
         let label_rect =
             egui::Rect::from_min_size(tab_rect.min + egui::vec2(4.0, 0.0), egui::vec2(label_w, bh));
         let text = if *is_active {
-            RichText::new(name.as_str()).small().strong().color(ACCENT)
+            RichText::new(name.as_str())
+                .small()
+                .strong()
+                .color(ui.visuals().hyperlink_color)
         } else {
             RichText::new(name.as_str()).small()
         };
@@ -182,9 +182,15 @@ pub(crate) fn draw_seq_tabs(
                 egui::pos2(tab_rect.right() - 16.0, y + 2.0),
                 egui::vec2(14.0, 16.0),
             );
-            if put_label(ui, close_rect, RichText::new("×").small().color(MUTED))
-                .on_hover_text("Close tab (sequence stays in project)")
-                .clicked()
+            if put_label(
+                ui,
+                close_rect,
+                RichText::new("×")
+                    .small()
+                    .color(crate::theme::section_header_color(ui)),
+            )
+            .on_hover_text("Close tab (sequence stays in project)")
+            .clicked()
             {
                 close_id = Some(*id);
             }

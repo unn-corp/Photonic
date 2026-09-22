@@ -37,9 +37,6 @@ use std::time::Duration;
 
 use super::VideoPanelUi;
 
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A); // `secondary`
-const ACCENT: Color32 = Color32::from_rgb(0x6E, 0x56, 0xCF); // `primary`
-const ERROR: Color32 = Color32::from_rgb(0xF8, 0x71, 0x71); // `error`
 const ERROR_BG: Color32 = Color32::from_rgba_premultiplied(0x3A, 0x14, 0x14, 0x60);
 
 fn state_id() -> egui::Id {
@@ -392,7 +389,10 @@ pub(crate) fn draw_export_dialog(
         .open(&mut open)
         .show(ctx, |ui| {
             let Some(seq_id) = seq_id else {
-                ui.label(RichText::new("No active sequence.").color(MUTED));
+                ui.label(
+                    RichText::new("No active sequence.")
+                        .color(crate::theme::section_header_color(ui)),
+                );
                 return;
             };
             if state.job.is_some() {
@@ -450,7 +450,7 @@ pub(crate) fn draw_export_dialog(
                 if !can_export {
                     ui.label(
                         RichText::new("Fix the issues above to enable Export.")
-                            .color(MUTED)
+                            .color(crate::theme::section_header_color(ui))
                             .small(),
                     );
                 }
@@ -519,7 +519,7 @@ fn draw_progress(ui: &mut egui::Ui, state: &mut DialogState) {
                     view.fps,
                     fmt_eta(view.eta)
                 ))
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
             );
             // Keep animating while the export runs.
@@ -527,17 +527,20 @@ fn draw_progress(ui: &mut egui::Ui, state: &mut DialogState) {
         }
         ExportPhase::Done => {
             ui.add(egui::ProgressBar::new(1.0));
-            ui.label(RichText::new("Export complete.").color(ACCENT));
+            ui.label(RichText::new("Export complete.").color(ui.visuals().hyperlink_color));
             if let Some(job) = &state.job {
                 ui.label(
                     RichText::new(format!("Saved to {}", job.output().display()))
-                        .color(MUTED)
+                        .color(crate::theme::section_header_color(ui))
                         .small(),
                 );
             }
         }
         ExportPhase::Cancelled => {
-            ui.label(RichText::new("Export cancelled — no output written.").color(MUTED));
+            ui.label(
+                RichText::new("Export cancelled — no output written.")
+                    .color(crate::theme::section_header_color(ui)),
+            );
         }
         ExportPhase::Failed => {
             egui::Frame::none()
@@ -546,7 +549,7 @@ fn draw_progress(ui: &mut egui::Ui, state: &mut DialogState) {
                 .rounding(3.0)
                 .show(ui, |ui| {
                     ui.colored_label(
-                        ERROR,
+                        ui.visuals().error_fg_color,
                         view.error
                             .as_deref()
                             .unwrap_or("The export did not complete."),
@@ -592,7 +595,11 @@ fn draw_preset_picker(ui: &mut egui::Ui, state: &mut DialogState) {
         .max_height(220.0)
         .show(ui, |ui| {
             let q = state.search.to_lowercase();
-            ui.label(RichText::new("BUILT-IN").small().color(MUTED));
+            ui.label(
+                RichText::new("BUILT-IN")
+                    .small()
+                    .color(crate::theme::section_header_color(ui)),
+            );
             for p in presets::built_in_presets() {
                 if !q.is_empty() && !p.name.to_lowercase().contains(&q) {
                     continue;
@@ -610,7 +617,11 @@ fn draw_preset_picker(ui: &mut egui::Ui, state: &mut DialogState) {
             let customs = presets::load_custom_presets().unwrap_or_default();
             if !customs.is_empty() {
                 ui.add_space(4.0);
-                ui.label(RichText::new("CUSTOM").small().color(MUTED));
+                ui.label(
+                    RichText::new("CUSTOM")
+                        .small()
+                        .color(crate::theme::section_header_color(ui)),
+                );
                 for p in customs {
                     if !q.is_empty() && !p.name.to_lowercase().contains(&q) {
                         continue;
@@ -945,7 +956,11 @@ fn draw_fields(ui: &mut egui::Ui, state: &mut DialogState) {
         });
 
     if let Err(e) = presets::validate(p) {
-        ui.label(RichText::new(format!("{e}")).color(ERROR).small());
+        ui.label(
+            RichText::new(format!("{e}"))
+                .color(ui.visuals().error_fg_color)
+                .small(),
+        );
     }
     if changed {
         note_customized(state);
@@ -1060,7 +1075,7 @@ fn draw_estimate(ui: &mut egui::Ui, doc: &Document, seq_id: SequenceId, state: &
             mb.max(0.0),
             duration_s.max(0.0)
         ))
-        .color(MUTED)
+        .color(crate::theme::section_header_color(ui))
         .small(),
     );
 }
@@ -1100,7 +1115,7 @@ fn draw_preflight_banner(ui: &mut egui::Ui, offline: &[String]) {
         .rounding(3.0)
         .show(ui, |ui| {
             ui.colored_label(
-                ERROR,
+                ui.visuals().error_fg_color,
                 format!(
                     "Offline media blocks export — {} clip(s): {}",
                     offline.len(),
@@ -1109,7 +1124,7 @@ fn draw_preflight_banner(ui: &mut egui::Ui, offline: &[String]) {
             );
             ui.label(
                 RichText::new("Relink from the Media Pool drawer, then retry.")
-                    .color(MUTED)
+                    .color(crate::theme::section_header_color(ui))
                     .small(),
             );
         });
@@ -1173,7 +1188,7 @@ fn draw_job_options(ui: &mut egui::Ui, state: &mut DialogState) {
         ui.label(
             RichText::new("Raw encoder args (key=value …)")
                 .small()
-                .color(MUTED),
+                .color(crate::theme::section_header_color(ui)),
         );
         ui.add(
             egui::TextEdit::singleline(&mut state.raw_encoder_args)

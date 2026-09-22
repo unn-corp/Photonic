@@ -6873,7 +6873,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "get_audio_meters",
-                "description": "Current/peak levels per track + master (09 §5). Live meters live inside the interactive audio mixer, which the headless MCP engine bridge does not run — returns NotSupportedV1.",
+                "description": "Live stereo peak/RMS levels for the playing sequence: master output and per-track post-fader, pre-mute taps. Values are linear amplitudes. Requires interactive audio playback; returns NotSupportedV1 when no matching feeder is running.",
                 "inputSchema": {
                     "type": "object",
                     "properties": { "sequence_id": { "type": "string" } },
@@ -6896,12 +6896,12 @@ pub fn tool_list() -> Value {
             // Title templates (05 §4b)
             {
                 "name": "list_title_templates",
-                "description": "List available vector title/lower-third templates (05 §4b). The shipped built-in library is a P6 deliverable not yet present in this build, so this returns an empty catalog.",
+                "description": "List starter text title presets shared with the GUI Titles drawer, including stable IDs, editable text fields, styles, and durations.",
                 "inputSchema": { "type": "object", "properties": {} }
             },
             {
                 "name": "insert_title_template",
-                "description": "Insert a vector title template onto the timeline as an embedded VectorDoc clip (05 §4b). The template library is not shipped in this build (P6) — returns NotSupportedV1.",
+                "description": "Insert a starter title as an editable Text clip on a video or text track, as one undo step. Use a template ID from list_title_templates. Start defaults to zero; supply at most one start time. text_overrides accepts a text field. Rejects locked tracks and overlaps.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6910,7 +6910,7 @@ pub fn tool_list() -> Value {
                         "start_ticks": { "type": "integer" },
                         "start_tc": { "type": "string" },
                         "start_seconds": { "type": "number" },
-                        "text_overrides": { "type": "object" }
+                        "text_overrides": { "type": "object", "properties": { "text": { "type": "string" } }, "additionalProperties": false }
                     },
                     "required": ["template","track_id"]
                 }
@@ -7505,7 +7505,15 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "sequence_id": { "type": "string", "format": "uuid" },
                 "peak": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
                 "rms": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
-                "graph_latency_samples": { "type": "integer", "minimum": 0 }, "source": { "const": "mixer_output" }
+                "graph_latency_samples": { "type": "integer", "minimum": 0 }, "source": { "const": "mixer_output" },
+                "tracks": { "type": "array", "items": {
+                    "type": "object", "properties": {
+                        "track_id": { "type": "string", "format": "uuid" },
+                        "peak": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                        "rms": { "type": "array", "items": { "type": "number" }, "minItems": 2, "maxItems": 2 },
+                        "tap": { "const": "post_fader_pre_mute" }
+                    }, "required": ["track_id", "peak", "rms", "tap"], "additionalProperties": false
+                } }
             }),
             &[
                 "sequence_id",

@@ -1,6 +1,21 @@
 use super::*;
 
 impl PhotonicApp {
+    fn retain_existing_timeline_selection(&mut self, doc: &Document) {
+        let sequence = doc.timeline.as_ref().and_then(|project| {
+            project
+                .active_sequence
+                .and_then(|id| project.sequences.get(&id))
+        });
+        self.timeline_selection.retain(|id| {
+            sequence.is_some_and(|sequence| {
+                sequence
+                    .tracks()
+                    .any(|track| track.clips.iter().any(|clip| clip.id == *id))
+            })
+        });
+    }
+
     pub(crate) fn process_panel_actions(
         &mut self,
         ctx: &egui::Context,
@@ -307,6 +322,7 @@ impl PhotonicApp {
                     if !cmds.is_empty() {
                         let batch = cmds.into_iter().map(Command::Timeline).collect();
                         history.execute_discrete(Command::Batch(batch), doc);
+                        self.retain_existing_timeline_selection(doc);
                         doc_modified = true;
                     }
                 }
@@ -7379,5 +7395,30 @@ impl PhotonicApp {
             self.prefs.save();
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod video_selection_tests {
+    use super::*;
+    use photonic_core::timeline::{
+        Clip, ClipSource, FrameRate, Sequence, Tick, TimelineProject, Track, TrackKind,
+    };
+    #[test]
+    fn batch_cleanup_keeps_surviving_clip_selection_in_order() {
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("test", FrameRate::FPS_30, 1920, 1080);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let clip = Clip::new(ClipSource::Adjustment, Tick::ZERO, Tick::from_seconds(1));
+        let id = clip.id;
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.active_sequence = Some(project.insert_sequence(sequence));
+        let mut doc = Document::new("test", 1920.0, 1080.0);
+        doc.timeline = Some(project);
+        let mut app = PhotonicApp::default();
+        app.timeline_selection = vec![photonic_core::timeline::ClipId::new(), id];
+        app.retain_existing_timeline_selection(&doc);
+        assert_eq!(app.timeline_selection, vec![id]);
     }
 }

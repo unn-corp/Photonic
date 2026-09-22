@@ -668,6 +668,17 @@ impl PhotonicApp {
                     doc, seq_id, track, clip,
                 );
         }
+        let composition = ui.data_mut(|data| {
+            data.remove_temp::<(ClipId, photonic_core::timeline::GraphId)>(egui::Id::new(
+                "clip_composition_request",
+            ))
+        });
+        if let Some((clip, graph)) = composition {
+            self.open_graph = Some(graph);
+            self.node_canvas_active = true;
+            self.selected_graph_node = None;
+            selection = vec![clip];
+        }
         // K-A7: context-menu "Grab item" seeds a session via egui temp data.
         if let Some((gseq, gtrack, gclip)) = ui.data(|d| {
             d.get_temp::<(SequenceId, TrackId, ClipId)>(egui::Id::new("k_a7_grab_request"))
@@ -2655,12 +2666,56 @@ fn clip_context_menu(
         ui.close_menu();
     }
     ui.separator();
-    ui.add_enabled(false, egui::Button::new("Add transition in"))
-        .on_disabled_hover_text("P6");
-    ui.add_enabled(false, egui::Button::new("Add transition out"))
-        .on_disabled_hover_text("P6");
-    ui.add_enabled(false, egui::Button::new("Open as node composition"))
-        .on_disabled_hover_text("P8");
+    let clip_state = doc
+        .timeline
+        .as_ref()
+        .and_then(|project| project.sequences.get(&seq_id))
+        .and_then(|seq| seq.track(track))
+        .and_then(|lane| {
+            lane.clips.iter().find(|item| item.id == clip).map(|item| {
+                (
+                    lane.locked,
+                    item.transition_in.is_some(),
+                    item.transition_out.is_some(),
+                    item.composition.is_some(),
+                    matches!(item.source, ClipSource::Adjustment),
+                )
+            })
+        });
+    if let Some((locked, has_in, has_out, has_composition, adjustment)) = clip_state {
+        for (is_in, exists, label) in [
+            (true, has_in, "Add transition in"),
+            (false, has_out, "Add transition out"),
+        ] {
+            if ui
+                .add_enabled(!locked && !exists, egui::Button::new(label))
+                .on_hover_text("Add a half-second dissolve; adjust it in the Clip Inspector")
+                .on_disabled_hover_text(if locked {
+                    "Unlock this track to add a transition."
+                } else {
+                    "A transition already exists. Edit it in the Clip Inspector."
+                })
+                .clicked()
+            {
+                match ops_bridge::add_default_transition(doc, history, seq_id, track, clip, is_in) {
+                    Ok(()) => ui.close_menu(),
+                    Err(error) => {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
+                    }
+                }
+            }
+        }
+        if ui.add_enabled(has_composition || (!locked && !adjustment), egui::Button::new("Open as node composition"))
+            .on_disabled_hover_text(if locked {"Unlock this track to create a composition."} else {"Adjustment clips apply effects to lower tracks and cannot have a source composition."}).clicked() {
+            match ops_bridge::open_clip_composition(doc, history, seq_id, track, clip) {
+                Ok(graph) => {
+                    ui.data_mut(|data| data.insert_temp(egui::Id::new("clip_composition_request"), (clip, graph)));
+                    ui.close_menu();
+                }
+                Err(error) => {ui.colored_label(ui.visuals().error_fg_color, error);}
+            }
+        }
+    }
 }
 
 /// Resolve a right-click on `target` to the set of clip ids an action should

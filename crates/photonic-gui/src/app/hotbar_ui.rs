@@ -67,11 +67,14 @@ impl PhotonicApp {
         }
     }
 
-    /// Draw the always-on hotbar. Rather than a full-width docked bar, it floats
+    /// Draw the vector hotbar. Rather than a full-width docked bar, it floats
     /// as a centred, content-width rounded pill pinned just below the top
     /// toolbar — detached from the panel stack so it hugs its contents and
-    /// overlays the canvas. Shown every frame regardless of selection.
+    /// overlays the vector canvas. Video mode has its own monitor controls.
     pub(crate) fn draw_hotbar(&mut self, ctx: &egui::Context, doc: &mut Document) {
+        if self.mode != AppMode::Vector {
+            return;
+        }
         let (bucket, single_is_group, single_is_fillable_path, single_id) = self.hotbar_bucket(doc);
         self.refresh_hotbar_cache(bucket, single_is_group, single_is_fillable_path);
         let items = self

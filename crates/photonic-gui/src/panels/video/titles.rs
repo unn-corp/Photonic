@@ -29,10 +29,8 @@
 //! **Not** in this cut (residual G-12 work, tracked in 17): `VectorDoc`
 //! template presets with pre-authored entrance/exit keyframes, Pin-To
 //! responsive-position reframing, protected intro/outro trims, real
-//! drag-to-timeline-position (see point 1), and the
-//! `list_title_templates`/`insert_title_template` MCP tools — those need the
-//! `VectorDoc`/`AssetSource::EmbeddedVector` path and touch the render + MCP
-//! territories too.
+//! drag-to-timeline-position (see point 1). The starter text presets are shared
+//! with MCP.
 //!
 //! Every mutation is built as a real `photonic_core::timeline::ops::*` call
 //! (reading `ctx.doc`, never mutating it) and handed to the app via
@@ -47,105 +45,21 @@
 //! `app/mod.rs`.
 
 use crate::panels::{PanelAction, PropPanelCtx};
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 use egui_phosphor::regular as ph;
 use photonic_core::timeline::clip::TextClipContent;
+use photonic_core::timeline::title_presets::{TitlePreset, TITLE_PRESETS as PRESETS};
 use photonic_core::timeline::{
-    ops, CaptionBackground, CaptionStyle, Clip, ClipId, ClipSource, SequenceId, Tick, TimelineCmd,
-    TimelineProject, TrackId,
+    ops, Clip, ClipId, ClipSource, SequenceId, Tick, TimelineCmd, TimelineProject, TrackId,
 };
-use photonic_core::Color;
-
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A); // `secondary`
-const SECTION: Color32 = Color32::from_rgb(0x50, 0x50, 0x6E); // section-header dim-muted
-
-/// One starter title preset. 05 §4b's shipped set is `VectorDoc`-templated
-/// with entrance/exit keyframes; this is the plain-`ClipSource::Text` subset
-/// of it (see module doc's scope cut) — three placements that cover the
-/// common cases (bottom-anchored name/role, dead-center hero text, a boxed
-/// card).
-struct TitlePreset {
-    name: &'static str,
-    glyph: &'static str,
-    description: &'static str,
-    sample_text: &'static str,
-    duration_secs: i64,
-    style: fn() -> CaptionStyle,
-}
-
-fn lower_third_style() -> CaptionStyle {
-    CaptionStyle {
-        font_size: 40.0,
-        position: [0.07, 0.84],
-        max_width: 0.5,
-        stroke: None,
-        background: Some(CaptionBackground {
-            color: Color::new(0.0, 0.0, 0.0, 0.55),
-            corner_radius: 4.0,
-            padding: 12.0,
-        }),
-        ..CaptionStyle::default()
-    }
-}
-
-fn centered_title_style() -> CaptionStyle {
-    CaptionStyle {
-        font_size: 96.0,
-        weight: 800,
-        position: [0.5, 0.5],
-        max_width: 0.8,
-        ..CaptionStyle::default()
-    }
-}
-
-fn caption_card_style() -> CaptionStyle {
-    CaptionStyle {
-        font_size: 34.0,
-        weight: 600,
-        position: [0.5, 0.5],
-        max_width: 0.6,
-        stroke: None,
-        background: Some(CaptionBackground {
-            color: Color::new(0.08, 0.08, 0.12, 0.85),
-            corner_radius: 10.0,
-            padding: 16.0,
-        }),
-        ..CaptionStyle::default()
-    }
-}
-
-const PRESETS: &[TitlePreset] = &[
-    TitlePreset {
-        name: "Lower Third",
-        glyph: ph::TEXT_ALIGN_LEFT,
-        description: "Name / role bar anchored bottom-left — the classic interview caption.",
-        sample_text: "Name Here\nRole / Title",
-        duration_secs: 5,
-        style: lower_third_style,
-    },
-    TitlePreset {
-        name: "Centered Title",
-        glyph: ph::TEXT_AA,
-        description: "Large hero text, dead center — cold opens and chapter cards.",
-        sample_text: "Title Goes Here",
-        duration_secs: 4,
-        style: centered_title_style,
-    },
-    TitlePreset {
-        name: "Caption Card",
-        glyph: ph::CARDS,
-        description: "Boxed text card for callouts, quotes, and CTAs.",
-        sample_text: "Caption text goes here.",
-        duration_secs: 4,
-        style: caption_card_style,
-    },
-];
 
 /// Left-rail Titles drawer: the starter-preset browser plus the selected
 /// Text clip's basic editor.
 pub(crate) fn draw_titles(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let Some(project) = ctx.doc.timeline.as_ref() else {
-        ui.label(RichText::new("No video project yet.").color(MUTED));
+        ui.label(
+            RichText::new("No video project yet.").color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
 
@@ -156,7 +70,7 @@ pub(crate) fn draw_titles(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     if project.active_sequence.is_none() {
         ui.label(
             RichText::new("Add a sequence first to place a title.")
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
         );
     } else {
@@ -176,12 +90,8 @@ pub(crate) fn draw_titles(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     }
 }
 
-/// A small, muted section heading (mirrors `effects_browser.rs`'s
-/// `section_header` idiom — DESIGN.md's `#50506E` "dim-muted" token).
 fn section_header(ui: &mut Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(text).small().color(SECTION));
-    ui.add_space(2.0);
+    crate::theme::section_header(ui, text);
 }
 
 fn draw_preset_row(
@@ -191,15 +101,19 @@ fn draw_preset_row(
     playhead: Tick,
     action: &mut Option<PanelAction>,
 ) {
-    let label = format!("{}  {}", preset.glyph, preset.name);
+    let label = format!("{}  {}", ph::TEXT_AA, preset.name);
+    let command = insert_preset_at_playhead(project, preset, playhead);
     let resp = ui
-        .add(egui::SelectableLabel::new(false, label))
+        .add_enabled(command.is_some(), egui::SelectableLabel::new(false, label))
         .on_hover_text(format!(
             "{} — click to insert a {}s title at the playhead",
             preset.description, preset.duration_secs
-        ));
+        ))
+        .on_disabled_hover_text(
+            "Add an unlocked video or text track with enough free space at the playhead.",
+        );
     if resp.clicked() {
-        if let Some(cmd) = insert_preset_at_playhead(project, preset, playhead) {
+        if let Some(cmd) = command {
             *action = Some(PanelAction::ClipEditDiscrete(cmd));
         }
     }
@@ -212,8 +126,7 @@ fn draw_preset_row(
 /// here purely over `&TimelineProject` since this panel has no
 /// `&mut CommandHistory` to call that helper with — same `PropPanelCtx`
 /// boundary every other left-rail video drawer works within). A rejected
-/// insert (no video track, no room anywhere) is a silent no-op, matching
-/// `ops_bridge.rs`'s own documented convention for invalid gestures.
+/// insert disables the preset and explains how to make room.
 fn insert_preset_at_playhead(
     project: &TimelineProject,
     preset: &TitlePreset,
@@ -286,7 +199,7 @@ fn draw_text_editor(
     let Some((seq_id, track_id, clip, content)) = selected_text_clip(selection, project) else {
         ui.label(
             RichText::new("Select a Text clip to edit its title.")
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
         );
         return;

@@ -37,6 +37,79 @@ fn commit_batch(history: &mut CommandHistory, doc: &mut Document, cmds: Vec<Time
     history.execute_discrete(Command::Batch(batch), doc);
 }
 
+/// Add a default dissolve to a clip, preserving existing transitions.
+pub(crate) fn add_default_transition(
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    seq_id: SequenceId,
+    track_id: TrackId,
+    clip_id: ClipId,
+    is_in: bool,
+) -> Result<(), String> {
+    let project = doc.timeline.as_ref().ok_or("No video project")?;
+    let clip = project
+        .sequences
+        .get(&seq_id)
+        .and_then(|seq| seq.track(track_id))
+        .and_then(|track| track.clips.iter().find(|clip| clip.id == clip_id))
+        .ok_or("Clip no longer exists")?;
+    let mut new = clip.clone();
+    let transition = if is_in {
+        &mut new.transition_in
+    } else {
+        &mut new.transition_out
+    };
+    if transition.is_some() {
+        return Ok(());
+    }
+    *transition = Some(photonic_core::timeline::Transition::new(
+        photonic_core::timeline::TransitionKind::CrossDissolve,
+        Tick((TICKS_PER_SECOND / 2).min(clip.duration.0)),
+    ));
+    let command =
+        ops::set_clip_prop(project, seq_id, track_id, new).map_err(|error| error.to_string())?;
+    commit(history, doc, command);
+    Ok(())
+}
+
+/// Open an existing composition or create the clip's source graph undoably.
+pub(crate) fn open_clip_composition(
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    seq_id: SequenceId,
+    track_id: TrackId,
+    clip_id: ClipId,
+) -> Result<photonic_core::timeline::GraphId, String> {
+    let project = doc.timeline.as_ref().ok_or("No video project")?;
+    let track = project
+        .sequences
+        .get(&seq_id)
+        .and_then(|seq| seq.track(track_id))
+        .ok_or("Track no longer exists")?;
+    let clip = track
+        .clips
+        .iter()
+        .find(|clip| clip.id == clip_id)
+        .ok_or("Clip no longer exists")?;
+    if let Some(graph) = clip.composition {
+        return Ok(graph);
+    }
+    if track.locked {
+        return Err("Unlock this track to create a composition.".into());
+    }
+    let commands = ops::create_clip_composition(project, seq_id, track_id, clip_id)
+        .map_err(|error| error.to_string())?;
+    let graph = commands
+        .iter()
+        .find_map(|command| match command {
+            TimelineCmd::AddGraph { graph } => Some(graph.id),
+            _ => None,
+        })
+        .ok_or("Composition did not produce a graph")?;
+    commit_batch(history, doc, commands);
+    Ok(graph)
+}
+
 // ── Aspect ratio / sequence format ──────────────────────────────────────────
 
 /// Switch the sequence to the aspect/frame named `name` (`w`×`h`): activate the
@@ -81,6 +154,50 @@ pub fn switch_to_aspect(
         new: new_idx,
     };
     commit_batch(history, doc, vec![add, activate]);
+}
+
+/// Activate an existing format without matching it by dimensions.
+pub fn activate_format(
+    history: &mut CommandHistory,
+    doc: &mut Document,
+    seq: SequenceId,
+    index: usize,
+) {
+    let Some(project) = doc.timeline.as_ref() else {
+        return;
+    };
+    if project
+        .sequences
+        .get(&seq)
+        .is_some_and(|s| s.active_format == index)
+    {
+        return;
+    }
+    if let Ok(command) = ops::set_active_format(project, seq, index) {
+        commit(history, doc, command);
+    }
+}
+
+/// Remove an inactive format and preserve every remaining clip's framing.
+pub fn remove_format(
+    history: &mut CommandHistory,
+    doc: &mut Document,
+    seq: SequenceId,
+    index: usize,
+) {
+    let Some(project) = doc.timeline.as_ref() else {
+        return;
+    };
+    if project
+        .sequences
+        .get(&seq)
+        .is_none_or(|s| s.active_format == index)
+    {
+        return;
+    }
+    if let Ok(commands) = ops::remove_sequence_format(project, seq, index) {
+        commit_batch(history, doc, commands);
+    }
 }
 
 /// The built-in quick aspect presets shown on the monitor's format bar
@@ -2376,5 +2493,77 @@ mod replace_source_tests {
         let c = find(&doc, seq, track, clip);
         assert_eq!(c.source, new_source);
         assert_eq!(c.source_in, Tick(0), "source_in untouched when None");
+    }
+}
+
+#[cfg(test)]
+mod polish_tests {
+    use super::*;
+    fn fixture() -> (Document, CommandHistory, SequenceId, TrackId, ClipId) {
+        let mut project = TimelineProject::new();
+        let mut seq = Sequence::new("test", FrameRate::new(30, 1), 1920, 1080);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::new(1.0, 0.0, 0.0, 1.0),
+            },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let clip_id = clip.id;
+        track.clips.push(clip);
+        let track_id = track.id;
+        seq.video_tracks.push(track);
+        let id = project.insert_sequence(seq);
+        project.active_sequence = Some(id);
+        let mut doc = Document::new("test", 1920.0, 1080.0);
+        doc.timeline = Some(project);
+        (doc, CommandHistory::new(64), id, track_id, clip_id)
+    }
+    #[test]
+    fn context_transition_and_composition_are_undoable_and_reuse_existing_graph() {
+        let (mut doc, mut history, seq, track, clip) = fixture();
+        add_default_transition(&mut doc, &mut history, seq, track, clip, true).unwrap();
+        assert!(
+            doc.timeline.as_ref().unwrap().sequences[&seq].video_tracks[0].clips[0]
+                .transition_in
+                .is_some()
+        );
+        history.undo(&mut doc);
+        assert!(
+            doc.timeline.as_ref().unwrap().sequences[&seq].video_tracks[0].clips[0]
+                .transition_in
+                .is_none()
+        );
+        let graph = open_clip_composition(&mut doc, &mut history, seq, track, clip).unwrap();
+        let revision = history.revision();
+        assert_eq!(
+            open_clip_composition(&mut doc, &mut history, seq, track, clip).unwrap(),
+            graph
+        );
+        assert_eq!(history.revision(), revision);
+        history.undo(&mut doc);
+        assert!(
+            doc.timeline.as_ref().unwrap().sequences[&seq].video_tracks[0].clips[0]
+                .composition
+                .is_none()
+        );
+        assert!(!doc.timeline.as_ref().unwrap().graphs.contains_key(&graph));
+    }
+    #[test]
+    fn context_mutations_reject_locked_tracks() {
+        let (mut doc, mut history, seq, track, clip) = fixture();
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        let revision = history.revision();
+        assert!(add_default_transition(&mut doc, &mut history, seq, track, clip, false).is_err());
+        assert!(open_clip_composition(&mut doc, &mut history, seq, track, clip).is_err());
+        assert_eq!(history.revision(), revision);
     }
 }

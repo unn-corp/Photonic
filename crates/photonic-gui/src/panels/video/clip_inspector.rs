@@ -38,8 +38,6 @@ use photonic_core::timeline::{
     TransitionKind, TransitionParams, TICKS_PER_SECOND,
 };
 
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A); // `secondary`
-const ACCENT: Color32 = Color32::from_rgb(0x6E, 0x56, 0xCF); // `primary`
 const SPEED_CURVE_MAX: f64 = 10.0;
 
 /// Live drag session for the speed curve. Holds a full working copy of the
@@ -58,31 +56,26 @@ struct SpeedCurveDrag {
 /// via `ctx` (`ctx.video.selection`, `ctx.doc`).
 pub(crate) fn draw_clip_inspector(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let Some(project) = ctx.doc.timeline.as_ref() else {
-        ui.label(RichText::new("No video project yet.").color(MUTED));
+        ui.label(
+            RichText::new("No video project yet.").color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
     let selection = ctx.video.selection;
     if selection.is_empty() {
-        ui.label(RichText::new("No clip selected.").color(MUTED));
+        ui.label(RichText::new("No clip selected.").color(crate::theme::section_header_color(ui)));
         return;
     }
     if selection.len() > 1 {
-        // 13 §16 finding #6: multi-clip common-value editing is unresolved by
-        // any spec doc; showing the (single-clip) inspector for the first
-        // selected clip is the documented interim behavior, not silent data
-        // loss — the other clips are simply not editable from here yet.
-        ui.label(
-            RichText::new(format!(
-                "{} clips selected — showing the first (multi-clip editing not yet supported).",
-                selection.len()
-            ))
-            .color(MUTED)
-            .small(),
-        );
+        super::multi_clip::draw(ui, ctx);
+        return;
     }
     let clip_id = selection[0];
     let Some((seq_id, track_id, clip)) = locate_clip(project, clip_id) else {
-        ui.label(RichText::new("Selected clip no longer exists.").color(MUTED));
+        ui.label(
+            RichText::new("Selected clip no longer exists.")
+                .color(crate::theme::section_header_color(ui)),
+        );
         return;
     };
 
@@ -204,7 +197,11 @@ fn set_clip_discrete(
 /// (targeting) without inventing a second keyframing UI.
 fn keyframe_diamond(ui: &mut Ui, ctx: &mut PropPanelCtx, clip_id: ClipId, has_track: bool) {
     let glyph = if has_track { "\u{25C6}" } else { "\u{25C7}" }; // filled / hollow diamond
-    let color = if has_track { ACCENT } else { MUTED };
+    let color = if has_track {
+        ui.visuals().hyperlink_color
+    } else {
+        crate::theme::section_header_color(ui)
+    };
     if ui
         .add(egui::Button::new(RichText::new(glyph).color(color)).small())
         .on_hover_text("Animate this property (opens the keyframe editor)")
@@ -431,7 +428,10 @@ fn speed_curve_canvas(
     painter.rect_stroke(
         rect,
         4.0,
-        egui::Stroke::new(1.0, MUTED.gamma_multiply(0.55)),
+        egui::Stroke::new(
+            1.0,
+            crate::theme::section_header_color(ui).gamma_multiply(0.55),
+        ),
     );
 
     // Soft vertical bands for sections between keys.
@@ -441,9 +441,9 @@ fn speed_curve_canvas(
             let x1 = tick_to_x(pair[1].at.0);
             if x1 > x0 {
                 let tint = if i % 2 == 0 {
-                    ACCENT.gamma_multiply(0.08)
+                    ui.visuals().hyperlink_color.gamma_multiply(0.08)
                 } else {
-                    MUTED.gamma_multiply(0.06)
+                    crate::theme::section_header_color(ui).gamma_multiply(0.06)
                 };
                 painter.rect_filled(
                     egui::Rect::from_min_max(
@@ -460,9 +460,12 @@ fn speed_curve_canvas(
     for value in [-10.0, -1.0, 0.0, 1.0, 10.0] {
         let y = speed_to_curve_y(value, rect);
         let stroke = if value == 0.0 {
-            egui::Stroke::new(1.0, ACCENT.gamma_multiply(0.7))
+            egui::Stroke::new(1.0, ui.visuals().hyperlink_color.gamma_multiply(0.7))
         } else {
-            egui::Stroke::new(1.0, MUTED.gamma_multiply(0.35))
+            egui::Stroke::new(
+                1.0,
+                crate::theme::section_header_color(ui).gamma_multiply(0.35),
+            )
         };
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
@@ -473,7 +476,7 @@ fn speed_curve_canvas(
             egui::Align2::LEFT_BOTTOM,
             format!("{value:.0}x"),
             egui::FontId::proportional(9.0),
-            MUTED,
+            crate::theme::section_header_color(ui),
         );
     }
 
@@ -489,7 +492,10 @@ fn speed_curve_canvas(
         curve.push(egui::pos2(tick_to_x(t.0), speed_to_curve_y(speed, rect)));
     }
     if curve.len() > 1 {
-        painter.add(egui::Shape::line(curve, egui::Stroke::new(2.0, ACCENT)));
+        painter.add(egui::Shape::line(
+            curve,
+            egui::Stroke::new(2.0, ui.visuals().hyperlink_color),
+        ));
     }
 
     let mut result: Option<Vec<SpeedKey>> = None;
@@ -584,12 +590,16 @@ fn speed_curve_canvas(
         let fill = if resp.dragged() || resp.is_pointer_button_down_on() {
             Color32::WHITE
         } else {
-            ACCENT
+            ui.visuals().hyperlink_color
         };
         painter.circle_filled(draw_p, r, fill);
         painter.circle_stroke(draw_p, r, egui::Stroke::new(1.5, Color32::WHITE));
         if resp.dragged() || resp.is_pointer_button_down_on() {
-            painter.circle_stroke(draw_p, r + 3.0, egui::Stroke::new(1.0, ACCENT));
+            painter.circle_stroke(
+                draw_p,
+                r + 3.0,
+                egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
+            );
         }
     }
 
@@ -794,7 +804,11 @@ fn draw_speed_ramp_editor(
     let mut discrete = false;
 
     ui.horizontal_wrapped(|ui| {
-        ui.label(RichText::new("Presets").color(MUTED).small());
+        ui.label(
+            RichText::new("Presets")
+                .color(crate::theme::section_header_color(ui))
+                .small(),
+        );
         for preset in ["Smooth", "Flow", "Hero", "Action", "Fast Lane"] {
             if ui.small_button(preset).clicked() {
                 new_keys = Some(preset_speed_keys(preset, clip.duration));
@@ -839,7 +853,7 @@ fn draw_speed_ramp_editor(
             RichText::new(
                 "Drag the handles (three sections by default). Click empty curve to add a point; drag through 0× for reverse.",
             )
-            .color(MUTED)
+            .color(crate::theme::section_header_color(ui))
             .small(),
         );
         if let Some(edited) = speed_curve_canvas(ui, clip, &sorted, frame_ticks) {
@@ -850,7 +864,7 @@ fn draw_speed_ramp_editor(
     if sorted.is_empty() {
         ui.label(
             RichText::new("No ramp points yet — add one to start shaping the ramp.")
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
         );
     } else {
@@ -858,10 +872,26 @@ fn draw_speed_ramp_editor(
             .num_columns(5)
             .spacing([4.0, 2.0])
             .show(ui, |ui| {
-                ui.label(RichText::new("At").color(MUTED).small());
-                ui.label(RichText::new("Speed").color(MUTED).small());
-                ui.label(RichText::new("Rev").color(MUTED).small());
-                ui.label(RichText::new("Ease").color(MUTED).small());
+                ui.label(
+                    RichText::new("At")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
+                ui.label(
+                    RichText::new("Speed")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
+                ui.label(
+                    RichText::new("Rev")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
+                ui.label(
+                    RichText::new("Ease")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
                 ui.label("");
                 ui.end_row();
 
@@ -960,7 +990,7 @@ fn draw_speed_ramp_editor(
     if let Some(first) = sorted.first() {
         let mut selected_interp = first.interp;
         ui.collapsing("Selected segment controls", |ui| {
-            ui.label(RichText::new("Use the row's Ease picker to select a segment. Custom Bezier handles apply to the first segment.").small().color(MUTED));
+            ui.label(RichText::new("Use the row's Ease picker to select a segment. Custom Bezier handles apply to the first segment.").small().color(crate::theme::section_header_color(ui)));
             if let Interp::Bezier {
                 mut out_handle,
                 mut in_handle,
@@ -1041,7 +1071,7 @@ fn draw_reframe_section(
             ui.horizontal(|ui| {
                 for i in 0..format_count {
                     let overridden = clip.reframe.contains_key(&i);
-                    let color = if i == active_format { ACCENT } else { MUTED };
+                    let color = if i == active_format { ui.visuals().hyperlink_color } else { crate::theme::section_header_color(ui) };
                     let glyph = if overridden { "\u{25CF}" } else { "\u{25CB}" };
                     ui.label(RichText::new(glyph).color(color))
                         .on_hover_text(format!(
@@ -1083,7 +1113,7 @@ fn draw_reframe_section(
                     }
                 }
                 if scales.is_none() {
-                    ui.label(RichText::new("Probe source media to enable Fill frame.").small().color(MUTED));
+                    ui.label(RichText::new("Probe source media to enable Fill frame.").small().color(crate::theme::section_header_color(ui)));
                 }
             }
             egui::Grid::new("clip_reframe_grid")
@@ -1147,7 +1177,7 @@ fn draw_level_horizon_section(
                     "Applies to active format: {} ({} x {})",
                     format.name, format.width, format.height
                 ))
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
             )
             .on_hover_text(
@@ -1276,7 +1306,7 @@ fn draw_stabilization_section(
             let Some(spec) = clip.stabilization.as_ref() else {
                 ui.label(
                     RichText::new("No motion metadata bound to this clip.")
-                        .color(MUTED)
+                        .color(crate::theme::section_header_color(ui))
                         .small(),
                 );
                 ui.label(
@@ -1284,7 +1314,7 @@ fn draw_stabilization_section(
                         "Import a gyro sidecar (.gcsv or Photonic gyro JSON) to stabilize \
                          this shot.",
                     )
-                    .color(MUTED)
+                    .color(crate::theme::section_header_color(ui))
                     .small(),
                 );
                 if ui
@@ -1309,7 +1339,11 @@ fn draw_stabilization_section(
                     .unwrap_or_else(|| path.display().to_string()),
             };
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Source").color(MUTED).small());
+                ui.label(
+                    RichText::new("Source")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
                 ui.label(RichText::new(source_label).small()).on_hover_text(
                     match &spec.binding.source {
                         MotionSourceRef::Sidecar { path, .. } => path.display().to_string(),
@@ -1325,13 +1359,21 @@ fn draw_stabilization_section(
             // sliders say.
             let analyzed = spec.analysis_key.is_some();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Status").color(MUTED).small());
+                ui.label(
+                    RichText::new("Status")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
                 if analyzed {
-                    ui.label(RichText::new("Analyzed").color(ACCENT).small());
+                    ui.label(
+                        RichText::new("Analyzed")
+                            .color(ui.visuals().hyperlink_color)
+                            .small(),
+                    );
                 } else {
                     ui.label(
                         RichText::new("Not analyzed — clip renders unstabilized")
-                            .color(MUTED)
+                            .color(crate::theme::section_header_color(ui))
                             .small(),
                     );
                 }
@@ -1339,7 +1381,11 @@ fn draw_stabilization_section(
 
             let anchors = spec.binding.sync.anchors.len();
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Clock sync").color(MUTED).small());
+                ui.label(
+                    RichText::new("Clock sync")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
                 let text = match anchors {
                     0 => "Dialect-declared".to_string(),
                     1 => "1 anchor (offset)".to_string(),
@@ -1352,7 +1398,11 @@ fn draw_stabilization_section(
             });
 
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Lens").color(MUTED).small());
+                ui.label(
+                    RichText::new("Lens")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
                 let text = match &spec.binding.lens {
                     LensProfileRef::RotationOnly => "Rotation only (uncalibrated)".to_string(),
                     LensProfileRef::UserFile { path, .. } => path
@@ -1616,7 +1666,7 @@ fn draw_effects_section(
             ui.data_mut(|d| d.insert_temp(fx_scope_id(), tab));
             ui.label(
                 RichText::new(scope_hint(tab, project, track, clip))
-                    .color(MUTED)
+                    .color(crate::theme::section_header_color(ui))
                     .small(),
             );
 
@@ -1624,7 +1674,11 @@ fn draw_effects_section(
                 return;
             };
             let Ok(stack) = ops::effect_stack(project, owner) else {
-                ui.label(RichText::new("Stack unavailable.").color(MUTED).small());
+                ui.label(
+                    RichText::new("Stack unavailable.")
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
                 return;
             };
 
@@ -1645,7 +1699,7 @@ fn draw_effects_section(
                         let label = if enabled {
                             RichText::new(name)
                         } else {
-                            RichText::new(name).color(MUTED)
+                            RichText::new(name).color(crate::theme::section_header_color(ui))
                         };
                         ui.label(label);
                         // Keyboard-reachable reorder fallback (13 §16 finding
@@ -1711,7 +1765,11 @@ fn draw_effects_section(
                 } else {
                     "No effects — drag one from the Effects browser onto this section."
                 };
-                ui.label(RichText::new(hint).color(MUTED).small());
+                ui.label(
+                    RichText::new(hint)
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                );
             }
 
             // Drop target for an Effects-browser drag (13 §6.3: "the Clip
@@ -1726,8 +1784,11 @@ fn draw_effects_section(
                     .pointer_latest_pos()
                     .is_some_and(|p| drop_rect.contains(p));
                 if hovering {
-                    ui.painter()
-                        .rect_stroke(drop_rect, 3.0, egui::Stroke::new(1.5, ACCENT));
+                    ui.painter().rect_stroke(
+                        drop_rect,
+                        3.0,
+                        egui::Stroke::new(1.5, ui.visuals().hyperlink_color),
+                    );
                     if ui.input(|i| i.pointer.any_released()) {
                         egui::DragAndDrop::clear_payload(ui.ctx());
                         let effect =
@@ -1780,7 +1841,11 @@ fn draw_effect_params(
 ) {
     let entries = prop_registry::entries(PropTargetKind::Effect(effect.kind));
     if entries.is_empty() {
-        ui.label(RichText::new("No parameters.").color(MUTED).small());
+        ui.label(
+            RichText::new("No parameters.")
+                .color(crate::theme::section_header_color(ui))
+                .small(),
+        );
         return;
     }
     // K-B6: cross-param refs (`%radius`, bare `amount`) + optional frame size.
@@ -1916,7 +1981,7 @@ fn draw_keyframes_section(
             ui.horizontal(|ui| {
                 ui.label(
                     RichText::new("Transform + effect params, animated over the clip")
-                        .color(MUTED)
+                        .color(crate::theme::section_header_color(ui))
                         .small(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {

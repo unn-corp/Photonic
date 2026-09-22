@@ -2354,7 +2354,7 @@ _No parameters._
 
 ## `get_audio_meters`
 
-Current/peak levels per track + master (09 §5). Live meters live inside the interactive audio mixer, which the headless MCP engine bridge does not run — returns NotSupportedV1.
+Live stereo peak/RMS levels for the playing sequence: master output and per-track post-fader, pre-mute taps. Values are linear amplitudes. Requires interactive audio playback; returns NotSupportedV1 when no matching feeder is running.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -2576,7 +2576,7 @@ Get derived word-timed transcript tokens from an explicitly chosen sequence/capt
 
 ## `get_video_capabilities`
 
-Read implemented video editing, transcript, inspection and export capabilities and limits. GPU initialization is null until first render/status call; false indicates failed initialization. FFmpeg availability is probed locally. Obtain full schemas with get_action_schema.
+Read implemented video editing, transcript, title, inspection and export capabilities, limits, and recommended tool workflows. GPU initialization is null until first render/status call; false indicates failed initialization. FFmpeg availability is probed locally. Obtain full schemas with get_action_schema.
 
 _No parameters._
 
@@ -2758,7 +2758,7 @@ Title/text clip (G-12): create a ClipSource::Text title/graphics clip spanning [
 
 ## `insert_title_template`
 
-Insert a vector title template onto the timeline as an embedded VectorDoc clip (05 §4b). The template library is not shipped in this build (P6) — returns NotSupportedV1.
+Insert a starter title as an editable Text clip on a video or text track, as one undo step. Use a template ID from list_title_templates. Start defaults to zero; supply at most one start time. text_overrides accepts a text field. Rejects locked tracks and overlaps.
 
 | Parameter | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -3091,7 +3091,7 @@ _No parameters._
 
 ## `list_title_templates`
 
-List available vector title/lower-third templates (05 §4b). The shipped built-in library is a P6 deliverable not yet present in this build, so this returns an empty catalog.
+List starter text title presets shared with the GUI Titles drawer, including stable IDs, editable text fields, styles, and durations.
 
 _No parameters._
 

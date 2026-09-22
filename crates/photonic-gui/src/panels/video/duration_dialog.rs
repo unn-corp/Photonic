@@ -7,14 +7,12 @@
 //! directly.
 
 use crate::app::timeline::ops_bridge;
-use egui::{Color32, RichText};
+use egui::RichText;
 use photonic_core::document::Document;
 use photonic_core::history::CommandHistory;
 use photonic_core::timeline::{
     ClipId, ClipTiming, FrameRate, SequenceId, Tick, Timecode, TrackId, TICKS_PER_SECOND,
 };
-
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A);
 
 /// Session state for the open Edit Duration dialog (K-A6).
 #[derive(Clone, Debug)]
@@ -129,7 +127,7 @@ pub(crate) fn draw_edit_duration_dialog(
         .show(ctx, |ui| {
             ui.label(
                 RichText::new("Frame-accurate position / in / out / duration (K-A6)")
-                    .color(MUTED)
+                    .color(crate::theme::section_header_color(ui))
                     .small(),
             );
             ui.add_space(6.0);
@@ -157,7 +155,7 @@ pub(crate) fn draw_edit_duration_dialog(
                     ui.label("Source Out");
                     ui.label(
                         RichText::new(source_out_preview.as_deref().unwrap_or("—"))
-                            .color(MUTED)
+                            .color(crate::theme::section_header_color(ui))
                             .monospace(),
                     );
                     ui.end_row();
@@ -178,7 +176,7 @@ pub(crate) fn draw_edit_duration_dialog(
                 );
 
             if let Some(err) = &dlg.error {
-                ui.colored_label(Color32::from_rgb(0xE5, 0x4D, 0x2E), err);
+                ui.colored_label(ui.visuals().error_fg_color, err);
             }
 
             ui.add_space(8.0);
@@ -196,7 +194,7 @@ pub(crate) fn draw_edit_duration_dialog(
                     rate.num as f64 / rate.den as f64,
                     TICKS_PER_SECOND
                 ))
-                .color(MUTED)
+                .color(crate::theme::section_header_color(ui))
                 .small(),
             );
         });

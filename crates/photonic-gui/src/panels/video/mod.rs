@@ -179,3 +179,5 @@ pub(crate) struct VideoPanelUi<'a> {
     /// opened from (`ClipSource::NestedSequence`, 01 §1).
     pub(crate) nested_sequence_breadcrumbs: &'a mut Vec<SequenceId>,
 }
+
+mod multi_clip;

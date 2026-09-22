@@ -32,6 +32,7 @@ pub mod scale;
 pub mod sequence;
 pub mod stabilization;
 pub mod time;
+pub mod title_presets;
 pub mod transcript;
 pub mod unknown;
 

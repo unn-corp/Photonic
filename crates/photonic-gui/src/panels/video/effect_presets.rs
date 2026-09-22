@@ -30,7 +30,7 @@
 //! — one user verb, one undo step, however many effects and however many
 //! selected clips.
 
-use egui::{Color32, RichText, Ui};
+use egui::{RichText, Ui};
 use photonic_core::timeline::commands::VfxOwner;
 use photonic_core::timeline::effect_preset::{
     self, EffectPreset, EffectPresetLibrary, LibraryLoad,
@@ -38,9 +38,6 @@ use photonic_core::timeline::effect_preset::{
 use photonic_core::timeline::{ClipId, EffectId, TimelineCmd, TimelineProject};
 
 use crate::panels::PanelAction;
-
-const MUTED: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x9A); // `secondary`
-const ACCENT: Color32 = Color32::from_rgb(0x6E, 0x56, 0xCF); // `primary`
 
 fn library_id() -> egui::Id {
     egui::Id::new("effect_preset_library")
@@ -142,7 +139,11 @@ pub(crate) fn favourite_ids(ui: &Ui) -> Vec<String> {
 /// on/off states differ by **colour**, using two palette tokens that already
 /// exist, rather than by a `STAR_FILL` glyph this build has no font for.
 pub(crate) fn favourite_toggle(ui: &mut Ui, id: &EffectId, starred: bool) -> bool {
-    let colour = if starred { ACCENT } else { MUTED };
+    let colour = if starred {
+        ui.visuals().hyperlink_color
+    } else {
+        crate::theme::section_header_color(ui)
+    };
     let tip = if starred {
         "Remove from favourites"
     } else {
@@ -387,7 +388,7 @@ pub(crate) fn preset_summary(preset: &EffectPreset) -> String {
 
 /// Section heading, matching `effects_browser.rs`'s idiom.
 pub(crate) fn muted(text: impl Into<String>) -> RichText {
-    RichText::new(text.into()).small().color(MUTED)
+    RichText::new(text.into()).small().weak()
 }
 
 #[cfg(test)]
