@@ -1,4 +1,5 @@
 use crate::handlers;
+use crate::procedural_work;
 use crate::protocol::*;
 use crate::server::{AppState, ToolOutput};
 use photonic_core::{audit_timestamp, AuditEntry, Command, Document};
@@ -436,18 +437,27 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "create_spiral" => {
             let a: CreateSpiralArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_spiral_work(a.turns, a.segments_per_turn) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_spiral(state, a).await,
             ))
         }
         "create_grid" => {
             let a: CreateGridArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_rectangular_grid_work(a.cols, a.rows) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_grid(state, a).await,
             ))
         }
         "create_polar_grid" => {
             let a: CreatePolarGridArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_polar_grid_work(a.rings, a.sectors) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_polar_grid(state, a).await,
             ))
@@ -651,6 +661,9 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "create_array" => {
             let a: CreateArrayArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_array_work(&a) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_array(state, a).await,
             ))
@@ -889,6 +902,9 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "scatter_copies" => {
             let a: ScatterCopiesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_scatter_work(a.count) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::scatter_copies(state, a).await,
             ))
@@ -1081,6 +1097,12 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "create_flare" => {
             let a: CreateFlareArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_flare_work(
+                a.ray_count.unwrap_or(12).max(2),
+                a.ring_count.unwrap_or(3),
+            ) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::create_flare(state, a).await,
             ))
@@ -1511,6 +1533,9 @@ pub(crate) async fn dispatch_tool_inner(
         }
         "split_into_grid" => {
             let a: SplitIntoGridArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            if let Err(error) = procedural_work::check_split_work(a.rows, a.cols) {
+                return Ok(ToolOutput::mutating(ToolResult::error(error)));
+            }
             Ok(ToolOutput::mutating(
                 handlers::nodes::split_into_grid(state, a).await,
             ))
@@ -3672,6 +3697,438 @@ mod tests {
         assert_eq!(entry.tool_name, "restore_checkpoint");
         assert_eq!(entry.args["checkpoint_id"], checkpoint_id.to_string());
         assert!(!entry.is_error);
+    }
+
+    async fn add_array_source(state: &AppState) -> uuid::Uuid {
+        let mut doc = state.document.lock().await;
+        let layer_id = doc.active_layer_id.expect("default layer");
+        let source = SceneNode::new(
+            "Array source",
+            layer_id,
+            SceneNodeKind::Path(PathNode::new(PathData::rect(0.0, 0.0, 10.0, 10.0))),
+        );
+        let source_id = source.id;
+        doc.add_node(source, Some(layer_id));
+        source_id
+    }
+
+    #[tokio::test]
+    async fn create_array_rejects_grid_product_overflow_and_over_cap() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let cases = [
+            (
+                "overflow",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": usize::MAX,
+                    "cols": 2
+                }),
+            ),
+            (
+                "over cap",
+                json!({
+                    "node_id": source_id,
+                    "mode": "grid",
+                    "rows": MAX_ARRAY_GRID_CELLS + 1,
+                    "cols": 1
+                }),
+            ),
+        ];
+
+        for (label, args) in cases {
+            let result = dispatch_tool(&state, "create_array", args)
+                .await
+                .unwrap_or_else(|error| panic!("{label}: dispatch failed: {error}"));
+            assert_eq!(
+                result.is_error,
+                Some(true),
+                "{label}: expected ToolResult error"
+            );
+            assert_eq!(
+                state.document.lock().await.nodes.len(),
+                1,
+                "{label}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{label}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_array_grid_and_radial_keep_copy_counts_and_single_undo_steps() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let grid = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "grid" }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(grid.is_error, Some(true));
+        assert_eq!(
+            structured_data(&grid)["node_ids"].as_array().unwrap().len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+
+        let radial = dispatch_tool(
+            &state,
+            "create_array",
+            json!({ "node_id": source_id, "mode": "radial", "count": 4 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(radial.is_error, Some(true));
+        assert_eq!(
+            structured_data(&radial)["node_ids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(state.document.lock().await.nodes.len(), 4);
+        assert_eq!(state.history.lock().await.undo_depth(), 1);
+
+        undo(&state).await;
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn procedural_generation_rejects_over_budget_without_document_mutation() {
+        let cases = [
+            "scatter_count",
+            "split_count",
+            "split_product",
+            "spiral_count",
+            "spiral_product",
+            "spiral_huge_finite_turns",
+            "rectangular_grid_count",
+            "rectangular_grid_u32_max",
+            "polar_grid_count",
+            "polar_grid_u32_max",
+            "array_radial_count",
+            "flare_ray_count",
+            "flare_ring_count",
+            "flare_product",
+        ];
+
+        for case in cases {
+            let state = test_state();
+            let (tool, args) = match case {
+                "scatter_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "scatter_copies",
+                        json!({
+                            "node_id": source_id,
+                            "count": MAX_GENERATED_WORK + 1,
+                            "x": 0.0,
+                            "y": 0.0,
+                            "width": 10.0,
+                            "height": 10.0
+                        }),
+                    )
+                }
+                "split_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "split_into_grid",
+                        json!({
+                            "node_id": source_id,
+                            "rows": MAX_GENERATED_WORK + 1,
+                            "cols": 1
+                        }),
+                    )
+                }
+                "split_product" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "split_into_grid",
+                        json!({ "node_id": source_id, "rows": 101, "cols": 100 }),
+                    )
+                }
+                "spiral_count" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 1.0,
+                        "segments_per_turn": MAX_GENERATED_WORK + 1
+                    }),
+                ),
+                "spiral_product" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 3.0,
+                        "segments_per_turn": 4_000
+                    }),
+                ),
+                "spiral_huge_finite_turns" => (
+                    "create_spiral",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "turns": 1.0e308,
+                        "segments_per_turn": 16
+                    }),
+                ),
+                "rectangular_grid_count" => (
+                    "create_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 100.0,
+                        "height": 100.0,
+                        "cols": MAX_GENERATED_WORK,
+                        "rows": MAX_GENERATED_WORK
+                    }),
+                ),
+                "rectangular_grid_u32_max" => (
+                    "create_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 100.0,
+                        "height": 100.0,
+                        "cols": u32::MAX,
+                        "rows": 1
+                    }),
+                ),
+                "polar_grid_count" => (
+                    "create_polar_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "rings": MAX_GENERATED_WORK,
+                        "sectors": MAX_GENERATED_WORK
+                    }),
+                ),
+                "polar_grid_u32_max" => (
+                    "create_polar_grid",
+                    json!({
+                        "x": 0.0,
+                        "y": 0.0,
+                        "outer_radius": 100.0,
+                        "rings": u32::MAX,
+                        "sectors": 1
+                    }),
+                ),
+                "array_radial_count" => {
+                    let source_id = add_array_source(&state).await;
+                    (
+                        "create_array",
+                        json!({
+                            "node_id": source_id,
+                            "mode": "radial",
+                            "count": MAX_GENERATED_WORK + 1
+                        }),
+                    )
+                }
+                "flare_ray_count" => (
+                    "create_flare",
+                    json!({ "cx": 0.0, "cy": 0.0, "ray_count": MAX_GENERATED_WORK + 1 }),
+                ),
+                "flare_ring_count" => (
+                    "create_flare",
+                    json!({ "cx": 0.0, "cy": 0.0, "ring_count": MAX_GENERATED_WORK + 1 }),
+                ),
+                "flare_product" => (
+                    "create_flare",
+                    json!({
+                        "cx": 0.0,
+                        "cy": 0.0,
+                        "ray_count": 5_000,
+                        "ring_count": 5_000
+                    }),
+                ),
+                _ => unreachable!("unknown test case"),
+            };
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let result = dispatch_tool(&state, tool, args)
+                .await
+                .unwrap_or_else(|error| panic!("{case}: dispatch failed: {error}"));
+
+            assert_eq!(result.is_error, Some(true), "{case}: expected rejection");
+            if case == "array_radial_count" {
+                let message = result
+                    .content
+                    .first()
+                    .and_then(|item| match item {
+                        ContentItem::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                assert!(
+                    message.contains("create_array"),
+                    "{case}: expected work-budget error, got {message:?}"
+                );
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before,
+                "{case}: mutated document"
+            );
+            assert_eq!(
+                state.history.lock().await.undo_depth(),
+                0,
+                "{case}: created history"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn split_into_grid_rejects_overflow_before_document_lookup() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+        let result = dispatch_tool(
+            &state,
+            "split_into_grid",
+            json!({
+                "node_id": source_id,
+                "rows": usize::MAX,
+                "cols": 2
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(state.document.lock().await.nodes.len(), 1);
+        assert_eq!(state.history.lock().await.undo_depth(), 0);
+    }
+
+    #[tokio::test]
+    async fn procedural_generation_accepts_representative_valid_counts() {
+        let state = test_state();
+        let source_id = add_array_source(&state).await;
+
+        let scatter = dispatch_tool(
+            &state,
+            "scatter_copies",
+            json!({
+                "node_id": source_id,
+                "count": 2,
+                "x": 0.0,
+                "y": 0.0,
+                "width": 10.0,
+                "height": 10.0
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(scatter.is_error, Some(true));
+
+        let spiral = dispatch_tool(
+            &state,
+            "create_spiral",
+            json!({
+                "x": 20.0,
+                "y": 20.0,
+                "outer_radius": 10.0,
+                "turns": 1.0,
+                "segments_per_turn": 4
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(spiral.is_error, Some(true));
+
+        let flare = dispatch_tool(
+            &state,
+            "create_flare",
+            json!({ "cx": 30.0, "cy": 30.0, "ray_count": 2, "ring_count": 0 }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(flare.is_error, Some(true));
+
+        let split = dispatch_tool(
+            &state,
+            "split_into_grid",
+            json!({ "node_id": source_id, "rows": 2, "cols": 2, "keep_original": true }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(split.is_error, Some(true));
+    }
+
+    #[tokio::test]
+    async fn grid_generators_create_expected_path_sizes() {
+        let state = test_state();
+
+        let rectangular = dispatch_tool(
+            &state,
+            "create_grid",
+            json!({
+                "x": 0.0,
+                "y": 0.0,
+                "width": 100.0,
+                "height": 80.0,
+                "cols": 2,
+                "rows": 3
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(rectangular.is_error, Some(true));
+        let rectangular_id = structured_data(&rectangular)["node_id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        {
+            let doc = state.document.lock().await;
+            let SceneNodeKind::Path(path) = &doc.nodes[&rectangular_id].kind else {
+                panic!("rectangular grid should create a path");
+            };
+            assert_eq!(path.path_data.to_bez_path().elements().len(), 14);
+        }
+
+        let polar = dispatch_tool(
+            &state,
+            "create_polar_grid",
+            json!({
+                "x": 0.0,
+                "y": 0.0,
+                "outer_radius": 100.0,
+                "inner_radius": 10.0,
+                "rings": 2,
+                "sectors": 3
+            }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(polar.is_error, Some(true));
+        let polar_id = structured_data(&polar)["node_id"]
+            .as_str()
+            .unwrap()
+            .parse::<uuid::Uuid>()
+            .unwrap();
+        let doc = state.document.lock().await;
+        let SceneNodeKind::Path(path) = &doc.nodes[&polar_id].kind else {
+            panic!("polar grid should create a path");
+        };
+        assert_eq!(path.path_data.to_bez_path().elements().len(), 24);
     }
 
     async fn swatch_state(with_matching_node: bool) -> AppState {
