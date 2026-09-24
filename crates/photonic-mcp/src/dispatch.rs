@@ -3420,6 +3420,81 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn create_shape_rejects_too_few_polygon_and_star_sides_without_mutation() {
+        for shape_type in ["polygon", "star"] {
+            for sides in [0, 1, 2] {
+                let state = test_state();
+                let before_document = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let before_history = state.history.lock().await.current_node();
+
+                let result = dispatch_tool(
+                    &state,
+                    "create_shape",
+                    json!({
+                        "shape_type": shape_type,
+                        "x": 0.0,
+                        "y": 0.0,
+                        "width": 10.0,
+                        "height": 10.0,
+                        "sides": sides
+                    }),
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(
+                    result.is_error,
+                    Some(true),
+                    "{shape_type} with {sides} sides should be rejected"
+                );
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before_document,
+                    "rejected {shape_type} request changed the document"
+                );
+                let history = state.history.lock().await;
+                assert_eq!(
+                    history.current_node(),
+                    before_history,
+                    "rejected {shape_type} request changed history"
+                );
+                assert_eq!(history.undo_depth(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn create_shape_accepts_minimum_and_default_polygon_and_star_sides() {
+        for (shape_type, sides) in [
+            ("polygon", Some(3)),
+            ("star", Some(3)),
+            ("polygon", None),
+            ("star", None),
+        ] {
+            let state = test_state();
+            let mut args = json!({
+                "shape_type": shape_type,
+                "x": 0.0,
+                "y": 0.0,
+                "width": 10.0,
+                "height": 10.0
+            });
+            if let Some(sides) = sides {
+                args["sides"] = json!(sides);
+            }
+
+            let result = dispatch_tool(&state, "create_shape", args).await.unwrap();
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "{shape_type} with {sides:?} sides should succeed"
+            );
+            assert_eq!(state.document.lock().await.nodes.len(), 1);
+            assert_eq!(state.history.lock().await.undo_depth(), 1);
+        }
+    }
+
     async fn undo(state: &AppState) {
         let result = dispatch_tool(state, "undo", json!({})).await.unwrap();
         assert_ne!(result.is_error, Some(true));

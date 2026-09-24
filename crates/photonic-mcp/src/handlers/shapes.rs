@@ -35,14 +35,22 @@ pub async fn create_shape(state: &AppState, args: CreateShapeArgs) -> ToolResult
             let cx = args.x + args.width / 2.0;
             let cy = args.y + args.height / 2.0;
             let r = args.width.min(args.height) / 2.0;
-            PathData::regular_polygon(cx, cy, r, args.sides.unwrap_or(6))
+            let sides = args.sides.unwrap_or(6);
+            if sides < 3 {
+                return ToolResult::error("Polygon sides must be at least 3");
+            }
+            PathData::regular_polygon(cx, cy, r, sides)
         }
         ShapeType::Star => {
             let cx = args.x + args.width / 2.0;
             let cy = args.y + args.height / 2.0;
             let outer = args.width.min(args.height) / 2.0;
             let inner = outer * args.inner_radius.unwrap_or(0.4);
-            PathData::star(cx, cy, outer, inner, args.sides.unwrap_or(5))
+            let sides = args.sides.unwrap_or(5);
+            if sides < 3 {
+                return ToolResult::error("Star sides must be at least 3");
+            }
+            PathData::star(cx, cy, outer, inner, sides)
         }
         ShapeType::Line => {
             PathData::line(args.x, args.y, args.x + args.width, args.y + args.height)

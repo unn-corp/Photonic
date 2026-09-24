@@ -68,7 +68,7 @@ pub fn tool_list() -> Value {
                         "arc_end_angle": { "type": "number", "description": "Arc end angle in degrees. Default: 270 (¾ circle)." },
                         "arc_open": { "type": "boolean", "description": "If true, draw open arc stroke only. If false (default), close back to center (pie sector)." },
                         "rx": { "type": "number", "description": "Reserved" },
-                        "sides": { "type": "integer", "description": "Sides (polygon/star)" },
+                        "sides": { "type": "integer", "minimum": 3, "description": "Sides (polygon/star)" },
                         "inner_radius": { "type": "number", "description": "Inner radius ratio (star, 0–1)" },
                         "fill": { "type": "object", "description": "Fill — solid: {\"type\":\"solid\",\"color\":\"#rrggbb\"} | none: {\"type\":\"none\"} | linear: {\"type\":\"gradient\",\"gradient_type\":\"linear\",\"colors\":[\"#hex1\",\"#hex2\"],\"coords\":[x0,y0,x1,y1]} | radial: {\"type\":\"gradient\",\"gradient_type\":\"radial\",\"colors\":[\"#hex1\",\"#hex2\"],\"coords\":[cx,cy,r]} | fluid: {\"type\":\"fluid_gradient\",\"points\":[{\"x\":100,\"y\":50,\"color\":\"#ff0000\"},...],\"power\":2.0} | mesh: {\"type\":\"mesh_gradient\",\"rows\":2,\"cols\":2,\"vertices\":[{\"x\":0,\"y\":0,\"color\":\"#ff0000\"},...]}" },
                         "color": { "type": "string", "description": "Shorthand for a solid fill colour, e.g. \"#2277ff\". Ignored when \"fill\" is also provided." },
@@ -7847,4 +7847,25 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "effect_favourite_set" => ExternalMutation,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_list;
+
+    #[test]
+    fn create_shape_sides_require_at_least_three() {
+        let manifest = tool_list();
+        let tool = manifest
+            .as_array()
+            .expect("tool list")
+            .iter()
+            .find(|tool| tool.get("name").and_then(|name| name.as_str()) == Some("create_shape"))
+            .expect("create_shape tool");
+
+        assert_eq!(
+            tool["inputSchema"]["properties"]["sides"]["minimum"].as_u64(),
+            Some(3)
+        );
+    }
 }
