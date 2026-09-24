@@ -4637,11 +4637,19 @@ mod tests {
             )
         };
 
-        let result = dispatch_tool(&state, "flatten_artwork", json!({ "target_name": 42 })).await;
-        let error = match result {
-            Ok(_) => panic!("malformed target_name must be rejected"),
-            Err(error) => error,
-        };
+        let result = dispatch_tool(&state, "flatten_artwork", json!({ "target_name": 42 }))
+            .await
+            .expect("known-tool argument errors use MCP error results");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(structured_data(&result)["error_code"], "InvalidArguments");
+        let error = result
+            .content
+            .first()
+            .and_then(|item| match item {
+                ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("argument error text");
         assert!(
             error.contains("string"),
             "unexpected argument error: {error}"
@@ -4690,11 +4698,19 @@ mod tests {
             )
         };
 
-        let result = dispatch_tool(&state, "clean_up", json!({ "dry_run": "yes" })).await;
-        let error = match result {
-            Ok(_) => panic!("malformed dry_run must be rejected"),
-            Err(error) => error,
-        };
+        let result = dispatch_tool(&state, "clean_up", json!({ "dry_run": "yes" }))
+            .await
+            .expect("known-tool argument errors use MCP error results");
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(structured_data(&result)["error_code"], "InvalidArguments");
+        let error = result
+            .content
+            .first()
+            .and_then(|item| match item {
+                ContentItem::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("argument error text");
         assert!(
             error.contains("boolean"),
             "unexpected argument error: {error}"
