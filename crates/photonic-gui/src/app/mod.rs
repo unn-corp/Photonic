@@ -1,3 +1,4 @@
+mod area_trace;
 mod dialogs;
 mod geometry;
 mod hotbar_ui;
@@ -1332,6 +1333,25 @@ pub struct PhotonicApp {
     /// Local-space points accumulated during the current drag.
     raster_stroke_pts: Vec<(f32, f32)>,
 
+    // ── Area Trace tool ─────────────────────────────────────────────────────
+    /// Maximum colors in the generated vector palette.
+    pub area_trace_colors: u32,
+    /// Sampling density as a fraction of source pixels.
+    pub area_trace_detail: f32,
+    /// Curve cleanup tolerance in document pixels.
+    pub area_trace_smoothing: f32,
+    /// Smallest retained contour in sampled pixels.
+    pub area_trace_min_area: u32,
+    /// Omit near-white palette regions from the generated vectors.
+    pub area_trace_ignore_white: bool,
+    /// Canvas-space origin and source raster for the active trace drag.
+    area_trace_start: Option<Point>,
+    area_trace_source: Option<NodeId>,
+    /// Retained region, sampled pixels, and transient vector nodes for the live
+    /// adjustment workflow. Preview nodes live in the document only until the
+    /// user applies or cancels; they are never added to history directly.
+    area_trace_session: Option<area_trace::AreaTraceSession>,
+
     // ── Raster masking (color range / remove background) ──────────────────────
     /// Fuzziness (0..1) for the color-range / magic-wand mask-out.
     pub raster_mask_tolerance: f32,
@@ -1849,6 +1869,14 @@ impl Default for PhotonicApp {
             raster_brush_hardness: 0.8,
             raster_stroke_orig: None,
             raster_stroke_pts: Vec::new(),
+            area_trace_colors: 8,
+            area_trace_detail: 0.75,
+            area_trace_smoothing: 1.5,
+            area_trace_min_area: 4,
+            area_trace_ignore_white: true,
+            area_trace_start: None,
+            area_trace_source: None,
+            area_trace_session: None,
             raster_mask_tolerance: 0.25,
             raster_mask_contiguous: false,
             raster_color_range: None,
@@ -2483,6 +2511,11 @@ impl PhotonicApp {
             .as_ref()
             .filter(|s| Some(s.node_id) == self.selected_id)
             .map(|s| s.target);
+        let area_trace_preview_active = self.area_trace_session.is_some();
+        let area_trace_preview_ready = self
+            .area_trace_session
+            .as_ref()
+            .is_some_and(|session| session.preview_root.is_some());
         let mut ctx = panels::PropPanelCtx {
             doc,
             active_tool: self.active_tool,
@@ -2517,6 +2550,13 @@ impl PhotonicApp {
             magic_wand_attribute: &mut self.magic_wand_attribute,
             magic_wand_tolerance: &mut self.magic_wand_tolerance,
             eraser_radius: &mut self.eraser_radius,
+            area_trace_colors: &mut self.area_trace_colors,
+            area_trace_detail: &mut self.area_trace_detail,
+            area_trace_smoothing: &mut self.area_trace_smoothing,
+            area_trace_min_area: &mut self.area_trace_min_area,
+            area_trace_ignore_white: &mut self.area_trace_ignore_white,
+            area_trace_preview_active,
+            area_trace_preview_ready,
             prop_spread: &mut self.prop_spread,
             prop_falloff_k: &mut self.prop_falloff_k,
             raster_mask_tolerance: &mut self.raster_mask_tolerance,
@@ -2839,6 +2879,19 @@ impl PhotonicApp {
         // candidate to migrate into `DirectSelectTool::on_activate`).
         if self.active_tool != self.last_tool {
             let (prev, cur) = (self.last_tool, self.active_tool);
+            if prev == Tool::AreaTrace {
+                self.area_trace_start = None;
+                self.area_trace_source = None;
+                self.cancel_area_trace_preview(doc, false);
+            }
+            if cur == Tool::AreaTrace {
+                // Surface the small slider panel immediately; the trace tool is
+                // intended to be usable without hunting through drawers.
+                self.open_drawer = Some(DrawerGroup::Inspector);
+                self.last_drawer_group = DrawerGroup::Inspector;
+                self.prefs.open_drawer = self.open_drawer;
+                self.prop_search.clear();
+            }
             crate::tools::tool_for(prev).on_deactivate(self);
             crate::tools::tool_for(cur).on_activate(self);
         }
@@ -6124,6 +6177,19 @@ impl PhotonicApp {
                         view.pan_x += delta.x as f64;
                         view.pan_y += delta.y as f64;
                     }
+                    return;
+                }
+
+                // ── Pen tool ─────────────────────────────────────────────────
+                if self.active_tool == Tool::AreaTrace {
+                    self.handle_area_trace_tool(
+                        ui,
+                        &response,
+                        doc,
+                        view,
+                        history,
+                        &mut doc_modified,
+                    );
                     return;
                 }
 

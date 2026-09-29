@@ -957,6 +957,16 @@ impl PhotonicApp {
                     }
                 }
 
+                PanelAction::ApplyAreaTrace => {
+                    if self.apply_area_trace_preview(doc, history) {
+                        doc_modified = true;
+                    }
+                }
+
+                PanelAction::CancelAreaTrace => {
+                    self.cancel_area_trace_preview(doc, true);
+                }
+
                 PanelAction::ClearRasterMask { node_id } => {
                     // Discard any live preview on this node first so the mask
                     // removal starts from the committed state.

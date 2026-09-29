@@ -61,6 +61,8 @@ const TOOLS: &[Tool] = &[
     Tool::Lasso,
     Tool::Pencil,
     Tool::Smooth,
+    Tool::Width,
+    Tool::AreaTrace,
     Tool::RasterBrush,
     Tool::RasterEraser,
 ];
@@ -107,6 +109,13 @@ fn tool_keywords(t: Tool) -> &'static [&'static str] {
         ],
         Tool::RasterBrush => &["paint", "pixel", "draw", "raster"],
         Tool::RasterEraser => &["erase", "rubber", "raster", "delete pixels"],
+        Tool::AreaTrace => &[
+            "image trace",
+            "vectorize",
+            "bitmap to vector",
+            "raster trace",
+            "convert image",
+        ],
     }
 }
 

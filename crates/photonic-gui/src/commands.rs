@@ -854,6 +854,7 @@ pub static TOOL_COMMANDS: &[(CommandId, Tool)] = &[
     ("tool.width", Tool::Width),
     ("tool.raster_brush", Tool::RasterBrush),
     ("tool.raster_eraser", Tool::RasterEraser),
+    ("tool.area_trace", Tool::AreaTrace),
 ];
 
 /// Resolve a tool-activation command id to its [`Tool`].

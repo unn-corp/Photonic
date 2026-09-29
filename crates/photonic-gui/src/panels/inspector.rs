@@ -2642,6 +2642,70 @@ pub(crate) fn draw_tool_shape_options(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let matches = |label: &str| -> bool { q.is_empty() || label.to_lowercase().contains(q) };
     let forced_open = ctx.forced_open;
     let mut action: Option<PanelAction> = None;
+    if ctx.active_tool == Tool::AreaTrace && matches("Area Trace") {
+        egui::CollapsingHeader::new("Area Trace")
+            .default_open(true)
+            .open(forced_open)
+            .show(ui, |ui| {
+                ui.label("Colors");
+                ui.add(egui::Slider::new(ctx.area_trace_colors, 1..=24));
+                ui.label("Detail");
+                ui.add(
+                    egui::Slider::new(ctx.area_trace_detail, 0.1..=1.0).custom_formatter(
+                        |value, _| format!("{}%", (value * 100.0).round() as u32),
+                    ),
+                );
+                ui.label("Smoothing");
+                ui.add(egui::Slider::new(ctx.area_trace_smoothing, 0.0..=8.0).suffix(" px"));
+                ui.label("Minimum area");
+                ui.add(egui::Slider::new(ctx.area_trace_min_area, 1..=128).suffix(" px"));
+                ui.checkbox(ctx.area_trace_ignore_white, "Ignore white background");
+                ui.add_space(7.0);
+                if ctx.area_trace_preview_active {
+                    ui.label(
+                        RichText::new(if ctx.area_trace_preview_ready {
+                            "● Live vector preview"
+                        } else {
+                            "● No visible result with these settings"
+                        })
+                        .color(if ctx.area_trace_preview_ready {
+                            Color32::from_rgb(92, 196, 132)
+                        } else {
+                            Color32::from_rgb(238, 166, 72)
+                        })
+                        .small(),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(ctx.area_trace_preview_ready, egui::Button::new("Apply"))
+                            .clicked()
+                        {
+                            ctx.action = Some(PanelAction::ApplyAreaTrace);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ctx.action = Some(PanelAction::CancelAreaTrace);
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Adjust freely · Enter applies · Esc cancels")
+                            .weak()
+                            .small(),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new("Drag over an image to define the trace area")
+                            .weak()
+                            .small(),
+                    );
+                    ui.label(
+                        RichText::new("A live preview appears before anything is committed")
+                            .weak()
+                            .small(),
+                    );
+                }
+            });
+        return;
+    }
     // ── Tool / shape options ──────────────────────────────────────────────────
     if matches("New Shape Fill") {
         egui::CollapsingHeader::new("New Shape Fill")

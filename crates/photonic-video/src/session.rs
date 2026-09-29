@@ -4590,7 +4590,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
         }
         drop(feeder);
-        std::fs::remove_file(path).unwrap();
+        // Windows can keep the ffmpeg input open briefly after the feeder's
+        // worker and child process have exited. Bound the cleanup wait so a
+        // persistent handle leak still fails this test.
+        let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match std::fs::remove_file(&path) {
+                Ok(()) => break,
+                Err(err)
+                    if cfg!(windows)
+                        && err.raw_os_error() == Some(32)
+                        && Instant::now() < cleanup_deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("failed to remove mixer test input: {err}"),
+            }
+        }
     }
 
     #[test]
