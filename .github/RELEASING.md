@@ -18,10 +18,11 @@ Complete these settings **before** setting `RELEASE_GATE_CONFIGURED=true`:
    `vMAJOR.MINOR.PATCH` format without leading zeroes. The workflow repeats the
    format check because GitHub's `v*` trigger is broader.
 3. Keep the `release` environment's required reviewer set to `Quad-Kamatu`,
-   with **Prevent self-review** enabled and administrator bypass disabled. The
-   only deployment branch/tag policy is the custom `v*` **tag** pattern. Since
-   Quad-Kamatu is the sole reviewer, another administrator must initiate a
-   release; a run initiated by Quad-Kamatu cannot be approved by Quad-Kamatu.
+   with **Prevent self-review** disabled so the repository owner can initiate
+   and approve a release. Keep administrator bypass disabled: every release
+   must still receive an explicit approval. The only deployment branch/tag
+   policy is the custom `v*` **tag** pattern. Self-approval is an operational
+   choice and does not provide an independent review of the release.
 4. Add `PHOTONIC_SIGNING_KEY` to **environment** secrets in `release` using the
    existing base64-encoded 64-byte private key. Remove the repository-level
    secret with the same name after migration so other workflows cannot read it.
@@ -34,10 +35,10 @@ Complete these settings **before** setting `RELEASE_GATE_CONFIGURED=true`:
    protection rules above.
 
 For a release, merge the reviewed version and changelog changes into `main`.
-An administrator other than Quad-Kamatu creates `vMAJOR.MINOR.PATCH` at that
-commit and pushes the tag. Quad-Kamatu inspects and approves the waiting
-`release` deployment.
-The signing job will fail without the environment key.
+Quad-Kamatu or another repository administrator creates `vMAJOR.MINOR.PATCH`
+at that commit and pushes the tag. Quad-Kamatu inspects and approves the
+waiting `release` deployment. The signing job will fail without the
+environment key.
 
 If the signing key is suspected to be compromised, stop releases and rotate the
 key in both the workflow environment and the updater's embedded public key
