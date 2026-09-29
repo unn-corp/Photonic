@@ -1172,6 +1172,14 @@ impl Document {
             .and_then(|id| self.layers.get(id))
     }
 
+    /// Template layers are implicitly locked, including in older documents
+    /// whose stored `locked` flag is false.
+    pub fn is_layer_locked(&self, id: &LayerId) -> bool {
+        self.layers
+            .get(id)
+            .is_some_and(|layer| layer.locked || layer.is_template)
+    }
+
     // --- Node operations ---
 
     /// Add a node to the specified layer (or the active layer if None).
