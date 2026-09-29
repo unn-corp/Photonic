@@ -1,12 +1,15 @@
-# Build, sign, and publish Photonic release binaries on every version tag.
+# Build Photonic release binaries from reviewed version tags, then require
+# release-environment approval before signing and publishing them.
 #
 # Trigger:  git tag v0.2.0 && git push origin v0.2.0
 # Result:   a GitHub Release with a signed binary archive per platform, which
 #           the in-app self-updater downloads and verifies.
 #
-# Required repo secret:
+# Required secret in the protected `release` environment:
 #   PHOTONIC_SIGNING_KEY = base64 of release/photonic-signing.priv
 #   (the ed25519 private key; the public key is committed and embedded in the app)
+# Configure required reviewers (with self-review disabled), allow only v* tags
+# to deploy, and protect v* tag creation with a repository ruleset.
 
 name: release
 
@@ -21,12 +24,11 @@ env:
   CARGO_TERM_COLOR: always
   ZIPSIGN_VERSION: "0.2.1"
   ZIPSIGN_SHA256: bc5d02b6a44b677c4c412fca9eb5c9b08f255692b30f6943248437b6add1f5c6
-  PHOTONIC_PUBLIC_KEY_SHA256: 34642dd944fd2940db6f08843aa8a2c31e66e5df16901b6d9be52c8509b1243d
 
 jobs:
   # Tags are accepted only when they resolve to a commit already reachable
   # from protected main. This is the approved release-branch path; repository
-  # administrators may additionally protect v* tags with a tag ruleset.
+  # administrators must also protect v* tags with a tag ruleset.
   validate_release:
     name: Validate release provenance
     runs-on: ubuntu-22.04
@@ -46,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          if [[ "$GITHUB_REF_TYPE" != "tag" || ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             echo "::error::release runs require a version tag such as v1.2.3" >&2
             exit 1
           fi
@@ -54,7 +56,13 @@ jobs:
           git fetch --no-tags origin \
             "refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
           tag_commit="$(git rev-parse --verify "$TAG_COMMIT^{commit}")"
+          ref_commit="$(git rev-parse --verify "refs/tags/$GITHUB_REF_NAME^{commit}")"
           main_ref="refs/remotes/origin/$DEFAULT_BRANCH"
+
+          if [[ "$tag_commit" != "$ref_commit" ]]; then
+            echo "::error::tag ref does not match the triggering commit" >&2
+            exit 1
+          fi
 
           if ! git merge-base --is-ancestor "$tag_commit" "$main_ref"; then
             echo "::error::${GITHUB_REF_NAME} does not point to a commit in protected $DEFAULT_BRANCH" >&2
@@ -155,143 +163,41 @@ jobs:
           compression-level: 0
           retention-days: 1
 
-  sign:
-    name: Sign ${{ matrix.target }}
+  sign_and_publish:
+    name: Approve, sign, and publish release
     needs: [validate_release, build]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-22.04
+    environment:
+      name: release
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            archive: photonic-x86_64-unknown-linux-gnu.tar.gz
-            archive_kind: tar
-            archive_member: photonic
-          - os: macos-13
-            target: x86_64-apple-darwin
-            archive: photonic-x86_64-apple-darwin.tar.gz
-            archive_kind: tar
-            archive_member: photonic
-          - os: macos-14
-            target: aarch64-apple-darwin
-            archive: photonic-aarch64-apple-darwin.tar.gz
-            archive_kind: tar
-            archive_member: photonic
-          - os: windows-2022
-            target: x86_64-pc-windows-msvc
-            archive: photonic-x86_64-pc-windows-msvc.zip
-            archive_kind: zip
-            archive_member: photonic.exe
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Check out reviewed release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
 
-      - name: Download unsigned archive
+      # GitHub silently creates missing environments without protection. Keep
+      # this job closed until an administrator completes the release setup.
+      - name: Require configured release environment
+        env:
+          RELEASE_GATE_CONFIGURED: ${{ vars.RELEASE_GATE_CONFIGURED }}
+        shell: bash
+        run: |
+          if [[ "$RELEASE_GATE_CONFIGURED" != "true" ]]; then
+            echo "::error::complete the protected release environment setup before publishing" >&2
+            exit 1
+          fi
+
+      - name: Download all unsigned archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: unsigned-${{ matrix.target }}
+          pattern: unsigned-*
           path: unsigned
+          merge-multiple: true
 
-      # This runs before the signing key is materialized. The build job is not
-      # trusted with the key, so the signing runner checks both the transferred
-      # archive and the exact member it is allowed to contain.
-      - name: Verify archive contents, digest, and release key
-        shell: bash
-        env:
-          ARCHIVE_PATH: unsigned/${{ matrix.archive }}
-          CHECKSUM_PATH: unsigned/${{ matrix.archive }}.sha256
-          ARCHIVE_KIND: ${{ matrix.archive_kind }}
-          ARCHIVE_MEMBER: ${{ matrix.archive_member }}
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import hashlib
-          import os
-          import stat
-          import tarfile
-          import zipfile
-          from pathlib import Path
-
-          root = Path("unsigned")
-          archive = Path(os.environ["ARCHIVE_PATH"])
-          checksum = Path(os.environ["CHECKSUM_PATH"])
-          expected_entries = {
-              archive.relative_to(root).as_posix(),
-              checksum.relative_to(root).as_posix(),
-          }
-          actual_entries = {
-              path.relative_to(root).as_posix() for path in root.rglob("*")
-          }
-          if actual_entries != expected_entries:
-              raise SystemExit(
-                  f"unexpected artifact files: {sorted(actual_entries)}"
-              )
-          if (
-              not archive.is_file()
-              or archive.is_symlink()
-              or not checksum.is_file()
-              or checksum.is_symlink()
-          ):
-              raise SystemExit("artifact manifest and archive must be regular files")
-
-          checksum_parts = checksum.read_text(encoding="ascii").split()
-          if len(checksum_parts) != 2 or checksum_parts[1].lstrip("*") != archive.name:
-              raise SystemExit("checksum manifest does not name the expected archive")
-          expected_digest = checksum_parts[0].lower()
-          if len(expected_digest) != 64 or any(
-              char not in "0123456789abcdef" for char in expected_digest
-          ):
-              raise SystemExit("checksum manifest contains an invalid SHA-256")
-
-          digest = hashlib.sha256()
-          with archive.open("rb") as handle:
-              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                  digest.update(chunk)
-          if digest.hexdigest() != expected_digest:
-              raise SystemExit("unsigned archive digest does not match its manifest")
-
-          public_key = Path("release/photonic-signing.pub")
-          if public_key.stat().st_size != 32:
-              raise SystemExit("release public key must be exactly 32 bytes")
-          public_digest = hashlib.sha256(public_key.read_bytes()).hexdigest()
-          if public_digest != os.environ["PHOTONIC_PUBLIC_KEY_SHA256"]:
-              raise SystemExit("release public key digest is not the reviewed key")
-
-          member_name = os.environ["ARCHIVE_MEMBER"]
-          if os.environ["ARCHIVE_KIND"] == "tar":
-              with tarfile.open(archive, "r:gz") as container:
-                  members = container.getmembers()
-                  if len(members) != 1:
-                      raise SystemExit("tar archive must contain exactly one member")
-                  member = members[0]
-                  if (
-                      member.name != member_name
-                      or not member.isfile()
-                      or member.size <= 0
-                  ):
-                      raise SystemExit("tar archive contains an unexpected member")
-          elif os.environ["ARCHIVE_KIND"] == "zip":
-              with zipfile.ZipFile(archive) as container:
-                  members = container.infolist()
-                  if len(members) != 1:
-                      raise SystemExit("zip archive must contain exactly one member")
-                  member = members[0]
-                  mode = (member.external_attr >> 16) & 0o170000
-                  if (
-                      member.filename != member_name
-                      or member.is_dir()
-                      or mode not in (0, stat.S_IFREG)
-                      or member.file_size <= 0
-                  ):
-                      raise SystemExit("zip archive contains an unexpected member")
-          else:
-              raise SystemExit("unsupported archive type")
-          print(f"verified {archive} ({expected_digest})")
-          PY
+      - name: Verify unsigned release artifacts
+        run: python .github/scripts/verify-release-artifacts.py
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
@@ -372,83 +278,75 @@ jobs:
           set -euo pipefail
           test "$(zipsign --version)" = "zipsign $ZIPSIGN_VERSION"
 
-      # The key is intentionally the last materialized input. Everything above
-      # is complete before this step can read the signing secret.
+      # The environment secret is read only after approval and input validation.
       - name: Decode signing key
         env:
           KEY_B64: ${{ secrets.PHOTONIC_SIGNING_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
+          python - <<'PYKEY'
           import base64
           import os
+          from pathlib import Path
 
-          key = base64.b64decode(os.environ["KEY_B64"], validate=True)
+          encoded = os.environ["KEY_B64"]
+          if not encoded:
+              raise SystemExit("release environment is missing PHOTONIC_SIGNING_KEY")
+          key = base64.b64decode(encoded, validate=True)
           if len(key) != 64:
               raise SystemExit("signing key must be a 64-byte Ed25519 keypair")
-          path = os.path.join(os.environ["RUNNER_TEMP"], "photonic-signing.priv")
-          descriptor = os.open(
-              path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
-          )
+          path = Path(os.environ["RUNNER_TEMP"]) / "photonic-signing.priv"
+          descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
           with os.fdopen(descriptor, "wb") as output:
               output.write(key)
-          PY
+          PYKEY
 
-      - name: Sign and verify archive
+      - name: Sign and verify every archive
         shell: bash
-        env:
-          ARCHIVE_PATH: unsigned/${{ matrix.archive }}
-          ARCHIVE_KIND: ${{ matrix.archive_kind }}
         run: |
           set -euo pipefail
           key_path="$RUNNER_TEMP/photonic-signing.priv"
           derived_public_key="$RUNNER_TEMP/photonic-signing.pub"
           zipsign gen-key "$key_path" "$derived_public_key" --extract
-          python - "$derived_public_key" release/photonic-signing.pub <<'PY'
-          import pathlib
-          import sys
+          cmp "$derived_public_key" release/photonic-signing.pub
+          for archive in \
+            photonic-x86_64-unknown-linux-gnu.tar.gz \
+            photonic-x86_64-apple-darwin.tar.gz \
+            photonic-aarch64-apple-darwin.tar.gz; do
+            zipsign sign tar "unsigned/$archive" "$key_path"
+            zipsign verify tar "unsigned/$archive" release/photonic-signing.pub
+          done
+          archive=photonic-x86_64-pc-windows-msvc.zip
+          zipsign sign zip "unsigned/$archive" "$key_path"
+          zipsign verify zip "unsigned/$archive" release/photonic-signing.pub
 
-          if pathlib.Path(sys.argv[1]).read_bytes() != pathlib.Path(sys.argv[2]).read_bytes():
-              raise SystemExit("signing key does not match the committed public key")
-          PY
-          zipsign sign "$ARCHIVE_KIND" "$ARCHIVE_PATH" "$key_path"
-          zipsign verify "$ARCHIVE_KIND" "$ARCHIVE_PATH" release/photonic-signing.pub
+      - name: Remove signing key before publishing
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/photonic-signing.priv" "$RUNNER_TEMP/photonic-signing.pub"
 
-      # Extract this tag's CHANGELOG section as the release body. Done once, on
-      # Linux, to avoid relying on awk on the Windows runner; the other matrix
-      # jobs publish without a body and softprops leaves the existing one intact.
       - name: Extract release notes
-        if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -euo pipefail
           VER="${GITHUB_REF_NAME#v}"
           awk -v ver="$VER" '
             $0 ~ "^## \\[" ver "\\]" { grab=1; next }
-            grab && /^## \[/ { exit }
+            grab && /^## \\[/ { exit }
             grab { print }
           ' CHANGELOG.md | sed '/./,$!d' > RELEASE_BODY.md
           if [ ! -s RELEASE_BODY.md ]; then
             echo "Photonic $GITHUB_REF_NAME" > RELEASE_BODY.md
           fi
-          echo "----- release body -----"; cat RELEASE_BODY.md
 
-      - name: Publish to release (with notes)
-        if: runner.os == 'Linux'
+      - name: Publish signed archives
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          files: unsigned/${{ matrix.archive }}
+          files: |
+            unsigned/photonic-x86_64-unknown-linux-gnu.tar.gz
+            unsigned/photonic-x86_64-apple-darwin.tar.gz
+            unsigned/photonic-aarch64-apple-darwin.tar.gz
+            unsigned/photonic-x86_64-pc-windows-msvc.zip
           fail_on_unmatched_files: true
           body_path: RELEASE_BODY.md
-
-      - name: Publish to release
-        if: runner.os != 'Linux'
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
-        with:
-          files: unsigned/${{ matrix.archive }}
-          fail_on_unmatched_files: true
-
-      - name: Clean up signing key
-        if: always()
-        shell: bash
-        run: rm -f "$RUNNER_TEMP/photonic-signing.priv" "$RUNNER_TEMP/photonic-signing.pub"
