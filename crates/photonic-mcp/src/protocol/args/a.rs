@@ -400,7 +400,7 @@ pub struct CreateScatterPlotArgs {
 pub struct ScatterCopiesArgs {
     /// Source node ID to scatter.
     pub node_id: String,
-    /// Number of copies (default: 20).
+    /// Number of copies (default: 20; maximum: [`MAX_GENERATED_WORK`]).
     pub count: Option<usize>,
     /// Scatter area left X.
     pub x: f64,
@@ -1082,11 +1082,11 @@ pub struct CreateFlareArgs {
     pub cy: f64,
     /// Halo radius in document units (default: 50).
     pub halo_radius: Option<f64>,
-    /// Number of radiating rays (default: 12).
+    /// Number of radiating rays (default: 12; maximum: [`MAX_GENERATED_WORK`]).
     pub ray_count: Option<usize>,
     /// Length of rays beyond the halo (default: 80).
     pub ray_length: Option<f64>,
-    /// Number of concentric rings (default: 3).
+    /// Number of concentric rings (default: 3; maximum: [`MAX_GENERATED_WORK`]).
     pub ring_count: Option<usize>,
     /// Halo color as hex (default: "#fffbe6" warm yellow).
     pub halo_color: Option<String>,
