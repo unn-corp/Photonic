@@ -2,6 +2,7 @@
 //! resolution, corner rounding, and path distortions). Pure functions — no UI.
 #![allow(clippy::too_many_arguments)]
 use super::*;
+use photonic_render::TextLayoutOptions;
 
 pub(crate) fn bez_to_screen_points(bez: &BezPath, view: &CanvasView) -> Vec<egui::Pos2> {
     let mut pts: Vec<egui::Pos2> = Vec::new();
@@ -94,7 +95,18 @@ pub(crate) fn text_aware_canvas_bounds(
             // is negative) with zoom factored out. For Normal nodes with no shift
             // this is size_scale()=1.0 and offset=0, leaving bounds byte-identical.
             let effective_font_size = t.font_size * t.script_position.size_scale();
-            let (w, h) = renderer.measure_text(&t.content, &t.font_family, effective_font_size);
+            let (w, h) = renderer.measure_text_with_layout(
+                &t.content,
+                &t.font_family,
+                effective_font_size,
+                TextLayoutOptions {
+                    font_weight: t.font_weight,
+                    font_style: t.font_style,
+                    line_height_mul: t.line_height as f32,
+                    letter_spacing: t.letter_spacing as f32,
+                    vertical: t.vertical,
+                },
+            );
             let offset_y =
                 -(t.script_position.baseline_offset_em() * t.font_size) - t.baseline_shift;
             kurbo::Rect::new(0.0, offset_y, w, offset_y + h)

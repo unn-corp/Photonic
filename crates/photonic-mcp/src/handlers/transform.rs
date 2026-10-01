@@ -1,4 +1,5 @@
 use crate::handlers::shared::{cloning::*, random::*};
+use crate::procedural_work::{check_array_work, check_scatter_work, check_split_work};
 use crate::protocol::*;
 use crate::server::AppState;
 use kurbo;
@@ -562,6 +563,10 @@ pub async fn duplicate_nodes(state: &AppState, args: DuplicateNodesArgs) -> Tool
 pub async fn create_array(state: &AppState, args: CreateArrayArgs) -> ToolResult {
     use photonic_core::transform::Transform;
 
+    if let Err(error) = check_array_work(&args) {
+        return ToolResult::error(error);
+    }
+
     // ── Read phase: validate source ───────────────────────────────────────
     let (src_id, src_layer, src_name, src_z) = {
         let doc = state.document.lock().await;
@@ -584,13 +589,26 @@ pub async fn create_array(state: &AppState, args: CreateArrayArgs) -> ToolResult
         ArrayMode::Grid => {
             let rows = args.rows.unwrap_or(2).max(1);
             let cols = args.cols.unwrap_or(2).max(1);
-            if rows * cols < 2 {
+            let cell_count = match rows.checked_mul(cols) {
+                Some(cell_count) => cell_count,
+                None => {
+                    return ToolResult::error(
+                        "Grid dimensions overflow before array allocation (rows × cols)",
+                    )
+                }
+            };
+            if cell_count > MAX_ARRAY_GRID_CELLS {
+                return ToolResult::error(format!(
+                    "Grid must have at most {MAX_ARRAY_GRID_CELLS} cells (rows × cols)"
+                ));
+            }
+            if cell_count < 2 {
                 return ToolResult::error("Grid must have at least 2 cells (rows × cols ≥ 2)");
             }
             let dx = args.col_stride.unwrap_or(100.0);
             let dy = args.row_stride.unwrap_or(100.0);
 
-            let mut out = Vec::with_capacity(rows * cols - 1);
+            let mut out = Vec::with_capacity(cell_count - 1);
             let mut n = 1usize;
             for r in 0..rows {
                 for c in 0..cols {
@@ -1264,6 +1282,9 @@ pub async fn fit_to_canvas(state: &AppState, args: FitToCanvasArgs) -> ToolResul
 pub async fn scatter_copies(state: &AppState, args: ScatterCopiesArgs) -> ToolResult {
     tracing::debug!("tool: scatter_copies");
 
+    if let Err(error) = check_scatter_work(args.count) {
+        return ToolResult::error(error);
+    }
     let count = args.count.unwrap_or(20).max(1);
     let rot_range = args.rotation_range.unwrap_or(0.0).abs();
     let scale_range = args.scale_range.unwrap_or(0.0).abs();
@@ -1527,12 +1548,13 @@ pub async fn transform_copies(state: &AppState, args: TransformCopiesArgs) -> To
 }
 /// Divide a path node's bounding box into a rows×cols grid of rectangle nodes.
 pub async fn split_into_grid(state: &AppState, args: SplitIntoGridArgs) -> ToolResult {
-    if args.rows == 0 {
-        return ToolResult::error("rows must be ≥ 1");
+    if let Err(error) = check_split_work(args.rows, args.cols) {
+        return ToolResult::error(error);
     }
-    if args.cols == 0 {
-        return ToolResult::error("cols must be ≥ 1");
-    }
+    let cell_count = args
+        .rows
+        .checked_mul(args.cols)
+        .expect("validated split grid dimensions");
 
     let mut doc = state.document.lock().await;
 
@@ -1596,8 +1618,8 @@ pub async fn split_into_grid(state: &AppState, args: SplitIntoGridArgs) -> ToolR
     let keep = args.keep_original.unwrap_or(false);
     let source_name = source.name.clone();
 
-    let mut commands: Vec<Command> = Vec::new();
-    let mut created_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut commands: Vec<Command> = Vec::with_capacity(cell_count + if keep { 0 } else { 1 });
+    let mut created_ids: Vec<uuid::Uuid> = Vec::with_capacity(cell_count);
 
     for r in 0..args.rows {
         for c in 0..args.cols {
