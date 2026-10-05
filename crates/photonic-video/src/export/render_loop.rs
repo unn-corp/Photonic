@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use photonic_core::timeline::FrameRate;
-use photonic_render::color::Colorimetry;
+use photonic_render::color::{Colorimetry, Matrix};
 
 use super::convert;
 use super::encoder::{
@@ -29,17 +29,19 @@ use super::encoder::{
     EncoderCapabilities, EncoderProcess, PlaneKind,
 };
 use super::presets::ExportPreset;
+use crate::graph::ir::FrameColorEncoding;
 use crate::media::ffmpeg_locate::FfmpegTools;
 
-/// One evaluated frame handed to the render loop: linear, premultiplied,
-/// Rec.709 RGBA — the CPU-side `f32` shape of an `Rgba16Float` working-texture
-/// readback (03 §4.4 rule 3 keeps CPU reference math in `f32`, not `f16`).
+/// One evaluated frame handed to the render loop. Its pixel interpretation
+/// must be explicit; format alone cannot distinguish linear working values
+/// from a managed display or video output signal.
 /// `rgba_premult.len()` must equal `width * height * 4`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub rgba_premult: Vec<f32>,
+    pub encoding: FrameColorEncoding,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -299,7 +301,7 @@ pub fn export_frames_multi(
                 let mut planes = None;
                 for (process, conversion) in &mut encoders {
                     if previous != Some(*conversion) {
-                        planes = Some(conversion.convert(&frame));
+                        planes = Some(conversion.convert(&frame)?);
                         previous = Some(*conversion);
                     }
                     process.write_video_frame(planes.as_ref().expect("converted above"))?;
@@ -341,20 +343,73 @@ struct FrameConversion {
 }
 
 impl FrameConversion {
-    fn convert(self, frame: &Frame) -> convert::EncodePlanes {
-        match self.kind {
-            PlaneKind::Rgba8 => {
-                convert::working_frame_to_rgba8(&frame.rgba_premult, frame.width, frame.height)
+    fn convert(self, frame: &Frame) -> Result<convert::EncodePlanes, ExportError> {
+        if let Some(component) = frame
+            .rgba_premult
+            .iter()
+            .position(|value| !value.is_finite())
+        {
+            return Err(ExportError::Resolve(format!(
+                "frame contains a non-finite RGBA component at index {component}"
+            )));
+        }
+        if frame.encoding == FrameColorEncoding::Bt709Video
+            && self.colorimetry.matrix != Matrix::Bt709
+        {
+            return Err(ExportError::Resolve(
+                "BT.709 video-signal pixels require a BT.709 export matrix".into(),
+            ));
+        }
+        let pixels = &frame.rgba_premult;
+        let (w, h) = (frame.width, frame.height);
+        let planes = match (frame.encoding, self.kind) {
+            (FrameColorEncoding::LegacyLinearRec709, PlaneKind::Rgba8) => {
+                convert::working_frame_to_rgba8(pixels, w, h)
             }
-            _ => convert::working_frame_to_yuv_planes(
-                &frame.rgba_premult,
-                frame.width,
-                frame.height,
+            (FrameColorEncoding::SrgbDisplay, PlaneKind::Rgba8) => {
+                convert::srgb_display_frame_to_rgba8(pixels, w, h)
+            }
+            (FrameColorEncoding::LegacyLinearRec709, PlaneKind::Yuv422P10) => {
+                convert::working_frame_to_yuv422p10(pixels, w, h, self.colorimetry)
+            }
+            (FrameColorEncoding::Bt709Video, PlaneKind::Yuv422P10) => {
+                convert::video_signal_frame_to_yuv422p10(pixels, w, h, self.colorimetry)
+            }
+            (FrameColorEncoding::LegacyLinearRec709, PlaneKind::Yuva444P12) => {
+                convert::working_frame_to_yuva444p12(pixels, w, h, self.colorimetry)
+            }
+            (FrameColorEncoding::Bt709Video, PlaneKind::Yuva444P12) => {
+                convert::video_signal_frame_to_yuva444p12(pixels, w, h, self.colorimetry)
+            }
+            (FrameColorEncoding::Bt709Video, PlaneKind::Rgba8) => {
+                return Err(ExportError::Resolve(
+                    "BT.709 video-signal pixels cannot be packed as an sRGB image".into(),
+                ));
+            }
+            (FrameColorEncoding::LegacyLinearRec709, _) => convert::working_frame_to_yuv_planes(
+                pixels,
+                w,
+                h,
                 self.colorimetry,
                 self.alpha,
                 self.kind == PlaneKind::Yuva444,
             ),
-        }
+            (FrameColorEncoding::Bt709Video, _) => convert::video_signal_frame_to_yuv_planes(
+                pixels,
+                w,
+                h,
+                self.colorimetry,
+                self.alpha,
+                self.kind == PlaneKind::Yuva444,
+            ),
+            _ => {
+                return Err(ExportError::Resolve(format!(
+                    "frame encoding {:?} is incompatible with {:?} export packing",
+                    frame.encoding, self.kind
+                )))
+            }
+        };
+        Ok(planes)
     }
 }
 
@@ -483,6 +538,201 @@ mod tests {
     };
     use crate::media::ffmpeg_locate::locate_for_test;
 
+    #[test]
+    fn frame_conversion_dispatches_on_pixel_encoding_and_rejects_mismatch() {
+        let rgba = [0.4_f32, 0.3, 0.2, 1.0].repeat(4);
+        let mut frame = Frame {
+            width: 2,
+            height: 2,
+            rgba_premult: rgba,
+            encoding: FrameColorEncoding::Bt709Video,
+        };
+        let yuv = FrameConversion {
+            kind: PlaneKind::Yuv420,
+            alpha: false,
+            colorimetry: Colorimetry::BT709_LIMITED,
+        };
+        assert_eq!(
+            yuv.convert(&frame).unwrap().to_bytes(),
+            convert::video_signal_frame_to_yuv_planes(
+                &frame.rgba_premult,
+                2,
+                2,
+                Colorimetry::BT709_LIMITED,
+                false,
+                false,
+            )
+            .to_bytes()
+        );
+        let png = FrameConversion {
+            kind: PlaneKind::Rgba8,
+            ..yuv
+        };
+        assert!(matches!(png.convert(&frame), Err(ExportError::Resolve(_))));
+        let wrong_matrix = FrameConversion {
+            colorimetry: Colorimetry {
+                matrix: Matrix::Bt601,
+                ..Colorimetry::BT709_LIMITED
+            },
+            ..yuv
+        };
+        assert!(matches!(
+            wrong_matrix.convert(&frame),
+            Err(ExportError::Resolve(message)) if message.contains("BT.709 export matrix")
+        ));
+        frame.encoding = FrameColorEncoding::SrgbDisplay;
+        assert!(matches!(yuv.convert(&frame), Err(ExportError::Resolve(_))));
+        assert_eq!(
+            png.convert(&frame).unwrap().to_bytes(),
+            convert::srgb_display_frame_to_rgba8(&frame.rgba_premult, 2, 2).to_bytes()
+        );
+        frame.encoding = FrameColorEncoding::SceneLinearAcescg;
+        assert!(matches!(png.convert(&frame), Err(ExportError::Resolve(_))));
+        frame.encoding = FrameColorEncoding::LegacyLinearRec709;
+        frame.rgba_premult[0] = f32::INFINITY;
+        assert!(matches!(
+            yuv.convert(&frame),
+            Err(ExportError::Resolve(message)) if message.contains("non-finite RGBA")
+        ));
+    }
+
+    #[test]
+    fn encoded_bt709_frame_exports_with_tags_and_reimports_without_second_transfer() {
+        let Some(tools) = locate_for_test() else {
+            eprintln!("ffmpeg/ffprobe unavailable; skipping encoded export round-trip");
+            return;
+        };
+        let mut preset = tiny_preset();
+        preset.audio = None;
+        let path = tmp_out("encoded-bt709.mp4");
+        let _ = std::fs::remove_file(&path);
+        let resolved = ResolvedExport::basic(
+            16,
+            16,
+            FrameRate::new(10, 1),
+            None,
+            path.clone(),
+            Colorimetry::BT709_LIMITED,
+        );
+        let scene = [0.18; 3];
+        let expected = crate::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_straight_video(scene)
+            .unwrap();
+        let frame = Frame {
+            width: 16,
+            height: 16,
+            rgba_premult: [
+                expected[0] as f32,
+                expected[1] as f32,
+                expected[2] as f32,
+                1.0,
+            ]
+            .repeat(256),
+            encoding: FrameColorEncoding::Bt709Video,
+        };
+        export_frames(
+            &tools,
+            &preset,
+            &resolved,
+            1,
+            |_| frame.clone(),
+            None,
+            &AtomicBool::new(false),
+            |_| {},
+        )
+        .unwrap();
+        let probe = std::process::Command::new(&tools.ffprobe)
+            .args(["-v", "error", "-show_streams", "-of", "json"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(probe.status.success());
+        let probe: serde_json::Value = serde_json::from_slice(&probe.stdout).unwrap();
+        let video = &probe["streams"][0];
+        assert_eq!(video["color_space"], "bt709");
+        assert_eq!(video["color_transfer"], "bt709");
+        assert_eq!(video["color_primaries"], "bt709");
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&path)
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 16 * 16 * 3);
+        for channel in 0..3 {
+            let got = decoded.stdout[channel] as f64 / 255.0;
+            assert!(
+                (got - expected[channel]).abs() < 0.04,
+                "channel {channel}: {got} vs {}",
+                expected[channel]
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn invalid_encoded_frame_preserves_existing_export_destination() {
+        let Some(tools) = locate_for_test() else {
+            return;
+        };
+        let mut preset = tiny_preset();
+        preset.audio = None;
+        let directory = std::env::temp_dir().join(format!(
+            "photonic-encoded-rejection-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("wrong-encoded-frame.mp4");
+        std::fs::write(&path, b"previous export").unwrap();
+        let resolved = ResolvedExport::basic(
+            16,
+            16,
+            FrameRate::new(10, 1),
+            None,
+            path.clone(),
+            Colorimetry::BT709_LIMITED,
+        );
+        let mut frame = Frame {
+            width: 16,
+            height: 16,
+            rgba_premult: [0.5, 0.5, 0.5, 1.0].repeat(256),
+            encoding: FrameColorEncoding::SrgbDisplay,
+        };
+        let result = export_frames(
+            &tools,
+            &preset,
+            &resolved,
+            1,
+            |_| frame.clone(),
+            None,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert!(matches!(result, Err(ExportError::Resolve(_))));
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        frame.encoding = FrameColorEncoding::Bt709Video;
+        frame.rgba_premult[0] = f32::NAN;
+        let nonfinite = export_frames(
+            &tools,
+            &preset,
+            &resolved,
+            1,
+            |_| frame.clone(),
+            None,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert!(
+            matches!(nonfinite, Err(ExportError::Resolve(message)) if message.contains("non-finite RGBA"))
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"previous export");
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     macro_rules! tools_or_skip {
         () => {
             match locate_for_test() {
@@ -517,6 +767,7 @@ mod tests {
             width: w,
             height: h,
             rgba_premult: rgba,
+            encoding: FrameColorEncoding::LegacyLinearRec709,
         }
     }
 
@@ -847,6 +1098,7 @@ mod tests {
             width: 16,
             height: 16,
             rgba_premult: [0.125, 0.25, 0.375, 0.5].repeat(256),
+            encoding: FrameColorEncoding::LegacyLinearRec709,
         };
         export_frames_multi(
             &tools,
@@ -944,6 +1196,7 @@ mod tests {
                         width: 16,
                         height: 16,
                         rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
                     }
                 }
             },

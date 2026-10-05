@@ -29,6 +29,10 @@ const KIND_CONTRAST: u32 = 1;
 const KIND_WHITE_BALANCE: u32 = 2;
 const KIND_CDL: u32 = 3;
 const KIND_HSL_QUALIFIER: u32 = 4;
+const KIND_LINEAR_OFFSET: u32 = 5;
+const KIND_HIGHLIGHT_ROLLOFF: u32 = 6;
+const KIND_SATURATION_VIBRANCE: u32 = 7;
+const KIND_PRINTER_LIGHTS: u32 = 8;
 
 // ── shared WGSL prelude (vertex quad + enc/dec + luma709 + hsl + mask) ──────
 
@@ -129,7 +133,7 @@ fn smoothstep1(e0: f32, e1: f32, x: f32) -> f32 {
 
 // Power-window weight at normalized coord (x,y). center.xy, size.xy in `c`;
 // rotation, softness in `p.xy`; `p.zw` is the physical→logical uv scale.
-// `rect` != 0 → rectangle (Chebyshev) else ellipse.
+// shape: 0 ellipse, 1 rectangle, 2 directional gradient.
 //
 // `x`/`y` arrive normalized against the RENDER TARGET, which is a pool-bucketed
 // texture whose dimensions are rounded up to a multiple of 64 — so uv 1.0 is the
@@ -139,7 +143,7 @@ fn smoothstep1(e0: f32, e1: f32, x: f32) -> f32 {
 // 1920x1080 buckets to 1920x1088 and the window lands 0.741% off vertically.
 // Scaling here rather than pre-scaling center/size on the CPU keeps the rotation
 // in logical space — with a per-axis scale, a rotated ellipse would shear.
-fn window_weight(x: f32, y: f32, c: vec4<f32>, p: vec4<f32>, rect: u32, invert: u32) -> f32 {
+fn window_weight(x: f32, y: f32, c: vec4<f32>, p: vec4<f32>, shape: u32, invert: u32) -> f32 {
     let dx = x * p.z - c.x;
     let dy = y * p.w - c.y;
     let sn = sin(p.x);
@@ -148,11 +152,16 @@ fn window_weight(x: f32, y: f32, c: vec4<f32>, p: vec4<f32>, rect: u32, invert: 
     let yl = -dx * sn + dy * cs;
     let sx = max(c.z, 1e-4);
     let sy = max(c.w, 1e-4);
-    var d: f32;
-    if (rect != 0u) { d = max(abs(xl / sx), abs(yl / sy)); }
-    else { d = sqrt((xl / sx) * (xl / sx) + (yl / sy) * (yl / sy)); }
-    let soft = max(p.y, 0.0);
-    var w = 1.0 - smoothstep1(1.0 - soft, 1.0 + soft, d);
+    var w: f32;
+    if (shape == 2u) {
+        w = 1.0 - smoothstep1(-sy, sy, yl);
+    } else {
+        var d: f32;
+        if (shape == 1u) { d = max(abs(xl / sx), abs(yl / sy)); }
+        else { d = sqrt((xl / sx) * (xl / sx) + (yl / sy) * (yl / sy)); }
+        let soft = max(p.y, 0.0);
+        w = 1.0 - smoothstep1(1.0 - soft, 1.0 + soft, d);
+    }
     if (invert != 0u) { w = 1.0 - w; }
     return w;
 }
@@ -172,6 +181,14 @@ fn unpremul3(c: vec4<f32>) -> vec3<f32> {
 /// Shared uniform for the uniform-math ops. Slots are interpreted per `kind`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct QualifierKeyUniform {
+    hue_sat: [f32; 4],
+    lum_soft: [f32; 4],
+    mode: [u32; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct MathUniform {
     /// x = op kind, y = has_mask, z = mask_rect, w = mask_invert.
     kind_flags: [u32; 4],
@@ -186,8 +203,11 @@ struct MathUniform {
     p3: [f32; 4],
     /// Qualifier: x=hue_lo, y=hue_hi, z=sat_lo, w=sat_hi.
     q_hue_sat: [f32; 4],
-    /// Qualifier: x=lum_lo, y=lum_hi, z=softness.
+    /// Qualifier: x=lum_lo, y=lum_hi, z=softness, w=black matte threshold.
     q_lum: [f32; 4],
+    /// x=sampled key count, y=matte-preview pass.
+    key_count: [u32; 4],
+    keys: [QualifierKeyUniform; photonic_core::timeline::MAX_QUALIFIER_KEYS],
     /// Mask: center.xy, size.xy.
     mask_c: [f32; 4],
     /// Mask: rotation, softness.
@@ -198,10 +218,17 @@ struct MathUniform {
 pub const MATH_SHADER: &str = r#"
 @group(0) @binding(0) var t_src: texture_2d<f32>;
 @group(0) @binding(1) var samp:  sampler;
+struct QualifierKey {
+    hue_sat: vec4<f32>,
+    lum_soft: vec4<f32>,
+    mode: vec4<u32>,
+}
 struct U {
     kind_flags: vec4<u32>,
     p0: vec4<f32>, p1: vec4<f32>, p2: vec4<f32>, p3: vec4<f32>,
     q_hue_sat: vec4<f32>, q_lum: vec4<f32>,
+    key_count: vec4<u32>,
+    keys: array<QualifierKey, 16>,
     mask_c: vec4<f32>, mask_p: vec4<f32>,
 }
 @group(0) @binding(2) var<uniform> u: U;
@@ -216,6 +243,24 @@ fn range_gate(v: f32, lo: f32, hi: f32, soft: f32) -> f32 {
 fn hue_gate(h: f32, lo: f32, hi: f32, soft: f32) -> f32 {
     return max(max(range_gate(h, lo, hi, soft), range_gate(h - 1.0, lo, hi, soft)),
                range_gate(h + 1.0, lo, hi, soft));
+}
+fn hsl_key_gate(hsl: vec3<f32>, hue_sat: vec4<f32>, lum_soft: vec4<f32>) -> f32 {
+    let hg = hue_gate(hsl.x / 360.0, hue_sat.x, hue_sat.y, lum_soft.z);
+    let sg = range_gate(hsl.y, hue_sat.z, hue_sat.w, lum_soft.z);
+    let lg = range_gate(hsl.z, lum_soft.x, lum_soft.y, lum_soft.z);
+    return hg * sg * lg;
+}
+
+fn native_cdl_power(value: f32, power: f32) -> f32 {
+    if (value <= 0.0) { return max(value, -65504.0); }
+    let ceiling = exp2(min(log2(65504.0) / power, 126.0));
+    return min(pow(min(value, ceiling), power), 65504.0);
+}
+fn native_cdl(rgb: vec3<f32>) -> vec3<f32> {
+    let sop = rgb * u.p0.xyz + u.p1.xyz;
+    let corrected = vec3<f32>(native_cdl_power(sop.r, u.p2.x), native_cdl_power(sop.g, u.p2.y), native_cdl_power(sop.b, u.p2.z));
+    let luma = dot(corrected, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return vec3<f32>(luma) + u.p3.x * (corrected - vec3<f32>(luma));
 }
 
 @fragment
@@ -239,17 +284,59 @@ fn fs_grade(in: VOut) -> @location(0) vec4<f32> {
         corrected = cdl3(c, u.p0.xyz, u.p1.xyz, u.p2.xyz, u.p3.x);
     } else if (kind == 4u) {
         corrected = cdl3(c, u.p0.xyz, u.p1.xyz, u.p2.xyz, u.p3.x);
-        let hsl = rgb_to_hsl(c);
-        let hg = hue_gate(hsl.x / 360.0, u.q_hue_sat.x, u.q_hue_sat.y, u.q_lum.z);
-        let sg = range_gate(hsl.y, u.q_hue_sat.z, u.q_hue_sat.w, u.q_lum.z);
-        let lg = range_gate(hsl.z, u.q_lum.x, u.q_lum.y, u.q_lum.z);
-        gate = hg * sg * lg;
+        var key_rgb = c;
+        if (u.key_count.z != 0u) {
+            corrected = native_cdl(c);
+            key_rgb = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+        let hsl = rgb_to_hsl(key_rgb);
+        var included = hsl_key_gate(hsl, u.q_hue_sat, u.q_lum);
+        var excluded = 0.0;
+        for (var index = 0u; index < u.key_count.x; index = index + 1u) {
+            let key = u.keys[index];
+            let value = hsl_key_gate(hsl, key.hue_sat, key.lum_soft);
+            if (key.mode.x != 0u) {
+                excluded = max(excluded, value);
+            } else {
+                included = max(included, value);
+            }
+        }
+        let weight = included * (1.0 - excluded);
+        gate = clamp((weight - u.q_lum.w) / (1.0 - u.q_lum.w - u.p3.y), 0.0, 1.0);
+    } else if (kind == 5u) {
+        corrected = c + u.p0.xyz;
+    } else if (kind == 6u) {
+        let knee = max(u.p0.x, 0.0);
+        let strength = max(u.p0.y, 0.0);
+        let peak = max(max(c.r, c.g), c.b);
+        if (strength > 0.0 && peak > knee && peak > 0.0) {
+            let excess = peak - knee;
+            let mapped_peak = knee + excess / (1.0 + strength * excess);
+            corrected = c * (mapped_peak / peak);
+        }
+    } else if (kind == 7u) {
+        let luma = luma709(c);
+        let peak = max(max(c.r, c.g), c.b);
+        let trough = min(min(c.r, c.g), c.b);
+        let reference = max(max(max(abs(c.r), abs(c.g)), abs(c.b)), 0.001);
+        let colorfulness = clamp((peak - trough) / reference, 0.0, 1.0);
+        let factor = max(u.p0.x, 0.0) * max(1.0 + clamp(u.p0.y, -1.0, 1.0) * (1.0 - colorfulness), 0.0);
+        corrected = vec3<f32>(luma) + (c - vec3<f32>(luma)) * factor;
+    } else if (kind == 8u) {
+        corrected = c * exp2(u.p0.xyz / 12.0);
     }
     var w = gate;
     if (u.kind_flags.y != 0u) {
         w = w * window_weight(in.uv.x, in.uv.y, u.mask_c, u.mask_p, u.kind_flags.z, u.kind_flags.w);
     }
-    return vec4<f32>(mix(c, corrected, w) * src.a, src.a);
+    if (kind == 4u && u.key_count.y != 0u) {
+        var matte = clamp(w * src.a, 0.0, 1.0);
+        if (u.key_count.w != 0u) { matte = select(0.0, clamp(w, 0.0, 1.0), src.a > 0.0); }
+        return vec4<f32>(vec3<f32>(matte), 1.0);
+    }
+    var result = mix(c, corrected, w) * src.a;
+    if (u.key_count.z != 0u) { result = clamp(result, vec3<f32>(-65504.0), vec3<f32>(65504.0)); }
+    return vec4<f32>(result, src.a);
 }
 "#;
 
@@ -258,25 +345,32 @@ fn fs_grade(in: VOut) -> @location(0) vec4<f32> {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct CurvesUniform {
+    domain: [u32; 4],
     /// x=has_mask, y=mask_rect, z=mask_invert, w=has_huehue.
     flags: [u32; 4],
-    /// x=has_huesat.
+    /// x=has_huesat, y=has_hueluma, z=has_lumasat, w=has_satsat.
     flags2: [u32; 4],
     mask_c: [f32; 4],
     mask_p: [f32; 4],
 }
 
 /// The curves grade kernel. `curves[row*256 + i]` holds row 0=master,
-/// 1=red, 2=green, 3=blue, 4=hue_vs_hue, 5=hue_vs_sat (07 §3.6).
+/// 1=red, 2=green, 3=blue, 4=hue_vs_hue, 5=hue_vs_sat,
+/// 6=hue_vs_luma, 7=luma_vs_sat, 8=sat_vs_sat.
 pub const CURVES_SHADER: &str = r#"
 @group(0) @binding(0) var t_src: texture_2d<f32>;
 @group(0) @binding(1) var samp:  sampler;
-struct U { flags: vec4<u32>, flags2: vec4<u32>, mask_c: vec4<f32>, mask_p: vec4<f32> }
+struct U { domain: vec4<u32>, flags: vec4<u32>, flags2: vec4<u32>, mask_c: vec4<f32>, mask_p: vec4<f32> }
 @group(0) @binding(2) var<uniform> u: U;
 @group(0) @binding(3) var<storage, read> curves: array<f32>;
 __PRELUDE__
 
 fn sample_curve(row: u32, v: f32) -> f32 {
+    let offset = row * 256u;
+    if (u.domain.x != 0u) {
+        if (v < 0.0) { return curves[offset] + v * 255.0 * (curves[offset + 1u] - curves[offset]); }
+        if (v > 1.0) { return curves[offset + 255u] + (v - 1.0) * 255.0 * (curves[offset + 255u] - curves[offset + 254u]); }
+    }
     let p = clamp(v, 0.0, 1.0) * 255.0;
     let i0 = u32(floor(p));
     let i1 = min(i0 + 1u, 255u);
@@ -295,9 +389,15 @@ fn fs_curves(in: VOut) -> @location(0) vec4<f32> {
         sample_curve(2u, sample_curve(0u, c.g)),
         sample_curve(3u, sample_curve(0u, c.b)),
     );
-    if (u.flags.w != 0u || u.flags2.x != 0u) {
-        var hsl = rgb_to_hsl(out);
+    if (u.flags.w != 0u || any(u.flags2 != vec4<u32>(0u))) {
+        var key_rgb = out;
+        if (u.domain.x != 0u) { key_rgb = clamp(out, vec3<f32>(0.0), vec3<f32>(1.0)); }
+        let residual = out - key_rgb;
+        var hsl = rgb_to_hsl(key_rgb);
         let hue_x = hsl.x / 360.0;
+        var source_luma = luma709(key_rgb);
+        if (u.domain.x != 0u) { source_luma = dot(key_rgb, vec3<f32>(0.27222872, 0.67408174, 0.053689517)); }
+        let source_sat = hsl.y;
         if (u.flags.w != 0u) {
             let delta = (sample_curve(4u, hue_x) - 0.5) * 360.0;
             hsl.x = hsl.x + delta;
@@ -305,13 +405,26 @@ fn fs_curves(in: VOut) -> @location(0) vec4<f32> {
         if (u.flags2.x != 0u) {
             hsl.y = clamp(hsl.y * sample_curve(5u, hue_x) * 2.0, 0.0, 1.0);
         }
+        if (u.flags2.z != 0u) {
+            hsl.y = clamp(hsl.y * sample_curve(7u, source_luma) * 2.0, 0.0, 1.0);
+        }
+        if (u.flags2.w != 0u) {
+            hsl.y = clamp(hsl.y * sample_curve(8u, source_sat) * 2.0, 0.0, 1.0);
+        }
         out = hsl_to_rgb(hsl);
+        if (u.flags2.y != 0u) {
+            let delta = sample_curve(6u, hue_x) - 0.5;
+            out = clamp(out + vec3<f32>(delta), vec3<f32>(0.0), vec3<f32>(1.0));
+        }
+        if (u.domain.x != 0u) { out = out + residual; }
     }
     var w = 1.0;
     if (u.flags.x != 0u) {
         w = window_weight(in.uv.x, in.uv.y, u.mask_c, u.mask_p, u.flags.y, u.flags.z);
     }
-    return vec4<f32>(mix(c, out, w) * src.a, src.a);
+    var premult = mix(c, out, w) * src.a;
+    if (u.domain.x != 0u) { premult = clamp(premult, vec3<f32>(-65504.0), vec3<f32>(65504.0)); }
+    return vec4<f32>(premult, src.a);
 }
 "#;
 
@@ -322,7 +435,7 @@ fn fs_curves(in: VOut) -> @location(0) vec4<f32> {
 struct Lut3dUniform {
     /// x=has_mask, y=mask_rect, z=mask_invert, w=tetrahedral.
     flags: [u32; 4],
-    /// x=intensity, y=size (as f32).
+    /// x=intensity, y=3D size, z=1D shaper size (zero when absent).
     misc: [f32; 4],
     dmin: [f32; 4],
     dmax: [f32; 4],
@@ -340,7 +453,21 @@ struct U { flags: vec4<u32>, misc: vec4<f32>, dmin: vec4<f32>, dmax: vec4<f32>, 
 @group(0) @binding(2) var<uniform> u: U;
 @group(0) @binding(3) var lut_tex: texture_3d<f32>;
 @group(0) @binding(4) var lut_samp: sampler;
+@group(0) @binding(5) var<storage, read> shaper: array<vec4<f32>>;
 __PRELUDE__
+
+fn shape_rgb(e: vec3<f32>) -> vec3<f32> {
+    if (u.misc.z < 2.0) { return e; }
+    let span = u.dmax.xyz - u.dmin.xyz;
+    let t = clamp((e - u.dmin.xyz) / span, vec3<f32>(0.0), vec3<f32>(1.0)) * (u.misc.z - 1.0);
+    let i0 = vec3<u32>(floor(t));
+    let i1 = min(i0 + vec3<u32>(1u), vec3<u32>(u32(u.misc.z) - 1u));
+    let f = t - vec3<f32>(i0);
+    return vec3<f32>(
+        mix(shaper[i0.x].x, shaper[i1.x].x, f.x),
+        mix(shaper[i0.y].y, shaper[i1.y].y, f.y),
+        mix(shaper[i0.z].z, shaper[i1.z].z, f.z));
+}
 
 fn lut_load(x: i32, y: i32, z: i32) -> vec3<f32> {
     return textureLoad(lut_tex, vec3<i32>(x, y, z), 0).rgb;
@@ -385,9 +512,11 @@ fn fs_lut3d(in: VOut) -> @location(0) vec4<f32> {
     let src = textureSample(t_src, samp, in.uv);
     // 03 §4.5.3: grade operates on straight colour, then re-premultiplies.
     let c = unpremul3(src);
-    let e = enc3(c);
+    var e = c;
+    if (u.misc.w == 0.0) { e = enc3(c); }
     let span = max(u.dmax.xyz - u.dmin.xyz, vec3<f32>(1e-9));
-    let t = clamp((e - u.dmin.xyz) / span, vec3<f32>(0.0), vec3<f32>(1.0));
+    var t = clamp((e - u.dmin.xyz) / span, vec3<f32>(0.0), vec3<f32>(1.0));
+    if (u.misc.z >= 2.0) { t = clamp(shape_rgb(e), vec3<f32>(0.0), vec3<f32>(1.0)); }
     let n = u.misc.y;
     var sampled: vec3<f32>;
     if (u.flags.w != 0u) {
@@ -399,12 +528,15 @@ fn fs_lut3d(in: VOut) -> @location(0) vec4<f32> {
         sampled = textureSampleLevel(lut_tex, lut_samp, coord, 0.0).rgb;
     }
     let mixed = mix(e, sampled, u.misc.x);
-    let out = dec3(mixed);
+    var out = mixed;
+    if (u.misc.w == 0.0) { out = dec3(mixed); }
     var w = 1.0;
     if (u.flags.x != 0u) {
         w = window_weight(in.uv.x, in.uv.y, u.mask_c, u.mask_p, u.flags.y, u.flags.z);
     }
-    return vec4<f32>(mix(c, out, w) * src.a, src.a);
+    var premult = mix(c, out, w) * src.a;
+    if (u.misc.w != 0.0) { premult = clamp(premult, vec3<f32>(-65504.0), vec3<f32>(65504.0)); }
+    return vec4<f32>(premult, src.a);
 }
 "#;
 
@@ -435,7 +567,15 @@ pub(crate) fn expanded_lut3d_shader() -> String {
 fn mask_fields(mask: Option<&ResolvedMask>, uv_scale: [f32; 2]) -> ([u32; 3], [f32; 4], [f32; 4]) {
     match mask {
         Some(m) => (
-            [1, m.rectangle as u32, m.invert as u32],
+            [
+                1,
+                match m.shape {
+                    photonic_core::timeline::WindowShape::Ellipse => 0,
+                    photonic_core::timeline::WindowShape::Rectangle => 1,
+                    photonic_core::timeline::WindowShape::Gradient => 2,
+                },
+                m.invert as u32,
+            ],
             [m.center[0], m.center[1], m.size[0], m.size[1]],
             [m.rotation, m.softness, uv_scale[0], uv_scale[1]],
         ),
@@ -446,7 +586,7 @@ fn mask_fields(mask: Option<&ResolvedMask>, uv_scale: [f32; 2]) -> ([u32; 3], [f
     }
 }
 
-fn new_working(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
+pub(crate) fn new_working(device: &wgpu::Device, w: u32, h: u32) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some("grade_out"),
         size: wgpu::Extent3d {
@@ -611,6 +751,17 @@ pub fn apply_grade_op_gpu(
     op: &ResolvedGradeOp,
     logical: (u32, u32),
 ) -> wgpu::Texture {
+    apply_grade_op_gpu_mode(device, queue, input, op, logical, false)
+}
+
+fn apply_grade_op_gpu_mode(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    op: &ResolvedGradeOp,
+    logical: (u32, u32),
+    matte: bool,
+) -> wgpu::Texture {
     let w = input.width();
     let h = input.height();
     let out = new_working(device, w, h);
@@ -624,109 +775,252 @@ pub fn apply_grade_op_gpu(
 
     match &op.payload {
         ResolvedGradePayload::Curves(c) => {
-            let mut data = Vec::with_capacity(256 * 6);
-            data.extend_from_slice(&c.master);
-            data.extend_from_slice(&c.red);
-            data.extend_from_slice(&c.green);
-            data.extend_from_slice(&c.blue);
-            data.extend_from_slice(&c.hue_vs_hue.unwrap_or([0.0; 256]));
-            data.extend_from_slice(&c.hue_vs_sat.unwrap_or([0.0; 256]));
-            let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("curve_lut"),
-                contents: bytemuck::cast_slice(&data),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            let uni = CurvesUniform {
-                flags: [mflag[0], mflag[1], mflag[2], c.hue_vs_hue.is_some() as u32],
-                flags2: [c.hue_vs_sat.is_some() as u32, 0, 0, 0],
-                mask_c: mc,
-                mask_p: mp,
-            };
-            let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("curves_u"),
-                contents: bytemuck::bytes_of(&uni),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let mut entries = base_entries().to_vec();
-            entries.push(wgpu::BindGroupLayoutEntry {
-                binding: 3,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            });
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("curves_bgl"),
-                entries: &entries,
-            });
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("curves_bg"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&in_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&samp),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: ubuf.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: buf.as_entire_binding(),
-                    },
-                ],
-            });
-            let pipeline = build_pipeline(device, &bgl, CURVES_SHADER, "fs_curves");
-            run_pass(device, queue, &pipeline, &bind, &out);
+            upload_and_run_curves(
+                device, queue, &in_view, &samp, c, mflag, mc, mp, &out, false,
+            );
         }
         ResolvedGradePayload::Lut3d(l) => {
-            upload_and_run_lut3d(device, queue, &in_view, &samp, l, mflag, mc, mp, &out);
+            upload_and_run_lut3d(
+                device, queue, &in_view, &samp, l, mflag, mc, mp, &out, false,
+            );
         }
         other => {
-            let uni = math_uniform(other, mflag, mc, mp);
-            let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("math_u"),
-                contents: bytemuck::bytes_of(&uni),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("math_bgl"),
-                entries: &base_entries(),
-            });
-            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("math_bg"),
-                layout: &bgl,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&in_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&samp),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: ubuf.as_entire_binding(),
-                    },
-                ],
-            });
-            let pipeline = build_pipeline(device, &bgl, MATH_SHADER, "fs_grade");
-            run_pass(device, queue, &pipeline, &bind, &out);
+            let mut uni = math_uniform(other, mflag, mc, mp);
+            if matte && matches!(other, ResolvedGradePayload::HslQualifier(_)) {
+                uni.key_count[1] = 1;
+            }
+            upload_and_run_math(device, queue, &in_view, &samp, &uni, &out);
         }
     }
     out
 }
 
+fn upload_and_run_math(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    in_view: &wgpu::TextureView,
+    samp: &wgpu::Sampler,
+    uni: &MathUniform,
+    out: &wgpu::Texture,
+) {
+    let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("math_u"),
+        contents: bytemuck::bytes_of(uni),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("math_bgl"),
+        entries: &base_entries(),
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("math_bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(in_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ubuf.as_entire_binding(),
+            },
+        ],
+    });
+    let pipeline = build_pipeline(device, &bgl, MATH_SHADER, "fs_grade");
+    run_pass(device, queue, &pipeline, &bind, out);
+}
+
+/// Apply a validated native logarithmic secondary. Spatial mixing remains a
+/// separate native mask node so its coordinates use the sequence canvas.
+pub fn apply_native_qualifier_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    output: &wgpu::Texture,
+    qualifier: &crate::grade::ResolvedHslQualifier,
+) -> Result<(), &'static str> {
+    apply_native_qualifier_mode(
+        device,
+        queue,
+        input,
+        output,
+        qualifier,
+        None,
+        (input.width(), input.height()),
+        false,
+    )
+}
+
+/// Unassociated key weight for a typed matte port. Native input is already
+/// encoded ACEScct/AP1; Legacy input is straight-coordinate linear Rec.709.
+/// Source alpha only determines whether a pixel has coverage; it is not
+/// multiplied into the key. The later image mix preserves original coverage.
 #[allow(clippy::too_many_arguments)]
+pub fn qualifier_key_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    qualifier: &crate::grade::ResolvedHslQualifier,
+    mask: Option<&ResolvedMask>,
+    logical: (u32, u32),
+    native: bool,
+) -> Result<wgpu::Texture, &'static str> {
+    crate::native_transfer::validate_native_qualifier(qualifier)?;
+    if let Some(mask) = mask {
+        validate_native_mask(mask)?;
+    }
+    if input.format() != WORKING_FORMAT
+        || logical.0 == 0
+        || logical.1 == 0
+        || input.width() < logical.0
+        || input.height() < logical.1
+    {
+        return Err("qualifier key requires positive logical dimensions in a working texture");
+    }
+    let (mflag, mc, mp) = mask_fields(
+        mask,
+        [
+            input.width() as f32 / logical.0 as f32,
+            input.height() as f32 / logical.1 as f32,
+        ],
+    );
+    let op = ResolvedGradeOp {
+        payload: ResolvedGradePayload::HslQualifier(Box::new(qualifier.clone())),
+        mask: mask.copied(),
+    };
+    let mut uniform = math_uniform(&op.payload, mflag, mc, mp);
+    uniform.key_count[1] = 1;
+    uniform.key_count[2] = u32::from(native);
+    uniform.key_count[3] = 1;
+    let output = new_working(device, input.width(), input.height());
+    let view = input.create_view(&Default::default());
+    let sampler = linear_sampler(device);
+    upload_and_run_math(device, queue, &view, &sampler, &uniform, &output);
+    Ok(output)
+}
+
+/// Isolation matte from the exact scene input of a native qualifier. Encoding
+/// uses the same half-float ACEScct pass as correction; CDL and later grades
+/// are excluded. Window and source coverage multiply the key.
+pub fn native_qualifier_matte_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_input: &wgpu::Texture,
+    qualifier: &crate::grade::ResolvedHslQualifier,
+    mask: Option<&ResolvedMask>,
+    logical: (u32, u32),
+) -> Result<wgpu::Texture, &'static str> {
+    crate::native_transfer::validate_native_qualifier(qualifier)?;
+    if logical.0 == 0 || logical.1 == 0 {
+        return Err("native qualifier matte requires positive logical dimensions");
+    }
+    let encoded = crate::native_transfer::NativeAcescctPass::new(device).apply(
+        device,
+        queue,
+        scene_input,
+        crate::native_transfer::AcescctDirection::Encode,
+    );
+    let output = new_working(device, scene_input.width(), scene_input.height());
+    apply_native_qualifier_mode(
+        device, queue, &encoded, &output, qualifier, mask, logical, true,
+    )?;
+    Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_native_qualifier_mode(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    output: &wgpu::Texture,
+    qualifier: &crate::grade::ResolvedHslQualifier,
+    mask: Option<&ResolvedMask>,
+    logical: (u32, u32),
+    matte: bool,
+) -> Result<(), &'static str> {
+    crate::native_transfer::validate_native_qualifier(qualifier)?;
+    if input.size() != output.size() || output.format() != WORKING_FORMAT {
+        return Err("native qualifier target must match source size and working format");
+    }
+    if let Some(mask) = mask {
+        validate_native_mask(mask)?;
+    }
+    let uv_scale = [
+        input.width() as f32 / logical.0.max(1) as f32,
+        input.height() as f32 / logical.1.max(1) as f32,
+    ];
+    let (flags, center, params) = mask_fields(mask, uv_scale);
+    let mut uni = math_uniform(
+        &ResolvedGradePayload::HslQualifier(Box::new(*qualifier)),
+        flags,
+        center,
+        params,
+    );
+    uni.key_count[2] = 1;
+    uni.key_count[1] = u32::from(matte);
+    let view = input.create_view(&Default::default());
+    let sampler = linear_sampler(device);
+    upload_and_run_math(device, queue, &view, &sampler, &uni, output);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Apply a declared native creative LUT directly in its input coordinates.
+/// No Legacy sRGB transfer is added. Caller supplies ACEScg or ACEScct pixels.
+/// Input/output color-domain equality is enforced by the graph compiler.
+pub fn apply_native_lut_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    output: &wgpu::Texture,
+    lut: &ResolvedLut3d,
+) -> Result<(), &'static str> {
+    validate_native_lut(lut)?;
+    if input.size() != output.size() || output.format() != WORKING_FORMAT {
+        return Err("native LUT target must match source size and working format");
+    }
+    let view = input.create_view(&Default::default());
+    let sampler = linear_sampler(device);
+    upload_and_run_lut3d(
+        device, queue, &view, &sampler, lut, [0; 3], [0.0; 4], [0.0; 4], output, true,
+    );
+    Ok(())
+}
+
+/// Validate native LUT data before either CPU indexing or GPU upload.
+pub fn validate_native_lut(lut: &ResolvedLut3d) -> Result<(), &'static str> {
+    let table = &lut.table;
+    if !lut.intensity.is_finite()
+        || !(0.0..=1.0).contains(&lut.intensity)
+        || !(2..=256).contains(&table.size)
+        || table.size.checked_pow(3) != Some(table.data.len())
+        || table
+            .data
+            .iter()
+            .flatten()
+            .any(|v| !v.is_finite() || v.abs() > 65504.0)
+        || table
+            .domain_min
+            .iter()
+            .zip(table.domain_max)
+            .any(|(lo, hi)| !lo.is_finite() || !hi.is_finite() || *lo >= hi)
+        || table.shaper.as_ref().is_some_and(|rows| {
+            rows.len() < 2
+                || rows
+                    .iter()
+                    .flatten()
+                    .any(|v| !v.is_finite() || v.abs() > 65504.0)
+        })
+    {
+        return Err("native LUT data, domain or intensity is invalid");
+    }
+    Ok(())
+}
+
 fn upload_and_run_lut3d(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -737,6 +1031,7 @@ fn upload_and_run_lut3d(
     mc: [f32; 4],
     mp: [f32; 4],
     out: &wgpu::Texture,
+    native: bool,
 ) {
     let n = l.table.size as u32;
     // Rgba16Float 3-D texture; red-fastest data order == x fastest.
@@ -780,9 +1075,32 @@ fn upload_and_run_lut3d(
         ..Default::default()
     });
     let lut_samp = linear_sampler(device);
+    let shaper_rows: Vec<[f32; 4]> = l
+        .table
+        .shaper
+        .as_ref()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| [row[0], row[1], row[2], 0.0])
+                .collect()
+        })
+        .unwrap_or_else(|| vec![[0.0; 4]]);
+    let shaper_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("lut1d_shaper"),
+        contents: bytemuck::cast_slice(&shaper_rows),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
     let uni = Lut3dUniform {
         flags: [mflag[0], mflag[1], mflag[2], l.tetrahedral as u32],
-        misc: [l.intensity, n as f32, 0.0, 0.0],
+        misc: [
+            l.intensity,
+            n as f32,
+            l.table
+                .shaper
+                .as_ref()
+                .map_or(0.0, |rows| rows.len() as f32),
+            if native { 1.0 } else { 0.0 },
+        ],
         dmin: [
             l.table.domain_min[0],
             l.table.domain_min[1],
@@ -820,6 +1138,16 @@ fn upload_and_run_lut3d(
         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
         count: None,
     });
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 5,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    });
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("lut3d_bgl"),
         entries: &entries,
@@ -847,6 +1175,10 @@ fn upload_and_run_lut3d(
             wgpu::BindGroupEntry {
                 binding: 4,
                 resource: wgpu::BindingResource::Sampler(&lut_samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: shaper_buf.as_entire_binding(),
             },
         ],
     });
@@ -877,6 +1209,12 @@ fn math_uniform(
         p3: [0.0; 4],
         q_hue_sat: [0.0; 4],
         q_lum: [0.0; 4],
+        key_count: [0; 4],
+        keys: [QualifierKeyUniform {
+            hue_sat: [0.0; 4],
+            lum_soft: [0.0; 4],
+            mode: [0; 4],
+        }; photonic_core::timeline::MAX_QUALIFIER_KEYS],
         mask_c,
         mask_p,
     };
@@ -884,6 +1222,27 @@ fn math_uniform(
         ResolvedGradePayload::Exposure { stops } => {
             u.kind_flags[0] = KIND_EXPOSURE;
             u.p0[0] = *stops;
+        }
+        ResolvedGradePayload::LinearOffset { rgb } => {
+            u.kind_flags[0] = KIND_LINEAR_OFFSET;
+            u.p0[..3].copy_from_slice(rgb);
+        }
+        ResolvedGradePayload::PrinterLights { points } => {
+            u.kind_flags[0] = KIND_PRINTER_LIGHTS;
+            u.p0[..3].copy_from_slice(points);
+        }
+        ResolvedGradePayload::HighlightRolloff { knee, strength } => {
+            u.kind_flags[0] = KIND_HIGHLIGHT_ROLLOFF;
+            u.p0[0] = *knee;
+            u.p0[1] = *strength;
+        }
+        ResolvedGradePayload::SaturationVibrance {
+            saturation,
+            vibrance,
+        } => {
+            u.kind_flags[0] = KIND_SATURATION_VIBRANCE;
+            u.p0[0] = *saturation;
+            u.p0[1] = *vibrance;
         }
         ResolvedGradePayload::Contrast { pivot, amount } => {
             u.kind_flags[0] = KIND_CONTRAST;
@@ -910,8 +1269,18 @@ fn math_uniform(
             u.p1 = p1;
             u.p2 = p2;
             u.p3 = p3;
+            u.p3[1] = q.matte_levels[1];
             u.q_hue_sat = [q.hue[0], q.hue[1], q.sat[0], q.sat[1]];
-            u.q_lum = [q.lum[0], q.lum[1], q.softness, 0.0];
+            u.q_lum = [q.lum[0], q.lum[1], q.softness, q.matte_levels[0]];
+            u.key_count[0] = q.key_count;
+            for index in 0..q.key_count as usize {
+                let key = q.keys[index];
+                u.keys[index] = QualifierKeyUniform {
+                    hue_sat: [key.hue[0], key.hue[1], key.sat[0], key.sat[1]],
+                    lum_soft: [key.lum[0], key.lum[1], key.softness, 0.0],
+                    mode: [u32::from(key.subtract), 0, 0, 0],
+                };
+            }
         }
         ResolvedGradePayload::Curves(_) | ResolvedGradePayload::Lut3d(_) => {
             unreachable!("curves/lut3d handled separately")
@@ -955,6 +1324,44 @@ pub fn apply_grade_stack_gpu(
             out
         }
     }
+}
+
+/// Render a qualifier's isolation matte from the input to its grade stack.
+/// The selected qualifier is evaluated after all preceding correctors, with
+/// the same GPU gate and window math as normal grading. The grayscale result
+/// is opaque; `None` means the selected op is not a qualifier.
+pub fn qualifier_matte_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    ops: &[ResolvedGradeOp],
+    target: usize,
+    logical: (u32, u32),
+) -> Option<wgpu::Texture> {
+    if !matches!(
+        ops.get(target)?.payload,
+        ResolvedGradePayload::HslQualifier(_)
+    ) {
+        return None;
+    }
+    let mut cur: Option<wgpu::Texture> = None;
+    for op in &ops[..target] {
+        cur = Some(apply_grade_op_gpu(
+            device,
+            queue,
+            cur.as_ref().unwrap_or(input),
+            op,
+            logical,
+        ));
+    }
+    Some(apply_grade_op_gpu_mode(
+        device,
+        queue,
+        cur.as_ref().unwrap_or(input),
+        &ops[target],
+        logical,
+        true,
+    ))
 }
 
 #[cfg(test)]
@@ -1324,6 +1731,223 @@ mod tests {
     /// `mask: None`, and its 8x8 canvas buckets to a *square* 64x64 where the
     /// two axes scale identically and a centred window stays centred.
     #[test]
+    fn matte_refinement_gpu_known_values_and_logical_picture_edges() {
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        use photonic_core::timeline::GradeMatteRefinement;
+        let pass = crate::grade_graph::GradeGraphMixPass::new(&device);
+        let input = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("refinement_padded_input"),
+            size: wgpu::Extent3d {
+                width: 128,
+                height: 128,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let output = new_working(&device, 128, 128);
+        let upload = |logical: &[[f32; 4]]| {
+            let mut bytes = Vec::with_capacity(128 * 128 * 8);
+            for y in 0..128 {
+                for x in 0..128 {
+                    let pixel = if x < 100 && y < 100 {
+                        logical[y * 100 + x]
+                    } else {
+                        [1.0; 4]
+                    };
+                    for value in pixel {
+                        bytes.extend_from_slice(&f32_to_f16_bits(value).to_le_bytes());
+                    }
+                }
+            }
+            queue.write_texture(
+                input.as_image_copy(),
+                &bytes,
+                wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(128 * 8),
+                    rows_per_image: Some(128),
+                },
+                input.size(),
+            );
+        };
+        let mut impulse = vec![[0.0, 0.0, 0.0, 1.0]; 10000];
+        impulse[5050] = [1.0; 4];
+        upload(&impulse);
+        for refinement in [
+            GradeMatteRefinement {
+                denoise: true,
+                ..Default::default()
+            },
+            GradeMatteRefinement {
+                grow: 0.01,
+                ..Default::default()
+            },
+            GradeMatteRefinement {
+                blur: 0.01,
+                ..Default::default()
+            },
+        ] {
+            pass.refine_into(&device, &queue, &input, &output, (100, 100), refinement)
+                .unwrap();
+            let pixels = readback_rgba16_2d(&device, &queue, &output, 100, 100);
+            let normal = (-3i32..=3)
+                .map(|offset| (-0.5 * f64::from(offset).powi(2)).exp())
+                .sum::<f64>();
+            for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                let dx = index as i32 % 100 - 50;
+                let dy = index as i32 / 100 - 50;
+                let expected = if refinement.denoise {
+                    0.0
+                } else if refinement.grow > 0.0 {
+                    if dx.abs() <= 1 && dy.abs() <= 1 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                } else if dx.abs() <= 3 && dy.abs() <= 3 {
+                    (-0.5 * (f64::from(dx).powi(2) + f64::from(dy).powi(2))).exp()
+                        / (normal * normal)
+                } else {
+                    0.0
+                };
+                assert!(
+                    (f64::from(pixel[0]) - expected).abs() < 0.0002,
+                    "{refinement:?}, ({dx},{dy}): {pixel:?} vs {expected}"
+                );
+                assert_eq!(pixel[3], 1.0);
+            }
+        }
+        let constant = vec![[0.25, 0.25, 0.25, 1.0]; 10000];
+        upload(&constant);
+        for refinement in [
+            GradeMatteRefinement {
+                denoise: true,
+                grow: 0.01,
+                blur: 0.01,
+                ..Default::default()
+            },
+            GradeMatteRefinement {
+                grow: -0.01,
+                blur: 0.01,
+                ..Default::default()
+            },
+            GradeMatteRefinement {
+                blur: f32::MIN_POSITIVE,
+                matte_levels: [0.2, 0.3],
+                ..Default::default()
+            },
+        ] {
+            pass.refine_into(&device, &queue, &input, &output, (100, 100), refinement)
+                .unwrap();
+            let expected = if refinement.matte_levels == [0.0; 2] {
+                0.25
+            } else {
+                0.1
+            };
+            for pixel in readback_rgba16_2d(&device, &queue, &output, 100, 100).chunks_exact(4) {
+                assert!(
+                    (pixel[0] - expected).abs() < 0.0002,
+                    "picture edge sampled white padding: {pixel:?}"
+                );
+                assert_eq!(pixel[3], 1.0);
+            }
+        }
+        let mut block = impulse.clone();
+        for y in 49..=51 {
+            for x in 49..=51 {
+                block[y * 100 + x] = [1.0; 4];
+            }
+        }
+        upload(&block);
+        pass.refine_into(
+            &device,
+            &queue,
+            &input,
+            &output,
+            (100, 100),
+            GradeMatteRefinement {
+                grow: -0.01,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (index, pixel) in readback_rgba16_2d(&device, &queue, &output, 100, 100)
+            .chunks_exact(4)
+            .enumerate()
+        {
+            let expected = if index == 5050 { 1.0 } else { 0.0 };
+            assert_eq!(pixel, &[expected, expected, expected, 1.0]);
+        }
+    }
+
+    #[test]
+    fn typed_grade_matte_preserves_coverage_and_key_mixing_known_weights() {
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        let pass = crate::grade_graph::GradeGraphMixPass::new(&device);
+        let original = solid_texture(&device, &queue, 8, 8, [0.125, -0.25, 1.0, 0.5]);
+        let corrected = solid_texture(&device, &queue, 8, 8, [0.75, 0.5, 2.0, 0.25]);
+        let matte = solid_texture(&device, &queue, 8, 8, [0.25, 0.25, 0.25, 1.0]);
+        let output = new_working(&device, 8, 8);
+        pass.matte_into(&device, &queue, &corrected, &original, &matte, &output)
+            .unwrap();
+        let pixels = readback_rgba16(&device, &queue, &output, 8);
+        // Straight corrected color is rescaled to the original coverage before mixing.
+        for pixel in pixels.chunks_exact(4) {
+            for (actual, expected) in pixel.iter().zip([0.46875, 0.0625, 1.75, 0.5]) {
+                assert!((*actual - expected).abs() < 0.002, "{pixel:?}");
+            }
+        }
+        pass.layer_into(&device, &queue, &corrected, &original, &output, 0.25)
+            .unwrap();
+        assert_eq!(readback_rgba16(&device, &queue, &output, 8), pixels);
+        let zero = solid_texture(&device, &queue, 8, 8, [0.0; 4]);
+        pass.matte_into(&device, &queue, &corrected, &zero, &matte, &output)
+            .unwrap();
+        assert!(readback_rgba16(&device, &queue, &output, 8)
+            .iter()
+            .all(|value| *value == 0.0));
+        let other = solid_texture(&device, &queue, 8, 8, [0.75, 0.75, 0.75, 1.0]);
+        use photonic_core::timeline::GradeKeyMixMode;
+        for (mode, expected) in [
+            (GradeKeyMixMode::Union, 0.75),
+            (GradeKeyMixMode::Intersect, 0.25),
+            (GradeKeyMixMode::Subtract, 0.0),
+            (GradeKeyMixMode::Multiply, 0.1875),
+        ] {
+            pass.key_into(&device, &queue, &matte, &other, &output, mode)
+                .unwrap();
+            for pixel in readback_rgba16(&device, &queue, &output, 8).chunks_exact(4) {
+                assert_eq!(pixel, &[expected, expected, expected, 1.0]);
+            }
+        }
+        let qualifier = ResolvedHslQualifier::default();
+        for alpha in [1.0, 0.5, 0.125, 0.0] {
+            let input = solid_texture(
+                &device,
+                &queue,
+                8,
+                8,
+                [0.4 * alpha, 0.5 * alpha, 0.6 * alpha, alpha],
+            );
+            let key =
+                qualifier_key_gpu(&device, &queue, &input, &qualifier, None, (8, 8), true).unwrap();
+            let expected = if alpha > 0.0 { 1.0 } else { 0.0 };
+            for pixel in readback_rgba16(&device, &queue, &key, 8).chunks_exact(4) {
+                assert_eq!(pixel, &[expected, expected, expected, 1.0]);
+            }
+        }
+    }
+
+    #[test]
     fn masked_grade_normalizes_the_window_against_the_logical_frame() {
         let Some((device, queue)) = try_device() else {
             eprintln!("no GPU adapter — skipping logical-frame mask parity test");
@@ -1341,7 +1965,7 @@ mod tests {
         let op = ResolvedGradeOp {
             payload: ResolvedGradePayload::Exposure { stops: 1.5 },
             mask: Some(ResolvedMask {
-                rectangle: false,
+                shape: photonic_core::timeline::WindowShape::Ellipse,
                 center: [0.5, 0.5],
                 // Hard-edged and well inside the frame, so the in/out boundary
                 // falls where a mis-scaled uv would visibly move it.
@@ -1465,6 +2089,86 @@ mod tests {
     }
 
     #[test]
+    fn gpu_printer_lights_match_cpu_with_highlights_negatives_and_alpha() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping printer lights parity test");
+            return;
+        };
+        let pixel = [1.0, 0.125, -0.25, 0.5];
+        let input = solid_texture(&device, &queue, 8, 8, pixel);
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::PrinterLights {
+                points: [6.0, -12.0, 3.0],
+            },
+            mask: None,
+        };
+        let output = apply_grade_op_gpu(&device, &queue, &input, &op, (8, 8));
+        let got = readback_rgba16_2d(&device, &queue, &output, 8, 8);
+        let mut expected = pixel.repeat(64);
+        apply_grade_cpu(&mut expected, 8, 8, &[op]);
+        for (index, (gpu, cpu)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (gpu - cpu).abs() < 0.003,
+                "component {index}: gpu={gpu}, cpu={cpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_highlight_rolloff_matches_cpu_on_extended_range_and_partial_alpha() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping highlight roll-off parity test");
+            return;
+        };
+        let pixel = [1.0, 0.25, -0.1, 0.5]; // premultiplied [2, 0.5, -0.2]
+        let input = solid_texture(&device, &queue, 8, 8, pixel);
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::HighlightRolloff {
+                knee: 1.0,
+                strength: 1.0,
+            },
+            mask: None,
+        };
+        let output = apply_grade_op_gpu(&device, &queue, &input, &op, (8, 8));
+        let got = readback_rgba16_2d(&device, &queue, &output, 8, 8);
+        let mut expected = pixel.repeat(64);
+        apply_grade_cpu(&mut expected, 8, 8, &[op]);
+        for (index, (gpu, cpu)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (gpu - cpu).abs() < 0.003,
+                "component {index}: gpu={gpu}, cpu={cpu}"
+            );
+        }
+    }
+
+    #[test]
+    fn gpu_saturation_vibrance_matches_cpu_on_extended_range_and_partial_alpha() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping saturation/vibrance parity test");
+            return;
+        };
+        let pixel = [1.0, 0.35, -0.1, 0.5];
+        let input = solid_texture(&device, &queue, 8, 8, pixel);
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::SaturationVibrance {
+                saturation: 1.25,
+                vibrance: 0.6,
+            },
+            mask: None,
+        };
+        let output = apply_grade_op_gpu(&device, &queue, &input, &op, (8, 8));
+        let got = readback_rgba16_2d(&device, &queue, &output, 8, 8);
+        let mut expected = pixel.repeat(64);
+        apply_grade_cpu(&mut expected, 8, 8, &[op]);
+        for (index, (gpu, cpu)) in got.iter().zip(&expected).enumerate() {
+            assert!(
+                (gpu - cpu).abs() < 0.004,
+                "component {index}: gpu={gpu}, cpu={cpu}"
+            );
+        }
+    }
+
+    #[test]
     fn gpu_contrast_matches_cpu() {
         assert_gpu_matches_cpu(
             ResolvedGradeOp {
@@ -1517,14 +2221,42 @@ mod tests {
             blue: crate::grade::curve_lut(&[]),
             hue_vs_hue: None,
             hue_vs_sat: None,
+            hue_vs_luma: None,
+            luma_vs_sat: None,
+            sat_vs_sat: None,
         };
-        assert_gpu_matches_cpu(
-            ResolvedGradeOp {
-                payload: ResolvedGradePayload::Curves(Box::new(curves)),
-                mask: None,
-            },
-            32,
-        );
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::Curves(Box::new(curves)),
+            mask: None,
+        };
+        assert_gpu_matches_cpu(op.clone(), 32);
+        assert_gpu_matches_cpu_alpha(op, 32, true, 2e-3);
+    }
+
+    #[test]
+    fn gpu_advanced_curves_match_cpu() {
+        let identity = crate::grade::curve_lut(&[]);
+        let curves = ResolvedCurves {
+            master: identity,
+            red: identity,
+            green: identity,
+            blue: identity,
+            hue_vs_hue: None,
+            hue_vs_sat: None,
+            hue_vs_luma: Some(crate::grade::curve_lut(&[
+                (0.0, 0.5),
+                (0.5, 0.6),
+                (1.0, 0.5),
+            ])),
+            luma_vs_sat: Some(crate::grade::curve_lut(&[(0.0, 0.3), (1.0, 0.7)])),
+            sat_vs_sat: Some(crate::grade::curve_lut(&[(0.0, 0.5), (1.0, 0.7)])),
+        };
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::Curves(Box::new(curves)),
+            mask: None,
+        };
+        assert_gpu_matches_cpu(op.clone(), 32);
+        assert_gpu_matches_cpu_alpha(op, 32, true, 2e-3);
     }
 
     #[test]
@@ -1568,6 +2300,34 @@ mod tests {
     }
 
     #[test]
+    fn gpu_combined_1d_shaper_and_3d_lut_match_cpu() {
+        let mut table = Lut3d::identity(16);
+        table.domain_min = [-0.25; 3];
+        table.domain_max = [1.25; 3];
+        table.shaper = Some(
+            (0..256)
+                .map(|i| {
+                    let t = i as f32 / 255.0;
+                    [t * 0.8, t, t * 0.6]
+                })
+                .collect(),
+        );
+        for tetrahedral in [false, true] {
+            assert_gpu_matches_cpu(
+                ResolvedGradeOp {
+                    payload: ResolvedGradePayload::Lut3d(ResolvedLut3d {
+                        table: Arc::new(table.clone()),
+                        intensity: 1.0,
+                        tetrahedral,
+                    }),
+                    mask: None,
+                },
+                32,
+            );
+        }
+    }
+
+    #[test]
     fn gpu_qualifier_matches_cpu() {
         let q = ResolvedHslQualifier {
             hue: [0.0, 1.0],
@@ -1580,14 +2340,200 @@ mod tests {
                 power: [1.0; 3],
                 sat: 1.0,
             },
+            ..ResolvedHslQualifier::default()
         };
         assert_gpu_matches_cpu(
             ResolvedGradeOp {
-                payload: ResolvedGradePayload::HslQualifier(q),
+                payload: ResolvedGradePayload::HslQualifier(Box::new(q)),
                 mask: None,
             },
             32,
         );
+    }
+
+    #[test]
+    fn gpu_qualifier_hue_gate_crosses_red_seam() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping hue seam parity test");
+            return;
+        };
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::HslQualifier(Box::new(ResolvedHslQualifier {
+                hue: [-0.05, 0.07],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: ResolvedCdl {
+                    slope: [1.0; 3],
+                    offset: [0.1; 3],
+                    power: [1.0; 3],
+                    sat: 1.0,
+                },
+                ..ResolvedHslQualifier::default()
+            })),
+            mask: None,
+        };
+        for rgb in [[1.0, 0.06, 0.0], [1.0, 0.0, 0.06], [0.0, 1.0, 0.0]] {
+            let input = solid_texture(&device, &queue, 8, 8, [rgb[0], rgb[1], rgb[2], 1.0]);
+            let output = apply_grade_op_gpu(&device, &queue, &input, &op, (8, 8));
+            let got = readback_rgba16(&device, &queue, &output, 8);
+            let mut want = [rgb[0], rgb[1], rgb[2], 1.0].repeat(64);
+            apply_grade_cpu(&mut want, 8, 8, std::slice::from_ref(&op));
+            for channel in 0..3 {
+                assert!(
+                    (got[channel] - want[channel]).abs() <= 0.003,
+                    "rgb={rgb:?} channel={channel}: gpu={} cpu={}",
+                    got[channel],
+                    want[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_disjoint_qualifier_add_subtract_matches_cpu() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping disjoint qualifier parity test");
+            return;
+        };
+        let mut qualifier = ResolvedHslQualifier {
+            hue: [-0.05, 0.05],
+            sat: [0.3, 1.0],
+            lum: [0.1, 0.9],
+            correction: ResolvedCdl {
+                slope: [1.0; 3],
+                offset: [0.12; 3],
+                power: [1.0; 3],
+                sat: 1.0,
+            },
+            ..ResolvedHslQualifier::default()
+        };
+        qualifier.keys[0] = crate::grade::ResolvedQualifierKey {
+            hue: [0.61, 0.72],
+            sat: [0.3, 1.0],
+            lum: [0.1, 0.9],
+            softness: 0.0,
+            subtract: false,
+        };
+        qualifier.keys[1] = crate::grade::ResolvedQualifierKey {
+            hue: [-0.03, 0.03],
+            sat: [0.3, 1.0],
+            lum: [0.1, 0.9],
+            softness: 0.0,
+            subtract: true,
+        };
+        qualifier.key_count = 2;
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::HslQualifier(Box::new(qualifier)),
+            mask: None,
+        };
+        for rgb in [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]] {
+            let input = solid_texture(&device, &queue, 8, 8, [rgb[0], rgb[1], rgb[2], 1.0]);
+            let output = apply_grade_op_gpu(&device, &queue, &input, &op, (8, 8));
+            let got = readback_rgba16(&device, &queue, &output, 8);
+            let mut want = [rgb[0], rgb[1], rgb[2], 1.0].repeat(64);
+            apply_grade_cpu(&mut want, 8, 8, std::slice::from_ref(&op));
+            for channel in 0..3 {
+                assert!(
+                    (got[channel] - want[channel]).abs() <= 0.003,
+                    "rgb={rgb:?} channel={channel}: gpu={} cpu={}",
+                    got[channel],
+                    want[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_qualifier_matte_levels_match_cpu_on_soft_edges() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping qualifier matte levels parity test");
+            return;
+        };
+        let op = ResolvedGradeOp {
+            payload: ResolvedGradePayload::HslQualifier(Box::new(ResolvedHslQualifier {
+                hue: [0.0, 0.1],
+                softness: 0.1,
+                matte_levels: [0.2, 0.2],
+                correction: ResolvedCdl {
+                    slope: [1.0; 3],
+                    offset: [0.15; 3],
+                    power: [1.0; 3],
+                    sat: 1.0,
+                },
+                ..ResolvedHslQualifier::default()
+            })),
+            mask: None,
+        };
+        for rgb in [[1.0, 0.75, 0.0], [1.0, 0.9, 0.0], [1.0, 1.0, 0.0]] {
+            let input = solid_texture(&device, &queue, 8, 8, [rgb[0], rgb[1], rgb[2], 1.0]);
+            let output = apply_grade_op_gpu(&device, &queue, &input, &op, (8, 8));
+            let got = readback_rgba16(&device, &queue, &output, 8);
+            let mut want = [rgb[0], rgb[1], rgb[2], 1.0].repeat(64);
+            apply_grade_cpu(&mut want, 8, 8, std::slice::from_ref(&op));
+            for channel in 0..3 {
+                assert!(
+                    (got[channel] - want[channel]).abs() <= 0.004,
+                    "rgb={rgb:?} channel={channel}: gpu={} cpu={}",
+                    got[channel],
+                    want[channel]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_qualifier_matte_matches_cpu_after_preceding_grade_and_window() {
+        let Some((device, queue)) = try_device() else {
+            eprintln!("no GPU adapter — skipping qualifier matte parity test");
+            return;
+        };
+        let n = 32;
+        let input = gradient_texture_with_alpha(&device, &queue, n);
+        let ops = vec![
+            ResolvedGradeOp {
+                payload: ResolvedGradePayload::Exposure { stops: 0.5 },
+                mask: None,
+            },
+            ResolvedGradeOp {
+                payload: ResolvedGradePayload::HslQualifier(Box::new(ResolvedHslQualifier {
+                    hue: [0.0, 1.0],
+                    sat: [0.0, 1.0],
+                    lum: [0.1, 0.3],
+                    softness: 0.05,
+                    matte_levels: [0.15, 0.1],
+                    correction: ResolvedCdl {
+                        slope: [2.0; 3],
+                        offset: [0.0; 3],
+                        power: [1.0; 3],
+                        sat: 1.0,
+                    },
+                    ..ResolvedHslQualifier::default()
+                })),
+                mask: Some(ResolvedMask {
+                    shape: photonic_core::timeline::WindowShape::Rectangle,
+                    center: [0.5, 0.5],
+                    size: [0.3, 1.0],
+                    rotation: 0.0,
+                    softness: 0.1,
+                    invert: false,
+                }),
+            },
+        ];
+        let out = qualifier_matte_gpu(&device, &queue, &input, &ops, 1, (n, 1)).unwrap();
+        let got = readback_rgba16(&device, &queue, &out, n);
+        let want =
+            crate::grade::qualifier_matte_cpu(&cpu_pixels_with_alpha(n), n, 1, &ops, 1).unwrap();
+        for i in 0..n as usize {
+            assert!(
+                (got[i * 4] - want[i]).abs() < 0.025,
+                "pixel {i}: gpu {} cpu {}",
+                got[i * 4],
+                want[i]
+            );
+            assert!((got[i * 4 + 3] - 1.0).abs() < 1e-3);
+        }
+        assert!(qualifier_matte_gpu(&device, &queue, &input, &ops, 0, (n, 1)).is_none());
     }
 
     #[test]
@@ -1596,11 +2542,29 @@ mod tests {
             ResolvedGradeOp {
                 payload: ResolvedGradePayload::Exposure { stops: 1.0 },
                 mask: Some(ResolvedMask {
-                    rectangle: false,
+                    shape: photonic_core::timeline::WindowShape::Ellipse,
                     center: [0.5, 0.5],
                     size: [0.3, 0.3],
                     rotation: 0.0,
                     softness: 0.2,
+                    invert: false,
+                }),
+            },
+            32,
+        );
+    }
+
+    #[test]
+    fn gpu_gradient_window_matches_cpu() {
+        assert_gpu_matches_cpu(
+            ResolvedGradeOp {
+                payload: ResolvedGradePayload::Exposure { stops: 1.0 },
+                mask: Some(ResolvedMask {
+                    shape: photonic_core::timeline::WindowShape::Gradient,
+                    center: [0.5, 0.5],
+                    size: [0.25, 0.3],
+                    rotation: 0.35,
+                    softness: 0.0,
                     invert: false,
                 }),
             },
@@ -1624,6 +2588,13 @@ mod tests {
         const TOL: f32 = 2e-3;
         let ops: Vec<ResolvedGradePayload> = vec![
             ResolvedGradePayload::Exposure { stops: 0.7 },
+            ResolvedGradePayload::LinearOffset {
+                rgb: [0.12, -0.05, 0.08],
+            },
+            ResolvedGradePayload::HighlightRolloff {
+                knee: 0.1,
+                strength: 2.0,
+            },
             ResolvedGradePayload::Contrast {
                 pivot: 0.4,
                 amount: 0.3,
@@ -1641,6 +2612,9 @@ mod tests {
                 blue: crate::grade::curve_lut(&[]),
                 hue_vs_hue: None,
                 hue_vs_sat: None,
+                hue_vs_luma: None,
+                luma_vs_sat: None,
+                sat_vs_sat: None,
             })),
             ResolvedGradePayload::Lut3d(ResolvedLut3d {
                 table: {
@@ -1666,4 +2640,305 @@ mod tests {
             );
         }
     }
+}
+
+/// Premultiplied image mixing through a sequence-coordinate power window.
+/// The graph enforces equal ACEScg/ACEScct coordinates for both inputs.
+pub struct NativeMaskMixPass {
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct NativeMaskUniform {
+    flags: [u32; 4],
+    center: [f32; 4],
+    params: [f32; 4],
+}
+
+pub fn validate_native_mask(mask: &ResolvedMask) -> Result<(), &'static str> {
+    if mask.center.iter().chain(&mask.size).any(|v| !v.is_finite())
+        || mask.size.iter().any(|v| *v <= 0.0)
+        || !mask.rotation.is_finite()
+        || !mask.softness.is_finite()
+        || mask.softness < 0.0
+    {
+        return Err("native power-window geometry must be finite with positive sizes and nonnegative feather");
+    }
+    Ok(())
+}
+
+impl NativeMaskMixPass {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let texture = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("native_mask_mix_layout"),
+            entries: &[
+                texture(0),
+                texture(1),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let source = format!(
+            "{}{}",
+            PRELUDE,
+            r#"
+@group(0) @binding(0) var corrected: texture_2d<f32>;
+@group(0) @binding(1) var original: texture_2d<f32>;
+struct Mask { flags: vec4<u32>, center: vec4<f32>, params: vec4<f32> }
+@group(0) @binding(2) var<uniform> mask: Mask;
+@fragment
+fn fs_native_mask(in: VOut) -> @location(0) vec4<f32> {
+    let pixel = vec2<i32>(in.clip_pos.xy);
+    let w = window_weight(in.uv.x, in.uv.y, mask.center, mask.params, mask.flags.x, mask.flags.y);
+    return mix(textureLoad(original, pixel, 0), textureLoad(corrected, pixel, 0), w);
+}
+"#
+        );
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("native_mask_mix_shader"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("native_mask_mix_pipeline_layout"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("native_mask_mix_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_quad",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_native_mask",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: WORKING_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview: None,
+            cache: None,
+        });
+        Self { layout, pipeline }
+    }
+
+    pub fn apply_into(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        corrected: &wgpu::Texture,
+        original: &wgpu::Texture,
+        output: &wgpu::Texture,
+        mask: &ResolvedMask,
+        logical: (u32, u32),
+    ) -> Result<(), &'static str> {
+        validate_native_mask(mask)?;
+        if corrected.size() != original.size()
+            || output.size() != original.size()
+            || output.format() != WORKING_FORMAT
+        {
+            return Err("native mask mix textures must have equal sizes and working format");
+        }
+        let (flags, center, params) = mask_fields(
+            Some(mask),
+            [
+                output.width() as f32 / logical.0.max(1) as f32,
+                output.height() as f32 / logical.1.max(1) as f32,
+            ],
+        );
+        let uniform = NativeMaskUniform {
+            flags: [flags[1], flags[2], 0, 0],
+            center,
+            params,
+        };
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("native_mask_mix_uniform"),
+            contents: bytemuck::bytes_of(&uniform),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let corrected_view = corrected.create_view(&Default::default());
+        let original_view = original.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_mask_mix_bind"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&corrected_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&original_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffer.as_entire_binding(),
+                },
+            ],
+        });
+        run_pass(device, queue, &self.pipeline, &bind, output);
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Explicit GPU source, target, data and mask bindings.
+fn upload_and_run_curves(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    in_view: &wgpu::TextureView,
+    samp: &wgpu::Sampler,
+    c: &crate::grade::ResolvedCurves,
+    mflag: [u32; 3],
+    mc: [f32; 4],
+    mp: [f32; 4],
+    out: &wgpu::Texture,
+    native: bool,
+) {
+    let mut data = Vec::with_capacity(256 * 9);
+    data.extend_from_slice(&c.master);
+    data.extend_from_slice(&c.red);
+    data.extend_from_slice(&c.green);
+    data.extend_from_slice(&c.blue);
+    data.extend_from_slice(&c.hue_vs_hue.unwrap_or([0.0; 256]));
+    data.extend_from_slice(&c.hue_vs_sat.unwrap_or([0.0; 256]));
+    data.extend_from_slice(&c.hue_vs_luma.unwrap_or([0.0; 256]));
+    data.extend_from_slice(&c.luma_vs_sat.unwrap_or([0.0; 256]));
+    data.extend_from_slice(&c.sat_vs_sat.unwrap_or([0.0; 256]));
+    let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("curve_lut"),
+        contents: bytemuck::cast_slice(&data),
+        usage: wgpu::BufferUsages::STORAGE,
+    });
+    let uni = CurvesUniform {
+        domain: [u32::from(native), 0, 0, 0],
+        flags: [mflag[0], mflag[1], mflag[2], c.hue_vs_hue.is_some() as u32],
+        flags2: [
+            c.hue_vs_sat.is_some() as u32,
+            c.hue_vs_luma.is_some() as u32,
+            c.luma_vs_sat.is_some() as u32,
+            c.sat_vs_sat.is_some() as u32,
+        ],
+        mask_c: mc,
+        mask_p: mp,
+    };
+    let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("curves_u"),
+        contents: bytemuck::bytes_of(&uni),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let mut entries = base_entries().to_vec();
+    entries.push(wgpu::BindGroupLayoutEntry {
+        binding: 3,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: true },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("curves_bgl"),
+        entries: &entries,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("curves_bg"),
+        layout: &bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(in_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(samp),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ubuf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: buf.as_entire_binding(),
+            },
+        ],
+    });
+    let pipeline = build_pipeline(device, &bgl, CURVES_SHADER, "fs_curves");
+    run_pass(device, queue, &pipeline, &bind, out);
+}
+
+pub fn validate_native_curves(c: &crate::grade::ResolvedCurves) -> Result<(), &'static str> {
+    for table in [
+        &c.hue_vs_hue,
+        &c.hue_vs_sat,
+        &c.hue_vs_luma,
+        &c.luma_vs_sat,
+        &c.sat_vs_sat,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if table
+            .iter()
+            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        {
+            return Err("native secondary curve samples must be finite within 0..1");
+        }
+    }
+    if [&c.master, &c.red, &c.green, &c.blue].iter().any(|table| {
+        table
+            .iter()
+            .any(|v| !v.is_finite() || !(-4.0..=4.0).contains(v))
+    }) {
+        return Err("native curve samples must be finite within -4..4");
+    }
+    Ok(())
+}
+/// ACEScct curves with extended RGB endpoints and bounded AP1 log secondary coordinates.
+pub fn apply_native_curves_into(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    input: &wgpu::Texture,
+    output: &wgpu::Texture,
+    c: &crate::grade::ResolvedCurves,
+) -> Result<(), &'static str> {
+    validate_native_curves(c)?;
+    if input.size() != output.size() || output.format() != WORKING_FORMAT {
+        return Err("native curve target must match source and use RGBA16F");
+    }
+    let view = input.create_view(&Default::default());
+    let samp = linear_sampler(device);
+    upload_and_run_curves(
+        device, queue, &view, &samp, c, [0; 3], [0.0; 4], [0.0; 4], output, true,
+    );
+    Ok(())
 }

@@ -86,6 +86,8 @@ pub(crate) enum ScopeKind {
     Waveform,
     /// RGB parade (three side-by-side waveforms).
     Parade,
+    /// Spatial RGB waveforms overlaid at each source column.
+    RgbWaveform,
     /// Cb/Cr vectorscope with skin-tone line (07 §6 vectorscope).
     Vectorscope,
     /// Luma/RGB histogram (07 §6 histogram).

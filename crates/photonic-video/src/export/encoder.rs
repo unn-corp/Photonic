@@ -43,12 +43,11 @@
 //!   at this build's default strictness — confirmed empirically — so alpha
 //!   VP9 uses `yuva420p` (full-res alpha plane, 4:2:0 chroma) plus
 //!   `-auto-alt-ref 0` (the standard recipe for VP9-alpha-in-WebM).
-//! - **ProRes 4444**: `prores_ks -profile:v 4`. `prores_ks` only accepts
-//!   10/12-bit pixel formats (`yuv444p10le`/`yuva444p10le` etc, no 8-bit);
-//!   feeding it our 8-bit `yuva444p` rawvideo and *not* forcing an output
-//!   `-pix_fmt` lets ffmpeg's implicit format-negotiation upconvert
-//!   automatically (confirmed empirically — no explicit `-pix_fmt`/`-vf
-//!   format=` needed on the output side).
+//! - **ProRes 4444**: `prores_ks -profile:v 4` receives `yuva444p12le`;
+//!   opaque ProRes HQ uses profile 3 with `yuv422p10le` input.
+//!   directly from the floating working frame. The synthetic export test
+//!   decodes the encoded stream and verifies more than 256 distinct luma
+//!   levels; no 8-bit rawvideo intermediate is used on this output path.
 //! - **Color tagging**: `-color_primaries/-color_trc/-colorspace bt709
 //!   -color_range tv` alone only reliably sets *container*-level tags for
 //!   some encoders (confirmed: `libx264` alone left `color_transfer`/
@@ -245,8 +244,10 @@ impl EncoderCapabilities {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PlaneKind {
     Yuv420,
+    Yuv422P10,
     Yuva420,
     Yuva444,
+    Yuva444P12,
     Rgba8,
 }
 
@@ -254,8 +255,10 @@ impl PlaneKind {
     pub fn ffmpeg_pix_fmt(self) -> &'static str {
         match self {
             PlaneKind::Yuv420 => "yuv420p",
+            PlaneKind::Yuv422P10 => "yuv422p10le",
             PlaneKind::Yuva420 => "yuva420p",
             PlaneKind::Yuva444 => "yuva444p",
+            PlaneKind::Yuva444P12 => "yuva444p12le",
             PlaneKind::Rgba8 => "rgba",
         }
     }
@@ -263,11 +266,13 @@ impl PlaneKind {
 
 /// §3.4's allow-list, restated as a plane-shape choice: PNG/APNG are RGB, VP9
 /// alpha is 4:2:0 (broad real-world decoder compatibility — `yuva444p` is
-/// rejected by `libvpx-vp9` at default strictness), ProRes 4444 is 4:4:4.
+/// rejected by `libvpx-vp9` at default strictness), ProRes 4444 is 4:4:4 and
+/// opaque ProRes HQ is 10-bit 4:2:2.
 pub fn plane_kind_for(codec: Option<VideoCodec>, alpha: bool) -> PlaneKind {
     match codec {
         Some(VideoCodec::Png) | Some(VideoCodec::Apng) => PlaneKind::Rgba8,
-        Some(VideoCodec::ProResLikeMezzanine) if alpha => PlaneKind::Yuva444,
+        Some(VideoCodec::ProResLikeMezzanine) if alpha => PlaneKind::Yuva444P12,
+        Some(VideoCodec::ProResLikeMezzanine) => PlaneKind::Yuv422P10,
         Some(VideoCodec::Vp9) if alpha => PlaneKind::Yuva420,
         _ if alpha => PlaneKind::Yuva444, // not reachable via `validate`'s allow-list; safe default
         _ => PlaneKind::Yuv420,
@@ -499,12 +504,12 @@ fn push_video_codec_args(
             }
         }
         VideoCodec::ProResLikeMezzanine => {
-            // profile 4 == "4444" (ffmpeg's -profile enum for prores_ks).
+            // profile 4 = 4444 with alpha; profile 3 = HQ 4:2:2 opaque.
             args.extend([
                 "-c:v".into(),
                 "prores_ks".into(),
                 "-profile:v".into(),
-                "4".into(),
+                if alpha { "4" } else { "3" }.into(),
             ]);
         }
         VideoCodec::Gif => {
@@ -1290,12 +1295,12 @@ mod tests {
         );
         assert_eq!(
             plane_kind_for(Some(VideoCodec::ProResLikeMezzanine), true),
-            PlaneKind::Yuva444
+            PlaneKind::Yuva444P12
         );
     }
 
     #[test]
-    fn plane_kind_no_alpha_is_yuv420_for_any_yuv_codec() {
+    fn plane_kind_no_alpha_prores_is_10_bit_422() {
         assert_eq!(
             plane_kind_for(Some(VideoCodec::H264), false),
             PlaneKind::Yuv420
@@ -1303,6 +1308,10 @@ mod tests {
         assert_eq!(
             plane_kind_for(Some(VideoCodec::Av1), false),
             PlaneKind::Yuv420
+        );
+        assert_eq!(
+            plane_kind_for(Some(VideoCodec::ProResLikeMezzanine), false),
+            PlaneKind::Yuv422P10
         );
     }
 
@@ -1423,6 +1432,20 @@ mod tests {
         // No output -pix_fmt override after the input declaration — only one
         // "-pix_fmt" occurrence total (the rawvideo input side).
         assert_eq!(args.iter().filter(|a| a.as_str() == "-pix_fmt").count(), 1);
+    }
+
+    #[test]
+    fn build_args_opaque_prores_uses_hq_422_profile() {
+        let mut preset = base_preset();
+        preset.container = Container::Mov;
+        preset.alpha = false;
+        preset.video = Some(VideoEncodeSpec {
+            codec: VideoCodec::ProResLikeMezzanine,
+            quality: QualityMode::Lossless,
+        });
+        let args = build_ffmpeg_args(&caps_with(&[]), &spec(&preset), "yuv422p10le", None).unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-profile:v", "3"]));
+        assert!(!args.windows(2).any(|pair| pair == ["-profile:v", "4"]));
     }
 
     #[test]

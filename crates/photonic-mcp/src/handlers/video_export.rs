@@ -29,6 +29,57 @@ pub struct ExportSequencesArgs {
     pub outputs: Vec<ExportSequenceArgs>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InspectRenderManifestArgs {
+    pub path: String,
+}
+
+pub async fn inspect_render_manifest(
+    state: &AppState,
+    args: InspectRenderManifestArgs,
+) -> ToolResult {
+    let path =
+        match crate::path_guard::check_path(state, &args.path, photonic_core::PathAccess::Read) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+    let manifest_path = path.clone();
+    let manifest = match tokio::task::spawn_blocking(move || {
+        photonic_video::export::manifest::read_manifest(&manifest_path)
+    })
+    .await
+    {
+        Ok(Ok(manifest)) => manifest,
+        Ok(Err(error)) => {
+            return ToolResult::error_with_code("RenderManifestInvalid", error.to_string())
+        }
+        Err(error) => {
+            return ToolResult::error_with_code("RenderManifestWorkerFailed", error.to_string())
+        }
+    };
+    let output = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(&manifest.output_file);
+    if let Err(error) =
+        crate::path_guard::check_path(state, &output, photonic_core::PathAccess::Read)
+    {
+        return error;
+    }
+    match tokio::task::spawn_blocking(move || {
+        photonic_video::export::manifest::verify_manifest_output(&manifest, &path)?;
+        Ok::<_, ExportError>(manifest)
+    })
+    .await
+    {
+        Ok(Ok(manifest)) => ToolResult::text("Render manifest snapshot and output verified")
+            .with_data(json!({"verified":true,"manifest":manifest})),
+        Ok(Err(error)) => ToolResult::error_with_code("RenderManifestInvalid", error.to_string()),
+        Err(error) => ToolResult::error_with_code("RenderManifestWorkerFailed", error.to_string()),
+    }
+}
+
 fn prepare(
     state: &AppState,
     snapshot: &RenderSnapshot,
@@ -48,6 +99,10 @@ fn prepare(
     }
     let output =
         crate::path_guard::check_path(state, &args.out_path, photonic_core::PathAccess::Write)?;
+    if args.write_manifest {
+        let sidecar = photonic_video::export::manifest::manifest_path(&output);
+        crate::path_guard::check_path(state, &sidecar, photonic_core::PathAccess::Write)?;
+    }
     let project = snapshot
         .project
         .as_ref()
@@ -109,7 +164,10 @@ fn prepare(
         preset,
         output,
         range,
-        options: Default::default(),
+        options: photonic_video::session::RenderJobOptions {
+            write_manifest: args.write_manifest,
+            ..Default::default()
+        },
     };
     let resolved = resolve_export_job(project, &job)
         .map_err(|error| ToolResult::error_with_code("ExportResolveFailed", error.to_string()))?;
@@ -186,6 +244,7 @@ fn start(
     };
     let outputs: Vec<Value> = prepared.iter().map(|(job,resolved)|json!({
         "sequence_id":job.sequence,"output_path":job.output,"total_frames":resolved.total_frames,
+        "manifest_path":if job.options.write_manifest { Some(photonic_video::export::manifest::manifest_path(&job.output)) } else { None },
         "width":resolved.out_size.0,"height":resolved.out_size.1,"format_index":job.format_index,"preset":job.preset.name,
         "audio":if job.preset.audio.is_some() { "muxed — offline sequence mix (K-0.7)" } else { "none in preset" },
     })).collect();

@@ -129,6 +129,9 @@ fn indexes_const_enum_and_fields_in_order() {
             "SetProxyMode",
             "SetPreviewTarget",
             "SetPreviewQuality",
+            // Native Managed export selects its output transform through an
+            // engine-only command; it does not mutate the document.
+            "SetNativeDelivery",
             // K-E2 scope tap — view state, sent beside the other Set* view
             // commands. The literal list caught this addition, which is exactly
             // the notice-me behaviour the note below asks of it.

@@ -26,6 +26,7 @@ fn test_state(mode: ProtocolMode) -> AppState {
         document: Arc::new(Mutex::new(Document::new("t", 1920.0, 1080.0))),
         history: Arc::new(Mutex::new(CommandHistory::new(200))),
         document_path: Arc::new(StdMutex::new(None)),
+        document_saves: Default::default(),
         capture_tx: Arc::new(StdMutex::new(tx)),
         config: McpServerConfig {
             port: 0,

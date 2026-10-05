@@ -1516,7 +1516,7 @@ impl PhotonicApp {
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new("Endpoint:  http://127.0.0.1:7842/mcp")
+                        RichText::new(format!("Endpoint:  http://127.0.0.1:{}/mcp", self.mcp_port))
                             .monospace()
                             .small(),
                     );
@@ -1535,11 +1535,11 @@ impl PhotonicApp {
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        RichText::new(
-                            "The server isn't listening on port 7842 — most often because another \
-                             Photonic instance is already using it. Close the other instance (or \
-                             free the port), then restart.",
-                        )
+                        RichText::new(format!(
+                            "The server isn't listening on port {}. Check whether another \
+                             application is using this port, then restart the server.",
+                            self.mcp_port,
+                        ))
                         .weak()
                         .small(),
                     );

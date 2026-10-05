@@ -3,10 +3,11 @@
 use super::audio::{MasterBus, TrackAudio};
 use super::captions::CaptionTrack;
 use super::clip::{Clip, ClipEffect};
-use super::grade::Grade;
+use super::grade::{Grade, SharedLook};
 use super::graph::NodeGraph;
 use super::ids::{
-    ClipId, CueId, GraphId, GroupId, MarkerCategoryId, MarkerId, SequenceId, TagId, TrackId,
+    AssetId, ClipId, CueId, GraphId, GroupId, MarkerCategoryId, MarkerId, SequenceId, SharedLookId,
+    TagId, TrackId,
 };
 use super::media::{MediaPool, MediaTag};
 use super::time::{FrameRate, Tick};
@@ -44,6 +45,9 @@ pub struct TimelineProject {
     /// taxonomy pattern as [`Self::marker_categories`]. Display order only.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media_tags: Vec<MediaTag>,
+    /// Reusable grades addressed by stable ID from clip look stages.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub shared_looks: HashMap<SharedLookId, SharedLook>,
 }
 
 impl TimelineProject {
@@ -59,6 +63,7 @@ impl TimelineProject {
             settings: ProjectVideoSettings::default(),
             marker_categories: Vec::new(),
             media_tags: Vec::new(),
+            shared_looks: HashMap::new(),
         }
     }
 
@@ -209,6 +214,12 @@ pub struct PreviewZone {
 /// A sequence: a stack of tracks with a frame rate and one or more aspect formats.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Sequence {
+    /// Versioned technical color intent; absent means the original SDR renderer.
+    #[serde(
+        default,
+        skip_serializing_if = "super::color::SequenceColorConfig::is_legacy"
+    )]
+    pub color: super::color::SequenceColorConfig,
     pub id: SequenceId,
     pub name: String,
     pub frame_rate: FrameRate,
@@ -241,6 +252,9 @@ pub struct Sequence {
     /// `None` = neutral.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_grade: Option<Grade>,
+    /// Gallery frames, pinned to their captured image and grading context.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_stills: Vec<ReferenceStill>,
     /// In/out for preview + export.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_range: Option<(Tick, Tick)>,
@@ -257,10 +271,29 @@ fn is_tick_zero(t: &Tick) -> bool {
     t.0 == 0
 }
 
+/// A captured program image for shot comparison. `image_asset` is an image in
+/// the media pool; its file may be missing after relink, but metadata survives.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceStill {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub image_asset: AssetId,
+    /// Full-file hash of the captured PNG; independent of mutable media metadata.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub image_hash: String,
+    pub source_clip: Option<ClipId>,
+    pub source_time: Tick,
+    /// Document revision of the rendered frame, not the later gallery edit.
+    pub grade_revision: u64,
+    pub color: super::color::SequenceColorConfig,
+    pub format_index: usize,
+}
+
 impl Sequence {
     /// A new sequence with one format and empty tracks.
     pub fn new(name: impl Into<String>, frame_rate: FrameRate, width: u32, height: u32) -> Self {
         Sequence {
+            color: Default::default(),
             id: SequenceId::new(),
             name: name.into(),
             frame_rate,
@@ -274,6 +307,7 @@ impl Sequence {
             audio_master: MasterBus::new(),
             master_effects: Vec::new(),
             master_grade: None,
+            reference_stills: Vec::new(),
             work_range: None,
             preview_zones: Vec::new(),
             start_timecode: Tick::ZERO,
@@ -334,6 +368,7 @@ impl Sequence {
         let mut dup = self.clone();
         dup.id = SequenceId::new();
         let mut link_remap: HashMap<LinkGroupId, LinkGroupId> = HashMap::new();
+        let mut clip_remap: HashMap<ClipId, ClipId> = HashMap::new();
         // Groups are remapped to fresh ids for the same reason link groups are:
         // so a grouped set stays grouped *within* the copy without tying it back
         // to the original (ids resolve across sequences).
@@ -349,7 +384,16 @@ impl Sequence {
         {
             track.id = TrackId::new();
             for clip in &mut track.clips {
+                let old_clip = clip.id;
                 clip.id = ClipId::new();
+                clip_remap.insert(old_clip, clip.id);
+                for version in &mut clip.grade_versions {
+                    let old = version.id;
+                    version.id = uuid::Uuid::new_v4();
+                    if clip.active_grade_version == Some(old) {
+                        clip.active_grade_version = Some(version.id);
+                    }
+                }
                 if let Some(old) = clip.link_group {
                     let fresh = *link_remap.entry(old).or_default();
                     clip.link_group = Some(fresh);
@@ -361,6 +405,12 @@ impl Sequence {
                     m.id = MarkerId::new();
                 }
             }
+        }
+        for still in &mut dup.reference_stills {
+            still.id = uuid::Uuid::new_v4();
+            still.source_clip = still
+                .source_clip
+                .and_then(|id| clip_remap.get(&id).copied());
         }
         if !group_remap.is_empty() {
             dup.groups = dup
@@ -1051,6 +1101,12 @@ pub struct GroupNode {
     pub kind: GroupKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<GroupId>,
+    /// Shared balance before each member clip's own grade, after its effects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_grade: Option<Grade>,
+    /// Shared look after each member clip's grade, before track grading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_grade: Option<Grade>,
 }
 
 impl GroupNode {
@@ -1060,6 +1116,8 @@ impl GroupNode {
             id: GroupId::new(),
             kind,
             parent: None,
+            pre_grade: None,
+            post_grade: None,
         }
     }
 }

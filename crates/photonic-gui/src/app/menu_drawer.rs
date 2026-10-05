@@ -151,7 +151,14 @@ impl PhotonicApp {
                                                 let path = if path.extension().is_none() {
                                                     path.with_extension(PHOTON_FILE_EXTENSION)
                                                 } else { path };
-                                                match write_photon_file(&path, doc, history) {
+                                                let prepared = super::copy_reference_stills_for_save_as(
+                                                    doc, self.current_file.as_deref(), &path,
+                                                );
+                                                let saved = prepared.and_then(|_| {
+                                                    write_photon_file(&path, doc, history)
+                                                        .map_err(|error| error.to_string())
+                                                });
+                                                match saved {
                                                     Ok(_) => {
                                                         self.welcome.add_recent(path.clone(), doc.name.clone());
                                                         self.file_status = Some(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
@@ -160,6 +167,35 @@ impl PhotonicApp {
                                                     }
                                                     Err(e) => self.file_status = Some(format!("Save failed: {e}")),
                                                 }
+                                            }
+                                        }
+                                        if ui.add_enabled(self.archive_job.is_none(), egui::Button::new("  Archive Project…  "))
+                                            .on_hover_text("Collect media, LUTs and reference stills into a portable folder")
+                                            .clicked()
+                                        {
+                                            self.active_drawer = None;
+                                            self.selected_drawer_option = None;
+                                            let default_name = self.current_file.as_ref()
+                                                .and_then(|path| path.file_stem())
+                                                .map(|name| format!("{}-archive", name.to_string_lossy()))
+                                                .unwrap_or_else(|| "Photonic-archive".to_string());
+                                            let source = self.current_file.clone();
+                                            if let Some(parent) = run_file_dialog(|| {
+                                                rfd::FileDialog::new().pick_folder()
+                                            }) {
+                                                let destination = parent.join(default_name);
+                                                let snapshot = doc.clone();
+                                                let (send, receive) = std::sync::mpsc::channel();
+                                                let repaint = ctx.clone();
+                                                std::thread::spawn(move || {
+                                                    let result = photonic_video::project::archive::archive_project(
+                                                        &snapshot, source.as_deref(), &destination,
+                                                    ).map_err(|error| error.to_string());
+                                                    let _ = send.send(result);
+                                                    repaint.request_repaint();
+                                                });
+                                                self.archive_job = Some(receive);
+                                                self.file_status = Some("Archiving project…".into());
                                             }
                                         }
                                     }

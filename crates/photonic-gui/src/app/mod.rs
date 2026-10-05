@@ -21,6 +21,7 @@ pub mod source_marks;
 pub mod autosave;
 mod clipboard;
 mod close_guard;
+mod color_windows;
 mod command_center;
 mod direct_select;
 pub mod engine;
@@ -65,8 +66,8 @@ use timeline::TimelineView;
 use crate::{
     hotbar::{self, HotbarAction, HotbarBucket, HotbarEffect, HotbarItem, HotbarMode},
     panels::{
-        self, ColorPageTab, DrawerGroup, EyedropperTarget, PanelAction, RightDrawerGroup,
-        ScopeKind, SelectSameAttr, ShapeKind, VideoPanelUi, ZOrderOp,
+        self, ColorPageTab, DrawerGroup, EyedropperTarget, PanelAction, QualifierSampleMode,
+        RightDrawerGroup, ScopeKind, SelectSameAttr, ShapeKind, VideoPanelUi, ZOrderOp,
     },
     preferences::AppPreferences,
     radial_wheel::{WheelContext, WheelNodeKind, WheelState},
@@ -785,6 +786,179 @@ pub(crate) enum TimelineTool {
     Slide,
 }
 
+struct PendingReferenceStill {
+    sequence: SequenceId,
+    time: Tick,
+    revision: u64,
+    source_clip: Option<ClipId>,
+    project_path: std::path::PathBuf,
+    requested_at: std::time::Instant,
+}
+
+struct ReferenceStillCapture {
+    id: uuid::Uuid,
+    relative: std::path::PathBuf,
+    path: std::path::PathBuf,
+    hash: String,
+    image_hash: String,
+}
+
+struct ReferenceStillJob {
+    request: PendingReferenceStill,
+    canceled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    receiver: std::sync::mpsc::Receiver<Result<ReferenceStillCapture, String>>,
+}
+
+impl Drop for ReferenceStillJob {
+    fn drop(&mut self) {
+        self.canceled
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(Ok(capture)) = self.receiver.try_recv() {
+            let _ = std::fs::remove_file(capture.path);
+        }
+    }
+}
+
+struct PendingShotMatch {
+    still: uuid::Uuid,
+    sequence: SequenceId,
+    clip: ClipId,
+    time: Tick,
+    revision: u64,
+    requested_at: std::time::Instant,
+}
+
+struct ShotMatchJob {
+    request: PendingShotMatch,
+    receiver: std::sync::mpsc::Receiver<
+        Result<Option<photonic_video::shot_match::PrinterLightSuggestion>, String>,
+    >,
+}
+
+struct ShotMatchPreview {
+    still: uuid::Uuid,
+    sequence: SequenceId,
+    clip: ClipId,
+    time: Tick,
+    revision: u64,
+    points: [f32; 3],
+}
+
+struct VideoEyedropperJob {
+    target: EyedropperTarget,
+    sequence: SequenceId,
+    time: Tick,
+    revision: u64,
+    frame_identity: Option<(u128, u64)>,
+    receiver: std::sync::mpsc::Receiver<Option<photonic_core::Color>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QualifierMatteTarget {
+    sequence: SequenceId,
+    track: TrackId,
+    clip: ClipId,
+    op: GradeOpId,
+    graph_node: Option<u32>,
+}
+
+impl QualifierMatteTarget {
+    fn tap(self, doc: &Document) -> photonic_video::graph::ScopeTapPoint {
+        let native = doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.sequences.get(&self.sequence))
+            .is_some_and(|s| !s.color.is_legacy());
+        if native && self.graph_node.is_some() {
+            photonic_video::graph::ScopeTapPoint::NativeGraphQualifierInput {
+                clip: self.clip,
+                node: self.graph_node.unwrap(),
+                op: self.op,
+            }
+        } else if native {
+            photonic_video::graph::ScopeTapPoint::NativeQualifierInput {
+                clip: self.clip,
+                op: self.op,
+            }
+        } else {
+            photonic_video::graph::ScopeTapPoint::ClipPreGrade(self.clip)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QualifierMatteKey {
+    target: QualifierMatteTarget,
+    time: Tick,
+    revision: u64,
+    snapshot_generation: u64,
+    content_hash: u128,
+    preview_quality: photonic_video::PreviewQuality,
+    proxy_mode: photonic_video::ProxyMode,
+}
+
+struct QualifierMatteJob {
+    key: QualifierMatteKey,
+    receiver: std::sync::mpsc::Receiver<Result<(Vec<u8>, u32, u32), String>>,
+}
+
+struct QualifierMattePreview {
+    key: QualifierMatteKey,
+    texture: egui::TextureHandle,
+    size: (u32, u32),
+}
+
+fn video_sample_coordinates(
+    image_rect: egui::Rect,
+    hit_rect: egui::Rect,
+    cursor: egui::Pos2,
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32)> {
+    if width == 0
+        || height == 0
+        || image_rect.width() <= 0.0
+        || image_rect.height() <= 0.0
+        || !hit_rect.contains(cursor)
+    {
+        return None;
+    }
+    let u = ((cursor.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+    let v = ((cursor.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
+    Some((
+        ((u * width as f32) as u32).min(width - 1),
+        ((v * height as f32) as u32).min(height - 1),
+    ))
+}
+
+struct ReferenceComparison {
+    still: uuid::Uuid,
+    sequence: SequenceId,
+    texture: egui::TextureHandle,
+    size: (u32, u32),
+    file: std::path::PathBuf,
+    file_len: u64,
+    file_modified: Option<std::time::SystemTime>,
+    image_hash: String,
+}
+
+impl ReferenceComparison {
+    fn file_valid(&self, path: &std::path::Path) -> bool {
+        if path != self.file {
+            return false;
+        }
+        std::fs::metadata(path).is_ok_and(|metadata| {
+            metadata.len() == self.file_len && metadata.modified().ok() == self.file_modified
+        })
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ReferenceCompareMode {
+    Wipe,
+    Split,
+}
+
 pub struct PhotonicApp {
     pub active_tool: Tool,
     /// The tool that was active on the previous frame. Used to edge-detect
@@ -911,6 +1085,8 @@ pub struct PhotonicApp {
     pub(crate) render_queue: photonic_video::export::RenderQueue,
     /// Whether the render-queue inspector panel is open (K-F1).
     pub(crate) render_queue_panel_open: bool,
+    /// Latest failure to prepare a multi-job export.
+    pub(crate) render_queue_error: Option<String>,
     /// Media pool drawer state + background import channel (05 §2).
     pub(crate) media_pool_ui: panels::media_pool::MediaPoolUi,
     /// Session clip-thumbnail + waveform caches feeding the timeline lane
@@ -932,6 +1108,24 @@ pub struct PhotonicApp {
     pub(crate) color_page_tab: ColorPageTab,
     /// [color_page, 07 §6] Floating scopes panel visibility.
     pub(crate) scopes_panel_open: bool,
+    /// Grading layout (restored from preferences): a shot strip takes the timeline's space.
+    pub(crate) color_workspace_open: bool,
+    color_layout_dirty: bool,
+    pending_reference_still: Option<PendingReferenceStill>,
+    reference_still_job: Option<ReferenceStillJob>,
+    pending_shot_match: Option<PendingShotMatch>,
+    shot_match_job: Option<ShotMatchJob>,
+    shot_match_preview: Option<ShotMatchPreview>,
+    video_sample_rect: Option<(egui::Rect, egui::Rect)>,
+    video_eyedropper_job: Option<VideoEyedropperJob>,
+    qualifier_matte_target: Option<QualifierMatteTarget>,
+    qualifier_matte_job: Option<QualifierMatteJob>,
+    qualifier_matte_preview: Option<QualifierMattePreview>,
+    reference_still_status: Option<String>,
+    selected_reference_still: Option<uuid::Uuid>,
+    reference_comparison: Option<ReferenceComparison>,
+    reference_compare_split: f32,
+    reference_compare_mode: ReferenceCompareMode,
     /// [color_page, 07 §6] Which scope the floating panel shows.
     pub(crate) scope_kind: ScopeKind,
     /// [node_editor, 08 §6.1] Graph open in the central node canvas, if any.
@@ -1208,6 +1402,9 @@ pub struct PhotonicApp {
     pub current_file: Option<std::path::PathBuf>,
     /// One-shot status message shown in the toolbar after save/load.
     file_status: Option<String>,
+    /// Background portable-project collection. Large source files must not
+    /// block the egui frame loop.
+    archive_job: Option<std::sync::mpsc::Receiver<Result<std::path::PathBuf, String>>>,
     /// Export settings modal — Some while open.
     export_dialog: Option<ExportDialog>,
     /// Simplify Path dialog — Some while open.
@@ -1463,6 +1660,8 @@ pub struct PhotonicApp {
     /// the MCP server thread after it has failed (#170). `None` until wired up by
     /// the host after construction.
     pub mcp_restart_requested: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Listener port supplied by the application host.
+    pub mcp_port: u16,
     /// Whether the MCP server status/restart modal is open (#170).
     pub show_mcp_modal: bool,
     /// Document-tab import/export settings (#176).
@@ -1652,11 +1851,29 @@ impl Default for PhotonicApp {
             /// K-F1 shared multi-job export queue (marker multi-export / multi-format).
             render_queue: photonic_video::export::RenderQueue::new(),
             render_queue_panel_open: false,
+            render_queue_error: None,
             media_pool_ui: panels::media_pool::MediaPoolUi::default(),
             timeline_media: None,
             selected_grade_op: None,
             color_page_tab: ColorPageTab::default(),
             scopes_panel_open: false,
+            color_workspace_open: false,
+            color_layout_dirty: false,
+            pending_reference_still: None,
+            reference_still_job: None,
+            pending_shot_match: None,
+            shot_match_job: None,
+            shot_match_preview: None,
+            video_sample_rect: None,
+            video_eyedropper_job: None,
+            qualifier_matte_target: None,
+            qualifier_matte_job: None,
+            qualifier_matte_preview: None,
+            reference_still_status: None,
+            selected_reference_still: None,
+            reference_comparison: None,
+            reference_compare_split: 0.5,
+            reference_compare_mode: ReferenceCompareMode::Wipe,
             scope_kind: ScopeKind::default(),
             open_graph: None,
             selected_graph_node: None,
@@ -1763,6 +1980,7 @@ impl Default for PhotonicApp {
 
             current_file: None,
             file_status: None,
+            archive_job: None,
             export_dialog: None,
             simplify_dialog: None,
             merge_vertices_dialog: None,
@@ -1820,6 +2038,7 @@ impl Default for PhotonicApp {
             history_graph: Vec::new(),
             history_current: 0,
             mcp_restart_requested: None,
+            mcp_port: 7842,
             show_mcp_modal: false,
             doc_export: DocExportSettings::default(),
             bleed_mm_input: 0.0,
@@ -2099,7 +2318,9 @@ fn load_document(
             .map(|doc| (doc, None))
             .map_err(|e| e.to_string())
     } else {
-        photonic_core::load_photon(&content).map_err(|e| e.to_string())
+        let (mut doc, history) = photonic_core::load_photon(&content).map_err(|e| e.to_string())?;
+        photonic_video::project::archive::resolve_project_relative_assets(&mut doc, path);
+        Ok((doc, history))
     }
 }
 
@@ -2148,6 +2369,41 @@ mod file_lifecycle_tests {
         assert_eq!(native_project_path(&path), None);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn moved_archive_opens_with_local_media_paths() {
+        use photonic_core::timeline::{AssetKind, AssetSource, MediaAsset, TimelineProject};
+
+        let root =
+            std::env::temp_dir().join(format!("photonic-gui-archive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let media = root.join("source.mov");
+        std::fs::write(&media, b"frames").unwrap();
+        let mut doc = photonic_core::Document::new("portable", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        project
+            .media
+            .insert(MediaAsset::from_file(AssetKind::Video, &media));
+        doc.timeline = Some(project);
+        let destination = root.join("archive");
+        photonic_video::project::archive::archive_project(&doc, None, &destination).unwrap();
+        let moved = root.join("moved");
+        std::fs::rename(&destination, &moved).unwrap();
+        let (loaded, history) = load_document(&moved.join("archive.photon")).unwrap();
+        assert!(history.is_none());
+        let asset = loaded
+            .timeline
+            .unwrap()
+            .media
+            .assets
+            .into_values()
+            .next()
+            .unwrap();
+        assert!(
+            matches!(asset.source, AssetSource::File { path, .. } if path.starts_with(&moved) && path.is_file())
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 
@@ -2329,9 +2585,12 @@ impl PhotonicApp {
         let open_drawer = prefs.open_drawer;
         let mut s = Self::default();
         s.prefs = prefs;
+        s.scope_kind = s.prefs.scope_window.kind;
+        s.scopes_panel_open = s.prefs.scope_window.open;
         s.fill_color = fill_color;
         s.lua_console.visible = console_visible;
         s.timeline_snap_enabled = s.prefs.timeline_snap_enabled;
+        s.color_workspace_open = s.prefs.color_workspace_open;
         // First-run coach: allowed only on a launch that has never shown it.
         s.coach_allowed_this_session = !s.prefs.video_coach_shown_once;
         s.open_drawer = open_drawer;
@@ -2374,6 +2633,7 @@ impl PhotonicApp {
         s.fill_color = fill_color;
         s.lua_console.visible = console_visible;
         s.timeline_snap_enabled = s.prefs.timeline_snap_enabled;
+        s.color_workspace_open = s.prefs.color_workspace_open;
         // First-run coach: allowed only on a launch that has never shown it.
         s.coach_allowed_this_session = !s.prefs.video_coach_shown_once;
         s.open_drawer = open_drawer;
@@ -2755,11 +3015,23 @@ impl PhotonicApp {
                     .into_iter()
                     .filter(|m| !m.waveform_only)
                     .filter_map(|m| {
-                        ops::set_asset_meta(project, m.asset, m.probe, m.content_hash).ok()
+                        let meta =
+                            ops::set_asset_meta(project, m.asset, m.probe, m.content_hash).ok()?;
+                        Some(match m.lut_full_hash {
+                            Some(hash) => {
+                                let pin =
+                                    ops::set_asset_lut_hash(project, m.asset, Some(hash)).ok()?;
+                                Command::Batch(vec![
+                                    Command::Timeline(meta),
+                                    Command::Timeline(pin),
+                                ])
+                            }
+                            None => Command::Timeline(meta),
+                        })
                     })
                     .collect();
                 for cmd in commands {
-                    history.execute_discrete(Command::Timeline(cmd), doc);
+                    history.execute_discrete(cmd, doc);
                     doc_modified = true;
                 }
             }
@@ -3434,6 +3706,21 @@ impl PhotonicApp {
                         self.enter_or_exit_video_mode(doc, history);
                     }
                     self.draw_video_hint_callout(ui.ctx(), video_resp.rect);
+                    if self.mode == AppMode::Video
+                        && ui
+                            .selectable_label(self.color_workspace_open, "Color")
+                            .on_hover_text("Toggle the grading layout and shot strip")
+                            .clicked()
+                    {
+                        self.color_workspace_open = !self.color_workspace_open;
+                        if self.color_workspace_open {
+                            self.open_right_drawer = Some(RightDrawerGroup::ColorControls);
+                            self.last_right_drawer_group = RightDrawerGroup::ColorControls;
+                            self.prefs.open_right_drawer = self.open_right_drawer;
+                        }
+                        self.prefs.color_workspace_open = self.color_workspace_open;
+                        self.prefs.save();
+                    }
 
                     // Audit log toggle
                     if ui
@@ -3567,7 +3854,7 @@ impl PhotonicApp {
                         // (status + restart, #170).
                         let (mcp_txt, mcp_col) = if mcp_running {
                             (
-                                format!("MCP :7842 {}", ph::CHECK),
+                                format!("MCP :{} {}", self.mcp_port, ph::CHECK),
                                 Color32::from_rgb(52, 211, 153),
                             )
                         } else {
@@ -4079,19 +4366,54 @@ impl PhotonicApp {
                         self.draw_claude_tab(ui);
                     }
                     RightDrawerGroup::ColorControls => {
-                        // Grade edits commit straight through `history`
-                        // (SetGrade → CommandHistory); disjoint `self` field
-                        // borrows keep this off `video_panel_ui`'s whole-self loan.
-                        panels::video::color_page::draw_color_controls(
-                            ui,
-                            doc,
-                            history,
-                            &mut self.pending_panel_actions,
-                            &self.timeline_selection,
-                            &mut self.selected_grade_op,
-                            &mut self.color_page_tab,
-                            &mut self.scopes_panel_open,
-                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("right_color_controls_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if let Some(frame) = self
+                                    .engine
+                                    .as_ref()
+                                    .and_then(|b| b.session().latest_frame())
+                                {
+                                    for error in &frame.color_errors {
+                                        ui.colored_label(ui.visuals().warn_fg_color, error);
+                                    }
+                                    for error in &frame.grading_errors {
+                                        ui.colored_label(
+                                            ui.visuals().warn_fg_color,
+                                            error.to_string(),
+                                        );
+                                    }
+                                }
+
+                                // Grade edits commit straight through `history`
+                                // (SetGrade → CommandHistory); disjoint `self` field
+                                // borrows keep this off `video_panel_ui`'s whole-self loan.
+                                let controls_id = egui::Id::new("advanced_color_controls");
+                                ui.ctx().data_mut(|data| {
+                                    data.insert_temp(
+                                        controls_id,
+                                        self.prefs.color_advanced_controls,
+                                    )
+                                });
+                                panels::video::color_page::draw_color_controls(
+                                    ui,
+                                    doc,
+                                    history,
+                                    &mut self.pending_panel_actions,
+                                    &self.timeline_selection,
+                                    &mut self.selected_grade_op,
+                                    &mut self.color_page_tab,
+                                    &mut self.scopes_panel_open,
+                                );
+                                let advanced = ui.ctx().data(|data| {
+                                    data.get_temp::<bool>(controls_id).unwrap_or(true)
+                                });
+                                if advanced != self.prefs.color_advanced_controls {
+                                    self.prefs.color_advanced_controls = advanced;
+                                    self.prefs.save();
+                                }
+                            });
                     }
                     // Hosted in a floating window instead — a stale
                     // `open_right_drawer` from an older build is migrated away
@@ -4148,13 +4470,45 @@ impl PhotonicApp {
         // egui-stacking order, so this must land after the console panel's
         // `show_animated` and before `CentralPanel::show`.
         if self.mode == AppMode::Video {
-            egui::TopBottomPanel::bottom("timeline")
+            if self.color_workspace_open {
+                let panel = egui::TopBottomPanel::bottom("color_shot_strip")
+                    .resizable(true)
+                    .default_height(self.prefs.color_shot_strip_height.clamp(80.0, 240.0))
+                    .min_height(80.0)
+                    .max_height(240.0)
+                    .show(ctx, |ui| self.draw_color_shot_strip(ui, doc, history));
+                let height = panel.response.rect.height().clamp(80.0, 240.0);
+                if (height - self.prefs.color_shot_strip_height).abs() > 0.5 {
+                    self.prefs.color_shot_strip_height = height;
+                    self.color_layout_dirty = true;
+                }
+            } else {
+                egui::TopBottomPanel::bottom("timeline")
+                    .resizable(true)
+                    .default_height(220.0)
+                    .min_height(120.0)
+                    .show(ctx, |ui| {
+                        self.draw_timeline_panel(ui, doc, history);
+                    });
+            }
+        }
+
+        if self.mode == AppMode::Video && self.color_workspace_open {
+            let panel = egui::SidePanel::left("color_reference_gallery")
                 .resizable(true)
-                .default_height(220.0)
-                .min_height(120.0)
-                .show(ctx, |ui| {
-                    self.draw_timeline_panel(ui, doc, history);
-                });
+                .default_width(self.prefs.color_gallery_width.clamp(145.0, 420.0))
+                .min_width(145.0)
+                .max_width(420.0)
+                .show(ctx, |ui| self.draw_reference_gallery(ui, doc, history));
+            let width = panel.response.rect.width().clamp(145.0, 420.0);
+            if (width - self.prefs.color_gallery_width).abs() > 0.5 {
+                self.prefs.color_gallery_width = width;
+                self.color_layout_dirty = true;
+            }
+        }
+        if self.color_layout_dirty && ctx.input(|input| input.pointer.any_released()) {
+            self.prefs.save();
+            self.color_layout_dirty = false;
         }
 
         // ── Audio mixer (floating window, 09) ────────────────────────────────
@@ -4204,6 +4558,11 @@ impl PhotonicApp {
         // floating windows, not drawers. Gated on their session flags (both
         // default-off, so vector mode and untouched video mode are unchanged).
         if self.mode == AppMode::Video {
+            let mut desired_tap = photonic_video::graph::ScopeTapPoint::Program;
+            if self.prefs.scope_window.open != self.scopes_panel_open {
+                self.prefs.scope_window.open = self.scopes_panel_open;
+                self.prefs.save();
+            }
             if self.scopes_panel_open {
                 // GPU scopes run over the engine's K-E2 scope tap (the clip's
                 // post-grade / pre-fold texture, or the program pre-caption) via
@@ -4223,25 +4582,86 @@ impl PhotonicApp {
                 }
                 let device = renderer.device_arc();
                 let queue = renderer.queue_arc();
+                let previous_scope_settings = self.prefs.scope_window.clone();
                 let want = panels::video::color_page::draw_scopes_panel(
                     ctx,
                     &device,
                     &queue,
-                    frame.as_deref(),
+                    frame
+                        .as_deref()
+                        .filter(|f| f.doc_revision == history.revision()),
                     doc,
                     &self.timeline_selection,
                     &mut self.scopes_panel_open,
                     &mut self.scope_kind,
+                    &mut self.prefs.scope_window,
                 );
-                // Stateless resend: the engine echoes the tap it was asked for on
-                // `EngineStatus`, so comparing against that sends one command per
-                // real change instead of one per frame.
-                if let Some(bridge) = self.engine.as_ref() {
-                    if bridge.session().status().scope_tap != want {
-                        bridge
-                            .session()
-                            .send(photonic_video::EngineCmd::SetScopeTap(want));
-                    }
+                if self.prefs.scope_window != previous_scope_settings {
+                    self.prefs.save();
+                }
+                desired_tap = want;
+            }
+            if let Some(target) = self.qualifier_matte_target {
+                desired_tap = target.tap(doc);
+            }
+            if let Some(EyedropperTarget::GradeQualifier {
+                graph_node,
+                seq,
+                track,
+                clip,
+                op,
+                ..
+            }) = self.eyedropper.target.as_ref()
+            {
+                let point = QualifierMatteTarget {
+                    graph_node: *graph_node,
+                    sequence: *seq,
+                    track: *track,
+                    clip: *clip,
+                    op: *op,
+                }
+                .tap(doc);
+                if matches!(
+                    point,
+                    photonic_video::graph::ScopeTapPoint::NativeQualifierInput { .. }
+                        | photonic_video::graph::ScopeTapPoint::NativeGraphQualifierInput { .. }
+                ) {
+                    desired_tap = point;
+                }
+            }
+            if let Some(EyedropperTarget::GradeCurve {
+                graph_node,
+                seq,
+                clip,
+                op,
+                ..
+            }) = self.eyedropper.target.as_ref()
+            {
+                if doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(seq))
+                    .is_some_and(|sequence| !sequence.color.is_legacy())
+                {
+                    desired_tap = if let Some(node) = graph_node {
+                        photonic_video::graph::ScopeTapPoint::NativeGraphCurveInput {
+                            clip: *clip,
+                            node: *node,
+                            op: *op,
+                        }
+                    } else {
+                        photonic_video::graph::ScopeTapPoint::NativeCurveInput {
+                            clip: *clip,
+                            op: *op,
+                        }
+                    };
+                }
+            }
+            if let Some(bridge) = self.engine.as_ref() {
+                if bridge.session().status().scope_tap != desired_tap {
+                    bridge
+                        .session()
+                        .send(photonic_video::EngineCmd::SetScopeTap(desired_tap));
                 }
             }
             // K-A6 Edit Duration floating form (position / in / out / duration +
@@ -4279,21 +4699,29 @@ impl PhotonicApp {
                     } else if let Some(bridge) = self.engine.as_ref() {
                         // Multi-format / marker multi-export (K-F1/F2): freeze
                         // the project and drain via the shared render queue.
-                        if let Ok(tools) = photonic_video::media::ffmpeg_locate::locate() {
-                            self.render_queue.ensure_worker(bridge.gpu().clone(), tools);
-                            if let Some(project) = doc.timeline.clone() {
-                                for job in jobs {
-                                    let label = job
-                                        .output
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_else(|| "export".into());
-                                    let _ = self.render_queue.enqueue(label, project.clone(), job);
+                        match photonic_video::media::ffmpeg_locate::locate() {
+                            Ok(tools) => {
+                                self.render_queue_error = None;
+                                self.render_queue.ensure_worker(bridge.gpu().clone(), tools);
+                                if let Some(project) = doc.timeline.clone() {
+                                    for job in jobs {
+                                        let label = job
+                                            .output
+                                            .file_name()
+                                            .map(|s| s.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| "export".into());
+                                        let _ =
+                                            self.render_queue.enqueue(label, project.clone(), job);
+                                    }
                                 }
-                                // Surface the queue inspector when multi-job lands.
-                                self.render_queue_panel_open = true;
+                            }
+                            Err(error) => {
+                                self.render_queue_error = Some(format!(
+                                    "Cannot prepare export: {error}. Install FFmpeg and FFprobe together, or set PHOTONIC_FFMPEG_DIR to their directory."
+                                ));
                             }
                         }
+                        self.render_queue_panel_open = true;
                     }
                 }
             }
@@ -4302,6 +4730,7 @@ impl PhotonicApp {
                     ctx,
                     &mut self.render_queue_panel_open,
                     &self.render_queue,
+                    self.render_queue_error.as_deref(),
                 );
             }
         }
@@ -4406,6 +4835,7 @@ impl PhotonicApp {
                     // edited; otherwise the monitor draws as before. Node-canvas
                     // entry/escape is wired by the node-editor (08) story.
                     if self.node_canvas_active {
+                        self.video_sample_rect = None;
                         let mut vid = self.video_panel_ui();
                         panels::video::node_editor::draw_node_canvas(
                             ui, rect, doc, history, &mut vid,
@@ -6753,6 +7183,9 @@ impl PhotonicApp {
                 }
             });
         doc_modified = self.process_panel_actions(ctx, doc, view, renderer, history, doc_modified);
+        if self.finish_video_eyedropper_if_ready(doc, history, &mut doc_modified) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
 
         // #171: commit the picked Fill/Stroke color to the Recent list only once
         // the drag ends, so the intermediate colors dragged through the picker
@@ -6799,78 +7232,100 @@ impl PhotonicApp {
                 self.eyedropper.cancel();
             } else {
                 if let Some(pos) = cursor {
-                    // Convert the egui cursor position (screen-space, relative to
-                    // the egui viewport) to canvas coordinates and sample the
-                    // topmost filled node in the document.  This is reliable on
-                    // all platforms including Wayland — no screen capture needed.
-                    let (cx, cy) = view.screen_to_canvas(pos.x as f64, pos.y as f64);
-                    // The raster color-range target samples the raster layer's
-                    // own pixels; every other target samples vector fills.
-                    let raster_target: Option<NodeId> = match &self.eyedropper.target {
-                        Some(EyedropperTarget::RasterColorRange { node_id }) => Some(*node_id),
-                        _ => None,
-                    };
-                    let raster_sample =
-                        raster_target.and_then(|nid| self.sample_raster_pixel(doc, nid, cx, cy));
-                    let sampled = if raster_target.is_some() {
-                        raster_sample.map(|(rgba, _)| {
-                            [
-                                rgba[0] as f32 / 255.0,
-                                rgba[1] as f32 / 255.0,
-                                rgba[2] as f32 / 255.0,
-                                rgba[3] as f32 / 255.0,
-                            ]
-                        })
-                    } else {
-                        photonic_core::sample_fill_at(doc, cx, cy)
-                    };
-
-                    // Draw color preview badge near cursor
-                    let preview_color = sampled
-                        .map(|c| {
-                            egui::Color32::from_rgba_unmultiplied(
-                                (c[0] * 255.0) as u8,
-                                (c[1] * 255.0) as u8,
-                                (c[2] * 255.0) as u8,
-                                (c[3] * 255.0) as u8,
+                    let video_grade_target = self.mode == AppMode::Video
+                        && matches!(
+                            self.eyedropper.target,
+                            Some(
+                                EyedropperTarget::GradeQualifier { .. }
+                                    | EyedropperTarget::GradeCurve { .. }
                             )
-                        })
-                        .unwrap_or(egui::Color32::TRANSPARENT);
-
-                    let painter = ctx.layer_painter(egui::LayerId::new(
-                        egui::Order::Tooltip,
-                        egui::Id::new("eyedropper_preview"),
-                    ));
-                    let preview_rect = egui::Rect::from_min_size(
-                        pos + egui::vec2(14.0, -28.0),
-                        egui::vec2(28.0, 28.0),
-                    );
-                    painter.rect_filled(preview_rect, 4.0, preview_color);
-                    painter.rect_stroke(
-                        preview_rect,
-                        4.0,
-                        egui::Stroke::new(1.5, egui::Color32::WHITE),
-                    );
-
-                    if clicked {
-                        if let Some(nid) = raster_target {
-                            // Begin (or restart) the color-range mask-out
-                            // session with the sampled pixel; a click outside
-                            // the layer just cancels the eyedropper.
-                            if let Some((rgba, seed)) = raster_sample {
-                                self.begin_raster_color_range(doc, nid, rgba, seed);
-                                doc_modified = true;
+                        );
+                    if video_grade_target {
+                        if clicked {
+                            if let Some(target) = self.eyedropper.target.clone() {
+                                self.start_video_eyedropper_sample(pos, target, doc, history);
                             }
-                        } else if let Some(rgba) = sampled {
-                            let picked = photonic_core::Color {
-                                r: rgba[0],
-                                g: rgba[1],
-                                b: rgba[2],
-                                a: rgba[3],
-                            };
-                            self.apply_eyedropper_color(doc, history, picked, &mut doc_modified);
+                            self.eyedropper.cancel();
                         }
-                        self.eyedropper.cancel();
+                    } else {
+                        // Convert the egui cursor position (screen-space, relative to
+                        // the egui viewport) to canvas coordinates and sample the
+                        // topmost filled node in the document.  This is reliable on
+                        // all platforms including Wayland — no screen capture needed.
+                        let (cx, cy) = view.screen_to_canvas(pos.x as f64, pos.y as f64);
+                        // The raster color-range target samples the raster layer's
+                        // own pixels; every other target samples vector fills.
+                        let raster_target: Option<NodeId> = match &self.eyedropper.target {
+                            Some(EyedropperTarget::RasterColorRange { node_id }) => Some(*node_id),
+                            _ => None,
+                        };
+                        let raster_sample = raster_target
+                            .and_then(|nid| self.sample_raster_pixel(doc, nid, cx, cy));
+                        let sampled = if raster_target.is_some() {
+                            raster_sample.map(|(rgba, _)| {
+                                [
+                                    rgba[0] as f32 / 255.0,
+                                    rgba[1] as f32 / 255.0,
+                                    rgba[2] as f32 / 255.0,
+                                    rgba[3] as f32 / 255.0,
+                                ]
+                            })
+                        } else {
+                            photonic_core::sample_fill_at(doc, cx, cy)
+                        };
+
+                        // Draw color preview badge near cursor
+                        let preview_color = sampled
+                            .map(|c| {
+                                egui::Color32::from_rgba_unmultiplied(
+                                    (c[0] * 255.0) as u8,
+                                    (c[1] * 255.0) as u8,
+                                    (c[2] * 255.0) as u8,
+                                    (c[3] * 255.0) as u8,
+                                )
+                            })
+                            .unwrap_or(egui::Color32::TRANSPARENT);
+
+                        let painter = ctx.layer_painter(egui::LayerId::new(
+                            egui::Order::Tooltip,
+                            egui::Id::new("eyedropper_preview"),
+                        ));
+                        let preview_rect = egui::Rect::from_min_size(
+                            pos + egui::vec2(14.0, -28.0),
+                            egui::vec2(28.0, 28.0),
+                        );
+                        painter.rect_filled(preview_rect, 4.0, preview_color);
+                        painter.rect_stroke(
+                            preview_rect,
+                            4.0,
+                            egui::Stroke::new(1.5, egui::Color32::WHITE),
+                        );
+
+                        if clicked {
+                            if let Some(nid) = raster_target {
+                                // Begin (or restart) the color-range mask-out
+                                // session with the sampled pixel; a click outside
+                                // the layer just cancels the eyedropper.
+                                if let Some((rgba, seed)) = raster_sample {
+                                    self.begin_raster_color_range(doc, nid, rgba, seed);
+                                    doc_modified = true;
+                                }
+                            } else if let Some(rgba) = sampled {
+                                let picked = photonic_core::Color {
+                                    r: rgba[0],
+                                    g: rgba[1],
+                                    b: rgba[2],
+                                    a: rgba[3],
+                                };
+                                self.apply_eyedropper_color(
+                                    doc,
+                                    history,
+                                    picked,
+                                    &mut doc_modified,
+                                );
+                            }
+                            self.eyedropper.cancel();
+                        }
                     }
                 }
 
@@ -6890,6 +7345,23 @@ impl PhotonicApp {
         // recovery folder when the interval elapses).
         self.sync_active_tab_meta(doc, doc_modified);
         self.run_autosave(ctx, doc, history);
+        if let Some(job) = self.archive_job.as_ref() {
+            match job.try_recv() {
+                Ok(Ok(path)) => {
+                    self.file_status = Some(format!("Archived to {}", path.display()));
+                    self.archive_job = None;
+                }
+                Ok(Err(error)) => {
+                    self.file_status = Some(format!("Archive failed: {error}"));
+                    self.archive_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.file_status = Some("Archive worker stopped unexpectedly".into());
+                    self.archive_job = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
 
         doc_modified
     }
@@ -6899,6 +7371,1665 @@ impl PhotonicApp {
     // (Select / Pen / Shape Builder handlers moved to `mod tool_handlers`)
 
     // (Layer/group operations moved to `mod layer_ops`)
+}
+
+fn reference_image_online(
+    doc: &Document,
+    project_path: Option<&std::path::Path>,
+    asset: photonic_core::timeline::AssetId,
+) -> bool {
+    reference_image_path(doc, project_path, asset).is_some()
+}
+
+fn reference_image_path(
+    doc: &Document,
+    project_path: Option<&std::path::Path>,
+    asset: photonic_core::timeline::AssetId,
+) -> Option<std::path::PathBuf> {
+    use photonic_core::timeline::AssetSource;
+    let Some(AssetSource::File { path, rel_path }) = doc
+        .timeline
+        .as_ref()
+        .and_then(|project| project.media.assets.get(&asset))
+        .map(|asset| &asset.source)
+    else {
+        return None;
+    };
+    rel_path
+        .as_ref()
+        .and_then(|rel| {
+            project_path
+                .and_then(|project| project.parent())
+                .map(|dir| dir.join(rel))
+        })
+        .filter(|candidate| candidate.is_file())
+        .or_else(|| path.is_file().then(|| path.clone()))
+}
+
+/// Copy captured gallery images before Save As writes a project at `destination`.
+/// The persisted relative path remains valid at the new location. Refuse hash
+/// mismatches and conflicting destination files instead of changing the look.
+fn copy_reference_stills_for_save_as(
+    doc: &Document,
+    source_project: Option<&std::path::Path>,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    let Some(project) = doc.timeline.as_ref() else {
+        return Ok(());
+    };
+    let target_dir = destination.parent().unwrap_or(std::path::Path::new("."));
+    for still in project.sequences.values().flat_map(|s| &s.reference_stills) {
+        let asset = project
+            .media
+            .assets
+            .get(&still.image_asset)
+            .ok_or_else(|| format!("reference {} has no image asset", still.name))?;
+        let photonic_core::timeline::AssetSource::File { rel_path, .. } = &asset.source else {
+            return Err(format!("reference {} is not a file", still.name));
+        };
+        let Some(relative) = rel_path
+            .as_ref()
+            .filter(|path| safe_reference_relative_path(path))
+        else {
+            return Err(format!(
+                "reference {} has an unexpected relative path",
+                still.name
+            ));
+        };
+        let source = reference_image_path(doc, source_project, still.image_asset)
+            .ok_or_else(|| format!("reference {} is offline", still.name))?;
+        let expected_hash = &still.image_hash;
+        if expected_hash.is_empty() {
+            return Err(format!("reference {} has no full image hash", still.name));
+        }
+        let source_hash =
+            photonic_video::media::full_content_hash(&source).map_err(|error| error.to_string())?;
+        if source_hash != expected_hash.as_str() {
+            return Err(format!("reference {} changed since capture", still.name));
+        }
+        let target = target_dir.join(relative);
+        if target == source {
+            continue;
+        }
+        if target.exists() {
+            let target_hash = photonic_video::media::full_content_hash(&target)
+                .map_err(|error| error.to_string())?;
+            if target_hash == expected_hash.as_str() {
+                continue;
+            }
+            return Err(format!(
+                "reference {} conflicts with an existing destination file",
+                still.name
+            ));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        let temporary = target.with_extension(format!("{}.copying", uuid::Uuid::new_v4()));
+        let copied = (|| -> Result<(), String> {
+            std::fs::copy(&source, &temporary).map_err(|error| error.to_string())?;
+            if photonic_video::media::full_content_hash(&temporary)
+                .map_err(|error| error.to_string())?
+                != expected_hash.as_str()
+            {
+                return Err(format!("reference {} changed during Save As", still.name));
+            }
+            // `rename` can replace a file created after the existence check.
+            // Link the verified staging file into place without overwriting a
+            // competing capture, then remove the staging name.
+            match std::fs::hard_link(&temporary, &target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let target_hash = photonic_video::media::full_content_hash(&target)
+                        .map_err(|error| error.to_string())?;
+                    if target_hash != expected_hash.as_str() {
+                        return Err(format!(
+                            "reference {} conflicts with an existing destination file",
+                            still.name
+                        ));
+                    }
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            std::fs::remove_file(&temporary).map_err(|error| error.to_string())?;
+            Ok(())
+        })();
+        if let Err(error) = copied {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn safe_reference_relative_path(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    let mut components = path.components();
+    let (Some(Component::Normal(dir)), Some(Component::Normal(file)), None) =
+        (components.next(), components.next(), components.next())
+    else {
+        return false;
+    };
+    let file = std::path::Path::new(file);
+    dir == std::ffi::OsStr::new("reference-stills")
+        && file.extension() == Some(std::ffi::OsStr::new("png"))
+        && file
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| uuid::Uuid::parse_str(stem).is_ok())
+}
+
+#[cfg(test)]
+mod reference_still_tests {
+    use super::*;
+    use photonic_core::timeline::{AssetKind, AssetSource, MediaAsset, Sequence, TimelineProject};
+
+    #[test]
+    fn capture_requires_a_saved_project_and_live_engine_without_editing_history() {
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("test", 100.0, 100.0);
+        let history = CommandHistory::new(20);
+        let mut project = TimelineProject::new();
+        project.insert_sequence(Sequence::new(
+            "cut",
+            photonic_core::timeline::FrameRate::FPS_30,
+            16,
+            16,
+        ));
+        doc.timeline = Some(project);
+        let original = doc.clone();
+        app.request_reference_still(&doc, &history);
+        assert!(app.pending_reference_still.is_none());
+        assert!(app
+            .reference_still_status
+            .as_ref()
+            .unwrap()
+            .contains("Save"));
+        app.current_file = Some(std::path::PathBuf::from("/tmp/test.photon"));
+        app.request_reference_still(&doc, &history);
+        assert!(app.pending_reference_still.is_none());
+        assert!(app
+            .reference_still_status
+            .as_ref()
+            .unwrap()
+            .contains("engine"));
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(history.revision(), 0);
+    }
+
+    #[test]
+    fn managed_reference_capture_and_comparison_reject_without_history() {
+        use photonic_core::timeline::color::{
+            DisplayView, ExportColorTransform, ManagedColorConfig, OcioConfigIdentity,
+            SequenceColorConfig, UnknownInputPolicy,
+        };
+        let mut app = PhotonicApp::default();
+        app.current_file = Some(std::path::PathBuf::from("/tmp/managed.photon"));
+        let mut doc = Document::new("test", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        sequence.color = SequenceColorConfig::Managed(Box::new(ManagedColorConfig {
+            version: 1,
+            grading_semantics_version: 1,
+            ocio: OcioConfigIdentity {
+                runtime_version: "2.5.2".into(),
+                name: "test".into(),
+                sha256: "a".repeat(64).try_into().unwrap(),
+                transform_assets: std::collections::BTreeMap::new(),
+            },
+            display: DisplayView {
+                display: "sRGB".into(),
+                view: "SDR".into(),
+            },
+            export: ExportColorTransform::ColorSpace {
+                name: "Rec.709".into(),
+            },
+            unknown_input: UnknownInputPolicy::RequireExplicit,
+        }));
+        let sequence_id = sequence.id;
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let history = CommandHistory::new(20);
+        app.request_reference_still(&doc, &history);
+        assert!(app.pending_reference_still.is_none());
+        assert!(app.reference_still_job.is_none());
+        assert!(app
+            .reference_still_status
+            .as_deref()
+            .unwrap()
+            .contains("Managed-color"));
+        let still = photonic_core::timeline::ReferenceStill {
+            id: uuid::Uuid::new_v4(),
+            name: "old".into(),
+            image_asset: photonic_core::timeline::AssetId::new(),
+            image_hash: String::new(),
+            source_clip: None,
+            source_time: Tick::ZERO,
+            grade_revision: 0,
+            color: doc.timeline.as_ref().unwrap().sequences[&sequence_id]
+                .color
+                .clone(),
+            format_index: 0,
+        };
+        assert!(app
+            .open_reference_comparison(&egui::Context::default(), &doc, sequence_id, &still)
+            .unwrap_err()
+            .contains("managed-color"));
+        assert_eq!(history.revision(), 0);
+    }
+
+    #[test]
+    fn gallery_checks_project_relative_image_when_absolute_path_is_stale() {
+        let dir =
+            std::env::temp_dir().join(format!("photonic-reference-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("reference-stills")).unwrap();
+        let relative = std::path::PathBuf::from("reference-stills/frame.png");
+        std::fs::write(dir.join(&relative), b"image").unwrap();
+        let asset = MediaAsset::new(
+            AssetKind::Image,
+            AssetSource::File {
+                path: dir.join("old-location.png"),
+                rel_path: Some(relative.clone()),
+            },
+        );
+        let id = asset.id;
+        let mut doc = Document::new("test", 100.0, 100.0);
+        let mut project = TimelineProject::new();
+        project.media.insert(asset);
+        doc.timeline = Some(project);
+        let project_path = dir.join("project.photon");
+        assert!(reference_image_online(&doc, Some(&project_path), id));
+        std::fs::remove_file(dir.join(relative)).unwrap();
+        assert!(!reference_image_online(&doc, Some(&project_path), id));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn save_as_copies_verified_reference_images_to_the_new_project() {
+        let root = std::env::temp_dir().join(format!(
+            "photonic-save-as-reference-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let old_dir = root.join("old");
+        let new_dir = root.join("new");
+        std::fs::create_dir_all(old_dir.join("reference-stills")).unwrap();
+        let id = uuid::Uuid::new_v4();
+        let relative = std::path::PathBuf::from("reference-stills").join(format!("{id}.png"));
+        let old_image = old_dir.join(&relative);
+        std::fs::write(&old_image, b"reference pixels").unwrap();
+        let mut asset = MediaAsset::new(
+            AssetKind::Image,
+            AssetSource::File {
+                path: old_image.clone(),
+                rel_path: Some(relative.clone()),
+            },
+        );
+        asset.content_hash = Some(photonic_video::media::content_hash(&old_image).unwrap());
+        let image_id = asset.id;
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        sequence
+            .reference_stills
+            .push(photonic_core::timeline::ReferenceStill {
+                id,
+                name: "Reference".into(),
+                image_asset: image_id,
+                image_hash: photonic_video::media::full_content_hash(&old_image).unwrap(),
+                source_clip: None,
+                source_time: Tick::ZERO,
+                grade_revision: 0,
+                color: sequence.color.clone(),
+                format_index: 0,
+            });
+        let mut project = TimelineProject::new();
+        project.media.insert(asset);
+        let duplicate = sequence.duplicate_with_fresh_ids();
+        assert_ne!(duplicate.reference_stills[0].id, id);
+        project.insert_sequence(duplicate);
+        project.insert_sequence(sequence);
+        let mut doc = Document::new("test", 16.0, 16.0);
+        doc.timeline = Some(project);
+        let old_project = old_dir.join("cut.photon");
+        let new_project = new_dir.join("cut.photon");
+        copy_reference_stills_for_save_as(&doc, Some(&old_project), &new_project).unwrap();
+        assert_eq!(
+            std::fs::read(new_dir.join(&relative)).unwrap(),
+            b"reference pixels"
+        );
+        std::fs::remove_file(&old_image).unwrap();
+        assert_eq!(
+            reference_image_path(&doc, Some(&new_project), image_id),
+            Some(new_dir.join(&relative))
+        );
+        std::fs::write(&old_image, b"reference pixels").unwrap();
+        std::fs::write(new_dir.join(&relative), b"different image").unwrap();
+        assert!(copy_reference_stills_for_save_as(&doc, Some(&old_project), &new_project).is_err());
+        assert_eq!(
+            std::fs::read(new_dir.join(&relative)).unwrap(),
+            b"different image"
+        );
+        assert!(!safe_reference_relative_path(std::path::Path::new(
+            "../escape.png"
+        )));
+        assert!(!safe_reference_relative_path(std::path::Path::new(
+            "reference-stills/not-a-uuid.png"
+        )));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn captures_a_full_quality_reference_and_undoes_gallery_edit() {
+        use photonic_core::timeline::{Clip, ClipSource, Track, TrackKind};
+        let Some(engine) = photonic_video::VideoEngine::headless() else {
+            eprintln!("GPU unavailable; reference capture integration skipped");
+            return;
+        };
+        let dir =
+            std::env::temp_dir().join(format!("photonic-capture-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = PhotonicApp::default();
+        app.current_file = Some(dir.join("project.photon"));
+        let mut doc = Document::new("test", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.clips.push(Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color {
+                    r: 0.5,
+                    g: 0.25,
+                    b: 0.125,
+                    a: 1.0,
+                },
+            },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        ));
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        app.engine = Some(bridge);
+        app.request_reference_still(&doc, &history);
+        assert!(app.pending_reference_still.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (app.pending_reference_still.is_some() || app.reference_still_job.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.finish_reference_still_if_ready(&mut doc, &mut history);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.pending_reference_still.is_none(),
+            "capture did not finish"
+        );
+        assert!(
+            app.reference_still_job.is_none(),
+            "capture worker did not finish"
+        );
+        let project = doc.timeline.as_ref().unwrap();
+        let stills = &project.sequences[&sequence_id].reference_stills;
+        assert_eq!(
+            stills.len(),
+            1,
+            "{}",
+            app.reference_still_status.as_deref().unwrap_or("no status")
+        );
+        let asset = &project.media.assets[&stills[0].image_asset];
+        assert!(asset.content_hash.is_some());
+        let AssetSource::File { path, .. } = &asset.source else {
+            panic!("reference is not a file")
+        };
+        let image =
+            photonic_core::RasterImage::from_encoded(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!((image.width, image.height), (16, 16));
+        assert_eq!(stills[0].grade_revision, 0);
+        let captured = stills[0].clone();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.open_reference_comparison(ctx, &doc, sequence_id, &captured)
+                .unwrap();
+        });
+        assert_eq!(app.reference_comparison.as_ref().unwrap().size, (16, 16));
+        assert!(app.reference_comparison.as_ref().unwrap().file_valid(path));
+        let mut wrong_format = captured.clone();
+        wrong_format.format_index = 1;
+        assert!(app
+            .open_reference_comparison(&ctx, &doc, sequence_id, &wrong_format)
+            .is_err());
+        std::fs::write(path, b"changed image").unwrap();
+        assert!(!app.reference_comparison.as_ref().unwrap().file_valid(path));
+        assert!(app
+            .open_reference_comparison(&ctx, &doc, sequence_id, &captured)
+            .is_err());
+        let rendered = app.engine.as_ref().unwrap().session.latest_frame().unwrap();
+        assert_eq!(
+            rendered.preview_quality,
+            photonic_video::PreviewQuality::Full
+        );
+        assert_eq!(
+            rendered.proxy_mode,
+            photonic_video::ProxyMode::ForceOriginal
+        );
+        assert!(!rendered.cached_preview);
+        assert!(history.undo(&mut doc));
+        assert!(doc.timeline.as_ref().unwrap().sequences[&sequence_id]
+            .reference_stills
+            .is_empty());
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_managed_reference_capture_matches_display_frame() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+            NativeManagedColorConfig, SequenceColorConfig,
+        };
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let Some(engine) = photonic_video::VideoEngine::headless() else {
+            return;
+        };
+        let Some(tools) = photonic_video::media::ffmpeg_locate::locate_for_test() else {
+            return;
+        };
+        let dir =
+            std::env::temp_dir().join(format!("photonic-native-gallery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.mkv");
+        assert!(std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=16x16:rate=30:duration=1",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                "-y",
+            ])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success());
+        let mut app = PhotonicApp::default();
+        app.current_file = Some(dir.join("native.photon"));
+        let mut doc = Document::new("test", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::from_file(AssetKind::Video, &source);
+        asset.probe = Some(photonic_video::media::probe::probe_asset(&tools, &source).unwrap());
+        asset.native_input_color = Some(NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        });
+        let asset_id = project.media.insert(asset);
+        let mut sequence =
+            Sequence::new("native", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        sequence.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.clips.push(Clip::new(
+            ClipSource::Asset { asset: asset_id },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        ));
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        app.engine = Some(bridge);
+        app.request_reference_still(&doc, &history);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (app.pending_reference_still.is_some() || app.reference_still_job.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.finish_reference_still_if_ready(&mut doc, &mut history);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let still =
+            doc.timeline.as_ref().unwrap().sequences[&sequence_id].reference_stills[0].clone();
+        let path =
+            reference_image_path(&doc, app.current_file.as_deref(), still.image_asset).unwrap();
+        let decoded =
+            photonic_core::RasterImage::from_encoded(&std::fs::read(&path).unwrap()).unwrap();
+        let offset = (8 * decoded.width as usize + 8) * 4;
+        let pixel = &decoded.pixels[offset..offset + 4];
+        assert!(
+            pixel[0] > 180 && pixel[1] < 50 && pixel[2] < 50,
+            "{pixel:?}"
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.open_reference_comparison(ctx, &doc, sequence_id, &still)
+                .unwrap();
+        });
+        assert_eq!(app.reference_comparison.as_ref().unwrap().size, (16, 16));
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn gallery_shot_match_is_one_undoable_edit_and_rejects_stale_preview() {
+        use photonic_core::timeline::{Clip, ClipSource, GradeOpParams, Track, TrackKind};
+        let Some(engine) = photonic_video::VideoEngine::headless() else {
+            eprintln!("GPU unavailable; gallery shot match integration skipped");
+            return;
+        };
+        let dir =
+            std::env::temp_dir().join(format!("photonic-shot-match-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut app = PhotonicApp::default();
+        app.current_file = Some(dir.join("project.photon"));
+        let mut doc = Document::new("test", 32.0, 32.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 32, 32);
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let first = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color {
+                    r: 0.2,
+                    g: 0.3,
+                    b: 0.4,
+                    a: 1.0,
+                },
+            },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let second = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color {
+                    r: 0.4,
+                    g: 0.45,
+                    b: 0.5,
+                    a: 1.0,
+                },
+            },
+            Tick::from_seconds(1),
+            Tick::from_seconds(1),
+        );
+        let second_id = second.id;
+        track.clips.extend([first, second]);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        app.engine = Some(bridge);
+        app.request_reference_still(&doc, &history);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (app.pending_reference_still.is_some() || app.reference_still_job.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.finish_reference_still_if_ready(&mut doc, &mut history);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.pending_reference_still.is_none());
+        let still_id =
+            doc.timeline.as_ref().unwrap().sequences[&sequence_id].reference_stills[0].id;
+        app.engine.as_mut().unwrap().sync_document(&doc, &history);
+        app.playhead = Tick::from_seconds(1);
+        app.timeline_selection = vec![second_id];
+        app.request_shot_match(&doc, &history, sequence_id, still_id);
+        assert!(app.pending_shot_match.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while (app.pending_shot_match.is_some() || app.shot_match_job.is_some())
+            && std::time::Instant::now() < deadline
+        {
+            app.finish_shot_match_if_ready(&doc, &history);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let preview = app
+            .shot_match_preview
+            .as_ref()
+            .expect("shot match proposal");
+        assert!(preview.points.iter().all(|point| *point < 0.0));
+        let before = history.revision();
+        app.apply_shot_match(&mut doc, &mut history);
+        assert_eq!(history.revision(), before + 1);
+        let clip = &doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[1];
+        assert!(matches!(
+            clip.grade.as_ref().unwrap().ops.last().unwrap().params.base,
+            GradeOpParams::PrinterLights { .. }
+        ));
+        assert!(history.undo(&mut doc));
+        assert!(
+            doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[1]
+                .grade
+                .is_none()
+        );
+
+        app.shot_match_preview = Some(ShotMatchPreview {
+            still: still_id,
+            sequence: sequence_id,
+            clip: second_id,
+            time: app.playhead,
+            revision: before,
+            points: [-12.0; 3],
+        });
+        let revision = history.revision();
+        app.apply_shot_match(&mut doc, &mut history);
+        assert_eq!(history.revision(), revision);
+        assert!(
+            doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[1]
+                .grade
+                .is_none()
+        );
+        let still = &doc.timeline.as_ref().unwrap().sequences[&sequence_id].reference_stills[0];
+        let path =
+            reference_image_path(&doc, app.current_file.as_deref(), still.image_asset).unwrap();
+        let original_image = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"changed reference").unwrap();
+        app.shot_match_preview = Some(ShotMatchPreview {
+            still: still_id,
+            sequence: sequence_id,
+            clip: second_id,
+            time: app.playhead,
+            revision,
+            points: [-12.0; 3],
+        });
+        app.apply_shot_match(&mut doc, &mut history);
+        assert_eq!(history.revision(), revision);
+        assert!(app
+            .reference_still_status
+            .as_deref()
+            .unwrap()
+            .contains("reference image changed"));
+        std::fs::write(&path, original_image).unwrap();
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        app.shot_match_preview = Some(ShotMatchPreview {
+            still: still_id,
+            sequence: sequence_id,
+            clip: second_id,
+            time: app.playhead,
+            revision,
+            points: [-12.0; 3],
+        });
+        app.apply_shot_match(&mut doc, &mut history);
+        assert_eq!(history.revision(), revision);
+        assert!(
+            doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[1]
+                .grade
+                .is_none()
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn background_shot_match_discards_stale_result() {
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("test", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        let sequence_id = sequence.id;
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let history = CommandHistory::new(20);
+        let still = uuid::Uuid::new_v4();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(Some(
+                photonic_video::shot_match::PrinterLightSuggestion {
+                    operator: "printer_lights",
+                    points: [-12.0; 3],
+                    raw_points: [-12.0; 3],
+                    eligible_pixels_reference: [256; 3],
+                    eligible_pixels_current: [256; 3],
+                    trimmed_pixels_reference: [50; 3],
+                    trimmed_pixels_current: [50; 3],
+                    method: "test",
+                    note: "test",
+                },
+            )))
+            .unwrap();
+        app.shot_match_job = Some(ShotMatchJob {
+            request: PendingShotMatch {
+                still,
+                sequence: sequence_id,
+                clip: ClipId::new(),
+                time: Tick::ZERO,
+                revision: history.revision(),
+                requested_at: std::time::Instant::now(),
+            },
+            receiver,
+        });
+        app.selected_reference_still = Some(still);
+        app.playhead = Tick::from_seconds(1);
+        app.finish_shot_match_if_ready(&doc, &history);
+        assert!(app.shot_match_job.is_none());
+        assert!(app.shot_match_preview.is_none());
+        assert_eq!(history.revision(), 0);
+    }
+
+    #[test]
+    fn stale_reference_capture_removes_uncommitted_image() {
+        let dir =
+            std::env::temp_dir().join(format!("photonic-stale-capture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("orphan.png");
+        std::fs::write(&path, b"orphan").unwrap();
+        let mut app = PhotonicApp::default();
+        app.current_file = Some(dir.join("current.photon"));
+        let mut doc = Document::new("test", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        let sequence_id = sequence.id;
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(ReferenceStillCapture {
+                id: uuid::Uuid::new_v4(),
+                relative: std::path::PathBuf::from("orphan.png"),
+                path: path.clone(),
+                hash: "hash".into(),
+                image_hash: "image-hash".into(),
+            }))
+            .unwrap();
+        app.reference_still_job = Some(ReferenceStillJob {
+            request: PendingReferenceStill {
+                sequence: sequence_id,
+                time: Tick::ZERO,
+                revision: 0,
+                source_clip: None,
+                project_path: dir.join("old.photon"),
+                requested_at: std::time::Instant::now(),
+            },
+            canceled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            receiver,
+        });
+        app.finish_reference_still_if_ready(&mut doc, &mut history);
+        assert!(app.reference_still_job.is_none());
+        assert!(!path.exists());
+        assert_eq!(history.revision(), 0);
+        assert!(doc.timeline.as_ref().unwrap().sequences[&sequence_id]
+            .reference_stills
+            .is_empty());
+        let abandoned = dir.join("abandoned.png");
+        std::fs::write(&abandoned, b"abandoned").unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Ok(ReferenceStillCapture {
+                id: uuid::Uuid::new_v4(),
+                relative: std::path::PathBuf::from("abandoned.png"),
+                path: abandoned.clone(),
+                hash: "hash".into(),
+                image_hash: "image-hash".into(),
+            }))
+            .unwrap();
+        drop(ReferenceStillJob {
+            request: PendingReferenceStill {
+                sequence: sequence_id,
+                time: Tick::ZERO,
+                revision: 0,
+                source_clip: None,
+                project_path: dir.join("old.photon"),
+                requested_at: std::time::Instant::now(),
+            },
+            canceled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            receiver,
+        });
+        assert!(!abandoned.exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn video_sample_coordinates_follow_zoomed_image_and_clip_to_viewer() {
+        let image = egui::Rect::from_min_max(egui::pos2(-50.0, 0.0), egui::pos2(150.0, 100.0));
+        let hit = image.intersect(egui::Rect::from_min_max(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(100.0, 100.0),
+        ));
+        assert_eq!(
+            video_sample_coordinates(image, hit, egui::pos2(0.0, 50.0), 200, 100),
+            Some((50, 50))
+        );
+        assert_eq!(
+            video_sample_coordinates(image, hit, egui::pos2(100.0, 100.0), 200, 100),
+            Some((150, 99))
+        );
+        assert_eq!(
+            video_sample_coordinates(image, hit, egui::pos2(-25.0, 50.0), 200, 100),
+            None
+        );
+    }
+
+    #[test]
+    fn program_viewer_curve_sample_is_undoable() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, Grade, GradeOp, GradeOpKind, GradeOpParams, Track, TrackKind,
+        };
+        let Some(engine) = photonic_video::VideoEngine::headless() else {
+            eprintln!("GPU unavailable; viewer curve sample integration skipped");
+            return;
+        };
+        let mut app = PhotonicApp::default();
+        app.mode = AppMode::Video;
+        let mut doc = Document::new("test", 32.0, 32.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 32, 32);
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let track_id = track.id;
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color {
+                    r: 0.25,
+                    g: 0.5,
+                    b: 0.75,
+                    a: 1.0,
+                },
+            },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let clip_id = clip.id;
+        let op = GradeOp::new(
+            GradeOpKind::Curves,
+            GradeOpParams::Curves {
+                master: vec![],
+                red: vec![],
+                green: vec![],
+                blue: vec![],
+                hue_vs_hue: vec![],
+                hue_vs_sat: vec![],
+                hue_vs_luma: vec![],
+                luma_vs_sat: vec![],
+                sat_vs_sat: vec![],
+            },
+        );
+        let op_id = op.id;
+        let mut grade = Grade::default();
+        grade.ops.push(op);
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        bridge.peek_sequence(sequence_id);
+        assert!(bridge.prepare_full_preview());
+        bridge.seek(Tick::ZERO);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while bridge.session.latest_frame().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let frame = bridge.session.latest_frame().expect("rendered frame");
+        bridge.presented_frame = Some((frame.time, frame.sequence));
+        app.engine = Some(bridge);
+        let rect = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(160.0, 160.0));
+        app.video_sample_rect = Some((rect, rect));
+        app.start_video_eyedropper_sample(
+            rect.center(),
+            EyedropperTarget::GradeCurve {
+                graph_node: None,
+                seq: sequence_id,
+                track: track_id,
+                clip: clip_id,
+                op: op_id,
+                channel: 1,
+            },
+            &doc,
+            &history,
+        );
+        assert!(app.video_eyedropper_job.is_some());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut changed = false;
+        while app.video_eyedropper_job.is_some() && std::time::Instant::now() < deadline {
+            app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut changed);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(changed);
+        assert_eq!(history.revision(), 1);
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        let GradeOpParams::Curves { red, .. } = &grade.ops[0].params.base else {
+            panic!("curves")
+        };
+        assert_eq!(red.len(), 3);
+        let expected = photonic_video::graph::ops::srgb_to_linear(0.25);
+        assert!((red[1].0 - expected).abs() < 0.02, "{red:?}");
+        assert!(history.undo(&mut doc));
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        let GradeOpParams::Curves { red, .. } = &grade.ops[0].params.base else {
+            panic!("curves")
+        };
+        assert!(red.is_empty());
+    }
+
+    #[test]
+    fn program_viewer_qualifier_sample_commits_once_and_discards_stale_result() {
+        use photonic_core::timeline::{
+            CdlParams, Clip, ClipSource, Grade, GradeOp, GradeOpKind, GradeOpParams, Track,
+            TrackKind,
+        };
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("test", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let track_id = track.id;
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::BLACK,
+            },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let clip_id = clip.id;
+        let op = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::default(),
+                keys: Vec::new(),
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        let op_id = op.id;
+        let mut grade = Grade::default();
+        grade.ops.push(op);
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let target = EyedropperTarget::GradeQualifier {
+            graph_node: None,
+            seq: sequence_id,
+            track: track_id,
+            clip: clip_id,
+            op: op_id,
+            mode: QualifierSampleMode::Replace,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Some(photonic_core::Color {
+                r: 0.1,
+                g: 0.2,
+                b: 0.3,
+                a: 1.0,
+            }))
+            .unwrap();
+        app.video_eyedropper_job = Some(VideoEyedropperJob {
+            target: target.clone(),
+            sequence: sequence_id,
+            time: Tick::ZERO,
+            revision: history.revision(),
+            frame_identity: None,
+            receiver,
+        });
+        let mut changed = false;
+        assert!(!app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut changed));
+        assert!(changed);
+        assert_eq!(history.revision(), 1);
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        let GradeOpParams::HslQualifier { hue, sat, lum, .. } = &grade.ops[0].params.base else {
+            panic!("qualifier")
+        };
+        let (h, s, l) = crate::panels::video::color_page::rgb_to_hsl(0.1, 0.2, 0.3);
+        assert!(hue[0] <= h && h <= hue[1]);
+        assert!(sat[0] <= s && s <= sat[1]);
+        assert!(lum[0] <= l && l <= lum[1]);
+        let seeded_hue = *hue;
+        app.eyedropper.target = Some(EyedropperTarget::GradeQualifier {
+            graph_node: None,
+            seq: sequence_id,
+            track: track_id,
+            clip: clip_id,
+            op: op_id,
+            mode: QualifierSampleMode::Add,
+        });
+        changed = false;
+        app.apply_eyedropper_color(
+            &mut doc,
+            &mut history,
+            photonic_core::Color {
+                r: 0.9,
+                g: 0.1,
+                b: 0.1,
+                a: 1.0,
+            },
+            &mut changed,
+        );
+        assert!(changed);
+        assert_eq!(history.revision(), 2);
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        let GradeOpParams::HslQualifier { hue, keys, .. } = &grade.ops[0].params.base else {
+            panic!("qualifier")
+        };
+        assert_eq!(*hue, seeded_hue);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].mode, photonic_core::timeline::QualifierKeyMode::Add);
+        app.eyedropper.target = Some(EyedropperTarget::GradeQualifier {
+            graph_node: None,
+            seq: sequence_id,
+            track: track_id,
+            clip: clip_id,
+            op: op_id,
+            mode: QualifierSampleMode::Add,
+        });
+        changed = false;
+        app.apply_eyedropper_color(
+            &mut doc,
+            &mut history,
+            photonic_core::Color {
+                r: 0.9,
+                g: 0.1,
+                b: 0.1,
+                a: 1.0,
+            },
+            &mut changed,
+        );
+        assert!(!changed);
+        assert_eq!(history.revision(), 2);
+        app.eyedropper.target = Some(EyedropperTarget::GradeQualifier {
+            graph_node: None,
+            seq: sequence_id,
+            track: track_id,
+            clip: clip_id,
+            op: op_id,
+            mode: QualifierSampleMode::Subtract,
+        });
+        changed = false;
+        app.apply_eyedropper_color(
+            &mut doc,
+            &mut history,
+            photonic_core::Color {
+                r: 0.9,
+                g: 0.1,
+                b: 0.1,
+                a: 1.0,
+            },
+            &mut changed,
+        );
+        assert!(changed);
+        assert_eq!(history.revision(), 3);
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        let GradeOpParams::HslQualifier { keys, .. } = &grade.ops[0].params.base else {
+            panic!("qualifier")
+        };
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[1].mode,
+            photonic_core::timeline::QualifierKeyMode::Subtract
+        );
+        assert!(history.undo(&mut doc));
+        assert!(history.undo(&mut doc));
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        let GradeOpParams::HslQualifier { hue, .. } = &grade.ops[0].params.base else {
+            panic!("qualifier")
+        };
+        assert_eq!(*hue, seeded_hue);
+        assert!(history.undo(&mut doc));
+        let revision = history.revision();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        sender
+            .send(Some(photonic_core::Color {
+                r: 0.8,
+                g: 0.2,
+                b: 0.1,
+                a: 1.0,
+            }))
+            .unwrap();
+        app.video_eyedropper_job = Some(VideoEyedropperJob {
+            target,
+            sequence: sequence_id,
+            time: Tick::ZERO,
+            revision,
+            frame_identity: None,
+            receiver,
+        });
+        app.playhead = Tick::from_seconds(1);
+        changed = false;
+        app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut changed);
+        assert!(!changed);
+        assert!(app.video_eyedropper_job.is_none());
+        assert_eq!(history.revision(), revision);
+    }
+
+    #[test]
+    fn native_qualifier_picker_and_matte_share_the_exact_input_and_preserve_history() {
+        check_native_correction_input_sampling(false, false, None);
+    }
+
+    #[test]
+    fn native_curve_picker_uses_ap1_log_input_before_own_and_later_corrections() {
+        check_native_correction_input_sampling(true, false, None);
+    }
+
+    #[test]
+    fn native_graph_qualifier_picker_and_matte_use_corrector_input() {
+        check_native_correction_input_sampling(false, true, None);
+    }
+
+    #[test]
+    fn native_graph_curve_picker_uses_corrector_input() {
+        check_native_correction_input_sampling(true, true, None);
+    }
+
+    #[test]
+    fn changing_graph_input_discards_armed_and_pending_samples_without_editing() {
+        let doc = Document::new("input choice", 16.0, 16.0);
+        let before = serde_json::to_value(&doc).unwrap();
+        let target = QualifierMatteTarget {
+            sequence: SequenceId::new(),
+            track: TrackId::new(),
+            clip: ClipId::new(),
+            op: GradeOpId::new(),
+            graph_node: Some(2),
+        };
+        let eye = EyedropperTarget::GradeCurve {
+            seq: target.sequence,
+            track: target.track,
+            clip: target.clip,
+            op: target.op,
+            graph_node: Some(1),
+            channel: 0,
+        };
+        let mut app = PhotonicApp::default();
+        app.eyedropper.target = Some(eye.clone());
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.video_eyedropper_job = Some(VideoEyedropperJob {
+            target: eye,
+            sequence: target.sequence,
+            time: Tick::ZERO,
+            revision: 0,
+            frame_identity: None,
+            receiver,
+        });
+        app.change_grade_input_selection(&egui::Context::default(), &doc, target);
+        assert!(app.eyedropper.target.is_none());
+        assert!(app.video_eyedropper_job.is_none());
+        assert!(
+            sender.send(None).is_err(),
+            "a pending result cannot reach the changed input selection"
+        );
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+    }
+
+    #[test]
+    fn native_node_qualifier_picker_and_matte_use_explicit_instance_input() {
+        check_native_correction_input_sampling(false, true, Some(2));
+    }
+
+    #[test]
+    fn native_node_key_source_picker_and_matte_use_explicit_source_input() {
+        check_native_correction_input_sampling(false, true, Some(5));
+    }
+
+    #[test]
+    fn native_node_curve_picker_uses_explicit_instance_input() {
+        check_native_correction_input_sampling(true, true, Some(2));
+    }
+
+    fn check_native_correction_input_sampling(curves: bool, graph: bool, graph_node: Option<u32>) {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+            NativeManagedColorConfig, SequenceColorConfig,
+        };
+        use photonic_core::timeline::{
+            CdlParams, Clip, ClipSource, Grade, GradeOp, GradeOpKind, GradeOpParams, Track,
+            TrackKind,
+        };
+        let engine = photonic_video::VideoEngine::headless()
+            .expect("native qualifier GUI qualification requires GPU");
+        let dir =
+            std::env::temp_dir().join(format!("photonic-native-key-ui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("source.png");
+        let mut image = photonic_core::RasterImage::new(16, 16);
+        let source_pixel = if curves {
+            [180, 60, 25, 128]
+        } else {
+            [100, 90, 80, 128]
+        };
+        for pixel in image.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&source_pixel);
+        }
+        std::fs::write(&path, image.to_png()).unwrap();
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::from_file(AssetKind::Image, &path);
+        asset.native_input_color = Some(NativeInputColorInterpretation {
+            version: 1,
+            standard: NativeInputStandard::SrgbDisplay,
+            range: InputSignalRange::Full,
+            matrix: InputMatrix::Rgb,
+            chroma_location: None,
+            reference_white_nits: None,
+            hlg_peak_nits: None,
+        });
+        let asset = project.media.insert(asset);
+        let mut sequence = Sequence::new(
+            "native key",
+            photonic_core::timeline::FrameRate::FPS_30,
+            16,
+            16,
+        );
+        sequence.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let track_id = track.id;
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let clip_id = clip.id;
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        let key = if curves {
+            GradeOp::new(
+                GradeOpKind::Curves,
+                GradeOpParams::Curves {
+                    master: vec![],
+                    red: vec![],
+                    green: vec![],
+                    blue: vec![],
+                    hue_vs_hue: vec![],
+                    hue_vs_sat: vec![],
+                    hue_vs_luma: vec![],
+                    luma_vs_sat: vec![],
+                    sat_vs_sat: vec![],
+                },
+            )
+        } else {
+            GradeOp::new(
+                GradeOpKind::HslQualifier,
+                GradeOpParams::HslQualifier {
+                    hue: [0.0, 1.0],
+                    sat: [0.0, 1.0],
+                    lum: [0.0, 1.0],
+                    softness: 0.0,
+                    correction: CdlParams {
+                        offset: [0.2, 0.0, 0.0],
+                        ..CdlParams::identity()
+                    },
+                    keys: vec![],
+                    matte_levels: [0.0, 0.0],
+                },
+            )
+        };
+        let op = key.id;
+        grade.ops.push(key);
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 2.0 },
+        ));
+        if graph {
+            grade.convert_to_graph();
+            if graph_node == Some(5) {
+                let key = grade
+                    .add_graph_utility(photonic_core::timeline::GradeGraphNode::QualifierMatte {
+                        input: 1,
+                        op,
+                        label: "Key input".into(),
+                    })
+                    .unwrap();
+                assert_eq!(key, 5);
+                grade
+                    .add_graph_utility(photonic_core::timeline::GradeGraphNode::MatteApply {
+                        original: 0,
+                        corrected: 3,
+                        matte: key,
+                        label: String::new(),
+                    })
+                    .unwrap();
+            }
+        }
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        let mut doc = Document::new("native key", 16.0, 16.0);
+        doc.timeline = Some(project);
+        let original = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::new(20);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        bridge.peek_sequence(sequence_id);
+        assert!(bridge.prepare_full_preview());
+        let target = QualifierMatteTarget {
+            graph_node,
+            sequence: sequence_id,
+            track: track_id,
+            clip: clip_id,
+            op,
+        };
+        let point = if curves {
+            if let Some(node) = graph_node {
+                photonic_video::graph::ScopeTapPoint::NativeGraphCurveInput {
+                    clip: clip_id,
+                    node,
+                    op,
+                }
+            } else {
+                photonic_video::graph::ScopeTapPoint::NativeCurveInput { clip: clip_id, op }
+            }
+        } else {
+            target.tap(&doc)
+        };
+        let sample_target = || {
+            if curves {
+                EyedropperTarget::GradeCurve {
+                    graph_node,
+                    seq: sequence_id,
+                    track: track_id,
+                    clip: clip_id,
+                    op,
+                    channel: 7,
+                }
+            } else {
+                EyedropperTarget::GradeQualifier {
+                    graph_node,
+                    seq: sequence_id,
+                    track: track_id,
+                    clip: clip_id,
+                    op,
+                    mode: QualifierSampleMode::Replace,
+                }
+            }
+        };
+        bridge
+            .session
+            .send(photonic_video::EngineCmd::SetScopeTap(point));
+        bridge.seek(Tick::ZERO);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let frame = loop {
+            if let Some(frame) = bridge.session.latest_frame() {
+                if frame.scope_tap_point == point && frame.scope_tap.is_some() {
+                    break frame;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native qualifier input did not render"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(
+            frame.scope_tap_encoding,
+            Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+        );
+        bridge.presented_frame = Some((frame.time, frame.sequence));
+        let mut app = PhotonicApp::default();
+        app.mode = AppMode::Video;
+        app.engine = Some(bridge);
+        app.timeline_selection.push(clip_id);
+        let ctx = egui::Context::default();
+        if !curves {
+            app.toggle_qualifier_matte(&ctx, &doc, target);
+            assert_eq!(app.qualifier_matte_target, Some(target));
+            while app.qualifier_matte_preview.is_none() && std::time::Instant::now() < deadline {
+                app.update_qualifier_matte_preview(&ctx, &doc, &history);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert_eq!(
+                app.qualifier_matte_preview
+                    .as_ref()
+                    .expect("native matte")
+                    .size,
+                (16, 16)
+            );
+            assert_eq!(serde_json::to_value(&doc).unwrap(), original);
+            assert_eq!(history.revision(), 0);
+        }
+        // Reject a completed native sample from a different source/graph snapshot.
+        for identity in [
+            (frame.content_hash.0 ^ 1, frame.snapshot_generation),
+            (frame.content_hash.0, frame.snapshot_generation + 1),
+        ] {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            sender
+                .send(Some(photonic_core::Color {
+                    r: 0.1,
+                    g: 0.2,
+                    b: 0.3,
+                    a: 1.0,
+                }))
+                .unwrap();
+            app.video_eyedropper_job = Some(VideoEyedropperJob {
+                target: sample_target(),
+                sequence: sequence_id,
+                time: Tick::ZERO,
+                revision: history.revision(),
+                frame_identity: Some(identity),
+                receiver,
+            });
+            let mut changed = false;
+            app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut changed);
+            assert!(!changed);
+            assert_eq!(history.revision(), 0);
+        }
+        app.video_sample_rect = Some((
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0)),
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(16.0, 16.0)),
+        ));
+        app.start_video_eyedropper_sample(egui::pos2(8.0, 8.0), sample_target(), &doc, &history);
+        assert!(app.video_eyedropper_job.is_some());
+        let mut changed = false;
+        while app.video_eyedropper_job.is_some() && std::time::Instant::now() < deadline {
+            app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut changed);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(changed);
+        assert_eq!(history.revision(), 1);
+        assert_eq!(
+            app.reference_still_status.as_deref(),
+            Some("Applied video colour sample")
+        );
+        let decode = |v: f64| {
+            let e = v / 255.0;
+            if e <= 0.04045 {
+                e / 12.92
+            } else {
+                ((e + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let linear =
+            [source_pixel[0], source_pixel[1], source_pixel[2]].map(|v| decode(f64::from(v)));
+        let ap1 = [
+            linear[0] * 0.6130974024 + linear[1] * 0.3395231462 + linear[2] * 0.0473794514,
+            linear[0] * 0.0701937225 + linear[1] * 0.9163538791 + linear[2] * 0.0134523985,
+            linear[0] * 0.0206155929 + linear[1] * 0.1095697729 + linear[2] * 0.8698146342,
+        ];
+        let logs = ap1.map(|v| ((v * 2.0).log2() + 9.72) / 17.52);
+        let expected_l = (logs.into_iter().fold(f64::INFINITY, f64::min)
+            + logs.into_iter().fold(f64::NEG_INFINITY, f64::max))
+            / 2.0;
+        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
+            .grade
+            .as_ref()
+            .unwrap();
+        if curves {
+            let GradeOpParams::Curves { luma_vs_sat, .. } = &grade.ops[1].params.base else {
+                panic!("curves")
+            };
+            let expected = logs[0] * 0.27222872 + logs[1] * 0.67408174 + logs[2] * 0.053689517;
+            assert_eq!(luma_vs_sat.len(), 3);
+            assert!(
+                (f64::from(luma_vs_sat[1].0) - expected).abs() < 0.0015,
+                "{luma_vs_sat:?} versus AP1 log luma {expected}"
+            );
+            assert_eq!(luma_vs_sat[1].1, 0.5);
+        } else {
+            let GradeOpParams::HslQualifier { lum, .. } = grade.ops[1].params.base else {
+                panic!("key")
+            };
+            assert!(
+                (f64::from((lum[0] + lum[1]) / 2.0) - expected_l).abs() < 0.01,
+                "{lum:?} versus log lightness {expected_l}"
+            );
+        }
+        assert!(history.undo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), original);
+        app.timeline_selection.clear();
+        app.update_qualifier_matte_preview(&ctx, &doc, &history);
+        assert!(app.qualifier_matte_preview.is_none());
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn qualifier_matte_preview_renders_held_frame_without_editing_document() {
+        use photonic_core::timeline::{
+            CdlParams, Clip, ClipSource, Grade, GradeOp, GradeOpKind, GradeOpParams, Track,
+            TrackKind,
+        };
+        let Some(engine) = photonic_video::VideoEngine::headless() else {
+            eprintln!("GPU unavailable; matte preview integration skipped");
+            return;
+        };
+        let mut app = PhotonicApp::default();
+        app.mode = AppMode::Video;
+        let mut doc = Document::new("matte", 16.0, 16.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 16, 16);
+        let sequence_id = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let track_id = track.id;
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color {
+                    r: 0.8,
+                    g: 0.2,
+                    b: 0.1,
+                    a: 1.0,
+                },
+            },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let clip_id = clip.id;
+        let op = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::default(),
+                keys: Vec::new(),
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        let op_id = op.id;
+        let mut grade = Grade::default();
+        grade.ops.push(op);
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let original = doc.clone();
+        let history = CommandHistory::new(20);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        bridge.peek_sequence(sequence_id);
+        assert!(bridge.prepare_full_preview());
+        bridge.session.send(photonic_video::EngineCmd::SetScopeTap(
+            photonic_video::graph::ScopeTapPoint::ClipPreGrade(clip_id),
+        ));
+        bridge.seek(Tick::ZERO);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let frame = loop {
+            if let Some(frame) = bridge.session.latest_frame() {
+                if frame.scope_tap_point
+                    == photonic_video::graph::ScopeTapPoint::ClipPreGrade(clip_id)
+                    && frame.scope_tap.is_some()
+                {
+                    break frame;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pre-grade tap did not render"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        bridge.presented_frame = Some((frame.time, frame.sequence));
+        app.engine = Some(bridge);
+        app.timeline_selection.push(clip_id);
+        app.qualifier_matte_target = Some(QualifierMatteTarget {
+            graph_node: None,
+            sequence: sequence_id,
+            track: track_id,
+            clip: clip_id,
+            op: op_id,
+        });
+        let ctx = egui::Context::default();
+        while app.qualifier_matte_preview.is_none() && std::time::Instant::now() < deadline {
+            app.update_qualifier_matte_preview(&ctx, &doc, &history);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let preview = app.qualifier_matte_preview.as_ref().expect("matte preview");
+        assert_eq!(preview.size, (16, 16));
+        assert_eq!(preview.key.target.op, op_id);
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(history.revision(), 0);
+        app.timeline_selection.clear();
+        app.update_qualifier_matte_preview(&ctx, &doc, &history);
+        assert!(app.qualifier_matte_target.is_none());
+        assert!(app.qualifier_matte_preview.is_none());
+    }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -7461,4 +9592,1553 @@ fn video_status_line(doc: &Document, playhead: photonic_core::timeline::Tick) ->
         seq.video_tracks.len(),
         seq.audio_tracks.len(),
     ))
+}
+
+impl PhotonicApp {
+    /// Shot browsing is session state: selecting a card only seeks and selects.
+    fn draw_color_shot_strip(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &mut Document,
+        history: &mut CommandHistory,
+    ) {
+        if self.timeline_media.is_none() {
+            self.timeline_media = Some(timeline::TimelineMediaCaches::new(
+                self.current_file.as_deref(),
+                self.active_tab,
+            ));
+        }
+        if let (Some(caches), Some(project)) = (self.timeline_media.as_mut(), doc.timeline.as_ref())
+        {
+            caches.refresh(
+                self.current_file.as_deref(),
+                self.active_tab,
+                &project.media,
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.strong("Shots");
+            ui.label("Select a shot to grade");
+            if ui.button("Capture still").clicked() {
+                self.request_reference_still(doc, history);
+            }
+            if let Some(status) = &self.reference_still_status {
+                ui.label(status);
+            }
+        });
+        self.finish_reference_still_if_ready(doc, history);
+        let shots = doc
+            .timeline
+            .as_ref()
+            .and_then(|project| {
+                project
+                    .active_sequence
+                    .and_then(|id| project.sequences.get(&id))
+            })
+            .map(|sequence| {
+                let mut shots: Vec<_> = sequence
+                    .video_tracks
+                    .iter()
+                    .filter(|track| track.kind.is_visual())
+                    .flat_map(|track| {
+                        track.clips.iter().map(move |clip| {
+                            let source = match &clip.source {
+                                photonic_core::timeline::ClipSource::Asset { asset } => {
+                                    Some((*asset, clip.source_in))
+                                }
+                                _ => None,
+                            };
+                            (
+                                clip.start,
+                                track.name.as_str(),
+                                clip.id,
+                                clip.name.as_str(),
+                                source,
+                            )
+                        })
+                    })
+                    .collect();
+                shots.sort_by_key(|(start, _, id, _, _)| (*start, *id));
+                shots
+            })
+            .unwrap_or_default();
+        let mut chosen = None;
+        let mut budget = timeline::clips::ThumbnailBudget::new(12);
+        let card_height = (ui.available_height() - 8.0).clamp(68.0, 180.0);
+        let card_width = 132.0 + (card_height - 68.0) * 1.5;
+        egui::ScrollArea::horizontal().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (_, track, id, name, source) in &shots {
+                    let selected = self.timeline_selection.contains(id);
+                    let (rect, response) = ui.allocate_exact_size(
+                        egui::vec2(card_width, card_height),
+                        egui::Sense::click(),
+                    );
+                    let response = response.on_hover_text(format!("{name} • {track}"));
+                    let painter = ui.painter().with_clip_rect(rect);
+                    painter.rect_filled(rect, 3.0, ui.visuals().widgets.inactive.bg_fill);
+                    let image_rect = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(2.0, 2.0),
+                        egui::vec2(card_width - 4.0, card_height - 24.0),
+                    );
+                    if let Some((asset, source_tick)) = source {
+                        if let Some(handle) = self
+                            .timeline_media
+                            .as_ref()
+                            .and_then(|caches| caches.shot_thumbnail(*asset, *source_tick))
+                        {
+                            if let Some(texture) =
+                                timeline::clips::thumbnail_texture(ui.ctx(), &handle, &mut budget)
+                            {
+                                painter.image(
+                                    texture,
+                                    image_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                        }
+                    }
+                    painter.text(
+                        rect.left_bottom() + egui::vec2(5.0, -11.0),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        egui::FontId::proportional(12.0),
+                        ui.visuals().text_color(),
+                    );
+                    if selected {
+                        painter.rect_stroke(
+                            rect,
+                            3.0,
+                            egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                        );
+                    }
+                    if response.clicked() {
+                        chosen = Some(*id);
+                    }
+                }
+            });
+        });
+        if let Some(id) = chosen {
+            self.select_grade_clip(doc, id);
+        }
+        if self
+            .timeline_media
+            .as_ref()
+            .is_some_and(timeline::TimelineMediaCaches::has_pending)
+        {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.pending_reference_still.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if self.reference_still_job.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn request_reference_still(&mut self, doc: &Document, history: &CommandHistory) {
+        if let Some(job) = self.reference_still_job.take() {
+            job.canceled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        self.pending_reference_still = None;
+        let Some(project_path) = self.current_file.clone() else {
+            self.reference_still_status = Some("Save the project before capturing a still".into());
+            return;
+        };
+        let Some(sequence) = doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.active_sequence.and_then(|id| p.sequences.get(&id)))
+        else {
+            self.reference_still_status = Some("No active sequence".into());
+            return;
+        };
+        if !sequence.color.is_legacy()
+            && !matches!(
+                sequence.color,
+                photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+            )
+        {
+            self.reference_still_status =
+                Some("Managed-color reference capture is unavailable until its output transform is qualified".into());
+            return;
+        }
+        let Some(bridge) = self.engine.as_mut() else {
+            self.reference_still_status = Some("Video engine is unavailable".into());
+            return;
+        };
+        self.monitor_playing = false;
+        bridge.peek_sequence(sequence.id);
+        if !bridge.prepare_full_preview() {
+            self.reference_still_status = Some("Could not request a full-quality frame".into());
+            return;
+        }
+        bridge.seek(self.playhead);
+        let source_clip = sequence
+            .video_tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .find(|clip| {
+                self.timeline_selection.contains(&clip.id)
+                    && clip.start <= self.playhead
+                    && self.playhead < clip.start + clip.duration
+            })
+            .map(|clip| clip.id);
+        self.pending_reference_still = Some(PendingReferenceStill {
+            sequence: sequence.id,
+            time: self.playhead,
+            revision: history.revision(),
+            source_clip,
+            project_path,
+            requested_at: std::time::Instant::now(),
+        });
+        self.reference_still_status = Some("Capturing full-quality still…".into());
+    }
+
+    fn draw_reference_gallery(
+        &mut self,
+        ui: &mut egui::Ui,
+        doc: &mut Document,
+        history: &mut CommandHistory,
+    ) {
+        ui.heading("Reference gallery");
+        self.finish_shot_match_if_ready(doc, history);
+        if self.pending_shot_match.is_some() || self.shot_match_job.is_some() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+        let Some((sequence_id, stills)) = doc.timeline.as_ref().and_then(|project| {
+            let id = project.active_sequence?;
+            Some((id, project.sequences.get(&id)?.reference_stills.clone()))
+        }) else {
+            return;
+        };
+        if stills.is_empty() {
+            ui.label("Capture a full-quality frame to compare shots.");
+            return;
+        }
+        let mut selected = None;
+        let mut budget = timeline::clips::ThumbnailBudget::new(8);
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for still in &stills {
+                let width = ui.available_width().max(120.0);
+                let (rect, response) =
+                    ui.allocate_exact_size(egui::vec2(width, 106.0), egui::Sense::click());
+                let painter = ui.painter().with_clip_rect(rect);
+                painter.rect_filled(rect, 3.0, ui.visuals().widgets.inactive.bg_fill);
+                let image_rect = egui::Rect::from_min_size(
+                    rect.min + egui::vec2(3.0, 3.0),
+                    egui::vec2(width - 6.0, 76.0),
+                );
+                let online =
+                    reference_image_online(doc, self.current_file.as_deref(), still.image_asset);
+                if let Some(handle) = online
+                    .then(|| {
+                        self.timeline_media
+                            .as_ref()
+                            .and_then(|cache| cache.shot_thumbnail(still.image_asset, Tick::ZERO))
+                    })
+                    .flatten()
+                {
+                    if let Some(texture) =
+                        timeline::clips::thumbnail_texture(ui.ctx(), &handle, &mut budget)
+                    {
+                        painter.image(
+                            texture,
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                painter.text(
+                    rect.left_bottom() + egui::vec2(5.0, -13.0),
+                    egui::Align2::LEFT_CENTER,
+                    &still.name,
+                    egui::FontId::proportional(12.0),
+                    ui.visuals().text_color(),
+                );
+                if self.selected_reference_still == Some(still.id) {
+                    painter.rect_stroke(
+                        rect,
+                        3.0,
+                        egui::Stroke::new(2.0, ui.visuals().selection.stroke.color),
+                    );
+                }
+                if response.clicked() {
+                    selected = Some(still.id);
+                }
+            }
+        });
+        if let Some(id) = selected {
+            if self.selected_reference_still != Some(id) {
+                self.reference_comparison = None;
+                self.shot_match_preview = None;
+                self.pending_shot_match = None;
+                self.shot_match_job = None;
+            }
+            self.selected_reference_still = Some(id);
+        }
+        if let Some(still) = stills
+            .iter()
+            .find(|still| Some(still.id) == self.selected_reference_still)
+        {
+            ui.separator();
+            ui.label(format!(
+                "Time {} · revision {}",
+                still.source_time.0, still.grade_revision
+            ));
+            ui.label(if still.color.is_legacy() {
+                "Legacy SDR"
+            } else {
+                "Managed color"
+            });
+            if !reference_image_online(doc, self.current_file.as_deref(), still.image_asset) {
+                ui.colored_label(ui.visuals().warn_fg_color, "Reference image is offline");
+            }
+            let comparing = self
+                .reference_comparison
+                .as_ref()
+                .is_some_and(|comparison| comparison.still == still.id);
+            if ui
+                .selectable_label(comparing, "Compare in viewer")
+                .clicked()
+            {
+                if comparing {
+                    self.reference_comparison = None;
+                } else if let Err(error) =
+                    self.open_reference_comparison(ui.ctx(), doc, sequence_id, still)
+                {
+                    self.reference_still_status = Some(format!("Comparison unavailable: {error}"));
+                }
+            }
+            if comparing {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.reference_compare_mode,
+                        ReferenceCompareMode::Wipe,
+                        "Wipe",
+                    );
+                    ui.selectable_value(
+                        &mut self.reference_compare_mode,
+                        ReferenceCompareMode::Split,
+                        "Split",
+                    );
+                });
+            }
+            if ui.button("Suggest shot match").clicked() {
+                self.request_shot_match(doc, history, sequence_id, still.id);
+            }
+            if let Some(preview) = &self.shot_match_preview {
+                if preview.still == still.id {
+                    ui.label(format!(
+                        "Printer lights · R {:+.1}  G {:+.1}  B {:+.1}",
+                        preview.points[0], preview.points[1], preview.points[2]
+                    ));
+                    ui.label("Global balance from the central 80% of usable pixels; inspect the result after applying.");
+                    if ui.button("Apply shot match").clicked() {
+                        self.apply_shot_match(doc, history);
+                    }
+                }
+            }
+            if ui.button("Remove still").clicked() {
+                if let Some(project) = doc.timeline.as_ref() {
+                    if let Ok(command) = photonic_core::timeline::ops::remove_reference_still(
+                        project,
+                        sequence_id,
+                        still.id,
+                    ) {
+                        history.execute_discrete(Command::Timeline(command), doc);
+                        self.selected_reference_still = None;
+                        self.reference_comparison = None;
+                    }
+                }
+            }
+        }
+    }
+
+    fn change_grade_input_selection(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &Document,
+        target: QualifierMatteTarget,
+    ) {
+        let matches = |eye: &EyedropperTarget| match eye {
+            EyedropperTarget::GradeQualifier { seq, clip, op, .. }
+            | EyedropperTarget::GradeCurve { seq, clip, op, .. } => {
+                *seq == target.sequence && *clip == target.clip && *op == target.op
+            }
+            _ => false,
+        };
+        if self.eyedropper.target.as_ref().is_some_and(matches)
+            || self
+                .video_eyedropper_job
+                .as_ref()
+                .is_some_and(|job| matches(&job.target))
+        {
+            self.eyedropper.cancel();
+            self.video_eyedropper_job = None;
+            self.reference_still_status = Some("Choose a sample from the new graph input".into());
+        }
+        if self.qualifier_matte_target.is_some_and(|old| {
+            old.sequence == target.sequence
+                && old.clip == target.clip
+                && old.op == target.op
+                && old != target
+        }) {
+            self.toggle_qualifier_matte(ctx, doc, target);
+        }
+    }
+
+    fn toggle_qualifier_matte(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &Document,
+        target: QualifierMatteTarget,
+    ) {
+        let native = doc
+            .timeline
+            .as_ref()
+            .and_then(|project| project.sequences.get(&target.sequence))
+            .is_some_and(|sequence| !sequence.color.is_legacy());
+        let valid = doc
+            .timeline
+            .as_ref()
+            .and_then(|project| project.sequences.get(&target.sequence))
+            .and_then(|sequence| sequence.track(target.track))
+            .and_then(|track| track.clips.iter().find(|clip| clip.id == target.clip))
+            .and_then(|clip| clip.grade.as_ref())
+            .is_some_and(|grade| {
+                !grade.bypass
+                    && (grade.graph.is_none()
+                        || (native && grade.has_grade_input(target.op, target.graph_node)))
+                    && grade.ops.iter().any(|op| {
+                        op.id == target.op
+                            && op.enabled
+                            && op.kind == photonic_core::timeline::GradeOpKind::HslQualifier
+                    })
+            });
+        self.qualifier_matte_target = if valid && self.qualifier_matte_target != Some(target) {
+            Some(target)
+        } else {
+            None
+        };
+        self.qualifier_matte_job = None;
+        self.qualifier_matte_preview = None;
+        ctx.data_mut(|data| {
+            data.insert_temp(
+                egui::Id::new("qualifier_matte_target"),
+                self.qualifier_matte_target
+                    .map(|target| (target.sequence, target.clip, target.op, target.graph_node)),
+            )
+        });
+    }
+
+    fn update_qualifier_matte_preview(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &Document,
+        history: &CommandHistory,
+    ) {
+        use photonic_video::graph::ScopeTapPoint;
+        let Some(target) = self.qualifier_matte_target else {
+            return;
+        };
+        // A full-resolution GPU readback for every playback frame would compete
+        // with the renderer. Inspect the held frame once playback is paused.
+        if self.monitor_playing {
+            return;
+        }
+        let valid = doc
+            .timeline
+            .as_ref()
+            .filter(|project| project.active_sequence == Some(target.sequence))
+            .and_then(|project| project.sequences.get(&target.sequence))
+            .and_then(|sequence| sequence.track(target.track))
+            .and_then(|track| track.clips.iter().find(|clip| clip.id == target.clip))
+            .and_then(|clip| clip.grade.as_ref())
+            .is_some_and(|grade| {
+                !grade.bypass
+                    && (grade.graph.is_none()
+                        || (doc
+                            .timeline
+                            .as_ref()
+                            .and_then(|project| project.sequences.get(&target.sequence))
+                            .is_some_and(|sequence| !sequence.color.is_legacy())
+                            && grade.has_grade_input(target.op, target.graph_node)))
+                    && grade.ops.iter().any(|op| {
+                        op.id == target.op
+                            && op.enabled
+                            && op.kind == photonic_core::timeline::GradeOpKind::HslQualifier
+                    })
+            });
+        if !valid || !self.timeline_selection.contains(&target.clip) {
+            self.qualifier_matte_target = None;
+            self.qualifier_matte_job = None;
+            self.qualifier_matte_preview = None;
+            ctx.data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::new("qualifier_matte_target"),
+                    None::<(SequenceId, ClipId, GradeOpId, Option<u32>)>,
+                )
+            });
+            return;
+        }
+        let Some(bridge) = self.engine.as_ref() else {
+            return;
+        };
+        let Some(frame) = bridge.session.latest_frame() else {
+            return;
+        };
+        if frame.sequence != target.sequence
+            || frame.doc_revision != history.revision()
+            || bridge.presented_frame != Some((frame.time, frame.sequence))
+            || frame.scope_tap_point != target.tap(doc)
+            || !frame.color_errors.is_empty()
+            || !frame.grading_errors.is_empty()
+        {
+            return;
+        }
+        let Some(tap) = frame.scope_tap.as_ref() else {
+            return;
+        };
+        let key = QualifierMatteKey {
+            target,
+            time: frame.time,
+            revision: frame.doc_revision,
+            snapshot_generation: frame.snapshot_generation,
+            content_hash: frame.content_hash.0,
+            preview_quality: frame.preview_quality,
+            proxy_mode: frame.proxy_mode,
+        };
+        if self
+            .qualifier_matte_preview
+            .as_ref()
+            .is_some_and(|preview| preview.key == key)
+        {
+            return;
+        }
+        if let Some(job) = self.qualifier_matte_job.as_ref() {
+            if job.key == key {
+                match job.receiver.try_recv() {
+                    Ok(Ok((rgba, width, height))) => {
+                        let texture = ctx.load_texture(
+                            format!("qualifier-matte-{}-{}", target.op, frame.time.0),
+                            egui::ColorImage::from_rgba_unmultiplied(
+                                [width as usize, height as usize],
+                                &rgba,
+                            ),
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.qualifier_matte_preview = Some(QualifierMattePreview {
+                            key,
+                            texture,
+                            size: (width, height),
+                        });
+                        self.qualifier_matte_job = None;
+                    }
+                    Ok(Err(error)) => {
+                        self.qualifier_matte_job = None;
+                        self.reference_still_status =
+                            Some(format!("Matte preview failed: {error}"));
+                        self.qualifier_matte_target = None;
+                        self.qualifier_matte_preview = None;
+                        ctx.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("qualifier_matte_target"),
+                                None::<(SequenceId, ClipId, GradeOpId, Option<u32>)>,
+                            )
+                        });
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        self.qualifier_matte_job = None;
+                        self.reference_still_status = Some("Matte preview worker stopped".into());
+                        self.qualifier_matte_target = None;
+                        self.qualifier_matte_preview = None;
+                        ctx.data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::new("qualifier_matte_target"),
+                                None::<(SequenceId, ClipId, GradeOpId, Option<u32>)>,
+                            )
+                        });
+                    }
+                }
+                return;
+            }
+            self.qualifier_matte_job = None;
+        }
+        self.qualifier_matte_preview = None;
+        let native = matches!(
+            frame.scope_tap_point,
+            ScopeTapPoint::NativeQualifierInput { .. }
+                | ScopeTapPoint::NativeGraphQualifierInput { .. }
+        );
+        let native_key = if let Some(node) = target.graph_node {
+            frame
+                .native_graph_qualifier_inspections
+                .iter()
+                .find(|(id, key)| *id == node && key.clip == target.clip && key.op == target.op)
+                .map(|(_, key)| key.clone())
+        } else {
+            frame
+                .native_qualifier_inspections
+                .iter()
+                .find(|inspection| inspection.clip == target.clip && inspection.op == target.op)
+                .cloned()
+        };
+        let (ops, index) = if native {
+            if native_key.is_none()
+                || frame.scope_tap_encoding
+                    != Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+            {
+                return;
+            }
+            (Vec::new(), 0)
+        } else {
+            let Some(inspection) = frame
+                .clip_grade_inspections
+                .iter()
+                .find(|inspection| inspection.clip == target.clip)
+            else {
+                return;
+            };
+            let Some(index) = inspection.ops.iter().position(|(id, _)| *id == target.op) else {
+                return;
+            };
+            (
+                inspection
+                    .ops
+                    .iter()
+                    .map(|(_, op)| op.clone())
+                    .collect::<Vec<_>>(),
+                index,
+            )
+        };
+        let texture = std::sync::Arc::clone(&tap.texture);
+        let (width, height) = (tap.width, tap.height);
+        let gpu = photonic_video::GpuContext::new(
+            std::sync::Arc::clone(bridge.gpu().device()),
+            std::sync::Arc::clone(bridge.gpu().queue()),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<_, String> {
+                let matte = if let Some(key) = native_key {
+                    photonic_render::grade_gpu::native_qualifier_matte_gpu(
+                        gpu.device(),
+                        gpu.queue(),
+                        &texture,
+                        &key.qualifier,
+                        key.mask.as_ref(),
+                        (width, height),
+                    )
+                    .map_err(str::to_owned)?
+                } else {
+                    photonic_render::qualifier_matte_gpu(
+                        gpu.device(),
+                        gpu.queue(),
+                        &texture,
+                        &ops,
+                        index,
+                        (width, height),
+                    )
+                    .ok_or("selected corrector is not a qualifier")?
+                };
+                let pixels =
+                    photonic_video::graph::eval::read_texture_rgba16f(&gpu, &matte, width, height);
+                if pixels.len() != width as usize * height as usize {
+                    return Err("matte readback was incomplete".into());
+                }
+                let mut rgba = Vec::with_capacity(pixels.len() * 4);
+                for pixel in pixels {
+                    let code = (pixel[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+                    rgba.extend_from_slice(&[code, code, code, 255]);
+                }
+                Ok((rgba, width, height))
+            })();
+            let _ = sender.send(result);
+        });
+        self.qualifier_matte_job = Some(QualifierMatteJob { key, receiver });
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    fn finish_video_eyedropper_if_ready(
+        &mut self,
+        doc: &mut Document,
+        history: &mut CommandHistory,
+        doc_modified: &mut bool,
+    ) -> bool {
+        let Some(job) = self.video_eyedropper_job.as_ref() else {
+            return false;
+        };
+        let stale = history.revision() != job.revision
+            || self.playhead != job.time
+            || doc.timeline.as_ref().and_then(|p| p.active_sequence) != Some(job.sequence)
+            || job.frame_identity.is_some_and(|identity| {
+                self.engine
+                    .as_ref()
+                    .and_then(|bridge| bridge.session.latest_frame())
+                    .is_none_or(|frame| {
+                        (frame.content_hash.0, frame.snapshot_generation) != identity
+                    })
+            });
+        if stale {
+            self.video_eyedropper_job = None;
+            self.reference_still_status =
+                Some("Video colour sample canceled: frame changed".into());
+            return false;
+        }
+        match job.receiver.try_recv() {
+            Ok(Some(color)) => {
+                let target = self.video_eyedropper_job.take().unwrap().target;
+                self.eyedropper.target = Some(target);
+                let previous_revision = history.revision();
+                self.apply_eyedropper_color(doc, history, color, doc_modified);
+                self.eyedropper.cancel();
+                self.reference_still_status = Some(if history.revision() != previous_revision {
+                    "Applied video colour sample".into()
+                } else {
+                    "Sample left the correction unchanged".into()
+                });
+                false
+            }
+            Ok(None) => {
+                self.video_eyedropper_job = None;
+                self.reference_still_status = Some("Video colour sample failed".into());
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.video_eyedropper_job = None;
+                self.reference_still_status = Some("Video colour sample worker stopped".into());
+                false
+            }
+        }
+    }
+
+    fn start_video_eyedropper_sample(
+        &mut self,
+        cursor: egui::Pos2,
+        target: EyedropperTarget,
+        doc: &Document,
+        history: &CommandHistory,
+    ) {
+        let Some((image_rect, hit_rect)) = self.video_sample_rect else {
+            return;
+        };
+        let Some(bridge) = self.engine.as_ref() else {
+            return;
+        };
+        let Some(frame) = bridge.session.latest_frame() else {
+            return;
+        };
+        let sequence = doc.timeline.as_ref().and_then(|p| p.active_sequence);
+        if sequence != Some(frame.sequence)
+            || bridge.presented_frame != Some((frame.time, frame.sequence))
+            || frame.doc_revision != history.revision()
+            || !frame.color_errors.is_empty()
+            || !frame.grading_errors.is_empty()
+            || frame.preview_asset.is_some()
+        {
+            self.reference_still_status =
+                Some("Video colour sample unavailable: displayed frame is stale".into());
+            return;
+        }
+        let native = doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.sequences.get(&frame.sequence))
+            .is_some_and(|s| !s.color.is_legacy());
+        let texture = if native {
+            use photonic_video::graph::ScopeTapPoint;
+            let (seq, point, input_available) = match &target {
+                EyedropperTarget::GradeQualifier {
+                    graph_node,
+                    seq,
+                    clip,
+                    op,
+                    ..
+                } => {
+                    let (point, available) = if let Some(node) = graph_node {
+                        (
+                            ScopeTapPoint::NativeGraphQualifierInput {
+                                clip: *clip,
+                                node: *node,
+                                op: *op,
+                            },
+                            frame
+                                .native_graph_qualifier_inspections
+                                .iter()
+                                .any(|(id, key)| {
+                                    *id == *node && key.clip == *clip && key.op == *op
+                                }),
+                        )
+                    } else {
+                        (
+                            ScopeTapPoint::NativeQualifierInput {
+                                clip: *clip,
+                                op: *op,
+                            },
+                            frame
+                                .native_qualifier_inspections
+                                .iter()
+                                .any(|key| key.clip == *clip && key.op == *op),
+                        )
+                    };
+                    (*seq, point, available)
+                }
+                EyedropperTarget::GradeCurve {
+                    graph_node,
+                    seq,
+                    clip,
+                    op,
+                    ..
+                } => {
+                    let (point, available) = if let Some(node) = graph_node {
+                        (
+                            ScopeTapPoint::NativeGraphCurveInput {
+                                clip: *clip,
+                                node: *node,
+                                op: *op,
+                            },
+                            frame
+                                .native_graph_curve_inputs
+                                .iter()
+                                .any(|(c, id, o, _)| *c == *clip && *id == *node && *o == *op),
+                        )
+                    } else {
+                        (
+                            ScopeTapPoint::NativeCurveInput {
+                                clip: *clip,
+                                op: *op,
+                            },
+                            frame
+                                .native_curve_inputs
+                                .iter()
+                                .any(|(c, o, _)| *c == *clip && *o == *op),
+                        )
+                    };
+                    (*seq, point, available)
+                }
+                _ => {
+                    self.reference_still_status = Some(
+                        "A qualified correction-input tap is required for native sampling".into(),
+                    );
+                    return;
+                }
+            };
+            if seq != frame.sequence
+                || frame.scope_tap_point != point
+                || frame.scope_tap_encoding
+                    != Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+                || !input_available
+            {
+                self.reference_still_status = Some(
+                    "Correction input is not ready; wait for the held frame and sample again"
+                        .into(),
+                );
+                return;
+            }
+            let Some(tap) = frame.scope_tap.as_ref() else {
+                return;
+            };
+            if (tap.width, tap.height) != frame.logical_size {
+                return;
+            }
+            std::sync::Arc::clone(&tap.texture)
+        } else {
+            std::sync::Arc::clone(&frame.texture)
+        };
+        let (w, h) = frame.logical_size;
+        let Some((x, y)) = video_sample_coordinates(image_rect, hit_rect, cursor, w, h) else {
+            return;
+        };
+        let gpu = photonic_video::GpuContext::new(
+            std::sync::Arc::clone(bridge.gpu().device()),
+            std::sync::Arc::clone(bridge.gpu().queue()),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Match the actual correction's ACEScct half-float boundary exactly.
+            let encoded = native.then(|| {
+                photonic_render::native_transfer::NativeAcescctPass::new(gpu.device()).apply(
+                    gpu.device(),
+                    gpu.queue(),
+                    &texture,
+                    photonic_render::native_transfer::AcescctDirection::Encode,
+                )
+            });
+            let sample_texture = encoded.as_ref().unwrap_or(&texture);
+            let pixels =
+                photonic_video::graph::eval::read_texture_rgba16f(&gpu, sample_texture, w, h);
+            let sampled = pixels
+                .get(y as usize * w as usize + x as usize)
+                .filter(|pixel| !native || pixel[3] > 0.0)
+                .map(|pixel| {
+                    let mut rgb = photonic_video::export::convert::unpremultiply(
+                        [pixel[0], pixel[1], pixel[2]],
+                        pixel[3],
+                    );
+                    if native {
+                        rgb = rgb.map(|v| v.clamp(0.0, 1.0));
+                    }
+                    photonic_core::Color {
+                        r: rgb[0],
+                        g: rgb[1],
+                        b: rgb[2],
+                        a: pixel[3],
+                    }
+                });
+            let _ = sender.send(sampled);
+        });
+        self.video_eyedropper_job = Some(VideoEyedropperJob {
+            target,
+            sequence: frame.sequence,
+            time: self.playhead,
+            revision: history.revision(),
+            frame_identity: native.then_some((frame.content_hash.0, frame.snapshot_generation)),
+            receiver,
+        });
+        self.reference_still_status = Some("Sampling video frame…".into());
+    }
+
+    fn request_shot_match(
+        &mut self,
+        doc: &Document,
+        history: &CommandHistory,
+        sequence_id: SequenceId,
+        still_id: uuid::Uuid,
+    ) {
+        self.shot_match_preview = None;
+        self.pending_shot_match = None;
+        self.shot_match_job = None;
+        let Some(project) = doc.timeline.as_ref() else {
+            return;
+        };
+        let Some(sequence) = project.sequences.get(&sequence_id) else {
+            return;
+        };
+        if !sequence.color.is_legacy() {
+            self.reference_still_status = Some("Shot match currently requires Legacy SDR".into());
+            return;
+        }
+        let visible: Vec<_> = sequence
+            .video_tracks
+            .iter()
+            .filter(|track| track.enabled)
+            .flat_map(|track| &track.clips)
+            .filter(|clip| {
+                clip.enabled && clip.start <= self.playhead && self.playhead < clip.end()
+            })
+            .collect();
+        if visible.len() != 1 || !self.timeline_selection.contains(&visible[0].id) {
+            self.reference_still_status =
+                Some("Select the only visible clip at the playhead".into());
+            return;
+        }
+        let Some(still) = sequence
+            .reference_stills
+            .iter()
+            .find(|still| still.id == still_id)
+        else {
+            return;
+        };
+        if still.color != sequence.color || still.format_index != sequence.active_format {
+            self.reference_still_status = Some("Reference color or format changed".into());
+            return;
+        }
+        let Some(bridge) = self.engine.as_mut() else {
+            return;
+        };
+        self.monitor_playing = false;
+        bridge.peek_sequence(sequence_id);
+        if !bridge.prepare_full_preview() {
+            self.reference_still_status = Some("Could not request a full-quality frame".into());
+            return;
+        }
+        bridge.seek(self.playhead);
+        self.pending_shot_match = Some(PendingShotMatch {
+            still: still_id,
+            sequence: sequence_id,
+            clip: visible[0].id,
+            time: self.playhead,
+            revision: history.revision(),
+            requested_at: std::time::Instant::now(),
+        });
+        self.reference_still_status = Some("Measuring full-quality shot…".into());
+    }
+
+    fn finish_shot_match_if_ready(&mut self, doc: &Document, history: &CommandHistory) {
+        use photonic_video::{PreviewQuality, ProxyMode};
+        if let Some(job) = self.shot_match_job.as_ref() {
+            let stale = history.revision() != job.request.revision
+                || doc.timeline.as_ref().and_then(|p| p.active_sequence)
+                    != Some(job.request.sequence)
+                || self.selected_reference_still != Some(job.request.still)
+                || self.playhead != job.request.time
+                || !self.timeline_selection.contains(&job.request.clip);
+            if stale {
+                self.shot_match_job = None;
+                self.reference_still_status =
+                    Some("Shot match canceled: selection or project changed".into());
+                return;
+            }
+            if job.request.requested_at.elapsed() > std::time::Duration::from_secs(30) {
+                self.shot_match_job = None;
+                self.reference_still_status = Some("Shot match timed out".into());
+                return;
+            }
+            match job.receiver.try_recv() {
+                Ok(result) => {
+                    let request = self.shot_match_job.take().unwrap().request;
+                    match result {
+                        Ok(Some(suggestion)) => {
+                            self.shot_match_preview = Some(ShotMatchPreview {
+                                still: request.still,
+                                sequence: request.sequence,
+                                clip: request.clip,
+                                time: request.time,
+                                revision: request.revision,
+                                points: suggestion.points,
+                            });
+                            self.reference_still_status = Some("Shot match proposal ready".into());
+                        }
+                        Ok(None) => {
+                            self.reference_still_status =
+                                Some("Shot match unavailable: too few usable pixels".into())
+                        }
+                        Err(error) => {
+                            self.reference_still_status =
+                                Some(format!("Shot match failed: {error}"))
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.shot_match_job = None;
+                    self.reference_still_status = Some("Shot match worker stopped".into());
+                }
+            }
+            return;
+        }
+        let Some(request) = self.pending_shot_match.as_ref() else {
+            return;
+        };
+        if history.revision() != request.revision
+            || doc.timeline.as_ref().and_then(|p| p.active_sequence) != Some(request.sequence)
+            || self.selected_reference_still != Some(request.still)
+            || self.playhead != request.time
+            || !self.timeline_selection.contains(&request.clip)
+        {
+            self.pending_shot_match = None;
+            self.reference_still_status =
+                Some("Shot match canceled: selection or project changed".into());
+            return;
+        }
+        if request.requested_at.elapsed() > std::time::Duration::from_secs(15) {
+            self.pending_shot_match = None;
+            self.reference_still_status = Some("Shot match timed out".into());
+            return;
+        }
+        let Some(bridge) = self.engine.as_ref() else {
+            return;
+        };
+        let Some(frame) = bridge.session.latest_frame() else {
+            return;
+        };
+        if frame.sequence != request.sequence
+            || frame.time != request.time
+            || frame.doc_revision != request.revision
+            || frame.preview_quality != PreviewQuality::Full
+            || frame.proxy_mode != ProxyMode::ForceOriginal
+            || frame.cached_preview
+            || frame.preview_asset.is_some()
+        {
+            return;
+        }
+        if !frame.color_errors.is_empty() || !frame.grading_errors.is_empty() {
+            self.pending_shot_match = None;
+            self.reference_still_status =
+                Some("Shot match failed: resolve color/grading errors".into());
+            return;
+        }
+        let request = self.pending_shot_match.take().unwrap();
+        let Some(sequence) = doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.sequences.get(&request.sequence))
+        else {
+            return;
+        };
+        let (w, h) = (sequence.format().width, sequence.format().height);
+        if frame.logical_size != (w, h) {
+            return;
+        }
+        let Some(still) = sequence
+            .reference_stills
+            .iter()
+            .find(|s| s.id == request.still)
+        else {
+            return;
+        };
+        let Some(path) = reference_image_path(doc, self.current_file.as_deref(), still.image_asset)
+        else {
+            return;
+        };
+        let expected_hash = still.image_hash.clone();
+        let gpu = photonic_video::GpuContext::new(
+            std::sync::Arc::clone(bridge.gpu().device()),
+            std::sync::Arc::clone(bridge.gpu().queue()),
+        );
+        let texture = std::sync::Arc::clone(&frame.texture);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> Result<_, String> {
+                let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+                if photonic_video::media::full_content_hash_bytes(&bytes) != expected_hash {
+                    return Err("reference image changed".into());
+                }
+                let reference = photonic_core::RasterImage::from_encoded(&bytes)?;
+                if (reference.width, reference.height) != (w, h) {
+                    return Err("reference dimensions changed".into());
+                }
+                let pixels =
+                    photonic_video::graph::eval::read_texture_rgba16f(&gpu, &texture, w, h);
+                if pixels.len() != w as usize * h as usize {
+                    return Err("frame readback was incomplete".into());
+                }
+                let photonic_video::export::convert::EncodePlanes::Rgba8 { rgba: current, .. } =
+                    photonic_video::export::convert::working_frame_to_rgba8(
+                        &photonic_video::export::flatten_pixels(&pixels),
+                        w,
+                        h,
+                    )
+                else {
+                    unreachable!()
+                };
+                Ok(photonic_video::shot_match::suggest_printer_lights(
+                    &reference.pixels,
+                    &current,
+                ))
+            })();
+            let _ = sender.send(result);
+        });
+        self.shot_match_job = Some(ShotMatchJob { request, receiver });
+        self.reference_still_status = Some("Measuring shot in background…".into());
+    }
+
+    fn apply_shot_match(&mut self, doc: &mut Document, history: &mut CommandHistory) {
+        use photonic_core::timeline::{ops, GradeOp, GradeOpKind, GradeOpParams};
+        let Some(preview) = self.shot_match_preview.take() else {
+            return;
+        };
+        if history.revision() != preview.revision
+            || self.playhead != preview.time
+            || self.selected_reference_still != Some(preview.still)
+            || !self.timeline_selection.contains(&preview.clip)
+        {
+            self.reference_still_status = Some("Shot match is stale; suggest again".into());
+            return;
+        }
+        let Some(project) = doc.timeline.as_ref() else {
+            return;
+        };
+        if project.active_sequence != Some(preview.sequence) {
+            return;
+        }
+        let Some(sequence) = project.sequences.get(&preview.sequence) else {
+            return;
+        };
+        let Some(still) = sequence
+            .reference_stills
+            .iter()
+            .find(|still| still.id == preview.still)
+        else {
+            return;
+        };
+        let Some(path) = reference_image_path(doc, self.current_file.as_deref(), still.image_asset)
+        else {
+            self.reference_still_status =
+                Some("Shot match failed: reference image is offline".into());
+            return;
+        };
+        if photonic_video::media::full_content_hash(&path)
+            .ok()
+            .as_deref()
+            != Some(still.image_hash.as_str())
+        {
+            self.reference_still_status = Some("Shot match failed: reference image changed".into());
+            return;
+        }
+        let visible: Vec<_> = sequence
+            .video_tracks
+            .iter()
+            .filter(|track| track.enabled)
+            .flat_map(|track| &track.clips)
+            .filter(|clip| clip.enabled && clip.start <= preview.time && preview.time < clip.end())
+            .collect();
+        if visible.len() != 1 || visible[0].id != preview.clip {
+            return;
+        }
+        let Some((track, clip)) = sequence.video_tracks.iter().find_map(|track| {
+            track
+                .clips
+                .iter()
+                .find(|clip| clip.id == preview.clip)
+                .map(|clip| (track, clip))
+        }) else {
+            return;
+        };
+        let mut grade = clip.grade.clone().unwrap_or_default();
+        if grade.bypass {
+            return;
+        }
+        let op = GradeOp::new(
+            GradeOpKind::PrinterLights,
+            GradeOpParams::PrinterLights {
+                points: preview.points,
+            },
+        );
+        if grade.graph.is_some() {
+            if let Err(error) = grade.add_graph_corrector(op, false) {
+                self.reference_still_status = Some(format!("Shot match failed: {error}"));
+                return;
+            }
+        } else {
+            grade.ops.push(op);
+        }
+        match ops::set_grade(
+            project,
+            preview.sequence,
+            track.id,
+            preview.clip,
+            Some(grade),
+        ) {
+            Ok(command) => {
+                history.execute_discrete(Command::Timeline(command), doc);
+                self.reference_still_status = Some("Applied shot-match correction".into());
+            }
+            Err(error) => self.reference_still_status = Some(format!("Shot match failed: {error}")),
+        }
+    }
+
+    fn open_reference_comparison(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &Document,
+        sequence_id: SequenceId,
+        still: &photonic_core::timeline::ReferenceStill,
+    ) -> Result<(), String> {
+        let project = doc.timeline.as_ref().ok_or("no video project")?;
+        let sequence = project
+            .sequences
+            .get(&sequence_id)
+            .ok_or("sequence missing")?;
+        if !sequence.color.is_legacy()
+            && !matches!(
+                sequence.color,
+                photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+            )
+        {
+            return Err("managed-color reference comparison is unavailable".into());
+        }
+        if still.color != sequence.color {
+            return Err("the sequence color configuration changed".into());
+        }
+        if still.format_index != sequence.active_format {
+            return Err("the sequence format changed".into());
+        }
+        let path = reference_image_path(doc, self.current_file.as_deref(), still.image_asset)
+            .ok_or("reference image is offline")?;
+        let expected_hash = &still.image_hash;
+        if expected_hash.is_empty() {
+            return Err("full image hash missing".into());
+        }
+        let before = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+        let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+        let after = std::fs::metadata(&path).map_err(|error| error.to_string())?;
+        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+            return Err("reference image changed while loading".into());
+        }
+        let actual_hash = photonic_video::media::full_content_hash_bytes(&bytes);
+        if actual_hash != expected_hash.as_str() {
+            return Err("reference image changed since capture".into());
+        }
+        let image = photonic_core::RasterImage::from_encoded(&bytes)?;
+        let (w, h) = (sequence.format().width, sequence.format().height);
+        if (image.width, image.height) != (w, h) {
+            return Err("reference dimensions differ from the current format".into());
+        }
+        let color =
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &image.pixels);
+        let texture = ctx.load_texture(
+            format!("reference-still-{}", still.id),
+            color,
+            egui::TextureOptions::LINEAR,
+        );
+        if let Some(bridge) = self.engine.as_mut() {
+            if bridge.compare_effects {
+                bridge.toggle_compare_effects();
+            }
+        }
+        self.reference_comparison = Some(ReferenceComparison {
+            still: still.id,
+            sequence: sequence_id,
+            texture,
+            size: (w, h),
+            file: path,
+            file_len: after.len(),
+            file_modified: after.modified().ok(),
+            image_hash: expected_hash.clone(),
+        });
+        self.reference_compare_split = 0.5;
+        self.reference_compare_mode = ReferenceCompareMode::Wipe;
+        self.reference_still_status = Some(format!("Comparing with {}", still.name));
+        Ok(())
+    }
+
+    fn finish_reference_still_if_ready(
+        &mut self,
+        doc: &mut Document,
+        history: &mut CommandHistory,
+    ) {
+        use photonic_core::timeline::{
+            ops, AssetKind, AssetSource, MediaAsset, ReferenceStill, TimelineCmd,
+        };
+        use photonic_video::{PreviewQuality, ProxyMode};
+
+        if let Some(job) = self.reference_still_job.as_ref() {
+            let stale = history.revision() != job.request.revision
+                || doc.timeline.as_ref().and_then(|p| p.active_sequence)
+                    != Some(job.request.sequence)
+                || self.current_file.as_ref() != Some(&job.request.project_path);
+            if stale || job.request.requested_at.elapsed() > std::time::Duration::from_secs(30) {
+                job.canceled
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Ok(Ok(capture)) = job.receiver.try_recv() {
+                    let _ = std::fs::remove_file(capture.path);
+                }
+                self.reference_still_job = None;
+                self.reference_still_status = Some(if stale {
+                    "Capture canceled: project changed".into()
+                } else {
+                    "Capture timed out".into()
+                });
+                return;
+            }
+            match job.receiver.try_recv() {
+                Ok(result) => {
+                    let job = self.reference_still_job.take().unwrap();
+                    let capture = match result {
+                        Ok(capture) => capture,
+                        Err(error) => {
+                            self.reference_still_status = Some(format!("Capture failed: {error}"));
+                            return;
+                        }
+                    };
+                    let Some(sequence) = doc
+                        .timeline
+                        .as_ref()
+                        .and_then(|p| p.sequences.get(&job.request.sequence))
+                    else {
+                        let _ = std::fs::remove_file(capture.path);
+                        return;
+                    };
+                    let mut asset = MediaAsset::new(
+                        AssetKind::Image,
+                        AssetSource::File {
+                            path: capture.path.clone(),
+                            rel_path: Some(capture.relative),
+                        },
+                    );
+                    asset.content_hash = Some(capture.hash);
+                    let still = ReferenceStill {
+                        id: capture.id,
+                        name: format!("Still {}", sequence.reference_stills.len() + 1),
+                        image_asset: asset.id,
+                        image_hash: capture.image_hash,
+                        source_clip: job.request.source_clip,
+                        source_time: job.request.time,
+                        grade_revision: job.request.revision,
+                        color: sequence.color.clone(),
+                        format_index: sequence.active_format,
+                    };
+                    let mut projected = doc.timeline.as_ref().unwrap().clone();
+                    projected.media.insert(asset.clone());
+                    match ops::add_reference_still(&projected, job.request.sequence, still) {
+                        Ok(command) => {
+                            history.execute_discrete(
+                                Command::Batch(vec![
+                                    Command::Timeline(TimelineCmd::AddAsset {
+                                        asset: Box::new(asset),
+                                    }),
+                                    Command::Timeline(command),
+                                ]),
+                                doc,
+                            );
+                            self.selected_reference_still = Some(capture.id);
+                            self.reference_still_status =
+                                Some(format!("Captured reference → {}", capture.path.display()));
+                        }
+                        Err(error) => {
+                            let _ = std::fs::remove_file(capture.path);
+                            self.reference_still_status = Some(format!("Capture failed: {error}"));
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.reference_still_job = None;
+                    self.reference_still_status = Some("Capture worker stopped".into());
+                }
+            }
+            return;
+        }
+
+        let Some(request) = self.pending_reference_still.as_ref() else {
+            return;
+        };
+        if history.revision() != request.revision
+            || doc.timeline.as_ref().and_then(|p| p.active_sequence) != Some(request.sequence)
+            || self.current_file.as_ref() != Some(&request.project_path)
+        {
+            self.pending_reference_still = None;
+            self.reference_still_status = Some("Capture canceled: project changed".into());
+            return;
+        }
+        if request.requested_at.elapsed() > std::time::Duration::from_secs(15) {
+            self.pending_reference_still = None;
+            self.reference_still_status =
+                Some("Capture timed out waiting for a full-quality frame".into());
+            return;
+        }
+        let Some(bridge) = self.engine.as_ref() else {
+            return;
+        };
+        let Some(frame) = bridge.session.latest_frame() else {
+            return;
+        };
+        if frame.sequence != request.sequence
+            || frame.time != request.time
+            || frame.doc_revision != request.revision
+            || frame.preview_quality != PreviewQuality::Full
+            || frame.proxy_mode != ProxyMode::ForceOriginal
+            || frame.cached_preview
+            || frame.preview_asset.is_some()
+        {
+            return;
+        }
+        if !frame.color_errors.is_empty() || !frame.grading_errors.is_empty() {
+            self.pending_reference_still = None;
+            self.reference_still_status =
+                Some("Capture failed: resolve color/grading errors".into());
+            return;
+        }
+        let request = self.pending_reference_still.take().unwrap();
+        let sequence = &doc.timeline.as_ref().unwrap().sequences[&request.sequence];
+        let expected_encoding = if sequence.color.is_legacy() {
+            photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709
+        } else {
+            photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay
+        };
+        if frame.output_encoding != expected_encoding {
+            self.reference_still_status =
+                Some("Capture failed: preview output encoding changed".into());
+            return;
+        }
+        let (w, h) = (sequence.format().width, sequence.format().height);
+        if frame.logical_size != (w, h) {
+            self.reference_still_status = Some("Capture failed: frame format changed".into());
+            return;
+        }
+        let id = uuid::Uuid::new_v4();
+        let relative = std::path::PathBuf::from("reference-stills").join(format!("{id}.png"));
+        let path = request
+            .project_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join(&relative);
+        let gpu = photonic_video::GpuContext::new(
+            std::sync::Arc::clone(bridge.gpu().device()),
+            std::sync::Arc::clone(bridge.gpu().queue()),
+        );
+        let texture = std::sync::Arc::clone(&frame.texture);
+        let output_encoding = frame.output_encoding;
+        let canceled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_canceled = std::sync::Arc::clone(&canceled);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            let result = (|| -> Result<ReferenceStillCapture, String> {
+                let pixels =
+                    photonic_video::graph::eval::read_texture_rgba16f(&gpu, &texture, w, h);
+                if pixels.len() != w as usize * h as usize {
+                    return Err("frame readback was incomplete".into());
+                }
+                if worker_canceled.load(Ordering::Acquire) {
+                    return Err("canceled".into());
+                }
+                let temporary = path.with_extension("tmp.png");
+                let written = photonic_video::export::write_frame_png_encoded(
+                    &photonic_video::export::flatten_pixels(&pixels),
+                    w,
+                    h,
+                    &temporary,
+                    output_encoding,
+                )
+                .and_then(|_| std::fs::rename(&temporary, &path).map_err(Into::into));
+                if let Err(error) = written {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(error.to_string());
+                }
+                if worker_canceled.load(Ordering::Acquire) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err("canceled".into());
+                }
+                let hashes = (
+                    photonic_video::media::content_hash(&path),
+                    photonic_video::media::full_content_hash(&path),
+                );
+                let (Ok(hash), Ok(image_hash)) = hashes else {
+                    let _ = std::fs::remove_file(&path);
+                    return Err("could not hash reference image".into());
+                };
+                Ok(ReferenceStillCapture {
+                    id,
+                    relative,
+                    path: path.clone(),
+                    hash,
+                    image_hash,
+                })
+            })();
+            if worker_canceled.load(Ordering::Acquire) {
+                if let Ok(capture) = result {
+                    let _ = std::fs::remove_file(capture.path);
+                }
+                return;
+            }
+            if let Err(error) = sender.send(result) {
+                if let Ok(capture) = error.0 {
+                    let _ = std::fs::remove_file(capture.path);
+                }
+            }
+        });
+        self.reference_still_job = Some(ReferenceStillJob {
+            request,
+            canceled,
+            receiver,
+        });
+        self.reference_still_status = Some("Writing reference still in background…".into());
+    }
 }

@@ -205,6 +205,48 @@ impl PhotonicApp {
         }
     }
 
+    /// Acknowledge an external save of the exact history node written to disk.
+    /// Later edits remain dirty; a save completing after a tab switch belongs to that tab.
+    pub fn acknowledge_external_save(
+        &mut self,
+        active: &Document,
+        history: &CommandHistory,
+        document: photonic_core::DocumentId,
+        node: u64,
+        path: PathBuf,
+    ) {
+        let index = if active.id == document {
+            Some(self.active_tab)
+        } else {
+            self.tabs
+                .iter()
+                .enumerate()
+                .find(|(index, tab)| *index != self.active_tab && tab.document.id == document)
+                .map(|(index, _)| index)
+        };
+        let Some(index) = index else {
+            return;
+        };
+        let active_tab = index == self.active_tab;
+        if active_tab {
+            self.current_file = Some(path.clone());
+        }
+        let tab = &mut self.tabs[index];
+        tab.current_file = Some(path.clone());
+        tab.last_saved_node = Some(node);
+        tab.dirty = if active_tab {
+            history.current_node() != node
+        } else {
+            tab.history.current_node() != node
+        };
+        tab.title = Self::tab_title(if active_tab { active } else { &tab.document }, &Some(path));
+        if !tab.dirty {
+            if let Some(recovery) = tab.recovery_path.take() {
+                let _ = std::fs::remove_file(recovery);
+            }
+        }
+    }
+
     /// Whether any open document (active or parked) has unsaved changes.
     pub(crate) fn any_unsaved(&self) -> bool {
         self.tabs.iter().any(|t| t.dirty)
@@ -278,5 +320,82 @@ impl PhotonicApp {
                         });
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod external_save_tests {
+    use super::*;
+
+    #[test]
+    fn external_save_clears_only_the_exact_saved_history_node() {
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("saved", 640.0, 360.0);
+        let mut history = CommandHistory::default();
+        app.ensure_initial_tab(&doc, &history);
+        app.tabs[0].dirty = true;
+        let saved = history.current_node();
+        let id = doc.id;
+        app.acknowledge_external_save(&doc, &history, id, saved, PathBuf::from("saved.photon"));
+        assert!(!app.has_unsaved_changes());
+        assert_eq!(app.tabs[0].last_saved_node, Some(saved));
+        let layer = doc.active_layer_id.unwrap();
+        let node = photonic_core::SceneNode::new(
+            "Later edit",
+            layer,
+            photonic_core::SceneNodeKind::Path(photonic_core::node::PathNode::new(
+                photonic_core::PathData::rect(1.0, 2.0, 3.0, 4.0),
+            )),
+        );
+        history.execute_discrete(
+            Command::AddNode {
+                node,
+                layer_id: Some(layer),
+            },
+            &mut doc,
+        );
+        app.acknowledge_external_save(&doc, &history, id, saved, PathBuf::from("saved.photon"));
+        assert!(
+            app.has_unsaved_changes(),
+            "an edit made after the saved snapshot must remain unsaved"
+        );
+        assert_eq!(app.tabs[0].last_saved_node, Some(saved));
+    }
+
+    #[test]
+    fn external_save_after_tab_switch_updates_only_the_saved_document() {
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("first", 640.0, 360.0);
+        let mut history = CommandHistory::default();
+        let mut view = CanvasView::default();
+        app.ensure_initial_tab(&doc, &history);
+        app.tabs[0].dirty = true;
+        let first_id = doc.id;
+        let saved = history.current_node();
+        app.open_in_new_tab(
+            &mut doc,
+            &mut history,
+            &mut view,
+            Document::new("second", 640.0, 360.0),
+            CommandHistory::default(),
+            Some(PathBuf::from("second.photon")),
+        );
+        let second_id = doc.id;
+        app.acknowledge_external_save(
+            &doc,
+            &history,
+            first_id,
+            saved,
+            PathBuf::from("first.photon"),
+        );
+        assert_eq!(doc.id, second_id);
+        assert_eq!(app.current_file, Some(PathBuf::from("second.photon")));
+        assert!(!app.tabs[0].dirty);
+        assert_eq!(
+            app.tabs[0].current_file,
+            Some(PathBuf::from("first.photon"))
+        );
+        assert_eq!(app.tabs[0].last_saved_node, Some(saved));
+        assert_eq!(app.tabs[1].title, "second");
     }
 }

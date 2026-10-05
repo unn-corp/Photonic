@@ -11,7 +11,7 @@ use super::audio::ClipAudio;
 use super::captions::CaptionStyle;
 use super::effect_kind::{EffectKind, EffectParams};
 use super::effect_manifest::EffectId;
-use super::grade::Grade;
+use super::grade::{ClipLook, Grade};
 use super::ids::{AssetId, ClipId, GraphId, GroupId, SequenceId};
 use super::prop_registry::PropTargetKind;
 use super::sequence::Marker;
@@ -26,6 +26,12 @@ use uuid::Uuid;
 /// A clip on a track.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
+    /// Explicit source interpretation for managed color; ignored in Legacy SDR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_color: Option<super::color::InputColorInterpretation>,
+    /// Explicit Photonic-owned input interpretation; never inferred from OCIO.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input_color: Option<super::color::NativeInputColorInterpretation>,
     pub id: ClipId,
     /// Defaults to the asset name.
     pub name: String,
@@ -49,6 +55,15 @@ pub struct Clip {
     /// Color grade (07); stored here, evaluated as graph nodes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grade: Option<Grade>,
+    /// Reusable or independent look stage after the clip grade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub look: Option<ClipLook>,
+    /// Saved alternatives for this clip. The active version mirrors `grade` so
+    /// ordinary grade edits and undo update the selected look.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grade_versions: Vec<GradeVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_grade_version: Option<Uuid>,
     /// Per-clip node graph (D-06); substitutes the clip's SOURCE op only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub composition: Option<GraphId>,
@@ -95,6 +110,8 @@ impl Clip {
     /// A clip covering `[start, start+duration)` from `source`.
     pub fn new(source: ClipSource, start: Tick, duration: Tick) -> Self {
         Clip {
+            input_color: None,
+            native_input_color: None,
             id: ClipId::new(),
             name: String::new(),
             start,
@@ -106,6 +123,9 @@ impl Clip {
             reframe: HashMap::new(),
             effects: Vec::new(),
             grade: None,
+            look: None,
+            grade_versions: Vec::new(),
+            active_grade_version: None,
             composition: None,
             transition_in: None,
             transition_out: None,
@@ -137,6 +157,14 @@ impl Clip {
     pub fn overlaps(&self, start: Tick, end: Tick) -> bool {
         self.start < end && start < self.end()
     }
+}
+
+/// A named alternate look for a clip. IDs survive renames and reordering.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GradeVersion {
+    pub id: Uuid,
+    pub name: String,
+    pub grade: Option<Grade>,
 }
 
 /// Identifies a link group — clips carrying the same id (e.g. a split A/V

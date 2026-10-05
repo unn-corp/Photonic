@@ -72,6 +72,12 @@ impl MediaPool {
 /// A media-pool asset.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaAsset {
+    /// Explicit source interpretation for managed color; ignored in Legacy SDR.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_color: Option<super::color::InputColorInterpretation>,
+    /// Explicit Photonic-owned input interpretation; independent of OCIO tags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_input_color: Option<super::color::NativeInputColorInterpretation>,
     pub id: AssetId,
     pub kind: AssetKind,
     pub source: AssetSource,
@@ -85,6 +91,14 @@ pub struct MediaAsset {
     /// xxh3 of file head+tail+len — the relink identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
+    /// Full-byte xxh3-128 pin for a creative LUT. Unlike the sampled media
+    /// relink hash, this detects changes anywhere in a small `.cube` file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lut_full_hash: Option<String>,
+    /// Creative/technical purpose and declared input/output signal spaces.
+    /// Absent in old projects, which retain Legacy SDR creative semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lut_color: Option<super::color::LutColorInterpretation>,
     /// Containing bin (folder), or `None` for the pool root/unfiled (01 §3).
     /// Additive field: v3 files written before bins load with this absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,12 +138,16 @@ pub struct MediaAsset {
 impl MediaAsset {
     pub fn new(kind: AssetKind, source: AssetSource) -> Self {
         MediaAsset {
+            input_color: None,
+            native_input_color: None,
             id: AssetId::new(),
             kind,
             source,
             probe: None,
             proxy: None,
             content_hash: None,
+            lut_full_hash: None,
+            lut_color: None,
             bin: None,
             effects: Vec::new(),
             grade: None,
@@ -446,6 +464,10 @@ pub struct ProbedColor {
     /// `true` = full/PC range, `false` = limited/TV range, `None` = unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_range: Option<bool>,
+    /// Source chroma location as reported by ffprobe; advisory until the user
+    /// explicitly sets native input interpretation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chroma_location: Option<String>,
 }
 
 /// How a proxy file entered the pool (G-15A).
@@ -562,6 +584,11 @@ mod tests {
     fn lut3d_is_a_media_asset_kind() {
         let a = MediaAsset::from_file(AssetKind::Lut3d, "/luts/kodak.cube");
         assert_eq!(a.kind, AssetKind::Lut3d);
+        assert!(!serde_json::to_string(&a).unwrap().contains("lut_full_hash"));
+        let mut pinned = a;
+        pinned.lut_full_hash = Some("0123456789abcdef".into());
+        let json = serde_json::to_string(&pinned).unwrap();
+        assert_eq!(serde_json::from_str::<MediaAsset>(&json).unwrap(), pinned);
     }
 
     #[test]

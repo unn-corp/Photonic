@@ -139,6 +139,8 @@ pub struct ImportMetaResult {
     pub asset: AssetId,
     pub probe: Option<photonic_core::timeline::MediaProbe>,
     pub content_hash: Option<String>,
+    /// Full-byte pin for imported `.cube` assets; computed on the worker.
+    pub lut_full_hash: Option<String>,
     pub poster_path: Option<PathBuf>,
     /// L4 keyframe index written (video only).
     pub keyframe_index: bool,
@@ -363,6 +365,17 @@ impl MediaPoolUi {
             for (asset, path) in jobs {
                 let asset_id = asset.id;
                 let hash = photonic_video::media::probe::content_hash(&path).ok();
+                let lut_full_hash = if asset.kind == AssetKind::Lut3d {
+                    match photonic_video::media::full_content_hash(&path) {
+                        Ok(hash) => Some(hash),
+                        Err(error) => {
+                            tracing::warn!("LUT import: full hash failed for {path:?}: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 let probe = tools.as_ref().and_then(|t| {
                     match photonic_video::media::probe::probe_asset(t, &path) {
                         Ok(p) => Some(p),
@@ -412,6 +425,7 @@ impl MediaPoolUi {
                         asset: asset_id,
                         probe: probe.clone(),
                         content_hash: hash.clone(),
+                        lut_full_hash,
                         poster_path,
                         keyframe_index,
                         waveform_ready: false,
@@ -485,6 +499,7 @@ impl MediaPoolUi {
                             asset: asset_id,
                             probe: None,
                             content_hash: hash,
+                            lut_full_hash: None,
                             poster_path: None,
                             keyframe_index: false,
                             waveform_ready: true,
@@ -670,6 +685,10 @@ pub fn l0_register_stubs(paths: &[PathBuf], bin: Option<BinId>) -> Vec<MediaAsse
             let kind = guess_asset_kind(path)?;
             let mut asset = MediaAsset::from_file(kind, path);
             asset.bin = bin;
+            if kind == AssetKind::Lut3d {
+                asset.lut_color =
+                    Some(photonic_core::timeline::color::LutColorInterpretation::legacy_creative());
+            }
             // Contract: L0 has no probe/hash yet.
             debug_assert!(asset.probe.is_none());
             debug_assert!(asset.content_hash.is_none());
@@ -1443,9 +1462,54 @@ fn draw_asset_cell(
                 });
                 ui.close_menu();
             }
-            if offline && ui.button("Relink…").clicked() {
+            if asset.kind == AssetKind::Lut3d && ui.button("Replace / repin LUT…").clicked() {
                 ctx.action = Some(PanelAction::MediaRelink { asset: asset.id });
                 ui.close_menu();
+            } else if offline && ui.button("Relink…").clicked() {
+                ctx.action = Some(PanelAction::MediaRelink { asset: asset.id });
+                ui.close_menu();
+            }
+            if asset.kind == AssetKind::Lut3d {
+                let technical = asset.lut_color.as_ref().is_some_and(|color| {
+                    color.purpose == photonic_core::timeline::color::LutPurpose::Technical
+                });
+                ui.menu_button("LUT interpretation", |ui| {
+                    if ui
+                        .selectable_label(asset.lut_color.as_ref().is_none_or(|color| color.validate_for_legacy_grade().is_ok()), "Creative (Legacy SDR)")
+                        .clicked()
+                    {
+                        ctx.action = Some(PanelAction::MediaSetLutPurpose {
+                            asset: asset.id,
+                            technical: false,
+                        });
+                        ui.close_menu();
+                    }
+                    for (space, label) in [
+                        (photonic_core::timeline::color::NativeLutSpace::Acescg, "Creative (ACEScg)"),
+                        (photonic_core::timeline::color::NativeLutSpace::Acescct, "Creative (ACEScct)"),
+                    ] {
+                        let selected = asset.lut_color.as_ref().and_then(|color| color.validate_for_native_grade().ok()) == Some(space);
+                        let response = ui.add_enabled(asset.lut_full_hash.is_some(), egui::SelectableLabel::new(selected, label));
+                        if response.on_hover_text("Declare both LUT input and output in this space. Use only for a LUT authored in this space; repin older LUT assets first.").clicked() {
+                            let declaration = photonic_core::timeline::color::LutColorSpace::Native { transform_revision: 1, space };
+                            ctx.action = Some(PanelAction::MediaSetLutColor { asset: asset.id, value: photonic_core::timeline::color::LutColorInterpretation {
+                                version: 1, purpose: photonic_core::timeline::color::LutPurpose::Creative,
+                                input: declaration.clone(), output: declaration,
+                            } });
+                            ui.close_menu();
+                        }
+                    }
+                    if ui
+                        .selectable_label(technical, "Technical (requires managed transform)")
+                        .clicked()
+                    {
+                        ctx.action = Some(PanelAction::MediaSetLutPurpose {
+                            asset: asset.id,
+                            technical: true,
+                        });
+                        ui.close_menu();
+                    }
+                });
             }
             // K-C2 star rating.
             ui.menu_button("Rating", |ui| {
@@ -1835,6 +1899,27 @@ mod tests {
         ids.sort_by_key(|i| i.0);
         ids.dedup();
         assert_eq!(ids.len(), 3);
+    }
+
+    #[test]
+    fn lut_import_hashes_full_file_on_worker_after_l0_registration() {
+        let path = std::env::temp_dir().join(format!("photonic-gui-lut-{}.cube", AssetId::new()));
+        let bytes = b"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        std::fs::write(&path, bytes).unwrap();
+        let mut ui = MediaPoolUi::default();
+        let stubs = ui.spawn_import(vec![path.clone()], None, None);
+        assert_eq!(stubs.len(), 1);
+        assert!(stubs[0].lut_full_hash.is_none());
+        let result = ui
+            .meta_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.asset, stubs[0].id);
+        assert_eq!(
+            result.lut_full_hash.as_deref(),
+            Some(photonic_video::media::full_content_hash_bytes(bytes).as_str())
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     // ── K-C6 relink flow ────────────────────────────────────────────────────

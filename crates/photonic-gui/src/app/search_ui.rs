@@ -444,11 +444,17 @@ impl PhotonicApp {
                 track,
                 clip,
                 op,
+                mode,
+                ..
             }) => {
-                use photonic_core::timeline::{ops as tlops, GradeOpParams};
+                use photonic_core::timeline::{
+                    ops as tlops, GradeOpParams, QualifierKey, QualifierKeyMode, MAX_QUALIFIER_KEYS,
+                };
                 let (h, s, l) =
                     crate::panels::video::color_page::rgb_to_hsl(picked.r, picked.g, picked.b);
-                let (nh, ns, nl) = crate::panels::video::color_page::seed_qualifier(h, s, l);
+                if !h.is_finite() || !s.is_finite() || !l.is_finite() {
+                    return;
+                }
                 let grade = doc
                     .timeline
                     .as_ref()
@@ -459,13 +465,64 @@ impl PhotonicApp {
                 if let Some(mut grade) = grade {
                     let mut seeded = false;
                     if let Some(o) = grade.ops.iter_mut().find(|o| o.id == op) {
-                        if let GradeOpParams::HslQualifier { hue, sat, lum, .. } =
-                            &mut o.params.base
+                        if let GradeOpParams::HslQualifier {
+                            hue,
+                            sat,
+                            lum,
+                            softness,
+                            keys,
+                            ..
+                        } = &mut o.params.base
                         {
-                            *hue = nh;
-                            *sat = ns;
-                            *lum = nl;
-                            seeded = true;
+                            let before = (*hue, *sat, *lum, keys.clone());
+                            let (nh, ns, nl) =
+                                crate::panels::video::color_page::seed_qualifier(h, s, l);
+                            match mode {
+                                QualifierSampleMode::Replace => {
+                                    *hue = nh;
+                                    *sat = ns;
+                                    *lum = nl;
+                                    keys.clear();
+                                }
+                                QualifierSampleMode::Add if keys.len() < MAX_QUALIFIER_KEYS => {
+                                    if *hue == [0.0, 1.0]
+                                        && *sat == [0.0, 1.0]
+                                        && *lum == [0.0, 1.0]
+                                        && keys.is_empty()
+                                    {
+                                        *hue = nh;
+                                        *sat = ns;
+                                        *lum = nl;
+                                    } else {
+                                        let proposed = QualifierKey {
+                                            mode: QualifierKeyMode::Add,
+                                            hue: nh,
+                                            sat: ns,
+                                            lum: nl,
+                                            softness: *softness,
+                                        };
+                                        if !keys.contains(&proposed) {
+                                            keys.push(proposed);
+                                        }
+                                    }
+                                }
+                                QualifierSampleMode::Subtract
+                                    if keys.len() < MAX_QUALIFIER_KEYS =>
+                                {
+                                    let proposed = QualifierKey {
+                                        mode: QualifierKeyMode::Subtract,
+                                        hue: nh,
+                                        sat: ns,
+                                        lum: nl,
+                                        softness: *softness,
+                                    };
+                                    if !keys.contains(&proposed) {
+                                        keys.push(proposed);
+                                    }
+                                }
+                                _ => {}
+                            }
+                            seeded = before != (*hue, *sat, *lum, keys.clone());
                         }
                     }
                     if seeded {
@@ -474,6 +531,83 @@ impl PhotonicApp {
                         });
                         if let Some(cmd) = cmd {
                             history.execute_discrete(Command::Timeline(cmd), doc);
+                            *doc_modified = true;
+                        }
+                    }
+                }
+            }
+            Some(EyedropperTarget::GradeCurve {
+                seq,
+                track,
+                clip,
+                op,
+                channel,
+                ..
+            }) => {
+                use photonic_core::timeline::{ops as tlops, GradeOpParams};
+                let native = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(&seq))
+                    .is_some_and(|sequence| !sequence.color.is_legacy());
+                let grade = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(&seq))
+                    .and_then(|sq| sq.track(track))
+                    .and_then(|t| t.clips.iter().find(|c| c.id == clip))
+                    .and_then(|c| c.grade.clone());
+                if let Some(mut grade) = grade {
+                    let mut added = false;
+                    if let Some(o) = grade.ops.iter_mut().find(|o| o.id == op) {
+                        if let GradeOpParams::Curves {
+                            master,
+                            red,
+                            green,
+                            blue,
+                            hue_vs_hue,
+                            hue_vs_sat,
+                            hue_vs_luma,
+                            luma_vs_sat,
+                            sat_vs_sat,
+                        } = &mut o.params.base
+                        {
+                            let curve = match channel {
+                                0 => Some(master),
+                                1 => Some(red),
+                                2 => Some(green),
+                                3 => Some(blue),
+                                4 => Some(hue_vs_hue),
+                                5 => Some(hue_vs_sat),
+                                6 => Some(hue_vs_luma),
+                                7 => Some(luma_vs_sat),
+                                8 => Some(sat_vs_sat),
+                                _ => None,
+                            };
+                            if let Some(curve) = curve {
+                                let mut visible = if curve.is_empty() {
+                                    crate::panels::video::color_page::neutral_curve_points(channel)
+                                } else {
+                                    curve.clone()
+                                };
+                                added = crate::panels::video::color_page::add_curve_sample_anchor_in_domain(
+                                    &mut visible,
+                                    channel,
+                                    [picked.r, picked.g, picked.b],
+                                    native,
+                                );
+                                if added {
+                                    *curve = visible;
+                                }
+                            }
+                        }
+                    }
+                    if added {
+                        let command = doc.timeline.as_ref().and_then(|project| {
+                            tlops::set_grade(project, seq, track, clip, Some(grade)).ok()
+                        });
+                        if let Some(command) = command {
+                            history.execute_discrete(Command::Timeline(command), doc);
                             *doc_modified = true;
                         }
                     }

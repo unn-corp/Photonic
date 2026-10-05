@@ -89,6 +89,12 @@ enum ImageZoomMode {
 const MONITOR_ZOOM_STATE_ID: &str = "photonic.video_monitor.zoom_state";
 const MONITOR_RESOLUTION_STATE_ID: &str = "photonic.video_monitor.playback_resolution";
 
+fn fit_comparison_image(bounds: egui::Rect, size: (u32, u32)) -> egui::Rect {
+    let source = egui::vec2(size.0.max(1) as f32, size.1.max(1) as f32);
+    let scale = (bounds.width() / source.x).min(bounds.height() / source.y);
+    egui::Rect::from_center_size(bounds.center(), source * scale)
+}
+
 impl PhotonicApp {
     fn monitor_zoom_state(&self, ctx: &egui::Context) -> MonitorZoom {
         ctx.data(|d| d.get_temp(egui::Id::new(MONITOR_ZOOM_STATE_ID)))
@@ -1187,7 +1193,9 @@ impl PhotonicApp {
         doc: &mut Document,
         history: &mut CommandHistory,
     ) {
+        self.video_sample_rect = None;
         self.drive_playback(ctx, doc);
+        self.update_qualifier_matte_preview(ctx, doc, history);
         self.handle_video_keyboard(ctx, doc, history);
 
         let format = active_format(doc);
@@ -1299,6 +1307,7 @@ impl PhotonicApp {
         } else {
             egui::Rect::from_center_size(image_area.center() + zoom.pan, video_size)
         };
+        self.video_sample_rect = Some((video_rect, video_rect.intersect(image_area)));
         // Clipped to `image_area` (not `content_rect`) so a zoomed-in
         // (Actual) frame can't paint over the format/scrub/transport bars
         // above and below it, nor over the master-meter column beside it.
@@ -1388,6 +1397,181 @@ impl PhotonicApp {
             }
         }
 
+        // Color workspace reference wipe: the saved still occupies the left
+        // side; the current program frame already painted above remains on the
+        // right. The still's captured color/format must still match the sequence.
+        if self.color_workspace_open && drew_frame {
+            if let Some(reference) = &self.reference_comparison {
+                let valid = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|project| {
+                        if project.active_sequence != Some(reference.sequence) {
+                            return None;
+                        }
+                        let sequence = project.sequences.get(&reference.sequence)?;
+                        let still = sequence
+                            .reference_stills
+                            .iter()
+                            .find(|s| s.id == reference.still)?;
+                        Some(
+                            still.color == sequence.color
+                                && still.format_index == sequence.active_format
+                                && still.image_hash == reference.image_hash
+                                && reference.size
+                                    == (sequence.format().width, sequence.format().height)
+                                && super::reference_image_path(
+                                    doc,
+                                    self.current_file.as_deref(),
+                                    still.image_asset,
+                                )
+                                .is_some_and(|path| reference.file_valid(&path)),
+                        )
+                    })
+                    .unwrap_or(false);
+                if valid {
+                    match self.reference_compare_mode {
+                        super::ReferenceCompareMode::Wipe => {
+                            let split = self.reference_compare_split.clamp(0.05, 0.95);
+                            let mid = video_rect.left() + video_rect.width() * split;
+                            let left = egui::Rect::from_min_max(
+                                video_rect.min,
+                                egui::pos2(mid, video_rect.bottom()),
+                            );
+                            let uv = egui::Rect::from_min_max(
+                                egui::pos2(0.0, 0.0),
+                                egui::pos2(split, 1.0),
+                            );
+                            content_painter.image(
+                                reference.texture.id(),
+                                left,
+                                uv,
+                                egui::Color32::WHITE,
+                            );
+                            content_painter.line_segment(
+                                [
+                                    egui::pos2(mid, video_rect.top()),
+                                    egui::pos2(mid, video_rect.bottom()),
+                                ],
+                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                            );
+                            let handle = egui::Rect::from_center_size(
+                                egui::pos2(mid, video_rect.center().y),
+                                egui::vec2(12.0, 48.0),
+                            );
+                            let response = ui.interact(
+                                handle,
+                                ui.id().with("reference_wipe"),
+                                egui::Sense::drag(),
+                            );
+                            if response.dragged() {
+                                if let Some(pointer) =
+                                    ui.input(|input| input.pointer.interact_pos())
+                                {
+                                    self.reference_compare_split =
+                                        ((pointer.x - video_rect.left()) / video_rect.width())
+                                            .clamp(0.05, 0.95);
+                                }
+                            }
+                            content_painter.rect_filled(
+                                handle,
+                                3.0,
+                                egui::Color32::from_white_alpha(180),
+                            );
+                        }
+                        super::ReferenceCompareMode::Split => {
+                            let mid = video_rect.center().x;
+                            let left = egui::Rect::from_min_max(
+                                video_rect.min,
+                                egui::pos2(mid, video_rect.bottom()),
+                            );
+                            let right = egui::Rect::from_min_max(
+                                egui::pos2(mid, video_rect.top()),
+                                video_rect.max,
+                            );
+                            content_painter.rect_filled(video_rect, 0.0, egui::Color32::BLACK);
+                            content_painter.image(
+                                reference.texture.id(),
+                                fit_comparison_image(left, reference.size),
+                                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                            if let Some(bridge) = &self.engine {
+                                if let Some(tex) = &bridge.monitor_tex {
+                                    let logical =
+                                        bridge.presented_logical_size.unwrap_or(reference.size);
+                                    content_painter.image(
+                                        tex.id,
+                                        fit_comparison_image(right, logical),
+                                        engine::padded_uv(logical, tex.physical),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            }
+                            content_painter.line_segment(
+                                [
+                                    egui::pos2(mid, video_rect.top()),
+                                    egui::pos2(mid, video_rect.bottom()),
+                                ],
+                                egui::Stroke::new(1.0, egui::Color32::WHITE),
+                            );
+                            content_painter.text(
+                                left.left_top() + egui::vec2(6.0, 6.0),
+                                egui::Align2::LEFT_TOP,
+                                "Reference",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            );
+                            content_painter.text(
+                                right.left_top() + egui::vec2(6.0, 6.0),
+                                egui::Align2::LEFT_TOP,
+                                "Current",
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            );
+                        }
+                    }
+                } else {
+                    self.reference_comparison = None;
+                    self.reference_still_status =
+                        Some("Comparison stopped: reference or sequence changed".into());
+                }
+            }
+        }
+
+        if let (Some(preview), Some(bridge)) = (&self.qualifier_matte_preview, &self.engine) {
+            let current = bridge.session.latest_frame();
+            if current.as_ref().is_some_and(|frame| {
+                !self.monitor_playing
+                    && self.qualifier_matte_target == Some(preview.key.target)
+                    && frame.sequence == preview.key.target.sequence
+                    && frame.time == preview.key.time
+                    && frame.doc_revision == preview.key.revision
+                    && frame.doc_revision == history.revision()
+                    && frame.content_hash.0 == preview.key.content_hash
+                    && frame.snapshot_generation == preview.key.snapshot_generation
+                    && frame.preview_quality == preview.key.preview_quality
+                    && frame.proxy_mode == preview.key.proxy_mode
+                    && bridge.presented_frame == Some((frame.time, frame.sequence))
+                    && frame.scope_tap_point == preview.key.target.tap(doc)
+                    && preview.size == frame.logical_size
+            }) {
+                content_painter.image(
+                    preview.texture.id(),
+                    video_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                content_painter.text(
+                    video_rect.right_top() + egui::vec2(-8.0, 8.0),
+                    egui::Align2::RIGHT_TOP,
+                    "Qualifier matte",
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+
         if self.monitor_safe_area {
             draw_safe_area_guides(&content_painter, video_rect);
         }
@@ -1406,6 +1590,17 @@ impl PhotonicApp {
                 doc,
                 history,
                 &self.timeline_selection,
+            );
+        }
+        if self.color_workspace_open && drew_frame && !self.monitor_transform_tool {
+            super::color_windows::draw_window_handles(
+                ui,
+                video_rect,
+                doc,
+                history,
+                &self.timeline_selection,
+                self.selected_grade_op,
+                self.playhead,
             );
         }
 
@@ -1917,6 +2112,7 @@ impl PhotonicApp {
                         )
                         .clicked()
                     {
+                        self.reference_comparison = None;
                         if let Some(eng) = self.engine.as_mut() {
                             eng.toggle_compare_effects();
                         }
@@ -2380,6 +2576,16 @@ impl PhotonicApp {
 #[cfg(test)]
 mod scrubber_tests {
     use super::*;
+
+    #[test]
+    fn split_reference_frames_keep_image_aspect_ratio() {
+        let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100.0, 100.0));
+        let fitted = fit_comparison_image(bounds, (1920, 1080));
+        assert!((fitted.width() / fitted.height() - 16.0 / 9.0).abs() < 1e-5);
+        assert!(bounds.contains(fitted.min));
+        assert!(bounds.contains(fitted.max));
+        assert!((fitted.center() - bounds.center()).length() < 1e-5);
+    }
 
     #[test]
     fn tick_to_x_maps_endpoints_and_midpoint() {

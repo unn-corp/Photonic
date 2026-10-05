@@ -249,6 +249,9 @@ impl Applicability {
             super::commands::VfxOwner::Track(_) => self.track,
             super::commands::VfxOwner::Master(_) => self.master,
             super::commands::VfxOwner::Asset(_) => self.asset,
+            super::commands::VfxOwner::GroupPre(_) | super::commands::VfxOwner::GroupPost(_) => {
+                false
+            }
         }
     }
 }

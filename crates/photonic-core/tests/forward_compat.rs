@@ -66,6 +66,7 @@ fn base_doc() -> Document {
             GradeOpParams::Exposure { stops: 0.5 },
         )],
         bypass: false,
+        graph: None,
     });
     vtrack.clips.push(c1);
 

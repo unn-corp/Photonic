@@ -50,10 +50,11 @@ use photonic_core::layer::BlendMode;
 use photonic_core::timeline::{
     self, AnchorSpace, AnimProps, AssetKind, CaptionAnim, CaptionCue, CaptionStyle, CaptionTrack,
     CaptionWord, Clip, ClipEffect, ClipId, ClipSource, ClipTransform, EaseCurve, EffectKind,
-    EffectParams, FrameRate, Grade, GradeOp, GradeOpKind, GradeOpParams, GraphId, GraphNode,
-    GraphNodeId, GraphNodeParams, GraphOp, InPort, KaraokeMode, LutInterp, NodeGraph, PropPath,
-    PropSet, PropTargetKind, PropValue, Ratio, ScanType, Sequence, SequenceFormat, SequenceId,
-    SpeedMap, TextClipContent, TimeSource, TimelineProject, TransitionKind,
+    EffectParams, FrameRate, Grade, GradeGraph, GradeGraphNode, GradeOp, GradeOpId, GradeOpKind,
+    GradeOpParams, GraphId, GraphNode, GraphNodeId, GraphNodeParams, GraphOp, InPort, KaraokeMode,
+    LutInterp, NodeGraph, PropPath, PropSet, PropTargetKind, PropValue, Ratio, ScanType, Sequence,
+    SequenceFormat, SequenceId, SpeedMap, TextClipContent, TimeSource, TimelineProject,
+    TransitionKind, VfxOwner,
 };
 use photonic_core::Color;
 use photonic_render::caption::CaptionWordRun;
@@ -64,7 +65,7 @@ use crate::contract::{
 };
 use crate::graph::ir::{
     Channel, ContentHash, DeinterlaceMethod, FieldOrder, FitMode, FrameGraph, IrNode, IrNodeId,
-    IrOp, LinearColor, OutPort, Sampling, TextureDesc, WipeDirection,
+    IrOp, LinearColor, OutPort, Sampling, TextureDesc, WipeDirection, WorkingColorDomain,
 };
 
 /// K-G6: if the asset's probe reports interlaced, return the default
@@ -121,8 +122,36 @@ pub struct ViewNodeOverride {
 /// which runs per frame, so it MUST be a lock-free read of a pre-warmed cache —
 /// never parse a `.cube` file here. A `None` result (offline / unresolvable /
 /// failed asset) keeps the LUT op inert (identity), never a black frame (07 §1).
+pub struct NativeLutBinding {
+    pub table: std::sync::Arc<photonic_render::Lut3d>,
+    pub space: timeline::color::NativeLutSpace,
+}
+
 pub trait LutProvider {
     fn lut(&self, asset: AssetId) -> Option<std::sync::Arc<photonic_render::Lut3d>>;
+    /// Return only a verified, pinned creative LUT with equal native input/output spaces.
+    fn native_lut(&self, _asset: AssetId) -> Option<NativeLutBinding> {
+        None
+    }
+}
+
+struct NativeLutView<'a> {
+    provider: &'a dyn LutProvider,
+    project: &'a TimelineProject,
+}
+impl LutProvider for NativeLutView<'_> {
+    fn lut(&self, asset: AssetId) -> Option<std::sync::Arc<photonic_render::Lut3d>> {
+        self.native_lut(asset).map(|binding| binding.table)
+    }
+    fn native_lut(&self, asset: AssetId) -> Option<NativeLutBinding> {
+        let media = self.project.media.assets.get(&asset)?;
+        if media.kind != AssetKind::Lut3d || media.lut_full_hash.is_none() {
+            return None;
+        }
+        let space = media.lut_color.as_ref()?.validate_for_native_grade().ok()?;
+        let binding = self.provider.native_lut(asset)?;
+        (binding.space == space).then_some(binding)
+    }
 }
 
 /// Supplies the compile-resolved deflicker gain for a clip at a tick
@@ -173,6 +202,11 @@ pub trait StabilizationProvider {
 /// `Media::*` is a mechanical rename.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CompileCode {
+    /// A sequence requires a color pipeline that this build cannot execute.
+    ColorPipelineUnavailable,
+    /// An enabled grading corrector was bypassed because it cannot resolve.
+    /// Preview remains available; final export must reject this frame.
+    GradeUnresolved,
     /// 38 §1.2 — a transition was shortened (Info) or suppressed (Warning)
     /// because the outgoing clip's source handle is too short.
     TransitionHandleClipped,
@@ -201,6 +235,8 @@ pub enum DiagSeverity {
 /// so every pre-existing `plain`/`at` call is unchanged).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompileDiagnostic {
+    /// Structured corrector/dependency context for grading failures.
+    pub grade: Option<photonic_render::grade::GradeDiagnostic>,
     pub message: String,
     pub graph: Option<GraphId>,
     pub node: Option<GraphNodeId>,
@@ -212,6 +248,7 @@ pub struct CompileDiagnostic {
 impl CompileDiagnostic {
     fn plain(message: impl Into<String>) -> Self {
         CompileDiagnostic {
+            grade: None,
             message: message.into(),
             graph: None,
             node: None,
@@ -222,6 +259,7 @@ impl CompileDiagnostic {
     }
     fn at(graph: GraphId, node: GraphNodeId, message: impl Into<String>) -> Self {
         CompileDiagnostic {
+            grade: None,
             message: message.into(),
             graph: Some(graph),
             node: Some(node),
@@ -239,6 +277,7 @@ impl CompileDiagnostic {
         message: impl Into<String>,
     ) -> Self {
         CompileDiagnostic {
+            grade: None,
             message: message.into(),
             graph: None,
             node: None,
@@ -270,6 +309,37 @@ pub struct CompiledFrame {
     /// fallback signal. A `Vec` and not a `HashMap` because a compiled frame
     /// holds a handful of clips and this is per-frame hot-path allocation.
     pub clip_taps: Vec<(ClipId, IrNodeId)>,
+    /// Clip image immediately before its own grade, after source effects,
+    /// clip effects, transform and group pre-grade. Used by qualifier matte
+    /// inspection so the key sees the same input as the selected corrector.
+    pub clip_pre_grade_taps: Vec<(ClipId, IrNodeId)>,
+    /// Exact animated correctors resolved for ordinary clip grades that
+    /// contain a qualifier. IDs are retained because unresolved/disabled ops
+    /// make authoring indices differ from rendered indices.
+    pub clip_grade_inspections: Vec<ClipGradeInspection>,
+    /// Exact scene input and key for native clip qualifier inspection (unambiguous graph correctors included).
+    pub native_qualifier_inspections: Vec<NativeQualifierInspection>,
+    /// Exact scene inputs before native clip curves, including neutral curves.
+    pub native_curve_inputs: Vec<(ClipId, GradeOpId, IrNodeId)>,
+    pub native_graph_qualifier_inspections: Vec<(u32, NativeQualifierInspection)>,
+    pub native_graph_curve_inputs: Vec<(ClipId, u32, GradeOpId, IrNodeId)>,
+    /// Rendered, unassociated weights from reachable native clip matte nodes.
+    pub native_graph_mattes: Vec<(ClipId, u32, IrNodeId)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClipGradeInspection {
+    pub clip: ClipId,
+    pub ops: Vec<(GradeOpId, photonic_render::grade::ResolvedGradeOp)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeQualifierInspection {
+    pub clip: ClipId,
+    pub op: GradeOpId,
+    pub input: IrNodeId,
+    pub qualifier: Box<photonic_render::grade::ResolvedHslQualifier>,
+    pub mask: Option<photonic_render::grade::ResolvedMask>,
 }
 
 /// Which texture the scopes read (K-E2 / 03 §3.6, reconciled with 07 §5's
@@ -283,13 +353,33 @@ pub enum ScopeTapPoint {
     /// Sequence output, post-master-grade, **pre-`CaptionOverlay`** (03 §3.6).
     /// The fallback 07 §5 / 13 §10.2 mandate when no clip is selected — and
     /// deliberately not the *presented* frame, which is post-caption and so
-    /// measures burnt-in caption pixels the colourist is not grading.
+    /// measures burnt-in caption pixels the colourist is not grading. The
+    /// qualified Native Managed path has no captions; its program tap is after
+    /// the display/output transform and carries that explicit encoding.
     #[default]
     Program,
     /// The named clip's texture after its own `Grade`, before the track fold
     /// (07 §5). Falls back to [`ScopeTapPoint::Program`] when the clip is not in
     /// this frame.
     Clip(ClipId),
+    /// The named clip immediately before its own grade. Intended for grade
+    /// inspection; falls back to Program when the clip is not in this frame.
+    ClipPreGrade(ClipId),
+    /// Native qualifier's scene input after earlier correctors, before its key/CDL.
+    NativeQualifierInput { clip: ClipId, op: GradeOpId },
+    /// Native curve scene input before this corrector.
+    NativeCurveInput { clip: ClipId, op: GradeOpId },
+    NativeGraphQualifierInput {
+        clip: ClipId,
+        node: u32,
+        op: GradeOpId,
+    },
+    GradeGraphMatteOutput { clip: ClipId, node: u32 },
+    NativeGraphCurveInput {
+        clip: ClipId,
+        node: u32,
+        op: GradeOpId,
+    },
 }
 
 impl CompiledFrame {
@@ -299,8 +389,34 @@ impl CompiledFrame {
     pub fn tap(&self, point: ScopeTapPoint) -> Option<IrNodeId> {
         match point {
             ScopeTapPoint::Program => self.program_tap,
+            ScopeTapPoint::GradeGraphMatteOutput { clip, node } => self.native_graph_mattes.iter().find(|(c, id, _)| *c == clip && *id == node).map(|(_, _, output)| *output),
             ScopeTapPoint::Clip(id) => self
                 .clip_taps
+                .iter()
+                .find(|(c, _)| *c == id)
+                .map(|(_, n)| *n),
+            ScopeTapPoint::NativeGraphQualifierInput { clip, node, op } => self
+                .native_graph_qualifier_inspections
+                .iter()
+                .find(|(id, key)| *id == node && key.clip == clip && key.op == op)
+                .map(|(_, key)| key.input),
+            ScopeTapPoint::NativeGraphCurveInput { clip, node, op } => self
+                .native_graph_curve_inputs
+                .iter()
+                .find(|(c, id, operator, _)| *c == clip && *id == node && *operator == op)
+                .map(|(_, _, _, input)| *input),
+            ScopeTapPoint::NativeCurveInput { clip, op } => self
+                .native_curve_inputs
+                .iter()
+                .find(|(c, o, _)| *c == clip && *o == op)
+                .map(|(_, _, input)| *input),
+            ScopeTapPoint::NativeQualifierInput { clip, op } => self
+                .native_qualifier_inspections
+                .iter()
+                .find(|inspection| inspection.clip == clip && inspection.op == op)
+                .map(|inspection| inspection.input),
+            ScopeTapPoint::ClipPreGrade(id) => self
+                .clip_pre_grade_taps
                 .iter()
                 .find(|(c, _)| *c == id)
                 .map(|(_, n)| *n),
@@ -342,6 +458,53 @@ pub fn fit_long_edge(w: u32, h: u32, max_long_edge: u32) -> (u32, u32) {
     (nw, nh)
 }
 
+/// Color encodings that the Legacy SDR BT.709/601 conversion cannot evaluate.
+/// Unknown metadata retains legacy behavior; known HDR/log/wide-gamut tags fail closed.
+fn unsupported_legacy_color<'a>(
+    project: &'a TimelineProject,
+    asset: AssetId,
+) -> Option<(&'static str, &'a str)> {
+    let color = &project
+        .media
+        .assets
+        .get(&asset)?
+        .probe
+        .as_ref()?
+        .video
+        .as_ref()?
+        .color;
+    if let Some(transfer) = color.transfer.as_deref() {
+        if matches!(
+            transfer.to_ascii_lowercase().as_str(),
+            "smpte2084" | "arib-std-b67" | "log100" | "log316" | "smpte428"
+        ) {
+            return Some(("transfer", transfer));
+        }
+    }
+    if let Some(matrix) = color.matrix.as_deref() {
+        if matches!(
+            matrix.to_ascii_lowercase().as_str(),
+            "bt2020nc"
+                | "bt2020c"
+                | "smpte2085"
+                | "chroma-derived-nc"
+                | "chroma-derived-c"
+                | "ictcp"
+        ) {
+            return Some(("matrix", matrix));
+        }
+    }
+    if let Some(primaries) = color.primaries.as_deref() {
+        if matches!(
+            primaries.to_ascii_lowercase().as_str(),
+            "bt2020" | "smpte428" | "smpte431" | "smpte432"
+        ) {
+            return Some(("primaries", primaries));
+        }
+    }
+    None
+}
+
 /// Single-asset source peek graph for the one-monitor `PreviewTarget::Asset`
 /// path (24-preview-media-load §3). Decode/still → Output at `out_w`×`out_h`.
 pub fn compile_asset_peek(
@@ -355,6 +518,76 @@ pub fn compile_asset_peek(
     let mut b = Builder::new();
     let w = out_w.max(1);
     let h = out_h.max(1);
+    if let Some(media) = project.media.assets.get(&asset) {
+        if matches!(media.kind, AssetKind::Video | AssetKind::Image) {
+            if let Some(input) = media.native_input_color.as_ref() {
+                let error = input.validate_asset_kind(media.kind).err().or_else(|| {
+                    deinterlace_for_asset(project, asset).map(|_| {
+                        "native interlaced source peek needs a qualified pre-IDT deinterlace"
+                            .to_owned()
+                    })
+                });
+                if let Some(error) = error {
+                    b.diag(CompileDiagnostic::coded(
+                        CompileCode::ColorPipelineUnavailable,
+                        DiagSeverity::Error,
+                        None,
+                        error,
+                    ));
+                    let blank = b.push(
+                        IrOp::SolidColor {
+                            color: LinearColor {
+                                r: 0.0,
+                                g: 0.0,
+                                b: 0.0,
+                                a: 0.0,
+                            },
+                        },
+                        vec![],
+                    );
+                    let output = b.push(IrOp::Output { w, h }, vec![(blank, OutPort::default())]);
+                    return b.finish(Some(output));
+                }
+                b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+                let source = b.push(
+                    if media.kind == AssetKind::Image {
+                        IrOp::NativeDecodeStill { asset }
+                    } else {
+                        IrOp::NativeDecodeVideo {
+                            asset,
+                            src_time: source_time,
+                            input: input.clone(),
+                        }
+                    },
+                    vec![],
+                );
+                b.program_tap = Some(source);
+                let output = b.push(IrOp::NativeSdrOutput, vec![(source, OutPort::default())]);
+                return b.finish(Some(output));
+            }
+        }
+    }
+    if let Some((field, value)) = unsupported_legacy_color(project, asset) {
+        b.diag(CompileDiagnostic::coded(
+            CompileCode::ColorPipelineUnavailable,
+            DiagSeverity::Error,
+            None,
+            format!("Asset {asset} uses {value} {field}, which Legacy SDR cannot interpret"),
+        ));
+        let source = b.push(
+            IrOp::SolidColor {
+                color: LinearColor {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                },
+            },
+            vec![],
+        );
+        let output = b.push(IrOp::Output { w, h }, vec![(source, OutPort::default())]);
+        return b.finish(Some(output));
+    }
     let kind = project
         .media
         .assets
@@ -378,6 +611,688 @@ pub fn compile_asset_peek(
     b.program_tap = Some(src);
     let output = b.push(IrOp::Output { w, h }, vec![(src, OutPort::default())]);
     b.finish(Some(output))
+}
+
+/// Conservative native-managed sequence preview. Explicitly interpreted video
+/// tracks, Normal composites, and supported serial grade primaries are qualified.
+/// Any authored stage this path cannot reproduce yields a diagnostic and blank frame.
+pub fn compile_native_preview(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+) -> CompiledFrame {
+    compile_native_sequence(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        false,
+        false,
+        None,
+        None,
+    )
+}
+
+/// Engine preview variant that verifies live source files before publishing a
+/// frame. The pure graph compiler above deliberately does no filesystem I/O.
+pub fn compile_native_preview_live(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+) -> CompiledFrame {
+    compile_native_preview_live_with_source_errors(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        &HashMap::new(),
+    )
+}
+
+/// Engine variant that also rejects a source whose fresh decoder probe differs
+/// from the pixel format recorded when the project imported it.
+pub fn compile_native_preview_live_with_source_errors(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+    source_errors: &HashMap<AssetId, String>,
+) -> CompiledFrame {
+    compile_native_sequence(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        false,
+        true,
+        Some(source_errors),
+        None,
+    )
+}
+
+/// Qualified BT.709 video-signal graph for offline delivery validation. The
+/// export job remains gated until this path has frame and codec preflight.
+pub fn compile_native_delivery(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+) -> CompiledFrame {
+    compile_native_sequence(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        true,
+        false,
+        None,
+        None,
+    )
+}
+
+/// Pure delivery compilation with already verified native color dependencies.
+pub fn compile_native_delivery_with_luts(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+    luts: &dyn LutProvider,
+) -> CompiledFrame {
+    compile_native_sequence(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        true,
+        false,
+        None,
+        Some(luts),
+    )
+}
+
+/// Delivery graph used by the live engine after its source workers have probed
+/// the on-disk media. The pure delivery compiler above remains IO-free.
+pub fn compile_native_delivery_live_with_source_errors(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+    source_errors: &HashMap<AssetId, String>,
+) -> CompiledFrame {
+    compile_native_sequence(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        true,
+        true,
+        Some(source_errors),
+        None,
+    )
+}
+
+/// Live native compiler with explicit output selection and pre-warmed color dependencies.
+pub fn compile_native_live_with_luts(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+    delivery: bool,
+    source_errors: &HashMap<AssetId, String>,
+    luts: &dyn LutProvider,
+) -> CompiledFrame {
+    compile_native_sequence(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        delivery,
+        true,
+        Some(source_errors),
+        Some(luts),
+    )
+}
+
+fn compile_native_sequence(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+    delivery: bool,
+    check_sources_online: bool,
+    source_errors: Option<&HashMap<AssetId, String>>,
+    luts: Option<&dyn LutProvider>,
+) -> CompiledFrame {
+    compile_native_sequence_impl(
+        project,
+        sequence,
+        format_index,
+        tick,
+        quality,
+        delivery,
+        check_sources_online,
+        source_errors,
+        luts,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_native_sequence_impl(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    format_index: usize,
+    tick: Tick,
+    quality: Quality,
+    delivery: bool,
+    check_sources_online: bool,
+    source_errors: Option<&HashMap<AssetId, String>>,
+    luts: Option<&dyn LutProvider>,
+    ancestry: &[SequenceId],
+) -> CompiledFrame {
+    let native_luts = luts.map(|provider| NativeLutView { provider, project });
+    let mut b = Builder::new();
+    b.luts = native_luts
+        .as_ref()
+        .map(|provider| provider as &dyn LutProvider);
+    let Some(seq) = project.sequences.get(&sequence) else {
+        b.diag(CompileDiagnostic::coded(
+            CompileCode::ColorPipelineUnavailable,
+            DiagSeverity::Error,
+            None,
+            "unknown native-managed sequence",
+        ));
+        return b.finish(None);
+    };
+    let Some(format) = seq.formats.get(format_index) else {
+        b.diag(CompileDiagnostic::coded(
+            CompileCode::ColorPipelineUnavailable,
+            DiagSeverity::Error,
+            None,
+            "native-managed sequence has no selected format",
+        ));
+        return b.finish(None);
+    };
+    let blank = |mut b: Builder<'_>, message: &str, clip: Option<ClipId>| {
+        b.diag(CompileDiagnostic::coded(
+            CompileCode::ColorPipelineUnavailable,
+            DiagSeverity::Error,
+            clip,
+            message,
+        ));
+        let source = b.transparent(format);
+        let output = b.push(
+            IrOp::Output {
+                w: format.width,
+                h: format.height,
+            },
+            vec![(source, OutPort::default())],
+        );
+        b.finish(Some(output))
+    };
+    if ancestry.contains(&sequence) || ancestry.len() >= 32 {
+        return blank(
+            b,
+            "native nested sequence is cyclic or exceeds the 32-level depth limit",
+            None,
+        );
+    }
+    let mut sequence_path = ancestry.to_vec();
+    sequence_path.push(sequence);
+    let timeline::color::SequenceColorConfig::NativeManaged(config) = &seq.color else {
+        return blank(b, "native preview requires a native-managed sequence", None);
+    };
+    if let Err(error) = config.validate() {
+        return blank(b, &error, None);
+    }
+    if delivery && config.export != timeline::color::NativeOutputTransform::Bt709VideoSdr {
+        return blank(
+            b,
+            "native delivery requires a BT.709 video-signal SDR output transform",
+            None,
+        );
+    }
+    if project.project_graph.is_some()
+        || !seq.caption_tracks.is_empty()
+        || !seq.master_effects.is_empty()
+    {
+        return blank(b, "native preview does not yet support project graphs, captions, or master effects and grades", None);
+    }
+    let active: Vec<_> = seq
+        .video_tracks
+        .iter()
+        .filter(|track| track.enabled && track.kind.is_visual())
+        .filter_map(|track| {
+            covering_clip_index(&track.clips, tick).map(|index| (track, &track.clips[index]))
+        })
+        .filter(|(_, clip)| clip.enabled)
+        .collect();
+    if active.is_empty() {
+        b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        let source = b.transparent(format);
+        let output = b.push(
+            if delivery {
+                IrOp::NativeSdrVideoOutput
+            } else {
+                IrOp::NativeSdrOutput
+            },
+            vec![(source, OutPort::default())],
+        );
+        return b.finish(Some(output));
+    }
+    b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+    b.sequence_path = sequence_path.clone();
+    let mut composite = None;
+    for (track, clip) in active {
+        if matches!(clip.source, ClipSource::Adjustment) {
+            if !track.effects.is_empty()
+                || track.grade.is_some()
+                || track.blend != BlendMode::Normal
+                || track.opacity != 1.0
+                || !clip.effects.is_empty()
+                || clip.group.is_some()
+                || clip.composition.is_some()
+                || clip.transition_in.is_some()
+                || clip.transition_out.is_some()
+                || clip.multicam.is_some()
+                || clip.stabilization.is_some()
+                || clip.transform != AnimProps::new(ClipTransform::default())
+                || !clip.reframe.is_empty()
+            {
+                return blank(Builder::new(), "native adjustment preview supports only an untransformed grade over the composite", Some(clip.id));
+            }
+            if let Some(below) = composite {
+                let adjusted = clip.grade.as_ref().map_or(below, |grade| {
+                    apply_grade(
+                        &mut b,
+                        grade,
+                        below,
+                        tick - clip.start,
+                        Some(VfxOwner::Clip(clip.id)),
+                    )
+                });
+                if b.diagnostics
+                    .iter()
+                    .any(|d| d.severity == DiagSeverity::Error)
+                {
+                    let diagnostics = std::mem::take(&mut b.diagnostics);
+                    let mut failed = blank(
+                        Builder::new(),
+                        "native adjustment grade cannot render accurately",
+                        Some(clip.id),
+                    );
+                    failed.diagnostics.extend(diagnostics);
+                    return failed;
+                }
+                composite = Some(adjusted);
+            }
+            continue;
+        }
+        if !track.effects.is_empty()
+            || track.blend != BlendMode::Normal
+            || !track.opacity.is_finite()
+            || !(0.0..=1.0).contains(&track.opacity)
+            || clip.composition.is_some()
+            || clip.transition_in.is_some()
+            || clip.transition_out.is_some()
+            || clip.multicam.is_some()
+            || clip.stabilization.is_some()
+            || !clip.effects.is_empty()
+        {
+            return blank(
+                Builder::new(),
+                "native preview cannot reproduce an authored effect or composite stage",
+                Some(clip.id),
+            );
+        }
+        // Do not truncate malformed ancestry and silently omit an authored grade.
+        let mut group_chain = Vec::new();
+        let mut group = clip.group;
+        let mut visited = HashSet::new();
+        while let Some(id) = group {
+            let Some(node) = seq.groups.get(&id) else {
+                return blank(
+                    Builder::new(),
+                    "native preview has a missing group reference",
+                    Some(clip.id),
+                );
+            };
+            if !visited.insert(id) {
+                return blank(
+                    Builder::new(),
+                    "native preview has a cyclic group reference",
+                    Some(clip.id),
+                );
+            }
+            if !matches!(
+                node.kind,
+                timeline::GroupKind::Normal | timeline::GroupKind::AvLink
+            ) {
+                return blank(
+                    Builder::new(),
+                    "native preview has an unsupported group kind",
+                    Some(clip.id),
+                );
+            }
+            group_chain.push(id);
+            group = node.parent;
+        }
+        let transform = clip
+            .reframe
+            .get(&format_index)
+            .copied()
+            .unwrap_or_else(|| eval_clip_transform(&clip.transform, tick - clip.start));
+        let matrix = clip_transform_matrix(&transform, format);
+        if !transform.opacity.is_finite()
+            || !(0.0..=1.0).contains(&transform.opacity)
+            || matrix
+                .to_cols_array()
+                .iter()
+                .any(|value| !value.is_finite())
+            || matrix.determinant().abs() < 1e-12
+        {
+            return blank(
+                Builder::new(),
+                "native preview requires a finite, invertible clip transform and opacity within 0..=1",
+                Some(clip.id),
+            );
+        }
+        let asset_graded = match clip.source {
+            ClipSource::Asset { asset } => {
+                if project.media.assets.get(&asset).is_none_or(|media| {
+                    !matches!(media.kind, AssetKind::Video | AssetKind::Image)
+                        || !media.effects.is_empty()
+                }) {
+                    return blank(
+                Builder::new(),
+                "native preview requires a video or sRGB still asset without asset-level effects",
+                Some(clip.id),
+            );
+                }
+                if check_sources_online {
+                    if let Some(error) = source_errors.and_then(|errors| errors.get(&asset)) {
+                        return blank(Builder::new(), error, Some(clip.id));
+                    }
+                    let Some(timeline::AssetSource::File { path, .. }) =
+                        project.media.assets.get(&asset).map(|media| &media.source)
+                    else {
+                        return blank(
+                            Builder::new(),
+                            "native preview source is not a file-backed asset",
+                            Some(clip.id),
+                        );
+                    };
+                    if !path.is_file() {
+                        return blank(
+                            Builder::new(),
+                            &format!(
+                                "native preview source {asset} is offline: {}",
+                                path.display()
+                            ),
+                            Some(clip.id),
+                        );
+                    }
+                    if let Some(diagnostic) = crate::color::inspect_input(project, seq, clip)
+                        .and_then(|finding| finding.diagnostic)
+                    {
+                        return blank(Builder::new(), &diagnostic, Some(clip.id));
+                    }
+                }
+                let source = build_clip_source(
+                    &mut b,
+                    project,
+                    seq,
+                    format_index,
+                    format,
+                    clip,
+                    tick,
+                    quality,
+                    &mut HashSet::new(),
+                );
+                project
+                    .media
+                    .assets
+                    .get(&asset)
+                    .and_then(|media| media.grade.as_ref())
+                    .map_or(source, |grade| {
+                        apply_grade(
+                            &mut b,
+                            grade,
+                            source,
+                            tick - clip.start,
+                            Some(VfxOwner::Asset(asset)),
+                        )
+                    })
+            }
+            ClipSource::NestedSequence {
+                sequence: nested_id,
+            } => {
+                let Some(nested) = project.sequences.get(&nested_id) else {
+                    return blank(b, "native nested sequence is missing", Some(clip.id));
+                };
+                if nested.color != seq.color
+                    || !rates_equal(nested.frame_rate, seq.frame_rate)
+                    || nested.formats.get(format_index).is_none_or(|inner| {
+                        inner.width != format.width || inner.height != format.height
+                    })
+                {
+                    return blank(b, "native nest requires matching color configuration, frame rate and selected canvas", Some(clip.id));
+                }
+                let src_time = clip.source_in + clip.speed.source_delta(tick - clip.start);
+                let end = nested.content_end();
+                let fold_tick = if end > Tick::ZERO && src_time >= end {
+                    b.diag_coded_once(CompileCode::NestedSequenceShortened, DiagSeverity::Warning, Some(clip.id), "native nested sequence is shorter than the outer reference; holding its last frame");
+                    Tick((end.0 - nested.frame_rate.ticks_per_frame().0).max(0))
+                } else {
+                    src_time
+                };
+                let inner = compile_native_sequence_impl(
+                    project,
+                    nested_id,
+                    format_index,
+                    fold_tick,
+                    quality,
+                    false,
+                    check_sources_online,
+                    source_errors,
+                    luts,
+                    &sequence_path,
+                );
+                if inner
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.severity == DiagSeverity::Error)
+                {
+                    let mut failed = blank(
+                        b,
+                        "native nested source cannot render accurately",
+                        Some(clip.id),
+                    );
+                    failed.diagnostics.extend(inner.diagnostics);
+                    return failed;
+                }
+                let Some(output) = inner.graph.output else {
+                    return blank(b, "native nested sequence has no output", Some(clip.id));
+                };
+                let output_node = &inner.graph.nodes[output.0 as usize];
+                if !matches!(output_node.op, IrOp::NativeSdrOutput) || output_node.inputs.len() != 1
+                {
+                    return blank(
+                        b,
+                        "native nested sequence has an invalid output boundary",
+                        Some(clip.id),
+                    );
+                }
+                let scene_output = output_node.inputs[0].0;
+                let mut imported = Vec::with_capacity(output.0 as usize);
+                for node in inner.graph.nodes.iter().take(output.0 as usize) {
+                    let inputs = node
+                        .inputs
+                        .iter()
+                        .map(|(id, port)| (imported[id.0 as usize], *port))
+                        .collect();
+                    imported.push(b.push(node.op.clone(), inputs));
+                }
+                for diagnostic in inner.diagnostics {
+                    b.diag(diagnostic);
+                }
+                imported[scene_output.0 as usize]
+            }
+            _ => {
+                return blank(
+                    b,
+                    "native preview requires a qualified asset or nested sequence source",
+                    Some(clip.id),
+                )
+            }
+        };
+        let transformed = if transform == ClipTransform::default() {
+            asset_graded
+        } else {
+            b.push(
+                IrOp::Transform2DTransparent {
+                    mat: matrix,
+                    sampling: Sampling::Bilinear,
+                },
+                vec![(asset_graded, OutPort::default())],
+            )
+        };
+        let mut pre_graded = transformed;
+        for id in group_chain.iter().rev() {
+            if let Some(grade) = seq.groups[id].pre_grade.as_ref() {
+                pre_graded = apply_grade(
+                    &mut b,
+                    grade,
+                    pre_graded,
+                    tick - clip.start,
+                    Some(VfxOwner::GroupPre(*id)),
+                );
+            }
+        }
+        b.clip_pre_grade_taps.push((clip.id, pre_graded));
+        let mut graded = clip.grade.as_ref().map_or(pre_graded, |grade| {
+            apply_grade(
+                &mut b,
+                grade,
+                pre_graded,
+                tick - clip.start,
+                Some(VfxOwner::Clip(clip.id)),
+            )
+        });
+        graded = apply_clip_look(&mut b, project, clip, graded, tick - clip.start);
+        for id in group_chain {
+            if let Some(grade) = seq.groups[&id].post_grade.as_ref() {
+                graded = apply_grade(
+                    &mut b,
+                    grade,
+                    graded,
+                    tick - clip.start,
+                    Some(VfxOwner::GroupPost(id)),
+                );
+            }
+        }
+        let track_graded = track.grade.as_ref().map_or(graded, |grade| {
+            apply_grade(&mut b, grade, graded, tick, Some(VfxOwner::Track(track.id)))
+        });
+        if b.diagnostics
+            .iter()
+            .any(|d| d.severity == DiagSeverity::Error)
+        {
+            let diagnostics = std::mem::take(&mut b.diagnostics);
+            let mut failed = blank(
+                Builder::new(),
+                "native preview cannot render this clip accurately",
+                Some(clip.id),
+            );
+            failed.diagnostics.extend(diagnostics);
+            return failed;
+        }
+        b.clip_taps.push((clip.id, graded));
+        composite = Some(fold_over(
+            &mut b,
+            composite,
+            track_graded,
+            (transform.opacity as f32) * track.opacity,
+            BlendMode::Normal,
+        ));
+    }
+    let Some(composite) = composite else {
+        let source = b.transparent(format);
+        let output = b.push(
+            if delivery {
+                IrOp::NativeSdrVideoOutput
+            } else {
+                IrOp::NativeSdrOutput
+            },
+            vec![(source, OutPort::default())],
+        );
+        return b.finish(Some(output));
+    };
+    let program = seq.master_grade.as_ref().map_or(composite, |grade| {
+        apply_grade(
+            &mut b,
+            grade,
+            composite,
+            tick,
+            Some(VfxOwner::Master(seq.id)),
+        )
+    });
+    if b.diagnostics
+        .iter()
+        .any(|d| d.severity == DiagSeverity::Error)
+    {
+        let diagnostics = std::mem::take(&mut b.diagnostics);
+        let mut failed = blank(
+            Builder::new(),
+            "native preview cannot render this clip accurately",
+            None,
+        );
+        failed.diagnostics.extend(diagnostics);
+        return failed;
+    }
+    let output_op = if delivery {
+        IrOp::NativeSdrVideoOutput
+    } else {
+        IrOp::NativeSdrOutput
+    };
+    let output = b.push(output_op, vec![(program, OutPort::default())]);
+    // Native program scopes measure the display/delivery signal. Clip taps
+    // remain scene-linear and are gated until a scene-referred scale exists.
+    b.program_tap = Some(output);
+    let compiled = b.finish(Some(output));
+    if let Err(error) = compiled.graph.validate_working_color_domain() {
+        return blank(Builder::new(), error, None);
+    }
+    let expected = if delivery {
+        crate::graph::ir::FrameColorEncoding::Bt709Video
+    } else {
+        crate::graph::ir::FrameColorEncoding::SrgbDisplay
+    };
+    if compiled.graph.output_color_encoding() != Ok(expected) {
+        return blank(
+            Builder::new(),
+            "native output did not produce its configured encoding",
+            None,
+        );
+    }
+    compiled
 }
 
 /// Compile the active sequence at `tick` in `format_index` to a frame graph.
@@ -407,7 +1322,7 @@ pub fn compile(
 /// [`compile`] with a [`LutProvider`] threaded in so `Grade` `Lut3d` ops resolve
 /// to real tables (K-0.5). The provider read is a lock-free cache hit (no `.cube`
 /// parsing on this per-frame path). `luts == None` behaves exactly like
-/// [`compile`] (LUT ops inert → identity).
+/// [`compile`] (LUT ops bypassed with an export-blocking diagnostic).
 #[allow(clippy::too_many_arguments)]
 pub fn compile_with_luts(
     project: &TimelineProject,
@@ -521,6 +1436,7 @@ pub fn compile_full(
         )));
         return b.finish(None);
     };
+    b.sequence_path.push(sequence);
     let format_index = format_index.min(seq.formats.len().saturating_sub(1));
     let Some(format) = seq.formats.get(format_index) else {
         b.diag(CompileDiagnostic::plain(format!(
@@ -528,6 +1444,26 @@ pub fn compile_full(
         )));
         return b.finish(None);
     };
+
+    if matches!(
+        seq.color,
+        timeline::color::SequenceColorConfig::NativeManaged(_)
+    ) {
+        b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+    }
+
+    if let Err(error) = crate::color::ensure_supported(seq) {
+        b.diag(CompileDiagnostic::coded(
+            CompileCode::ColorPipelineUnavailable,
+            DiagSeverity::Error,
+            None,
+            error,
+        ));
+        let blank = b.transparent(format);
+        let (w, h) = (format.width, format.height);
+        let output = b.push(IrOp::Output { w, h }, vec![(blank, OutPort::default())]);
+        return b.finish(Some(output));
+    }
 
     let mut cycle = HashSet::new();
     cycle.insert(sequence);
@@ -558,6 +1494,7 @@ pub fn compile_full(
             p,
             tick,
             None,
+            Some(VfxOwner::Master(seq.id)),
         )
     });
 
@@ -598,11 +1535,14 @@ pub fn compile_full(
 /// (every input is pushed before its consumer), so the finished `nodes` vector is
 /// already topologically sorted (02 §2 "topo-sorted at build").
 struct Builder<'a> {
+    working_color_domain: WorkingColorDomain,
     nodes: Vec<IrNode>,
     /// content hash → node id, so an identical (op, inputs) subgraph is emitted
     /// once (TimeOffset dedup, 02 §2 step 7).
     dedup: HashMap<u128, IrNodeId>,
     diagnostics: Vec<CompileDiagnostic>,
+    /// Root-to-leaf sequence context while recursively folding nests.
+    sequence_path: Vec<SequenceId>,
     /// Records every lowered `(graph, node)` → IR id so a `ViewNodeOverride`
     /// (08 §6.7) can reroute output to a pinned node.
     view_index: HashMap<(GraphId, GraphNodeId), IrNodeId>,
@@ -617,6 +1557,13 @@ struct Builder<'a> {
     stabilization: Option<&'a dyn StabilizationProvider>,
     /// K-E2 scope taps: each lowered clip's post-`Grade` node (07 §5).
     clip_taps: Vec<(ClipId, IrNodeId)>,
+    clip_pre_grade_taps: Vec<(ClipId, IrNodeId)>,
+    clip_grade_inspections: Vec<ClipGradeInspection>,
+    native_qualifier_inspections: Vec<NativeQualifierInspection>,
+    native_curve_inputs: Vec<(ClipId, GradeOpId, IrNodeId)>,
+    native_graph_qualifier_inspections: Vec<(u32, NativeQualifierInspection)>,
+    native_graph_curve_inputs: Vec<(ClipId, u32, GradeOpId, IrNodeId)>,
+    native_graph_mattes: Vec<(ClipId, u32, IrNodeId)>,
     /// K-E2: the folded program before `CaptionOverlay` (03 §3.6).
     program_tap: Option<IrNodeId>,
     /// K-B5 compare: when true, skip each clip's effect stack + grade so the
@@ -628,14 +1575,23 @@ struct Builder<'a> {
 impl<'a> Builder<'a> {
     fn new() -> Self {
         Builder {
+            working_color_domain: WorkingColorDomain::LegacyLinearRec709,
             nodes: Vec::new(),
             dedup: HashMap::new(),
             diagnostics: Vec::new(),
+            sequence_path: Vec::new(),
             view_index: HashMap::new(),
             luts: None,
             deflicker: None,
             stabilization: None,
             clip_taps: Vec::new(),
+            clip_pre_grade_taps: Vec::new(),
+            clip_grade_inspections: Vec::new(),
+            native_qualifier_inspections: Vec::new(),
+            native_curve_inputs: Vec::new(),
+            native_graph_qualifier_inspections: Vec::new(),
+            native_graph_curve_inputs: Vec::new(),
+            native_graph_mattes: Vec::new(),
             program_tap: None,
             skip_clip_looks: false,
         }
@@ -741,15 +1697,39 @@ impl<'a> Builder<'a> {
         )
     }
 
-    fn finish(self, output: Option<IrNodeId>) -> CompiledFrame {
+    fn finish(mut self, output: Option<IrNodeId>) -> CompiledFrame {
+        if self.native_qualifier_inspections.len() > 1 {
+            let mut qualifier_counts = HashMap::new();
+            for key in &self.native_qualifier_inspections {
+                *qualifier_counts.entry((key.clip, key.op)).or_insert(0usize) += 1;
+            }
+            self.native_qualifier_inspections
+                .retain(|key| qualifier_counts[&(key.clip, key.op)] == 1);
+        }
+        if self.native_curve_inputs.len() > 1 {
+            let mut curve_counts = HashMap::new();
+            for (clip, op, _) in &self.native_curve_inputs {
+                *curve_counts.entry((*clip, *op)).or_insert(0usize) += 1;
+            }
+            self.native_curve_inputs
+                .retain(|(clip, op, _)| curve_counts[&(*clip, *op)] == 1);
+        }
         CompiledFrame {
             graph: FrameGraph {
+                working_color_domain: self.working_color_domain,
                 nodes: self.nodes,
                 output,
             },
             diagnostics: self.diagnostics,
             program_tap: self.program_tap,
             clip_taps: self.clip_taps,
+            clip_pre_grade_taps: self.clip_pre_grade_taps,
+            clip_grade_inspections: self.clip_grade_inspections,
+            native_qualifier_inspections: self.native_qualifier_inspections,
+            native_curve_inputs: self.native_curve_inputs,
+            native_graph_qualifier_inspections: self.native_graph_qualifier_inspections,
+            native_graph_curve_inputs: self.native_graph_curve_inputs,
+            native_graph_mattes: self.native_graph_mattes,
         }
     }
 }
@@ -790,6 +1770,15 @@ fn fold_sequence(
     quality: Quality,
     cycle: &mut HashSet<SequenceId>,
 ) -> Option<IrNodeId> {
+    if let Err(error) = crate::color::ensure_supported(seq) {
+        b.diag(CompileDiagnostic::coded(
+            CompileCode::ColorPipelineUnavailable,
+            DiagSeverity::Error,
+            None,
+            error,
+        ));
+        return Some(b.transparent(format));
+    }
     let mut acc: Option<IrNodeId> = None;
 
     for track in &seq.video_tracks {
@@ -819,6 +1808,7 @@ fn fold_sequence(
                     below,
                     dt,
                     Some(clip.id),
+                    Some(VfxOwner::Clip(clip.id)),
                 ));
             }
             continue;
@@ -849,8 +1839,15 @@ fn fold_sequence(
                     // before it merges — never on the accumulator. Sequence-
                     // relative keyframes.
                     // TODO(30 §2.3): gate on the track stack's Applicability once a manifest type exists.
-                    let node =
-                        apply_stack(b, &track.effects, track.grade.as_ref(), node, tick, None);
+                    let node = apply_stack(
+                        b,
+                        &track.effects,
+                        track.grade.as_ref(),
+                        node,
+                        tick,
+                        None,
+                        Some(VfxOwner::Track(track.id)),
+                    );
                     acc = Some(fold_over(b, acc, node, track.opacity, track.blend));
                     continue;
                 }
@@ -901,7 +1898,15 @@ fn fold_sequence(
         // OWN composited content before it merges into the accumulator — never on
         // the accumulator itself. Track keyframes are sequence-relative (`tick`).
         // TODO(30 §2.3): gate on the track stack's Applicability once a manifest type exists.
-        let image = apply_stack(b, &track.effects, track.grade.as_ref(), image, tick, None);
+        let image = apply_stack(
+            b,
+            &track.effects,
+            track.grade.as_ref(),
+            image,
+            tick,
+            None,
+            Some(VfxOwner::Track(track.id)),
+        );
         acc = Some(fold_over(
             b,
             acc,
@@ -1423,6 +2428,19 @@ fn build_clip_chain(
     if opacity <= 0.0 {
         return None; // dead branch (step 8).
     }
+    if seq.color.is_legacy() {
+        if let ClipSource::Asset { asset } = clip.source {
+            if let Some((field, value)) = unsupported_legacy_color(project, asset) {
+                b.diag(CompileDiagnostic::coded(
+                CompileCode::ColorPipelineUnavailable,
+                DiagSeverity::Error,
+                Some(clip.id),
+                format!("Clip {} uses asset {asset} with {value} {field}, which Legacy SDR cannot interpret", clip.id),
+            ));
+                return Some((b.transparent(format), opacity));
+            }
+        }
+    }
 
     // Step 3: composition substitutes the SOURCE op only; else the plain source.
     let source = match clip.composition {
@@ -1462,7 +2480,15 @@ fn build_clip_chain(
         .asset()
         .and_then(|a| project.media.assets.get(&a))
     {
-        Some(asset) => apply_stack(b, &asset.effects, asset.grade.as_ref(), source, dt, None),
+        Some(asset) => apply_stack(
+            b,
+            &asset.effects,
+            asset.grade.as_ref(),
+            source,
+            dt,
+            None,
+            Some(VfxOwner::Asset(asset.id)),
+        ),
         None => source,
     };
 
@@ -1510,11 +2536,52 @@ fn build_clip_chain(
         cur = apply_stack(
             b,
             &clip.effects,
-            clip.grade.as_ref(),
+            None,
             cur,
             dt,
             Some(clip.id),
+            Some(VfxOwner::Clip(clip.id)),
         );
+        let group_chain = clip.group.map(|id| seq.group_chain(id)).unwrap_or_default();
+        // Root→leaf before the shot correction; leaf→root after it. This is
+        // per-member grading, not a grade on the composite of grouped clips.
+        for id in group_chain.iter().rev() {
+            if let Some(grade) = seq
+                .groups
+                .get(id)
+                .and_then(|group| group.pre_grade.as_ref())
+            {
+                cur = apply_grade(b, grade, cur, dt, Some(VfxOwner::GroupPre(*id)));
+            }
+        }
+        b.clip_pre_grade_taps.push((clip.id, cur));
+        if let Some(grade) = clip.grade.as_ref() {
+            if !grade.bypass
+                && grade.graph.is_none()
+                && grade
+                    .ops
+                    .iter()
+                    .any(|op| op.enabled && op.kind == GradeOpKind::HslQualifier)
+            {
+                let (ops, _) =
+                    photonic_render::grade::resolve_with_ids_and_diagnostics(grade, dt, |asset| {
+                        b.luts.and_then(|provider| provider.lut(asset))
+                    });
+                b.clip_grade_inspections
+                    .push(ClipGradeInspection { clip: clip.id, ops });
+            }
+            cur = apply_grade(b, grade, cur, dt, Some(VfxOwner::Clip(clip.id)));
+        }
+        cur = apply_clip_look(b, project, clip, cur, dt);
+        for id in group_chain {
+            if let Some(grade) = seq
+                .groups
+                .get(&id)
+                .and_then(|group| group.post_grade.as_ref())
+            {
+                cur = apply_grade(b, grade, cur, dt, Some(VfxOwner::GroupPost(id)));
+            }
+        }
     }
     // K-E2 / 07 §5: this node — post-`Grade`, pre-fold — is the per-clip scope
     // tap. Recorded for every lowered clip (including clips inside a nest, which
@@ -1526,10 +2593,9 @@ fn build_clip_chain(
 
 /// Append an enabled effect stack then a grade (if any) onto `input`, in the one
 /// normative scope order (02 §2 steps 1–7 / §2.3, restated by 35 §2): every
-/// enabled effect in author order, then the grade on top. This is the SINGLE place
-/// the "effects beneath grade" rule lives — it is called at all four effect scopes
-/// (asset, clip, track, master, 35 §2.4) so the ordering can never drift between
-/// them.
+/// enabled effect in author order, then the grade on top. Asset, track and
+/// master scopes use both parts. The clip scope calls this with no grade, then
+/// inserts group pre → clip grade → group post explicitly at its grade stage.
 ///
 /// `dt` is the keyframe-evaluation domain for the scope being applied, and it is
 /// NOT the same at every scope: the clip and asset stacks are **clip-relative**
@@ -1549,6 +2615,7 @@ fn apply_stack(
     input: IrNodeId,
     dt: Tick,
     scope: Option<ClipId>,
+    grade_owner: Option<VfxOwner>,
 ) -> IrNodeId {
     let mut cur = input;
     for fx in effects {
@@ -1615,7 +2682,7 @@ fn apply_stack(
         );
     }
     if let Some(grade) = grade {
-        cur = apply_grade(b, grade, cur, dt);
+        cur = apply_grade(b, grade, cur, dt, grade_owner);
     }
     cur
 }
@@ -1623,31 +2690,756 @@ fn apply_stack(
 /// Resolve `grade` at `tick` and emit a `Grade` IR op carrying the resolved stack
 /// (07 §2/§3), or return `input` unchanged when the grade is bypassed / empty /
 /// fully inert. Shared by clip grades (step 2) and graph `Grade`/`Lut` nodes.
-fn apply_grade(b: &mut Builder<'_>, grade: &Grade, input: IrNodeId, tick: Tick) -> IrNodeId {
-    let ops = resolve_grade(b.luts, grade, tick);
+/// Resolve the independent/shared look with identical provenance in both color domains.
+fn apply_clip_look(
+    b: &mut Builder<'_>,
+    project: &TimelineProject,
+    clip: &Clip,
+    input: IrNodeId,
+    dt: Tick,
+) -> IrNodeId {
+    let mut cur = input;
+    if let Some(look) = clip.look.as_ref() {
+        let (grade, stage) = match look {
+            timeline::ClipLook::Local(grade) => (
+                Some(grade.as_ref()),
+                photonic_render::grade::GradeStage::LocalLook,
+            ),
+            timeline::ClipLook::Shared(id) => (
+                project.shared_looks.get(id).map(|look| &look.grade),
+                photonic_render::grade::GradeStage::SharedLook { id: *id },
+            ),
+        };
+        if let Some(grade) = grade {
+            let first_diagnostic = b.diagnostics.len();
+            cur = apply_grade(b, grade, cur, dt, Some(VfxOwner::Clip(clip.id)));
+            for diagnostic in &mut b.diagnostics[first_diagnostic..] {
+                if let Some(grade) = diagnostic.grade.as_mut() {
+                    grade.stage = Some(stage.clone());
+                    diagnostic.message = grade.to_string();
+                } else {
+                    let label = match &stage {
+                        photonic_render::grade::GradeStage::LocalLook => {
+                            "Independent look".to_owned()
+                        }
+                        photonic_render::grade::GradeStage::SharedLook { id } => {
+                            format!("Shared look {id}")
+                        }
+                    };
+                    diagnostic.message =
+                        format!("{label} on clip {}: {}", clip.id, diagnostic.message);
+                }
+            }
+        } else if let timeline::ClipLook::Shared(id) = look {
+            let diagnostic = photonic_render::grade::GradeDiagnostic {
+                op: timeline::GradeOpId::nil(),
+                sequence_path: b.sequence_path.clone(),
+                graph_node: None,
+                owner: Some(VfxOwner::Clip(clip.id)),
+                stage: Some(photonic_render::grade::GradeStage::SharedLook { id: *id }),
+                issue: photonic_render::grade::GradeIssue::MissingSharedLook(*id),
+            };
+            let mut compiled = CompileDiagnostic::coded(
+                CompileCode::GradeUnresolved,
+                DiagSeverity::Error,
+                Some(clip.id),
+                diagnostic.to_string(),
+            );
+            compiled.grade = Some(diagnostic);
+            b.diag(compiled);
+        }
+    }
+    cur
+}
+
+fn apply_grade(
+    b: &mut Builder<'_>,
+    grade: &Grade,
+    input: IrNodeId,
+    tick: Tick,
+    owner: Option<VfxOwner>,
+) -> IrNodeId {
+    apply_grade_at_node(b, grade, input, tick, owner, None)
+}
+
+fn apply_grade_at_node(
+    b: &mut Builder<'_>,
+    grade: &Grade,
+    input: IrNodeId,
+    tick: Tick,
+    owner: Option<VfxOwner>,
+    graph_node: Option<u32>,
+) -> IrNodeId {
+    if grade.bypass {
+        return input;
+    }
+    if let Some(graph) = &grade.graph {
+        if let Err(error) = graph.validate(&grade.ops) {
+            b.diag(CompileDiagnostic::coded(
+                CompileCode::GradeUnresolved,
+                DiagSeverity::Error,
+                match owner {
+                    Some(VfxOwner::Clip(id)) => Some(id),
+                    _ => None,
+                },
+                error,
+            ));
+            return input;
+        }
+        fn lower(
+            b: &mut Builder<'_>,
+            grade: &Grade,
+            graph: &GradeGraph,
+            node: u32,
+            input: IrNodeId,
+            tick: Tick,
+            owner: Option<VfxOwner>,
+            memo: &mut HashMap<u32, IrNodeId>,
+        ) -> IrNodeId {
+            if let Some(&cached) = memo.get(&node) {
+                return cached;
+            }
+            let result = match &graph.nodes[&node] {
+                GradeGraphNode::Input => input,
+                GradeGraphNode::Corrector {
+                    input: upstream,
+                    op,
+                    ..
+                } => {
+                    let upstream = lower(b, grade, graph, *upstream, input, tick, owner, memo);
+                    let corrector = grade
+                        .ops
+                        .iter()
+                        .find(|candidate| candidate.id == *op)
+                        .expect("validated grading graph");
+                    let single = Grade {
+                        ops: vec![corrector.clone()],
+                        bypass: false,
+                        graph: None,
+                    };
+                    apply_grade_at_node(b, &single, upstream, tick, owner, Some(node))
+                }
+                GradeGraphNode::QualifierMatte {
+                    input: upstream,
+                    op,
+                    ..
+                } => {
+                    let upstream = lower(b, grade, graph, *upstream, input, tick, owner, memo);
+                    let corrector = grade
+                        .ops
+                        .iter()
+                        .find(|candidate| candidate.id == *op)
+                        .expect("validated qualifier source");
+                    let single = Grade {
+                        ops: vec![corrector.clone()],
+                        bypass: false,
+                        graph: None,
+                    };
+                    let (resolved, diagnostics) =
+                        photonic_render::grade::resolve_with_ids_and_diagnostics(
+                            &single,
+                            tick,
+                            |asset| b.luts.and_then(|provider| provider.lut(asset)),
+                        );
+                    for mut diagnostic in diagnostics {
+                        diagnostic.owner = owner;
+                        diagnostic.sequence_path = b.sequence_path.clone();
+                        diagnostic.graph_node = Some(node);
+                        let mut compiled = CompileDiagnostic::coded(
+                            CompileCode::GradeUnresolved,
+                            DiagSeverity::Error,
+                            match owner {
+                                Some(VfxOwner::Clip(id)) => Some(id),
+                                _ => None,
+                            },
+                            diagnostic.to_string(),
+                        );
+                        compiled.grade = Some(diagnostic);
+                        b.diag(compiled);
+                    }
+                    match resolved.into_iter().next() {
+                        Some((_, resolved)) => {
+                            if let photonic_render::grade::ResolvedGradePayload::HslQualifier(
+                                qualifier,
+                            ) = resolved.payload
+                            {
+                                let native =
+                                    b.working_color_domain == WorkingColorDomain::SceneLinearAcescg;
+                                if native && b.sequence_path.len() == 1 {
+                                    if let Some(VfxOwner::Clip(clip)) = owner {
+                                        b.native_graph_qualifier_inspections.push((
+                                            node,
+                                            NativeQualifierInspection {
+                                                clip,
+                                                op: *op,
+                                                input: upstream,
+                                                qualifier: qualifier.clone(),
+                                                mask: resolved.mask,
+                                            },
+                                        ));
+                                    }
+                                }
+                                let upstream = if native {
+                                    b.push(IrOp::NativeAcescct { direction: photonic_render::native_transfer::AcescctDirection::Encode }, vec![(upstream, OutPort::default())])
+                                } else {
+                                    upstream
+                                };
+                                b.push(
+                                    IrOp::QualifierMatte {
+                                        qualifier,
+                                        mask: resolved.mask,
+                                        native,
+                                    },
+                                    vec![(upstream, OutPort::default())],
+                                )
+                            } else {
+                                unreachable!("validated qualifier source")
+                            }
+                        }
+                        None => b.push(IrOp::GradeMatteConstant { weight: 0.0 }, vec![]),
+                    }
+                }
+                GradeGraphNode::MatteRefine {
+                    input: upstream,
+                    refinement,
+                    ..
+                } => {
+                    let upstream = lower(b, grade, graph, *upstream, input, tick, owner, memo);
+                    if refinement.is_neutral() {
+                        upstream
+                    } else {
+                        b.push(
+                            IrOp::GradeMatteRefine {
+                                refinement: *refinement,
+                            },
+                            vec![(upstream, OutPort::default())],
+                        )
+                    }
+                }
+                GradeGraphNode::KeyMixer {
+                    top, bottom, mode, ..
+                } => {
+                    let top = lower(b, grade, graph, *top, input, tick, owner, memo);
+                    let bottom = lower(b, grade, graph, *bottom, input, tick, owner, memo);
+                    b.push(
+                        IrOp::GradeKeyMix { mode: *mode },
+                        vec![(top, OutPort::default()), (bottom, OutPort::default())],
+                    )
+                }
+                GradeGraphNode::MatteApply {
+                    original,
+                    corrected,
+                    matte,
+                    ..
+                } => {
+                    let corrected = lower(b, grade, graph, *corrected, input, tick, owner, memo);
+                    let original = lower(b, grade, graph, *original, input, tick, owner, memo);
+                    let matte = lower(b, grade, graph, *matte, input, tick, owner, memo);
+                    b.push(
+                        IrOp::GradeMatteApply,
+                        vec![
+                            (corrected, OutPort::default()),
+                            (original, OutPort::default()),
+                            (matte, OutPort::default()),
+                        ],
+                    )
+                }
+                GradeGraphNode::LayerMixer {
+                    top,
+                    bottom,
+                    opacity,
+                    ..
+                } => {
+                    let top = lower(b, grade, graph, *top, input, tick, owner, memo);
+                    let bottom = lower(b, grade, graph, *bottom, input, tick, owner, memo);
+                    b.push(
+                        if b.working_color_domain == WorkingColorDomain::SceneLinearAcescg {
+                            IrOp::GradeLayerMix { opacity: *opacity }
+                        } else {
+                            IrOp::Merge {
+                                mode: BlendMode::Normal,
+                                opacity: *opacity,
+                            }
+                        },
+                        vec![(top, OutPort::default()), (bottom, OutPort::default())],
+                    )
+                }
+                GradeGraphNode::Output { input: upstream } => {
+                    lower(b, grade, graph, *upstream, input, tick, owner, memo)
+                }
+            };
+            if b.working_color_domain == WorkingColorDomain::SceneLinearAcescg
+                && b.sequence_path.len() == 1
+                && graph.nodes[&node].output_type() == photonic_core::timeline::GradeGraphPortType::Matte
+            {
+                if let Some(VfxOwner::Clip(clip)) = owner {
+                    b.native_graph_mattes.push((clip, node, result));
+                }
+            }
+            memo.insert(node, result);
+            result
+        }
+        return lower(
+            b,
+            grade,
+            graph,
+            graph.output,
+            input,
+            tick,
+            owner,
+            &mut HashMap::new(),
+        );
+    }
+    let (ops, diagnostics) =
+        photonic_render::grade::resolve_with_ids_and_diagnostics(grade, tick, |asset| {
+            b.luts.and_then(|provider| provider.lut(asset))
+        });
+    for mut diagnostic in diagnostics {
+        diagnostic.owner = owner;
+        diagnostic.sequence_path = b.sequence_path.clone();
+        diagnostic.graph_node = graph_node;
+        let clip = match owner {
+            Some(VfxOwner::Clip(id)) => Some(id),
+            _ => None,
+        };
+        let mut compiled = CompileDiagnostic::coded(
+            CompileCode::GradeUnresolved,
+            DiagSeverity::Error,
+            clip,
+            diagnostic.to_string(),
+        );
+        compiled.grade = Some(diagnostic);
+        b.diag(compiled);
+    }
+    if b.working_color_domain == WorkingColorDomain::SceneLinearAcescg {
+        let mut current = input;
+        for (op_id, op) in ops {
+            let mask = op.mask;
+            let mask_valid = mask
+                .as_ref()
+                .is_none_or(|mask| photonic_render::grade_gpu::validate_native_mask(mask).is_ok());
+            if let photonic_render::grade::ResolvedGradePayload::Lut3d(lut) = &op.payload {
+                if mask_valid && photonic_render::grade_gpu::validate_native_lut(lut).is_ok() {
+                    let asset =
+                        grade.ops.iter().find(|op| op.id == op_id).and_then(|op| {
+                            match op.params.base {
+                                timeline::GradeOpParams::Lut3d { asset, .. } => Some(asset),
+                                _ => None,
+                            }
+                        });
+                    let binding = asset
+                        .and_then(|asset| b.luts.and_then(|provider| provider.native_lut(asset)));
+                    if let Some(binding) = binding {
+                        if matches!(
+                            binding.space,
+                            timeline::color::NativeLutSpace::Acescg
+                                | timeline::color::NativeLutSpace::Acescct
+                        ) {
+                            let log = binding.space == timeline::color::NativeLutSpace::Acescct;
+                            if log {
+                                current = b.push(IrOp::NativeAcescct { direction: photonic_render::native_transfer::AcescctDirection::Encode }, vec![(current, OutPort::default())]);
+                            }
+                            let original = current;
+                            current = b.push(
+                                IrOp::NativeLut3d { lut: lut.clone() },
+                                vec![(current, OutPort::default())],
+                            );
+                            if let Some(mask) = mask {
+                                current = b.push(
+                                    IrOp::NativeMaskMix { mask },
+                                    vec![
+                                        (current, OutPort::default()),
+                                        (original, OutPort::default()),
+                                    ],
+                                );
+                            }
+                            if log {
+                                current = b.push(IrOp::NativeAcescct { direction: photonic_render::native_transfer::AcescctDirection::Decode }, vec![(current, OutPort::default())]);
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+            if let photonic_render::grade::ResolvedGradePayload::Curves(ref curves) = op.payload {
+                let authored = grade.ops.iter().find(|op| op.id == op_id).and_then(|op| {
+                    if let timeline::GradeOpParams::Curves {
+                        master,
+                        red,
+                        green,
+                        blue,
+                        hue_vs_hue,
+                        hue_vs_sat,
+                        hue_vs_luma,
+                        luma_vs_sat,
+                        sat_vs_sat,
+                    } = &op.params.base
+                    {
+                        Some([
+                            master,
+                            red,
+                            green,
+                            blue,
+                            hue_vs_hue,
+                            hue_vs_sat,
+                            hue_vs_luma,
+                            luma_vs_sat,
+                            sat_vs_sat,
+                        ])
+                    } else {
+                        None
+                    }
+                });
+                let authored_valid = authored.is_some_and(|channels| {
+                    channels
+                        .iter()
+                        .all(|points| points.iter().all(|(x, y)| x.is_finite() && y.is_finite()))
+                });
+                let authored_identity = authored.is_some_and(|channels| {
+                    channels.iter().take(4).all(|points| {
+                        points.len() < 2
+                            || (points
+                                .iter()
+                                .all(|(x, y)| x == y && (0.0..=1.0).contains(x))
+                                && points.contains(&(0.0, 0.0))
+                                && points.contains(&(1.0, 1.0)))
+                    }) && channels.iter().skip(4).all(|points| {
+                        points.is_empty()
+                            || (points
+                                .iter()
+                                .all(|(x, y)| (0.0..=1.0).contains(x) && *y == 0.5)
+                                && points.contains(&(0.0, 0.5))
+                                && points.contains(&(1.0, 0.5)))
+                    })
+                });
+                if mask_valid
+                    && authored_valid
+                    && photonic_render::grade_gpu::validate_native_curves(curves).is_ok()
+                {
+                    if b.sequence_path.len() == 1 {
+                        if let Some(VfxOwner::Clip(clip)) = owner {
+                            b.native_curve_inputs.push((clip, op_id, current));
+                            if let Some(node) = graph_node {
+                                b.native_graph_curve_inputs
+                                    .push((clip, node, op_id, current));
+                            }
+                        }
+                    }
+                    let identity = photonic_render::grade::curve_lut(&[]);
+                    if !authored_identity
+                        && ([&curves.master, &curves.red, &curves.green, &curves.blue]
+                            .iter()
+                            .any(|table| **table != identity)
+                            || [
+                                &curves.hue_vs_hue,
+                                &curves.hue_vs_sat,
+                                &curves.hue_vs_luma,
+                                &curves.luma_vs_sat,
+                                &curves.sat_vs_sat,
+                            ]
+                            .iter()
+                            .any(|table| table.is_some()))
+                    {
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Encode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                        let original = current;
+                        current = b.push(
+                            IrOp::NativeLogCurves {
+                                curves: curves.clone(),
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                        if let Some(mask) = mask {
+                            current = b.push(
+                                IrOp::NativeMaskMix { mask },
+                                vec![
+                                    (current, OutPort::default()),
+                                    (original, OutPort::default()),
+                                ],
+                            );
+                        }
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Decode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                    }
+                    continue;
+                }
+            }
+            if let photonic_render::grade::ResolvedGradePayload::HslQualifier(ref qualifier) =
+                op.payload
+            {
+                if mask_valid
+                    && photonic_render::native_transfer::validate_native_qualifier(qualifier)
+                        .is_ok()
+                {
+                    if b.sequence_path.len() == 1 {
+                        if let Some(VfxOwner::Clip(clip)) = owner {
+                            let inspection = NativeQualifierInspection {
+                                clip,
+                                op: op_id,
+                                input: current,
+                                qualifier: qualifier.clone(),
+                                mask,
+                            };
+                            if let Some(node) = graph_node {
+                                b.native_graph_qualifier_inspections
+                                    .push((node, inspection.clone()));
+                            }
+                            b.native_qualifier_inspections.push(inspection);
+                        }
+                    }
+                    let cdl = qualifier.correction;
+                    if cdl.slope != [1.0; 3]
+                        || cdl.offset != [0.0; 3]
+                        || cdl.power != [1.0; 3]
+                        || cdl.sat != 1.0
+                    {
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Encode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                        let original = current;
+                        current = b.push(
+                            IrOp::NativeLogQualifier {
+                                qualifier: qualifier.clone(),
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                        if let Some(mask) = mask {
+                            current = b.push(
+                                IrOp::NativeMaskMix { mask },
+                                vec![
+                                    (current, OutPort::default()),
+                                    (original, OutPort::default()),
+                                ],
+                            );
+                        }
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Decode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                    }
+                    continue;
+                }
+            }
+            if let photonic_render::grade::ResolvedGradePayload::Cdl(cdl) = op.payload {
+                if mask_valid && photonic_render::native_transfer::validate_native_cdl(&cdl).is_ok()
+                {
+                    if cdl.slope != [1.0; 3]
+                        || cdl.offset != [0.0; 3]
+                        || cdl.power != [1.0; 3]
+                        || cdl.sat != 1.0
+                    {
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Encode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                        let original = current;
+                        current = b.push(
+                            IrOp::NativeLogCdl { cdl },
+                            vec![(current, OutPort::default())],
+                        );
+                        if let Some(mask) = mask {
+                            current = b.push(
+                                IrOp::NativeMaskMix { mask },
+                                vec![
+                                    (current, OutPort::default()),
+                                    (original, OutPort::default()),
+                                ],
+                            );
+                        }
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Decode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                    }
+                    continue;
+                }
+            }
+            if let photonic_render::grade::ResolvedGradePayload::Contrast { pivot, amount } =
+                op.payload
+            {
+                if mask_valid
+                    && pivot.is_finite()
+                    && (0.0..=1.0).contains(&pivot)
+                    && amount.is_finite()
+                    && (-4.0..=4.0).contains(&amount)
+                {
+                    // Skip neutral contrast to preserve exact scene-linear identity.
+                    if amount != 0.0 {
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Encode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                        let original = current;
+                        current = b.push(
+                            IrOp::NativeLogContrast { pivot, amount },
+                            vec![(current, OutPort::default())],
+                        );
+                        if let Some(mask) = mask {
+                            current = b.push(
+                                IrOp::NativeMaskMix { mask },
+                                vec![
+                                    (current, OutPort::default()),
+                                    (original, OutPort::default()),
+                                ],
+                            );
+                        }
+                        current = b.push(
+                            IrOp::NativeAcescct {
+                                direction:
+                                    photonic_render::native_transfer::AcescctDirection::Decode,
+                            },
+                            vec![(current, OutPort::default())],
+                        );
+                    }
+                    continue;
+                }
+            }
+            if let photonic_render::grade::ResolvedGradePayload::WhiteBalance { temp, tint } =
+                op.payload
+            {
+                if mask_valid {
+                    if let Ok(points) =
+                        photonic_render::native_transfer::white_balance_printer_points(temp, tint)
+                    {
+                        // Exact neutral bypass avoids needless half-float quantization.
+                        if temp != 0.0 || tint != 0.0 {
+                            let original = current;
+                            current = b.push(
+                                IrOp::NativePrinterLights { points },
+                                vec![(current, OutPort::default())],
+                            );
+                            if let Some(mask) = mask {
+                                current = b.push(
+                                    IrOp::NativeMaskMix { mask },
+                                    vec![
+                                        (current, OutPort::default()),
+                                        (original, OutPort::default()),
+                                    ],
+                                );
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+            use photonic_render::grade::ResolvedGradePayload as P;
+            let native: Result<IrOp, &str> = if !mask_valid {
+                Err("native power-window geometry must be finite with positive sizes and nonnegative feather")
+            } else {
+                match op.payload {
+                P::WhiteBalance { .. } => Err("native temperature and tint must be finite and within -1..=1"),
+                P::Exposure { stops }
+                    if stops.is_finite() && (-32.0..=32.0).contains(&stops) =>
+                {
+                    Ok(IrOp::NativeExposure { stops })
+                }
+                P::Exposure { .. } => Err("native exposure must be finite and within -32..=32 stops"),
+                P::LinearOffset { rgb }
+                    if rgb.iter().all(|value| value.is_finite() && (-16.0..=16.0).contains(value)) =>
+                {
+                    Ok(IrOp::NativeLinearOffset { rgb })
+                }
+                P::LinearOffset { .. } => Err("native linear offset must be finite and within -16..=16"),
+                P::PrinterLights { points }
+                    if points.iter().all(|value| value.is_finite() && (-120.0..=120.0).contains(value)) =>
+                {
+                    Ok(IrOp::NativePrinterLights { points })
+                }
+                P::PrinterLights { .. } => Err("native printer lights must be finite and within -120..=120 points"),
+                P::HighlightRolloff { knee, strength }
+                    if knee.is_finite() && (0.0..=64.0).contains(&knee)
+                        && strength.is_finite() && (0.0..=64.0).contains(&strength) =>
+                {
+                    Ok(IrOp::NativeHighlightRolloff { knee, strength })
+                }
+                P::HighlightRolloff { .. } => Err("native highlight roll-off parameters must be finite and within 0..=64"),
+                P::SaturationVibrance { saturation, vibrance }
+                    if saturation.is_finite() && (0.0..=4.0).contains(&saturation)
+                        && vibrance.is_finite() && (-1.0..=1.0).contains(&vibrance) =>
+                {
+                    Ok(IrOp::NativeSaturationVibrance { saturation, vibrance })
+                }
+                P::SaturationVibrance { .. } => Err("native saturation must be within 0..=4 and vibrance within -1..=1; both must be finite"),
+                _ => Err("managed grading does not yet support this corrector or mask; corrector bypassed"),
+            }
+            };
+            match native {
+                Ok(native) => {
+                    let original = current;
+                    current = b.push(native, vec![(current, OutPort::default())]);
+                    if let Some(mask) = mask {
+                        current = b.push(
+                            IrOp::NativeMaskMix { mask },
+                            vec![
+                                (current, OutPort::default()),
+                                (original, OutPort::default()),
+                            ],
+                        );
+                    }
+                }
+                Err(message) => {
+                    let diagnostic = photonic_render::grade::GradeDiagnostic {
+                        op: op_id,
+                        owner,
+                        graph_node,
+                        stage: None,
+                        sequence_path: b.sequence_path.clone(),
+                        issue: photonic_render::grade::GradeIssue::NativeCorrectionUnavailable(
+                            message.into(),
+                        ),
+                    };
+                    let mut compiled = CompileDiagnostic::coded(
+                        CompileCode::ColorPipelineUnavailable,
+                        DiagSeverity::Error,
+                        match owner {
+                            Some(VfxOwner::Clip(id)) => Some(id),
+                            _ => None,
+                        },
+                        diagnostic.to_string(),
+                    );
+                    compiled.grade = Some(diagnostic);
+                    b.diag(compiled);
+                }
+            }
+        }
+        return current;
+    }
     if ops.is_empty() {
         input
     } else {
-        b.push(IrOp::Grade { ops }, vec![(input, OutPort::default())])
+        b.push(
+            IrOp::Grade {
+                ops: ops.into_iter().map(|(_, op)| op).collect(),
+            },
+            vec![(input, OutPort::default())],
+        )
     }
-}
-
-/// Resolve an authoring [`Grade`] at `tick` into the resolved op stack (07 §2)
-/// via `photonic_render::grade::resolve`.
-///
-/// `Lut3d` asset ops resolve against `luts` (K-0.5): a table is looked up per
-/// referenced [`AssetId`]; a `None` result (no provider / offline / failed asset)
-/// drops the op to identity (07 §1 — never a black frame). The provider's `lut`
-/// is a lock-free read of a pre-warmed cache, so no `.cube` parsing happens on
-/// this per-frame path (see [`LutProvider`]).
-fn resolve_grade(
-    luts: Option<&dyn LutProvider>,
-    grade: &Grade,
-    tick: Tick,
-) -> Vec<crate::contract::ResolvedGradeOp> {
-    photonic_render::grade::resolve(grade, tick, |asset: AssetId| {
-        luts.and_then(|p| p.lut(asset))
-    })
 }
 
 // ── Step 2: clip source ────────────────────────────────────────────────────────
@@ -1710,7 +3502,78 @@ fn build_clip_source(
                 }
             }
             match kind {
+                AssetKind::Image
+                    if matches!(
+                        seq.color,
+                        timeline::color::SequenceColorConfig::NativeManaged(_)
+                    ) =>
+                {
+                    let input = clip.native_input_color.as_ref().or_else(|| {
+                        project
+                            .media
+                            .assets
+                            .get(asset)
+                            .and_then(|a| a.native_input_color.as_ref())
+                    });
+                    if input.is_none_or(|input| {
+                        input.standard != timeline::color::NativeInputStandard::SrgbDisplay
+                            || input.validate_asset_kind(AssetKind::Image).is_err()
+                    }) {
+                        b.diag_coded_once(CompileCode::ColorPipelineUnavailable, DiagSeverity::Error, Some(clip.id), "native still requires an explicit full-range sRGB display interpretation");
+                        return b.transparent(format);
+                    }
+                    b.push(IrOp::NativeDecodeStill { asset: *asset }, vec![])
+                }
                 AssetKind::Image => b.push(IrOp::DecodeStill { asset: *asset }, vec![]),
+                AssetKind::Video
+                    if matches!(
+                        seq.color,
+                        timeline::color::SequenceColorConfig::NativeManaged(_)
+                    ) =>
+                {
+                    let authored = clip.native_input_color.as_ref().or_else(|| {
+                        project
+                            .media
+                            .assets
+                            .get(asset)
+                            .and_then(|media| media.native_input_color.as_ref())
+                    });
+                    let Some(input) = authored else {
+                        b.diag_coded_once(
+                            CompileCode::ColorPipelineUnavailable,
+                            DiagSeverity::Error,
+                            Some(clip.id),
+                            "native video clip requires an explicit input interpretation",
+                        );
+                        return b.transparent(format);
+                    };
+                    if let Err(error) = input.validate() {
+                        b.diag_coded_once(
+                            CompileCode::ColorPipelineUnavailable,
+                            DiagSeverity::Error,
+                            Some(clip.id),
+                            error,
+                        );
+                        return b.transparent(format);
+                    }
+                    if deinterlace_for_asset(project, *asset).is_some() {
+                        b.diag_coded_once(
+                            CompileCode::ColorPipelineUnavailable,
+                            DiagSeverity::Error,
+                            Some(clip.id),
+                            "native interlaced input needs a qualified pre-IDT deinterlace",
+                        );
+                        return b.transparent(format);
+                    }
+                    b.push(
+                        IrOp::NativeDecodeVideo {
+                            asset: *asset,
+                            src_time,
+                            input: input.clone(),
+                        },
+                        vec![],
+                    )
+                }
                 AssetKind::Video | AssetKind::Audio | AssetKind::VectorDoc | AssetKind::Lut3d => {
                     let decode = b.push(
                         IrOp::DecodeVideo {
@@ -1908,6 +3771,7 @@ fn build_nested_sequence(
     // so an inner clip's `reframe` entry for the OUTER format index is what
     // applies (a nest reframes to its host).
     cycle.insert(sequence);
+    b.sequence_path.push(sequence);
     let program = fold_sequence(
         b,
         project,
@@ -1918,6 +3782,7 @@ fn build_nested_sequence(
         quality,
         cycle,
     );
+    b.sequence_path.pop();
     cycle.remove(&sequence);
 
     // 38 §2.3: the inner sequence's own caption tracks are part of the picture —
@@ -2288,7 +4153,7 @@ fn lower_node_uncached(
         }
         GraphOp::Grade { grade } => {
             let input = lower_primary_or_default(b, lc, primary(), tick, cycle);
-            apply_grade(b, grade, input, tick)
+            apply_grade(b, grade, input, tick, None)
         }
         GraphOp::Lut { asset } => {
             // 08 §2: `Lut` lowers to a single-op `Grade{Lut3d}` — one mechanism,
@@ -2296,7 +4161,7 @@ fn lower_node_uncached(
             // at compile), so this is a passthrough until the lut_provider reaches
             // compile; the chain shape is correct now.
             let input = lower_primary_or_default(b, lc, primary(), tick, cycle);
-            apply_grade(b, &single_lut_grade(*asset), input, tick)
+            apply_grade(b, &single_lut_grade(*asset), input, tick, None)
         }
         GraphOp::Text { .. } => {
             // 08 §2: `Text` lowers to the dedicated `TextGen` IR op (a 0-input
@@ -3041,6 +4906,20 @@ fn hash_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &IrOp) {
             h.update(&src_time.0.to_le_bytes());
             h.update(&[*proxy as u8]);
         }
+        IrOp::NativeDecodeVideo {
+            asset,
+            src_time,
+            input,
+        } => {
+            h.update(&[25]);
+            h.update(&asset.0.as_u128().to_le_bytes());
+            h.update(&src_time.0.to_le_bytes());
+            h.update(&serde_json::to_vec(input).expect("native input interpretation serializes"));
+        }
+        IrOp::NativeDecodeStill { asset } => {
+            h.update(&[34]);
+            h.update(&asset.0.as_u128().to_le_bytes());
+        }
         IrOp::DecodeStill { asset } => {
             h.update(&[1]);
             h.update(&asset.0.as_u128().to_le_bytes());
@@ -3066,6 +4945,13 @@ fn hash_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &IrOp) {
         }
         IrOp::Transform2D { mat, sampling } => {
             h.update(&[4]);
+            for v in mat.to_cols_array() {
+                f32b(h, v);
+            }
+            h.update(&[*sampling as u8]);
+        }
+        IrOp::Transform2DTransparent { mat, sampling } => {
+            h.update(&[29]);
             for v in mat.to_cols_array() {
                 f32b(h, v);
             }
@@ -3102,6 +4988,143 @@ fn hash_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &IrOp) {
                 hash_resolved_grade_op(h, op);
             }
         }
+        IrOp::NativeExposure { stops } => {
+            h.update(&[21]);
+            f32b(h, *stops);
+        }
+        IrOp::NativeLinearOffset { rgb } => {
+            h.update(&[26]);
+            for value in rgb {
+                f32b(h, *value);
+            }
+        }
+        IrOp::NativePrinterLights { points } => {
+            h.update(&[27]);
+            for value in points {
+                f32b(h, *value);
+            }
+        }
+        IrOp::NativeHighlightRolloff { knee, strength } => {
+            h.update(&[28]);
+            f32b(h, *knee);
+            f32b(h, *strength);
+        }
+        IrOp::NativeMaskMix { mask } => {
+            h.update(&[32]);
+            hash_resolved_grade_op(
+                h,
+                &photonic_render::grade::ResolvedGradeOp {
+                    payload: photonic_render::grade::ResolvedGradePayload::Exposure { stops: 0.0 },
+                    mask: Some(*mask),
+                },
+            );
+        }
+        IrOp::NativeLut3d { lut } => {
+            h.update(&[31]);
+            hash_resolved_grade_op(
+                h,
+                &photonic_render::grade::ResolvedGradeOp {
+                    payload: photonic_render::grade::ResolvedGradePayload::Lut3d(lut.clone()),
+                    mask: None,
+                },
+            );
+        }
+        IrOp::NativeLogCurves { curves } => {
+            h.update(&[36]);
+            hash_resolved_grade_op(
+                h,
+                &photonic_render::grade::ResolvedGradeOp {
+                    payload: photonic_render::grade::ResolvedGradePayload::Curves(curves.clone()),
+                    mask: None,
+                },
+            );
+        }
+        IrOp::QualifierMatte {
+            qualifier,
+            mask,
+            native,
+        } => {
+            h.update(&[38, u8::from(*native)]);
+            let mut key = **qualifier;
+            key.correction = photonic_render::grade::ResolvedCdl {
+                slope: [1.0; 3],
+                offset: [0.0; 3],
+                power: [1.0; 3],
+                sat: 1.0,
+            };
+            hash_resolved_grade_op(
+                h,
+                &photonic_render::grade::ResolvedGradeOp {
+                    payload: photonic_render::grade::ResolvedGradePayload::HslQualifier(Box::new(
+                        key,
+                    )),
+                    mask: *mask,
+                },
+            );
+        }
+        IrOp::GradeMatteRefine { refinement } => {
+            h.update(&[43, u8::from(refinement.denoise)]);
+            f32b(h, refinement.grow);
+            f32b(h, refinement.blur);
+            for value in refinement.matte_levels {
+                f32b(h, value);
+            }
+        }
+        IrOp::GradeKeyMix { mode } => {
+            h.update(&[39, *mode as u8]);
+        }
+        IrOp::GradeMatteApply => {
+            h.update(&[40]);
+        }
+        IrOp::GradeMatteConstant { weight } => {
+            h.update(&[41]);
+            f32b(h, *weight);
+        }
+        IrOp::GradeLayerMix { opacity } => {
+            h.update(&[42]);
+            f32b(h, *opacity);
+        }
+        IrOp::NativeLogQualifier { qualifier } => {
+            h.update(&[37]);
+            hash_resolved_grade_op(
+                h,
+                &photonic_render::grade::ResolvedGradeOp {
+                    payload: photonic_render::grade::ResolvedGradePayload::HslQualifier(
+                        qualifier.clone(),
+                    ),
+                    mask: None,
+                },
+            );
+        }
+        IrOp::NativeLogCdl { cdl } => {
+            h.update(&[35]);
+            hash_resolved_grade_op(
+                h,
+                &photonic_render::grade::ResolvedGradeOp {
+                    payload: photonic_render::grade::ResolvedGradePayload::Cdl(*cdl),
+                    mask: None,
+                },
+            );
+        }
+        IrOp::NativeLogContrast { pivot, amount } => {
+            h.update(&[33]);
+            f32b(h, *pivot);
+            f32b(h, *amount);
+        }
+        IrOp::NativeSaturationVibrance {
+            saturation,
+            vibrance,
+        } => {
+            h.update(&[30]);
+            f32b(h, *saturation);
+            f32b(h, *vibrance);
+        }
+        IrOp::NativeAcescct { direction } => {
+            h.update(&[22]);
+            h.update(&[*direction as u8]);
+        }
+        IrOp::NativeSdrOutput => h.update(&[23]),
+        IrOp::NativeSdrVideoOutput => h.update(&[24]),
         IrOp::Merge { mode, opacity } => {
             h.update(&[7]);
             h.update(&[*mode as u8]);
@@ -3285,7 +5308,15 @@ fn hash_resolved_grade_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &crate::contract:
     match &op.mask {
         None => h.update(&[0]),
         Some(m) => {
-            h.update(&[1, m.rectangle as u8, m.invert as u8]);
+            h.update(&[
+                1,
+                match m.shape {
+                    photonic_core::timeline::WindowShape::Ellipse => 0,
+                    photonic_core::timeline::WindowShape::Rectangle => 1,
+                    photonic_core::timeline::WindowShape::Gradient => 2,
+                },
+                m.invert as u8,
+            ]);
             for v in [
                 m.center[0],
                 m.center[1],
@@ -3302,6 +5333,31 @@ fn hash_resolved_grade_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &crate::contract:
         P::Exposure { stops } => {
             h.update(&[0]);
             f32b(h, *stops);
+        }
+        P::LinearOffset { rgb } => {
+            h.update(&[7]);
+            for channel in rgb {
+                f32b(h, *channel);
+            }
+        }
+        P::PrinterLights { points } => {
+            h.update(&[10]);
+            for point in points {
+                f32b(h, *point);
+            }
+        }
+        P::HighlightRolloff { knee, strength } => {
+            h.update(&[8]);
+            f32b(h, *knee);
+            f32b(h, *strength);
+        }
+        P::SaturationVibrance {
+            saturation,
+            vibrance,
+        } => {
+            h.update(&[9]);
+            f32b(h, *saturation);
+            f32b(h, *vibrance);
         }
         P::Contrast { pivot, amount } => {
             h.update(&[1]);
@@ -3324,7 +5380,13 @@ fn hash_resolved_grade_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &crate::contract:
                     f32b(h, *v);
                 }
             }
-            for opt in [&c.hue_vs_hue, &c.hue_vs_sat] {
+            for opt in [
+                &c.hue_vs_hue,
+                &c.hue_vs_sat,
+                &c.hue_vs_luma,
+                &c.luma_vs_sat,
+                &c.sat_vs_sat,
+            ] {
                 match opt {
                     Some(a) => {
                         h.update(&[1]);
@@ -3344,6 +5406,27 @@ fn hash_resolved_grade_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &crate::contract:
                 f32b(h, v);
             }
             cdl(h, &q.correction);
+            // Preserve the original default-key identity, while all added
+            // selection/refinement state participates in invalidation.
+            if q.key_count != 0 || q.matte_levels != [0.0, 0.0] {
+                h.update(&[0x51]);
+                for value in q.matte_levels {
+                    f32b(h, value);
+                }
+                h.update(&q.key_count.to_le_bytes());
+                for key in q.keys.iter().take(q.key_count as usize) {
+                    for value in key
+                        .hue
+                        .into_iter()
+                        .chain(key.sat)
+                        .chain(key.lum)
+                        .chain([key.softness])
+                    {
+                        f32b(h, value);
+                    }
+                    h.update(&[u8::from(key.subtract)]);
+                }
+            }
         }
         P::Lut3d(l) => {
             h.update(&[6]);
@@ -3362,6 +5445,17 @@ fn hash_resolved_grade_op(h: &mut xxhash_rust::xxh3::Xxh3, op: &crate::contract:
                 for v in sample {
                     f32b(h, *v);
                 }
+            }
+            if let Some(shaper) = &l.table.shaper {
+                h.update(&[1]);
+                h.update(&(shaper.len() as u32).to_le_bytes());
+                for sample in shaper {
+                    for v in sample {
+                        f32b(h, *v);
+                    }
+                }
+            } else {
+                h.update(&[0]);
             }
         }
     }
@@ -3396,11 +5490,1507 @@ pub fn output_desc(format: &SequenceFormat) -> TextureDesc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_transform_has_distinct_cache_identity() {
+        let mat = Mat3::from_translation(glam::Vec2::new(2.0, -1.0));
+        let legacy = content_hash(
+            &IrOp::Transform2D {
+                mat,
+                sampling: Sampling::Bilinear,
+            },
+            &[],
+            &[],
+        );
+        let native = content_hash(
+            &IrOp::Transform2DTransparent {
+                mat,
+                sampling: Sampling::Bilinear,
+            },
+            &[],
+            &[],
+        );
+        assert_ne!(legacy, native);
+    }
+
+    #[test]
+    fn native_qualifier_neutral_window_and_cache_contract() {
+        let compile = |correction: timeline::CdlParams, hue, mask| {
+            let mut b = Builder::new();
+            b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+            let source = b.push(
+                IrOp::SolidColor {
+                    color: LinearColor {
+                        r: 0.18,
+                        g: 0.18,
+                        b: 0.18,
+                        a: 0.5,
+                    },
+                },
+                vec![],
+            );
+            let mut grade = Grade::new();
+            let mut op = GradeOp::new(
+                GradeOpKind::HslQualifier,
+                GradeOpParams::HslQualifier {
+                    hue,
+                    sat: [0.0, 1.0],
+                    lum: [0.0, 1.0],
+                    softness: 0.1,
+                    correction,
+                    keys: vec![],
+                    matte_levels: [0.0, 0.0],
+                },
+            );
+            op.mask = mask;
+            grade.ops.push(op);
+            let output = apply_grade(&mut b, &grade, source, Tick::ZERO, None);
+            (source, output, b.finish(Some(output)))
+        };
+        let (source, output, frame) = compile(timeline::CdlParams::identity(), [0.0, 1.0], None);
+        assert_eq!(source, output);
+        assert!(frame.diagnostics.is_empty());
+        let correction = timeline::CdlParams {
+            offset: [0.01; 3],
+            ..timeline::CdlParams::identity()
+        };
+        let mask = timeline::GradeMask::PowerWindow {
+            shape: timeline::WindowShape::Rectangle,
+            center: [0.5; 2],
+            size: [0.2; 2],
+            rotation: 0.0,
+            softness: 0.1,
+            invert: false,
+        };
+        let (_, _, frame) = compile(correction, [-0.1, 0.1], Some(mask));
+        assert!(frame.diagnostics.is_empty());
+        assert!(frame.graph.validate_working_color_domain().is_ok());
+        assert!(frame
+            .graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, IrOp::NativeMaskMix { .. })));
+        let q = frame
+            .graph
+            .nodes
+            .iter()
+            .find_map(|n| {
+                if let IrOp::NativeLogQualifier { qualifier } = &n.op {
+                    Some(qualifier.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let hash = |q| {
+            content_hash(
+                &IrOp::NativeLogQualifier {
+                    qualifier: Box::new(q),
+                },
+                &[],
+                &[],
+            )
+        };
+        let baseline = hash(*q);
+        for variant in 0..6 {
+            let mut changed = *q;
+            match variant {
+                0 => changed.hue[0] -= 0.01,
+                1 => changed.sat[0] += 0.01,
+                2 => changed.lum[0] += 0.01,
+                3 => changed.softness += 0.01,
+                4 => changed.matte_levels[0] += 0.01,
+                _ => {
+                    changed.key_count = 1;
+                    changed.keys[0].subtract = true;
+                }
+            }
+            assert_ne!(baseline, hash(changed));
+        }
+        let (source, output, invalid) = compile(correction, [0.5, 0.2], None);
+        assert_eq!(source, output);
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == DiagSeverity::Error));
+    }
+
+    #[test]
+    fn native_white_balance_lowers_gains_and_preserves_neutral_identity() {
+        let compile = |temp, tint| {
+            let mut builder = Builder::new();
+            builder.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+            let source = builder.push(
+                IrOp::SolidColor {
+                    color: LinearColor {
+                        r: -0.1,
+                        g: 0.18,
+                        b: 4.0,
+                        a: 0.5,
+                    },
+                },
+                vec![],
+            );
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::WhiteBalance,
+                GradeOpParams::WhiteBalance { temp, tint },
+            ));
+            let output = apply_grade(&mut builder, &grade, source, Tick::ZERO, None);
+            (source, output, builder.finish(Some(output)))
+        };
+        let (source, output, neutral) = compile(0.0, 0.0);
+        assert_eq!(source, output);
+        assert!(neutral.diagnostics.is_empty());
+        let mut hashes = std::collections::HashSet::new();
+        for (temp, tint) in [(-1.0, -1.0), (1.0, 1.0), (0.2, -0.3), (0.2, 0.3)] {
+            let (_, output, frame) = compile(temp, tint);
+            assert!(frame.diagnostics.is_empty());
+            assert!(frame.graph.validate_working_color_domain().is_ok());
+            let IrOp::NativePrinterLights { points } = frame.graph.nodes[output.0 as usize].op
+            else {
+                panic!("white balance must lower to native scene gains")
+            };
+            let expected = [1.0 + 0.4 * temp, 1.0 - 0.2 * tint, 1.0 - 0.4 * temp];
+            for (point, gain) in points.into_iter().zip(expected) {
+                assert!((2.0_f32.powf(point / 12.0) - gain).abs() < 1e-6);
+            }
+            assert!(hashes.insert(content_hash(
+                &IrOp::NativePrinterLights { points },
+                &[],
+                &[]
+            )));
+        }
+        for (temp, tint) in [
+            (2.0, 0.0),
+            (0.0, -2.0),
+            (f32::NAN, 0.0),
+            (0.0, f32::INFINITY),
+        ] {
+            let (source, output, frame) = compile(temp, tint);
+            assert_eq!(source, output);
+            assert!(frame
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == DiagSeverity::Error));
+        }
+    }
+
+    #[test]
+    fn native_curves_neutral_cache_and_secondary_family_contract() {
+        let identity = photonic_render::grade::curve_lut(&[]);
+        let curves = photonic_render::grade::ResolvedCurves {
+            master: identity,
+            red: identity,
+            green: identity,
+            blue: identity,
+            hue_vs_hue: None,
+            hue_vs_sat: None,
+            hue_vs_luma: None,
+            luma_vs_sat: None,
+            sat_vs_sat: None,
+        };
+        let hash = |curves| {
+            content_hash(
+                &IrOp::NativeLogCurves {
+                    curves: Box::new(curves),
+                },
+                &[],
+                &[],
+            )
+        };
+        for channel in 0..9 {
+            let mut changed = curves.clone();
+            match channel {
+                0 => changed.master[100] += 0.01,
+                1 => changed.red[100] += 0.01,
+                2 => changed.green[100] += 0.01,
+                3 => changed.blue[100] += 0.01,
+                4 => changed.hue_vs_hue = Some([0.6; 256]),
+                5 => changed.hue_vs_sat = Some([0.6; 256]),
+                6 => changed.hue_vs_luma = Some([0.6; 256]),
+                7 => changed.luma_vs_sat = Some([0.6; 256]),
+                _ => changed.sat_vs_sat = Some([0.6; 256]),
+            }
+            assert_ne!(hash(curves.clone()), hash(changed));
+        }
+        for (shift, secondary) in [
+            (0.0, None),
+            (0.02, None),
+            (0.0, Some(0.5)),
+            (0.0, Some(0.6)),
+            (0.0, Some(f32::NAN)),
+        ] {
+            let mut b = Builder::new();
+            b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+            let source = b.push(
+                IrOp::SolidColor {
+                    color: LinearColor {
+                        r: 0.1,
+                        g: 0.2,
+                        b: 0.3,
+                        a: 1.0,
+                    },
+                },
+                vec![],
+            );
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Curves,
+                GradeOpParams::Curves {
+                    master: vec![(0.0, shift), (1.0, 1.0 + shift)],
+                    red: vec![],
+                    green: vec![],
+                    blue: vec![],
+                    hue_vs_hue: vec![],
+                    hue_vs_sat: secondary
+                        .map(|value| vec![(0.0, value), (1.0, value)])
+                        .unwrap_or_default(),
+                    hue_vs_luma: vec![],
+                    luma_vs_sat: vec![],
+                    sat_vs_sat: vec![],
+                },
+            ));
+            let output = apply_grade(&mut b, &grade, source, Tick::ZERO, None);
+            let frame = b.finish(Some(output));
+            assert_eq!(
+                !frame.diagnostics.is_empty(),
+                secondary.is_some_and(|v| v.is_nan()),
+                "{:?}",
+                frame.diagnostics
+            );
+            assert!(frame.graph.validate_working_color_domain().is_ok());
+            assert_eq!(
+                frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, IrOp::NativeLogCurves { .. })),
+                (shift != 0.0 || secondary.is_some_and(|v| v != 0.5))
+                    && !secondary.is_some_and(|v| v.is_nan())
+            );
+            if shift == 0.0
+                && (secondary.is_none_or(|v| v == 0.5) || secondary.is_some_and(|v| v.is_nan()))
+            {
+                assert_eq!(output, source);
+            }
+        }
+    }
+
+    #[test]
+    fn native_cdl_and_wheels_neutral_lowering_validation_and_cache() {
+        use photonic_render::grade::ResolvedCdl;
+        let neutral = ResolvedCdl {
+            slope: [1.0; 3],
+            offset: [0.0; 3],
+            power: [1.0; 3],
+            sat: 1.0,
+        };
+        let hash = |cdl| content_hash(&IrOp::NativeLogCdl { cdl }, &[], &[]);
+        for field in 0..10 {
+            let mut changed = neutral;
+            match field {
+                0..=2 => changed.slope[field] = 1.1,
+                3..=5 => changed.offset[field - 3] = 0.1,
+                6..=8 => changed.power[field - 6] = 1.1,
+                _ => changed.sat = 1.1,
+            }
+            assert_ne!(hash(neutral), hash(changed));
+        }
+        for (kind, params, active, invalid) in [
+            (
+                GradeOpKind::Cdl,
+                GradeOpParams::Cdl {
+                    slope: [1.0; 3],
+                    offset: [0.0; 3],
+                    power: [1.0; 3],
+                    sat: 1.0,
+                },
+                false,
+                false,
+            ),
+            (
+                GradeOpKind::Wheels,
+                GradeOpParams::Wheels {
+                    lift: [0.0; 3],
+                    gamma: [1.0; 3],
+                    gain: [1.0; 3],
+                    sat: 1.0,
+                },
+                false,
+                false,
+            ),
+            (
+                GradeOpKind::Cdl,
+                GradeOpParams::Cdl {
+                    slope: [1.1; 3],
+                    offset: [0.02; 3],
+                    power: [0.9; 3],
+                    sat: 1.1,
+                },
+                true,
+                false,
+            ),
+            (
+                GradeOpKind::Wheels,
+                GradeOpParams::Wheels {
+                    lift: [-0.1; 3],
+                    gamma: [1.1; 3],
+                    gain: [1.1; 3],
+                    sat: 1.1,
+                },
+                true,
+                false,
+            ),
+            (
+                GradeOpKind::Cdl,
+                GradeOpParams::Cdl {
+                    slope: [-0.1; 3],
+                    offset: [0.0; 3],
+                    power: [1.0; 3],
+                    sat: 1.0,
+                },
+                false,
+                true,
+            ),
+        ] {
+            let mut b = Builder::new();
+            b.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+            let source = b.push(
+                IrOp::SolidColor {
+                    color: LinearColor {
+                        r: 0.1,
+                        g: 0.2,
+                        b: 0.3,
+                        a: 1.0,
+                    },
+                },
+                vec![],
+            );
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(kind, params));
+            let output = apply_grade(&mut b, &grade, source, Tick::ZERO, None);
+            let frame = b.finish(Some(output));
+            assert_eq!(
+                !frame.diagnostics.is_empty(),
+                invalid,
+                "{:?}",
+                frame.diagnostics
+            );
+            assert!(frame.graph.validate_working_color_domain().is_ok());
+            assert_eq!(
+                frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, IrOp::NativeLogCdl { .. })),
+                active
+            );
+            if !active {
+                assert_eq!(output, source);
+            }
+        }
+    }
+
+    #[test]
+    fn native_contrast_cache_and_neutral_lowering_contract() {
+        let hash =
+            |pivot, amount| content_hash(&IrOp::NativeLogContrast { pivot, amount }, &[], &[]);
+        assert_ne!(hash(0.4, 1.0), hash(0.5, 1.0));
+        assert_ne!(hash(0.4, 1.0), hash(0.4, 2.0));
+        for amount in [0.0, 1.0] {
+            let mut builder = Builder::new();
+            builder.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+            let source = builder.push(
+                IrOp::SolidColor {
+                    color: LinearColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    },
+                },
+                vec![],
+            );
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Contrast,
+                GradeOpParams::Contrast { pivot: 0.4, amount },
+            ));
+            let output = apply_grade(&mut builder, &grade, source, Tick::ZERO, None);
+            let frame = builder.finish(Some(output));
+            assert!(frame.diagnostics.is_empty());
+            assert!(frame.graph.validate_working_color_domain().is_ok());
+            assert_eq!(
+                frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.op, IrOp::NativeLogContrast { .. }))
+                    .count(),
+                usize::from(amount != 0.0)
+            );
+            if amount == 0.0 {
+                assert_eq!(output, source);
+            }
+        }
+    }
+
+    #[test]
+    fn native_exposure_cache_identity_includes_stops_and_operator_kind() {
+        let exposure = |stops| content_hash(&IrOp::NativeExposure { stops }, &[], &[]);
+        assert_ne!(exposure(0.0), exposure(1.0));
+        assert_ne!(exposure(-1.0), exposure(1.0));
+        let offset = |rgb| content_hash(&IrOp::NativeLinearOffset { rgb }, &[], &[]);
+        assert_ne!(offset([0.0; 3]), offset([0.1, 0.0, 0.0]));
+        assert_ne!(offset([0.1, 0.0, 0.0]), offset([0.0, 0.1, 0.0]));
+        assert_ne!(offset([0.0; 3]), exposure(0.0));
+        let printer = |points| content_hash(&IrOp::NativePrinterLights { points }, &[], &[]);
+        assert_ne!(printer([0.0; 3]), printer([12.0, 0.0, 0.0]));
+        assert_ne!(printer([12.0, 0.0, 0.0]), printer([0.0, 12.0, 0.0]));
+        assert_ne!(printer([0.0; 3]), offset([0.0; 3]));
+        let rolloff = |knee, strength| {
+            content_hash(&IrOp::NativeHighlightRolloff { knee, strength }, &[], &[])
+        };
+        assert_ne!(rolloff(1.0, 0.5), rolloff(2.0, 0.5));
+        assert_ne!(rolloff(1.0, 0.5), rolloff(1.0, 1.0));
+        assert_ne!(rolloff(1.0, 0.5), printer([0.0; 3]));
+        assert_ne!(
+            exposure(0.0),
+            content_hash(&IrOp::Grade { ops: vec![] }, &[], &[])
+        );
+        let saturation = |saturation, vibrance| {
+            content_hash(
+                &IrOp::NativeSaturationVibrance {
+                    saturation,
+                    vibrance,
+                },
+                &[],
+                &[],
+            )
+        };
+        assert_ne!(saturation(1.0, 0.0), saturation(1.1, 0.0));
+        assert_ne!(saturation(1.0, 0.0), saturation(1.0, 0.1));
+        assert_ne!(saturation(1.0, 0.0), exposure(0.0));
+        let transfer = |direction| content_hash(&IrOp::NativeAcescct { direction }, &[], &[]);
+        assert_ne!(
+            transfer(photonic_render::native_transfer::AcescctDirection::Encode),
+            transfer(photonic_render::native_transfer::AcescctDirection::Decode)
+        );
+        assert_ne!(
+            content_hash(&IrOp::NativeSdrOutput, &[], &[]),
+            transfer(photonic_render::native_transfer::AcescctDirection::Decode)
+        );
+        assert_ne!(
+            content_hash(&IrOp::NativeSdrOutput, &[], &[]),
+            content_hash(&IrOp::NativeSdrVideoOutput, &[], &[])
+        );
+    }
+
+    #[test]
+    fn native_video_source_cache_identity_includes_input_interpretation() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+        };
+        let asset = AssetId::new();
+        let mut input = NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        };
+        let hash = |input: NativeInputColorInterpretation| {
+            content_hash(
+                &IrOp::NativeDecodeVideo {
+                    asset,
+                    src_time: Tick(0),
+                    input,
+                },
+                &[],
+                &[],
+            )
+        };
+        let limited = hash(input.clone());
+        input.range = InputSignalRange::Full;
+        assert_ne!(limited, hash(input.clone()));
+        input.range = InputSignalRange::Limited;
+        input.chroma_location = Some(photonic_core::timeline::color::NativeChromaLocation::Left);
+        assert_ne!(limited, hash(input));
+        assert_ne!(
+            limited,
+            content_hash(
+                &IrOp::DecodeVideo {
+                    asset,
+                    src_time: Tick(0),
+                    proxy: false
+                },
+                &[],
+                &[]
+            )
+        );
+    }
+
+    #[test]
+    fn native_source_lowering_prefers_clip_override_and_rejects_missing_input() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+            NativeManagedColorConfig, SequenceColorConfig,
+        };
+        let (mut project, sequence_id) = base_project();
+        let mut asset = MediaAsset::from_file(AssetKind::Video, "/missing/native-source.mp4");
+        let asset_id = asset.id;
+        let bt709 = NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        };
+        let bt2020 = NativeInputColorInterpretation {
+            standard: NativeInputStandard::Bt2020Scene,
+            matrix: InputMatrix::Bt2020NonConstant,
+            ..bt709.clone()
+        };
+        asset.native_input_color = Some(bt709.clone());
+        project.media.assets.insert(asset_id, asset);
+        let mut seq = project.sequences[&sequence_id].clone();
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: asset_id },
+            Tick(0),
+            Tick(1_000_000),
+        );
+        clip.native_input_color = Some(bt2020.clone());
+        let lowered = |project: &TimelineProject, clip: &Clip| {
+            let mut builder = Builder::new();
+            let mut cycle = HashSet::new();
+            let node = build_clip_source(
+                &mut builder,
+                &project,
+                &seq,
+                0,
+                &seq.formats[0],
+                clip,
+                Tick(0),
+                Quality::FULL,
+                &mut cycle,
+            );
+            (
+                builder.nodes[node.0 as usize].op.clone(),
+                builder.diagnostics,
+            )
+        };
+        assert!(
+            matches!(lowered(&project, &clip).0, IrOp::NativeDecodeVideo { input, .. } if input == bt2020)
+        );
+        clip.native_input_color = None;
+        assert!(
+            matches!(lowered(&project, &clip).0, IrOp::NativeDecodeVideo { input, .. } if input == bt709)
+        );
+        project
+            .media
+            .assets
+            .get_mut(&asset_id)
+            .unwrap()
+            .native_input_color = None;
+        let (op, diagnostics) = lowered(&project, &clip);
+        assert!(matches!(op, IrOp::SolidColor { .. }));
+        assert!(diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+    }
     use photonic_core::timeline::{
         Clip, FrameRate, GraphEdge, GraphNode, GraphOp, InPort, MediaAsset, NodeGraph,
         OutPort as GOutPort, Sequence, Track, TrackKind,
     };
     use photonic_core::Color;
+
+    #[test]
+    fn managed_grade_lowers_scene_primaries_and_rejects_legacy_math() {
+        let mut builder = Builder::new();
+        builder.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        let source = builder.push(
+            IrOp::SolidColor {
+                color: LinearColor {
+                    r: 2.0,
+                    g: 0.5,
+                    b: 0.25,
+                    a: 1.0,
+                },
+            },
+            vec![],
+        );
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [0.1, 0.0, 0.0],
+            },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::PrinterLights,
+            GradeOpParams::PrinterLights {
+                points: [12.0, 0.0, -12.0],
+            },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::HighlightRolloff,
+            GradeOpParams::HighlightRolloff {
+                knee: 1.0,
+                strength: 0.5,
+            },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::WhiteBalance,
+            GradeOpParams::WhiteBalance {
+                temp: 2.0,
+                tint: 0.0,
+            },
+        ));
+        let output = apply_grade(&mut builder, &grade, source, Tick(0), None);
+        let frame = builder.finish(Some(output));
+        assert_eq!(
+            frame.graph.working_color_domain,
+            WorkingColorDomain::SceneLinearAcescg
+        );
+        assert!(
+            matches!(frame.graph.nodes[output.0 as usize].op, IrOp::NativeHighlightRolloff { knee, strength } if knee == 1.0 && strength == 0.5)
+        );
+        assert!(frame.graph.nodes.iter().any(|node| matches!(node.op, IrOp::NativePrinterLights { points } if points == [12.0, 0.0, -12.0])));
+        assert!(frame.graph.nodes.iter().any(
+            |node| matches!(node.op, IrOp::NativeLinearOffset { rgb } if rgb == [0.1, 0.0, 0.0])
+        ));
+        assert!(frame
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeExposure { stops } if stops == 1.0)));
+        assert!(!frame
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::Grade { .. })));
+        assert!(frame
+            .diagnostics
+            .iter()
+            .any(|diag| diag.code == Some(CompileCode::ColorPipelineUnavailable)));
+    }
+
+    #[test]
+    fn managed_serial_grade_graph_uses_native_scene_operators() {
+        let mut builder = Builder::new();
+        builder.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        let source = builder.push(
+            IrOp::SolidColor {
+                color: LinearColor {
+                    r: 2.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+            },
+            vec![],
+        );
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [-0.5, 0.0, 0.0],
+            },
+        ));
+        grade.graph = Some(GradeGraph::from_stack(&grade.ops));
+        let output = apply_grade(&mut builder, &grade, source, Tick(0), None);
+        let frame = builder.finish(Some(output));
+        assert!(frame.diagnostics.is_empty());
+        assert!(frame.graph.validate_working_color_domain().is_ok());
+        assert!(
+            matches!(frame.graph.nodes[output.0 as usize].op, IrOp::NativeLinearOffset { rgb } if rgb == [-0.5, 0.0, 0.0])
+        );
+        assert!(frame
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeExposure { stops } if stops == 1.0)));
+        assert!(!frame
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::Grade { .. })));
+    }
+
+    #[test]
+    fn invalid_native_primary_is_diagnosed_before_graph_evaluation() {
+        let mut builder = Builder::new();
+        builder.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        let source = builder.push(
+            IrOp::SolidColor {
+                color: LinearColor {
+                    r: 1.0,
+                    g: 0.5,
+                    b: 0.25,
+                    a: 1.0,
+                },
+            },
+            vec![],
+        );
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: f32::NAN },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [0.1, 0.0, 0.0],
+            },
+        ));
+        let output = apply_grade(&mut builder, &grade, source, Tick(0), None);
+        let frame = builder.finish(Some(output));
+        assert!(frame.diagnostics.iter().any(|finding| finding.code
+            == Some(CompileCode::ColorPipelineUnavailable)
+            && finding.message.contains("native exposure must be finite")));
+        assert!(!frame
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeExposure { .. })));
+        assert!(matches!(
+            frame.graph.nodes[output.0 as usize].op,
+            IrOp::NativeLinearOffset { .. }
+        ));
+        assert!(frame.graph.validate_working_color_domain().is_ok());
+    }
+
+    #[test]
+    fn serial_grading_graph_preserves_corrector_order_at_clip_stage() {
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [0.1, 0.0, 0.0],
+            },
+        ));
+        let mut clip = solid_clip(
+            Color {
+                r: 0.2,
+                g: 0.2,
+                b: 0.2,
+                a: 1.0,
+            },
+            0,
+            1000,
+        );
+        clip.grade = Some(grade.clone());
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips
+            .push(clip);
+        let legacy = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let legacy_ops: Vec<_> = legacy
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                IrOp::Grade { ops } => Some(ops.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .grade
+            .as_mut()
+            .unwrap()
+            .graph = Some(GradeGraph::from_stack(&grade.ops));
+        let converted = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let graph_ops: Vec<_> = converted
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                IrOp::Grade { ops } => Some(ops.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(converted.diagnostics.is_empty());
+        assert_eq!(graph_ops, legacy_ops);
+        let legacy_image = crate::graph::eval_cpu::evaluate(
+            &legacy.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        let converted_image = crate::graph::eval_cpu::evaluate(
+            &converted.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        assert_eq!(converted_image.pixels, legacy_image.pixels);
+        let mut expected = project.clone();
+        let expected_grade = expected
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .grade
+            .as_mut()
+            .unwrap();
+        expected_grade.graph = None;
+        expected_grade.ops.pop();
+        let expected_frame = compile(&expected, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let graph_grade = project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .grade
+            .as_mut()
+            .unwrap();
+        let second_node = graph_grade
+            .graph
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node, GradeGraphNode::Corrector { op, .. } if *op == grade.ops[1].id)
+                    .then_some(*id)
+            })
+            .unwrap();
+        graph_grade.remove_graph_node(second_node).unwrap();
+        let removed_frame = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let expected_image = crate::graph::eval_cpu::evaluate(
+            &expected_frame.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        let removed_image = crate::graph::eval_cpu::evaluate(
+            &removed_frame.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        assert_eq!(removed_image.pixels, expected_image.pixels);
+    }
+
+    #[test]
+    fn graph_corrector_failure_identifies_its_node_and_owner() {
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let missing_lut = AssetId::new();
+        let mut grade = single_lut_grade(missing_lut);
+        let op_id = grade.ops[0].id;
+        grade.convert_to_graph();
+        let node_id = grade
+            .graph
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node, GradeGraphNode::Corrector { op, .. } if *op == op_id).then_some(*id)
+            })
+            .unwrap();
+        let mut clip = solid_clip(Color::WHITE, 0, 1000);
+        let clip_id = clip.id;
+        clip.grade = Some(grade);
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips
+            .push(clip);
+        let frame = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(frame.diagnostics.iter().any(|finding| {
+            finding.grade.as_ref().is_some_and(|diagnostic| {
+                diagnostic.op == op_id
+                    && diagnostic.graph_node == Some(node_id)
+                    && diagnostic.owner == Some(VfxOwner::Clip(clip_id))
+                    && matches!(diagnostic.issue, photonic_render::grade::GradeIssue::MissingLut(id) if id == missing_lut)
+                    && finding.message.contains(&format!("Graph node {node_id}"))
+            })
+        }));
+    }
+
+    #[test]
+    fn invalid_grading_graph_blocks_export_with_coded_error() {
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let mut grade = Grade::new();
+        grade.graph = Some(GradeGraph::from_stack(&[GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        )]));
+        let mut clip = solid_clip(
+            Color {
+                r: 0.2,
+                g: 0.2,
+                b: 0.2,
+                a: 1.0,
+            },
+            0,
+            1000,
+        );
+        clip.grade = Some(grade);
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips
+            .push(clip);
+        let frame = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(frame
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::GradeUnresolved)
+                && d.severity == DiagSeverity::Error));
+    }
+
+    #[test]
+    fn parallel_grading_graph_mixes_corrected_and_original_branches() {
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let mut grade = Grade::new();
+        grade.convert_to_graph();
+        grade.add_graph_corrector(op, true).unwrap();
+        let mut clip = solid_clip(
+            Color {
+                r: 0.2,
+                g: 0.2,
+                b: 0.2,
+                a: 1.0,
+            },
+            0,
+            1000,
+        );
+        clip.grade = Some(grade);
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips
+            .push(clip);
+        let frame = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(frame.diagnostics.is_empty());
+        assert!(frame.graph.nodes.iter().any(|node| matches!(node.op,
+            IrOp::Merge { opacity, .. } if opacity == 0.5)));
+        let image = crate::graph::eval_cpu::evaluate(
+            &frame.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        let mut clean_project = project.clone();
+        clean_project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .grade = None;
+        let clean = compile(&clean_project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let clean_image = crate::graph::eval_cpu::evaluate(
+            &clean.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        let mut full_project = project;
+        full_project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .grade
+            .as_mut()
+            .unwrap()
+            .graph = None;
+        let full = compile(&full_project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let full_image = crate::graph::eval_cpu::evaluate(
+            &full.graph,
+            (4, 4),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        let mixed = image.pixels[0][0];
+        let ungraded = clean_image.pixels[0][0];
+        let graded = full_image.pixels[0][0];
+        assert!(
+            ungraded < mixed && mixed < graded,
+            "{ungraded} < {mixed} < {graded}"
+        );
+    }
+
+    #[test]
+    fn group_pre_clip_and_group_post_grades_keep_their_stage_order() {
+        use photonic_core::timeline::{
+            Grade, GradeOp, GradeOpKind, GradeOpParams, GroupKind, GroupNode,
+        };
+        use photonic_render::grade::ResolvedGradePayload;
+
+        let exposure = |stops| {
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops },
+            ));
+            grade
+        };
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let sequence = project.sequences.get_mut(&sequence_id).unwrap();
+        let mut group = GroupNode::new(GroupKind::Normal);
+        group.pre_grade = Some(exposure(1.0));
+        group.post_grade = Some(exposure(3.0));
+        let mut parent = GroupNode::new(GroupKind::Normal);
+        parent.pre_grade = Some(exposure(0.5));
+        parent.post_grade = Some(exposure(4.0));
+        group.parent = Some(parent.id);
+        let group_id = group.id;
+        sequence.groups.insert(parent.id, parent);
+        sequence.groups.insert(group_id, group);
+        let mut clip = solid_clip(
+            Color {
+                r: 0.2,
+                g: 0.2,
+                b: 0.2,
+                a: 1.0,
+            },
+            0,
+            1000,
+        );
+        clip.group = Some(group_id);
+        clip.grade = Some(exposure(2.0));
+        sequence.video_tracks[track_index].clips.push(clip);
+        let mut sibling = solid_clip(
+            Color {
+                r: 0.2,
+                g: 0.2,
+                b: 0.2,
+                a: 1.0,
+            },
+            1000,
+            1000,
+        );
+        sibling.group = Some(group_id);
+        sequence.video_tracks[track_index].clips.push(sibling);
+        let compiled = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        let stages: Vec<f32> = compiled
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let IrOp::Grade { ops } = &node.op else {
+                    return None;
+                };
+                match &ops[0].payload {
+                    ResolvedGradePayload::Exposure { stops } => Some(*stops),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(stages, vec![0.5, 1.0, 2.0, 3.0, 4.0]);
+        let sibling_frame = compile(&project, sequence_id, 0, Tick(1000), Quality::FULL, None);
+        let sibling_stages: Vec<f32> = sibling_frame
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| {
+                let IrOp::Grade { ops } = &node.op else {
+                    return None;
+                };
+                match &ops[0].payload {
+                    ResolvedGradePayload::Exposure { stops } => Some(*stops),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(sibling_stages, vec![0.5, 1.0, 3.0, 4.0]);
+        let clean = compile_with_luts_and_opts(
+            &project,
+            sequence_id,
+            0,
+            Tick(0),
+            Quality::FULL,
+            None,
+            None,
+            true,
+        );
+        assert!(!clean
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::Grade { .. })));
+    }
+
+    #[test]
+    fn shared_look_stage_resolves_and_missing_reference_blocks_export() {
+        use photonic_core::timeline::{
+            ClipLook, Grade, GradeOp, GradeOpKind, GradeOpParams, SharedLook, SharedLookId,
+        };
+        use photonic_render::grade::{GradeIssue, GradeStage, ResolvedGradePayload};
+
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        let id = SharedLookId::new();
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let sequence = project.sequences.get_mut(&sequence_id).unwrap();
+        let mut clip = solid_clip(Color::WHITE, 0, 1000);
+        clip.look = Some(ClipLook::Shared(id));
+        sequence.video_tracks[track_index].clips.push(clip);
+        let missing = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(missing.diagnostics.iter().any(|diagnostic| diagnostic
+            .grade
+            .as_ref()
+            .is_some_and(
+                |grade| matches!(grade.issue, GradeIssue::MissingSharedLook(found) if found == id)
+            )));
+        project.shared_looks.insert(
+            id,
+            SharedLook {
+                id,
+                name: "Scene".into(),
+                grade: grade.clone(),
+            },
+        );
+        let resolved = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(resolved
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.grade.is_none()));
+        assert!(resolved.graph.nodes.iter().any(|node| matches!(&node.op, IrOp::Grade { ops } if matches!(ops[0].payload, ResolvedGradePayload::Exposure { stops } if stops == 1.0))));
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .look = Some(ClipLook::Local(Box::new(grade)));
+        let local = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert_eq!(
+            resolved.graph.nodes[resolved.graph.output.unwrap().0 as usize].content_hash,
+            local.graph.nodes[local.graph.output.unwrap().0 as usize].content_hash
+        );
+        let mut missing_lut = Grade::new();
+        missing_lut.ops.push(GradeOp::new(
+            GradeOpKind::Lut3d,
+            GradeOpParams::Lut3d {
+                asset: AssetId::new(),
+                intensity: 1.0,
+                interp: timeline::LutInterp::Trilinear,
+            },
+        ));
+        project.shared_looks.get_mut(&id).unwrap().grade = missing_lut.clone();
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .look = Some(ClipLook::Shared(id));
+        let shared_failure = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(shared_failure.diagnostics.iter().any(|finding| finding.grade.as_ref()
+            .is_some_and(|grade| matches!(grade.stage, Some(GradeStage::SharedLook { id: found }) if found == id))));
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips[0]
+            .look = Some(ClipLook::Local(Box::new(missing_lut)));
+        let local_failure = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(local_failure.diagnostics.iter().any(|finding| finding
+            .grade
+            .as_ref()
+            .is_some_and(|grade| matches!(grade.stage, Some(GradeStage::LocalLook)))));
+    }
+
+    #[test]
+    fn legacy_sdr_rejects_tagged_hdr_source_before_decode() {
+        use photonic_core::timeline::{
+            AssetKind, Clip, ClipSource, MediaAsset, MediaProbe, ProbedColor, VideoStreamInfo,
+        };
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let mut asset = MediaAsset::from_file(AssetKind::Video, "/tmp/pq.mov");
+        let mut probe = MediaProbe::basic(Tick(1000), "mov", "prores");
+        probe.video = Some(VideoStreamInfo {
+            width: 16,
+            height: 16,
+            frame_rate: FrameRate::FPS_30,
+            pixel_aspect: 1.0,
+            color: ProbedColor {
+                transfer: Some("smpte2084".into()),
+                ..Default::default()
+            },
+            keyframe_index_cached: false,
+            scan: Default::default(),
+        });
+        asset.probe = Some(probe);
+        let id = asset.id;
+        project.media.insert(asset);
+        let clip = Clip::new(ClipSource::Asset { asset: id }, Tick(0), Tick(1000));
+        let clip_id = clip.id;
+        project
+            .sequences
+            .get_mut(&sequence_id)
+            .unwrap()
+            .video_tracks[track_index]
+            .clips
+            .push(clip);
+        let frame = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(frame.diagnostics.iter().any(|finding| finding.code
+            == Some(CompileCode::ColorPipelineUnavailable)
+            && finding.clip == Some(clip_id)
+            && finding.message.contains("smpte2084")));
+        assert!(!frame
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::DecodeVideo { asset, .. } if asset == id)));
+        let peek = compile_asset_peek(&project, id, Tick(0), Quality::FULL, 16, 16);
+        assert!(peek
+            .diagnostics
+            .iter()
+            .any(|finding| finding.code == Some(CompileCode::ColorPipelineUnavailable)));
+
+        for (color, expected) in [
+            (
+                ProbedColor {
+                    matrix: Some("bt2020nc".into()),
+                    ..Default::default()
+                },
+                "bt2020nc matrix",
+            ),
+            (
+                ProbedColor {
+                    primaries: Some("smpte432".into()),
+                    ..Default::default()
+                },
+                "smpte432 primaries",
+            ),
+        ] {
+            project
+                .media
+                .assets
+                .get_mut(&id)
+                .unwrap()
+                .probe
+                .as_mut()
+                .unwrap()
+                .video
+                .as_mut()
+                .unwrap()
+                .color = color;
+            let frame = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+            assert!(frame.diagnostics.iter().any(|finding| finding.code
+                == Some(CompileCode::ColorPipelineUnavailable)
+                && finding.message.contains(expected)));
+            assert!(!frame
+                .graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, IrOp::DecodeVideo { asset, .. } if asset == id)));
+            let peek = compile_asset_peek(&project, id, Tick(0), Quality::FULL, 16, 16);
+            assert!(peek.diagnostics.iter().any(|finding| finding.code
+                == Some(CompileCode::ColorPipelineUnavailable)
+                && finding.message.contains(expected)));
+        }
+    }
+
+    #[test]
+    fn missing_group_lut_identifies_the_group_stage() {
+        use photonic_core::timeline::{GroupKind, GroupNode};
+
+        let (mut project, sequence_id) = base_project();
+        let track_index = add_video_track(&mut project, sequence_id);
+        let sequence = project.sequences.get_mut(&sequence_id).unwrap();
+        let mut group = GroupNode::new(GroupKind::Normal);
+        group.pre_grade = Some(single_lut_grade(AssetId::new()));
+        let group_id = group.id;
+        sequence.groups.insert(group_id, group);
+        for start in [0, 1000] {
+            let mut clip = solid_clip(Color::WHITE, start, 1000);
+            clip.group = Some(group_id);
+            sequence.video_tracks[track_index].clips.push(clip);
+        }
+        let compiled = compile(&project, sequence_id, 0, Tick(0), Quality::FULL, None);
+        assert!(compiled.diagnostics.iter().any(|diagnostic| {
+            diagnostic.grade.as_ref().is_some_and(|grade| {
+                grade.owner == Some(VfxOwner::GroupPre(group_id))
+                    && matches!(
+                        grade.issue,
+                        photonic_render::grade::GradeIssue::MissingLut(_)
+                    )
+            })
+        }));
+    }
+
+    #[test]
+    fn window_shape_changes_grade_cache_key() {
+        use photonic_core::timeline::WindowShape;
+        use photonic_render::grade::{ResolvedGradePayload, ResolvedMask};
+
+        let digest = |shape| {
+            let mut hash = xxhash_rust::xxh3::Xxh3::new();
+            hash_resolved_grade_op(
+                &mut hash,
+                &crate::contract::ResolvedGradeOp {
+                    payload: ResolvedGradePayload::Exposure { stops: 1.0 },
+                    mask: Some(ResolvedMask {
+                        shape,
+                        center: [0.5, 0.5],
+                        size: [0.25, 0.25],
+                        rotation: 0.0,
+                        softness: 0.1,
+                        invert: false,
+                    }),
+                },
+            );
+            hash.digest128()
+        };
+        assert_ne!(digest(WindowShape::Ellipse), digest(WindowShape::Rectangle));
+        assert_ne!(digest(WindowShape::Ellipse), digest(WindowShape::Gradient));
+        assert_ne!(
+            digest(WindowShape::Rectangle),
+            digest(WindowShape::Gradient)
+        );
+    }
+
+    #[test]
+    fn linear_offset_channels_invalidate_grade_cache_key() {
+        use photonic_render::grade::ResolvedGradePayload;
+        let digest = |rgb: [f32; 3]| {
+            let mut hash = xxhash_rust::xxh3::Xxh3::new();
+            hash_resolved_grade_op(
+                &mut hash,
+                &crate::contract::ResolvedGradeOp {
+                    payload: ResolvedGradePayload::LinearOffset { rgb },
+                    mask: None,
+                },
+            );
+            hash.digest()
+        };
+        let neutral = digest([0.0; 3]);
+        for rgb in [[0.1, 0.0, 0.0], [0.0, 0.1, 0.0], [0.0, 0.0, 0.1]] {
+            assert_ne!(digest(rgb), neutral);
+        }
+    }
+
+    #[test]
+    fn highlight_rolloff_controls_invalidate_grade_cache_key() {
+        use photonic_render::grade::ResolvedGradePayload;
+        let digest = |knee, strength| {
+            let mut hash = xxhash_rust::xxh3::Xxh3::new();
+            hash_resolved_grade_op(
+                &mut hash,
+                &crate::contract::ResolvedGradeOp {
+                    payload: ResolvedGradePayload::HighlightRolloff { knee, strength },
+                    mask: None,
+                },
+            );
+            hash.digest()
+        };
+        assert_ne!(digest(1.0, 0.5), digest(1.5, 0.5));
+        assert_ne!(digest(1.0, 0.5), digest(1.0, 0.8));
+    }
+
+    #[test]
+    fn saturation_vibrance_controls_invalidate_grade_cache_key() {
+        use photonic_render::grade::ResolvedGradePayload;
+        let digest = |saturation, vibrance| {
+            let mut hash = xxhash_rust::xxh3::Xxh3::new();
+            hash_resolved_grade_op(
+                &mut hash,
+                &crate::contract::ResolvedGradeOp {
+                    payload: ResolvedGradePayload::SaturationVibrance {
+                        saturation,
+                        vibrance,
+                    },
+                    mask: None,
+                },
+            );
+            hash.digest()
+        };
+        assert_ne!(digest(1.0, 0.0), digest(1.2, 0.0));
+        assert_ne!(digest(1.0, 0.0), digest(1.0, 0.3));
+    }
+
+    #[test]
+    fn advanced_curve_changes_invalidate_grade_cache_key() {
+        use photonic_render::grade::{ResolvedCurves, ResolvedGradePayload};
+        let identity = photonic_render::grade::curve_lut(&[]);
+        let base = ResolvedCurves {
+            master: identity,
+            red: identity,
+            green: identity,
+            blue: identity,
+            hue_vs_hue: None,
+            hue_vs_sat: None,
+            hue_vs_luma: None,
+            luma_vs_sat: None,
+            sat_vs_sat: None,
+        };
+        let digest = |curves: ResolvedCurves| {
+            let mut hash = xxhash_rust::xxh3::Xxh3::new();
+            hash_resolved_grade_op(
+                &mut hash,
+                &crate::contract::ResolvedGradeOp {
+                    payload: ResolvedGradePayload::Curves(Box::new(curves)),
+                    mask: None,
+                },
+            );
+            hash.digest()
+        };
+        let original = digest(base.clone());
+        let changed = photonic_render::grade::curve_lut(&[(0.0, 0.5), (1.0, 0.7)]);
+        let mut hue_luma = base.clone();
+        hue_luma.hue_vs_luma = Some(changed);
+        let mut luma_sat = base.clone();
+        luma_sat.luma_vs_sat = Some(changed);
+        let mut sat_sat = base;
+        sat_sat.sat_vs_sat = Some(changed);
+        for key in [digest(hue_luma), digest(luma_sat), digest(sat_sat)] {
+            assert_ne!(key, original);
+        }
+    }
 
     // ---- Task 5: Typewriter reveal by grapheme cluster (42 §6.5) ----
 
@@ -4524,6 +8114,1599 @@ mod tests {
     }
 
     #[test]
+    fn native_asset_peek_has_explicit_source_and_display_transform() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+        };
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::from_file(AssetKind::Video, "/tmp/native-peek.mp4");
+        let input = NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        };
+        asset.native_input_color = Some(input.clone());
+        let id = asset.id;
+        project.media.insert(asset);
+        let compiled = compile_asset_peek(&project, id, Tick::ZERO, Quality::PREVIEW, 640, 360);
+        assert!(compiled.diagnostics.is_empty());
+        assert_eq!(
+            compiled.graph.working_color_domain,
+            WorkingColorDomain::SceneLinearAcescg
+        );
+        assert!(matches!(
+            compiled.graph.nodes[0].op,
+            IrOp::NativeDecodeVideo { asset, input: ref authored, .. } if asset == id && authored == &input
+        ));
+        assert!(matches!(compiled.graph.nodes[1].op, IrOp::NativeSdrOutput));
+        assert_eq!(
+            compiled.graph.output_color_encoding(),
+            Ok(crate::graph::ir::FrameColorEncoding::SrgbDisplay)
+        );
+        project
+            .media
+            .assets
+            .get_mut(&id)
+            .unwrap()
+            .native_input_color
+            .as_mut()
+            .unwrap()
+            .version = 2;
+        let invalid = compile_asset_peek(&project, id, Tick::ZERO, Quality::FULL, 640, 360);
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+        assert!(!invalid.graph.nodes.iter().any(|node| matches!(
+            node.op,
+            IrOp::DecodeVideo { .. } | IrOp::NativeDecodeVideo { .. }
+        )));
+        use photonic_core::timeline::{MediaProbe, ProbedColor, VideoStreamInfo};
+        let media = project.media.assets.get_mut(&id).unwrap();
+        media.native_input_color.as_mut().unwrap().version = 1;
+        let mut probe = MediaProbe::basic(Tick(1_000), "mov", "prores");
+        probe.video = Some(VideoStreamInfo {
+            width: 640,
+            height: 360,
+            frame_rate: FrameRate::FPS_30,
+            pixel_aspect: 1.0,
+            color: ProbedColor::default(),
+            keyframe_index_cached: false,
+            scan: ScanType::InterlacedTopFirst,
+        });
+        media.probe = Some(probe);
+        let interlaced = compile_asset_peek(&project, id, Tick::ZERO, Quality::FULL, 640, 360);
+        assert!(interlaced
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)
+                && d.message.contains("pre-IDT deinterlace")));
+    }
+
+    fn native_group_look_fixture() -> (
+        TimelineProject,
+        SequenceId,
+        timeline::GroupId,
+        timeline::SharedLookId,
+    ) {
+        use timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+            NativeManagedColorConfig, SequenceColorConfig,
+        };
+        let exposure = |stops| {
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops },
+            ));
+            grade
+        };
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::from_file(AssetKind::Video, "/tmp/native-stage-fixture.mp4");
+        asset.native_input_color = Some(NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        });
+        asset.grade = Some(exposure(0.25));
+        let asset_id = asset.id;
+        project.media.insert(asset);
+        let mut seq = Sequence::new("native stages", FrameRate::FPS_30, 16, 16);
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut parent = timeline::GroupNode::new(timeline::GroupKind::Normal);
+        parent.pre_grade = Some(exposure(0.5));
+        parent.post_grade = Some(exposure(4.0));
+        let mut group = timeline::GroupNode::new(timeline::GroupKind::Normal);
+        group.parent = Some(parent.id);
+        group.pre_grade = Some(exposure(1.0));
+        group.post_grade = Some(exposure(3.0));
+        let group_id = group.id;
+        seq.groups.insert(parent.id, parent);
+        seq.groups.insert(group.id, group);
+        let look_id = timeline::SharedLookId::new();
+        project.shared_looks.insert(
+            look_id,
+            timeline::SharedLook {
+                id: look_id,
+                name: "shared".into(),
+                grade: exposure(2.5),
+            },
+        );
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: asset_id },
+            Tick::ZERO,
+            Tick(1000),
+        );
+        clip.group = Some(group_id);
+        clip.grade = Some(exposure(2.0));
+        clip.look = Some(timeline::ClipLook::Shared(look_id));
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.grade = Some(exposure(5.0));
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        seq.master_grade = Some(exposure(6.0));
+        let sequence = seq.id;
+        project.insert_sequence(seq);
+        (project, sequence, group_id, look_id)
+    }
+
+    #[test]
+    fn native_lut_lowering_obeys_declared_scene_or_log_coordinates() {
+        use timeline::color::{LutColorInterpretation, LutColorSpace, LutPurpose, NativeLutSpace};
+        struct Provider {
+            table: std::sync::Arc<photonic_render::Lut3d>,
+            space: NativeLutSpace,
+        }
+        impl LutProvider for Provider {
+            fn lut(&self, _: AssetId) -> Option<std::sync::Arc<photonic_render::Lut3d>> {
+                None
+            }
+            fn native_lut(&self, _: AssetId) -> Option<NativeLutBinding> {
+                Some(NativeLutBinding {
+                    table: self.table.clone(),
+                    space: self.space,
+                })
+            }
+        }
+        for space in [NativeLutSpace::Acescg, NativeLutSpace::Acescct] {
+            let (mut project, sequence, _, _) = native_group_look_fixture();
+            let mut asset = MediaAsset::from_file(AssetKind::Lut3d, "/tmp/native-fixture.cube");
+            asset.lut_full_hash = Some("verified-fixture".into());
+            let declaration = LutColorSpace::Native {
+                transform_revision: 1,
+                space,
+            };
+            asset.lut_color = Some(LutColorInterpretation {
+                version: 1,
+                purpose: LutPurpose::Creative,
+                input: declaration.clone(),
+                output: declaration,
+            });
+            let id = asset.id;
+            project.media.insert(asset);
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Lut3d,
+                GradeOpParams::Lut3d {
+                    asset: id,
+                    intensity: 1.0,
+                    interp: timeline::LutInterp::Tetrahedral,
+                },
+            ));
+            grade.ops[0].mask = Some(timeline::GradeMask::PowerWindow {
+                shape: timeline::WindowShape::Ellipse,
+                center: [0.5; 2],
+                size: [0.25; 2],
+                rotation: 0.0,
+                softness: 0.1,
+                invert: false,
+            });
+            project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+                Some(grade);
+            let provider = Provider {
+                table: std::sync::Arc::new(photonic_render::Lut3d::identity(2)),
+                space,
+            };
+            for delivery in [false, true] {
+                let frame = compile_native_sequence(
+                    &project,
+                    sequence,
+                    0,
+                    Tick::ZERO,
+                    Quality::FULL,
+                    delivery,
+                    false,
+                    None,
+                    Some(&provider),
+                );
+                assert!(frame.diagnostics.is_empty(), "{:?}", frame.diagnostics);
+                assert!(frame.graph.validate_working_color_domain().is_ok());
+                assert!(frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, IrOp::NativeLut3d { .. })));
+                let mask_node = frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .position(|n| matches!(n.op, IrOp::NativeMaskMix { .. }))
+                    .unwrap();
+                assert_eq!(
+                    frame
+                        .graph
+                        .node_color_encoding(IrNodeId(mask_node as u32))
+                        .unwrap(),
+                    if space == NativeLutSpace::Acescct {
+                        crate::graph::ir::FrameColorEncoding::Acescct
+                    } else {
+                        crate::graph::ir::FrameColorEncoding::SceneLinearAcescg
+                    }
+                );
+                let transfers = frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .filter(|n| matches!(n.op, IrOp::NativeAcescct { .. }))
+                    .count();
+                assert_eq!(
+                    transfers,
+                    if space == NativeLutSpace::Acescct {
+                        2
+                    } else {
+                        0
+                    }
+                );
+                assert!(!frame
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, IrOp::Grade { .. })));
+            }
+            project.media.assets.get_mut(&id).unwrap().lut_full_hash = None;
+            let missing_pin = compile_native_sequence(
+                &project,
+                sequence,
+                0,
+                Tick::ZERO,
+                Quality::FULL,
+                false,
+                false,
+                None,
+                Some(&provider),
+            );
+            assert!(missing_pin
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == DiagSeverity::Error));
+            assert!(!missing_pin.graph.nodes.iter().any(|n| matches!(
+                n.op,
+                IrOp::NativeDecodeVideo { .. } | IrOp::NativeLut3d { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn native_group_and_shared_look_stages_match_preview_and_delivery() {
+        let (project, sequence, _, _) = native_group_look_fixture();
+        for compiled in [
+            compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+            compile_native_delivery(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+        ] {
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+            assert!(compiled.graph.validate_working_color_domain().is_ok());
+            let stages: Vec<_> = compiled
+                .graph
+                .nodes
+                .iter()
+                .filter_map(|node| match node.op {
+                    IrOp::NativeExposure { stops } => Some(stops),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(stages, [0.25, 0.5, 1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0]);
+        }
+    }
+
+    #[test]
+    fn native_group_offsets_surround_clip_exposure_numerically() {
+        let (mut project, sequence, group, _) = native_group_look_fixture();
+        let offset = |value| {
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::LinearOffset,
+                GradeOpParams::LinearOffset { rgb: [value; 3] },
+            ));
+            grade
+        };
+        for media in project.media.assets.values_mut() {
+            media.grade = None;
+        }
+        let seq = project.sequences.get_mut(&sequence).unwrap();
+        seq.master_grade = None;
+        seq.video_tracks[0].grade = None;
+        let clip = &mut seq.video_tracks[0].clips[0];
+        clip.look = None;
+        let clip_id = clip.id;
+        if let GradeOpParams::Exposure { stops } =
+            &mut clip.grade.as_mut().unwrap().ops[0].params.base
+        {
+            *stops = 1.0;
+        }
+        let node = seq.groups.get_mut(&group).unwrap();
+        node.parent = None;
+        node.pre_grade = Some(offset(0.2));
+        node.post_grade = Some(offset(0.3));
+        let compiled = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            compiled.diagnostics.is_empty(),
+            "{:?}",
+            compiled.diagnostics
+        );
+        let mut graph = compiled.graph.clone();
+        for node in &mut graph.nodes {
+            if matches!(node.op, IrOp::NativeDecodeVideo { .. }) {
+                node.op = IrOp::SolidColor {
+                    color: crate::graph::ir::LinearColor {
+                        r: 0.1,
+                        g: 0.1,
+                        b: 0.1,
+                        a: 1.0,
+                    },
+                };
+            }
+        }
+        let tap = compiled.tap(ScopeTapPoint::Clip(clip_id)).unwrap();
+        graph.nodes.truncate(tap.0 as usize + 1);
+        graph.output = Some(tap);
+        assert!(
+            graph.validate_working_color_domain().is_ok(),
+            "{:?}",
+            graph.validate_working_color_domain()
+        );
+        let image = crate::graph::eval_cpu::evaluate(
+            &graph,
+            (16, 16),
+            &mut crate::graph::eval_cpu::EmptyProvider,
+        );
+        for pixel in image.pixels {
+            for value in &pixel[..3] {
+                assert!((value - 0.9).abs() < 1e-6, "{pixel:?}");
+            }
+            assert_eq!(pixel[3], 1.0);
+        }
+    }
+
+    fn native_nest_fixture() -> (TimelineProject, SequenceId, SequenceId) {
+        let (mut project, inner, _, _) = native_group_look_fixture();
+        for asset in project.media.assets.values_mut() {
+            asset.grade = None;
+        }
+        let exposure = || {
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 1.0 },
+            ));
+            grade
+        };
+        let seq = project.sequences.get_mut(&inner).unwrap();
+        seq.groups.clear();
+        seq.video_tracks[0].grade = None;
+        seq.video_tracks[0].clips[0].group = None;
+        seq.video_tracks[0].clips[0].look = None;
+        seq.video_tracks[0].clips[0].grade = Some(exposure());
+        seq.master_grade = Some(exposure());
+        let mut outer = Sequence::new("outer", FrameRate::FPS_30, 16, 16);
+        outer.color = seq.color.clone();
+        outer.master_grade = Some(exposure());
+        let mut track = Track::new(TrackKind::Video, "nest");
+        let mut clip = Clip::new(
+            ClipSource::NestedSequence { sequence: inner },
+            Tick::ZERO,
+            Tick(10000),
+        );
+        clip.grade = Some(exposure());
+        track.clips.push(clip);
+        outer.video_tracks.push(track);
+        let outer_id = outer.id;
+        project.insert_sequence(outer);
+        (project, outer_id, inner)
+    }
+
+    #[test]
+    fn native_nests_keep_scene_stages_and_apply_output_once() {
+        let (project, outer, _) = native_nest_fixture();
+        for tick in [Tick::ZERO, Tick(2000)] {
+            for mut compiled in [
+                compile_native_preview(&project, outer, 0, tick, Quality::FULL),
+                compile_native_delivery(&project, outer, 0, tick, Quality::FULL),
+            ] {
+                assert!(
+                    !compiled
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.severity == DiagSeverity::Error),
+                    "{:?}",
+                    compiled.diagnostics
+                );
+                assert_eq!(
+                    compiled
+                        .graph
+                        .nodes
+                        .iter()
+                        .filter(|n| matches!(
+                            n.op,
+                            IrOp::NativeSdrOutput | IrOp::NativeSdrVideoOutput
+                        ))
+                        .count(),
+                    1
+                );
+                for node in &mut compiled.graph.nodes {
+                    if let IrOp::NativeDecodeVideo { src_time, .. } = node.op {
+                        assert_eq!(src_time, Tick::ZERO); // Tail holds inner frame zero.
+                        node.op = IrOp::SolidColor {
+                            color: LinearColor {
+                                r: -0.05,
+                                g: 0.1,
+                                b: 0.5,
+                                a: 0.5,
+                            },
+                        };
+                    }
+                }
+                let output = compiled.graph.output.unwrap();
+                let scene = compiled.graph.nodes[output.0 as usize].inputs[0].0;
+                compiled.graph.nodes.truncate(scene.0 as usize + 1);
+                compiled.graph.output = Some(scene);
+                let image = crate::graph::eval_cpu::evaluate(
+                    &compiled.graph,
+                    (2, 2),
+                    &mut crate::graph::eval_cpu::EmptyProvider,
+                );
+                for pixel in image.pixels {
+                    assert_eq!(pixel, [-0.8, 1.6, 8.0, 0.5]);
+                }
+                if tick != Tick::ZERO {
+                    assert!(compiled
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code == Some(CompileCode::NestedSequenceShortened)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_nests_refuse_cycles_missing_sources_and_mismatched_boundaries() {
+        for case in 0..4 {
+            let (mut project, outer, inner) = native_nest_fixture();
+            match case {
+                0 => {
+                    project.sequences.get_mut(&inner).unwrap().video_tracks[0].clips[0].source =
+                        ClipSource::NestedSequence { sequence: outer }
+                }
+                1 => {
+                    project.sequences.remove(&inner);
+                }
+                2 => project.sequences.get_mut(&inner).unwrap().formats[0].width = 32,
+                _ => {
+                    project.sequences.get_mut(&inner).unwrap().color =
+                        timeline::color::SequenceColorConfig::LegacySdr
+                }
+            }
+            for compiled in [
+                compile_native_preview(&project, outer, 0, Tick::ZERO, Quality::FULL),
+                compile_native_delivery(&project, outer, 0, Tick::ZERO, Quality::FULL),
+            ] {
+                assert!(
+                    compiled
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.severity == DiagSeverity::Error),
+                    "case {case}"
+                );
+                assert!(!compiled
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|n| matches!(n.op, IrOp::NativeDecodeVideo { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn native_still_timeline_requires_matching_explicit_interpretation() {
+        use timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+        };
+        let (mut project, sequence, _, _) = native_group_look_fixture();
+        let asset = project.sequences[&sequence].video_tracks[0].clips[0]
+            .source
+            .asset()
+            .unwrap();
+        project.media.assets.get_mut(&asset).unwrap().kind = AssetKind::Image;
+        for standard in [
+            NativeInputStandard::Bt709Scene,
+            NativeInputStandard::SrgbDisplay,
+        ] {
+            project
+                .media
+                .assets
+                .get_mut(&asset)
+                .unwrap()
+                .native_input_color = Some(NativeInputColorInterpretation {
+                hlg_peak_nits: None,
+                reference_white_nits: None,
+                version: 1,
+                standard,
+                range: InputSignalRange::Full,
+                matrix: if standard == NativeInputStandard::SrgbDisplay {
+                    InputMatrix::Rgb
+                } else {
+                    InputMatrix::Bt709
+                },
+                chroma_location: None,
+            });
+            for compiled in [
+                compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+                compile_native_delivery(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+            ] {
+                if standard == NativeInputStandard::SrgbDisplay {
+                    assert!(
+                        !compiled
+                            .diagnostics
+                            .iter()
+                            .any(|d| d.severity == DiagSeverity::Error),
+                        "{:?}",
+                        compiled.diagnostics
+                    );
+                    assert!(compiled
+                        .graph
+                        .nodes
+                        .iter()
+                        .any(|n| matches!(n.op, IrOp::NativeDecodeStill { .. })));
+                    assert!(compiled.graph.validate_working_color_domain().is_ok());
+                } else {
+                    assert!(compiled
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.severity == DiagSeverity::Error));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_typed_matte_graph_lowers_key_domain_and_preserves_cache_dependencies() {
+        let (mut project, sequence, _, _) = native_group_look_fixture();
+        let mut grade = Grade::new();
+        let key = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: timeline::CdlParams::identity(),
+                keys: vec![],
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        let key_id = key.id;
+        grade.ops.push(key);
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        grade.convert_to_graph();
+        grade
+            .add_graph_corrector(
+                GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: -0.5 },
+                ),
+                true,
+            )
+            .unwrap();
+        let graph = grade.graph.as_ref().unwrap();
+        let original = graph
+            .nodes
+            .iter()
+            .find(|(_, node)| matches!(node, GradeGraphNode::Input))
+            .map(|(&id, _)| id)
+            .unwrap();
+        let corrected = match graph.nodes[&graph.output] {
+            GradeGraphNode::Output { input } => input,
+            _ => unreachable!(),
+        };
+        let matte = grade
+            .add_graph_utility(GradeGraphNode::QualifierMatte {
+                input: original,
+                op: key_id,
+                label: String::new(),
+            })
+            .unwrap();
+        let refined = grade
+            .add_graph_utility(GradeGraphNode::MatteRefine {
+                input: matte,
+                refinement: Default::default(),
+                label: "Refine".into(),
+            })
+            .unwrap();
+        let mixed = grade
+            .add_graph_utility(GradeGraphNode::KeyMixer {
+                top: refined,
+                bottom: matte,
+                mode: timeline::GradeKeyMixMode::Multiply,
+                label: String::new(),
+            })
+            .unwrap();
+        grade
+            .add_graph_utility(GradeGraphNode::MatteApply {
+                original,
+                corrected,
+                matte: mixed,
+                label: String::new(),
+            })
+            .unwrap();
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(grade.clone());
+        let first = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            first
+                .diagnostics
+                .iter()
+                .all(|d| d.severity != DiagSeverity::Error),
+            "{:?}",
+            first.diagnostics
+        );
+        assert_eq!(first.graph.validate_working_color_domain(), Ok(()));
+        assert!(first
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::GradeLayerMix { .. })));
+        let (key_index, key_node) = first
+            .graph
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, node)| matches!(node.op, IrOp::QualifierMatte { native: true, .. }))
+            .unwrap();
+        assert_eq!(
+            first
+                .graph
+                .node_color_encoding(IrNodeId(key_index as u32))
+                .unwrap(),
+            crate::graph::ir::FrameColorEncoding::MatteWeight
+        );
+        assert!(
+            !first
+                .graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, IrOp::GradeMatteRefine { .. })),
+            "neutral refinement must be a passthrough"
+        );
+        let mut spatial = grade.clone();
+        if let GradeGraphNode::MatteRefine { refinement, .. } = spatial
+            .graph
+            .as_mut()
+            .unwrap()
+            .nodes
+            .get_mut(&refined)
+            .unwrap()
+        {
+            refinement.blur = 0.005;
+        }
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(spatial.clone());
+        let blurred = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        let blur_hash = blurred
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.op, IrOp::GradeMatteRefine { .. }))
+            .unwrap()
+            .content_hash;
+        assert_eq!(blurred.graph.validate_working_color_domain(), Ok(()));
+        if let GradeGraphNode::MatteRefine { refinement, .. } = spatial
+            .graph
+            .as_mut()
+            .unwrap()
+            .nodes
+            .get_mut(&refined)
+            .unwrap()
+        {
+            refinement.blur = 0.01;
+        }
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(spatial);
+        let stronger = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert_ne!(
+            blur_hash,
+            stronger
+                .graph
+                .nodes
+                .iter()
+                .find(|node| matches!(node.op, IrOp::GradeMatteRefine { .. }))
+                .unwrap()
+                .content_hash
+        );
+        let source_input = first
+            .tap(ScopeTapPoint::NativeGraphQualifierInput {
+                clip: project.sequences[&sequence].video_tracks[0].clips[0].id,
+                node: matte,
+                op: key_id,
+            })
+            .expect("key utility exposes its scene input");
+        assert_eq!(
+            first.graph.node_color_encoding(source_input).unwrap(),
+            crate::graph::ir::FrameColorEncoding::SceneLinearAcescg
+        );
+        let key_hash = key_node.content_hash;
+        if let GradeOpParams::HslQualifier { correction, .. } = &mut grade.ops[0].params.base {
+            correction.offset = [0.1; 3];
+        }
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade = Some(grade);
+        let changed = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        let changed_key = changed
+            .graph
+            .nodes
+            .iter()
+            .find(|node| matches!(node.op, IrOp::QualifierMatte { .. }))
+            .unwrap();
+        assert_eq!(
+            key_hash, changed_key.content_hash,
+            "a key-only output must ignore the source qualifier's CDL"
+        );
+        assert_ne!(
+            first.graph.nodes.last().unwrap().content_hash,
+            changed.graph.nodes.last().unwrap().content_hash,
+            "the image correction still depends on its CDL"
+        );
+    }
+
+    #[test]
+    fn native_qualifier_input_tap_excludes_own_and_later_corrections() {
+        let (mut project, sequence, _, _) = native_group_look_fixture();
+        let clip_id = project.sequences[&sequence].video_tracks[0].clips[0].id;
+        let clip = project.sequences.get_mut(&sequence).unwrap().video_tracks[0]
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == clip_id)
+            .unwrap();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.7 },
+        ));
+        let key = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.1,
+                correction: timeline::CdlParams::identity(),
+                keys: vec![],
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        let op = key.id;
+        grade.ops.push(key);
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: -0.3 },
+        ));
+        clip.grade = Some(grade.clone());
+        let frame = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            frame
+                .diagnostics
+                .iter()
+                .all(|d| d.severity != DiagSeverity::Error),
+            "{:?}",
+            frame.diagnostics
+        );
+        let point = ScopeTapPoint::NativeQualifierInput { clip: clip_id, op };
+        let input = frame
+            .tap(point)
+            .expect("neutral qualifier still has an exact input tap");
+        assert!(
+            matches!(frame.graph.nodes[input.0 as usize].op, IrOp::NativeExposure { stops } if stops == 0.7)
+        );
+        assert_eq!(
+            frame.graph.node_color_encoding(input).unwrap(),
+            crate::graph::ir::FrameColorEncoding::SceneLinearAcescg
+        );
+        assert!(!frame
+            .graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, IrOp::NativeLogQualifier { .. })));
+        assert_eq!(frame.resolve_tap(point), Some((point, input)));
+        assert!(frame
+            .tap(ScopeTapPoint::NativeQualifierInput {
+                clip: clip_id,
+                op: GradeOpId::new()
+            })
+            .is_none());
+        assert_eq!(
+            frame
+                .resolve_tap(ScopeTapPoint::NativeQualifierInput {
+                    clip: clip_id,
+                    op: GradeOpId::new()
+                })
+                .unwrap()
+                .0,
+            ScopeTapPoint::Program
+        );
+        grade.convert_to_graph();
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(grade.clone());
+        let serial = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        let serial_input = serial
+            .tap(point)
+            .expect("serial graph corrector has its upstream input");
+        assert!(
+            matches!(serial.graph.nodes[serial_input.0 as usize].op, IrOp::NativeExposure { stops } if stops == 0.7)
+        );
+        let graph = grade.graph.as_mut().unwrap();
+        let corrector = graph
+            .nodes
+            .iter()
+            .find_map(|(&id, node)| {
+                matches!(node, GradeGraphNode::Corrector { op: candidate, .. } if *candidate == op)
+                    .then_some(id)
+            })
+            .unwrap();
+        graph
+            .nodes
+            .get_mut(&corrector)
+            .unwrap()
+            .set_input("image", 0)
+            .unwrap();
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(grade.clone());
+        let rewired = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        let rewired_input = rewired.tap(point).expect("rewired graph has an input");
+        assert!(
+            !matches!(rewired.graph.nodes[rewired_input.0 as usize].op, IrOp::NativeExposure { stops } if stops == 0.7)
+        );
+        assert_ne!(
+            serial.graph.nodes[serial_input.0 as usize].content_hash,
+            rewired.graph.nodes[rewired_input.0 as usize].content_hash
+        );
+        let graph = grade.graph.as_mut().unwrap();
+        let duplicate = graph.next_id;
+        graph.next_id += 2;
+        graph.nodes.insert(
+            duplicate,
+            GradeGraphNode::Corrector {
+                input: 1,
+                op,
+                label: "Repeated operator".into(),
+            },
+        );
+        let old_output = match graph.nodes[&graph.output] {
+            GradeGraphNode::Output { input } => input,
+            _ => unreachable!(),
+        };
+        graph.nodes.insert(
+            duplicate + 1,
+            GradeGraphNode::LayerMixer {
+                top: duplicate,
+                bottom: old_output,
+                opacity: 0.5,
+                label: String::new(),
+            },
+        );
+        graph
+            .nodes
+            .get_mut(&graph.output)
+            .unwrap()
+            .set_input("image", duplicate + 1)
+            .unwrap();
+        assert_eq!(graph.validate(&grade.ops), Ok(()));
+        assert!(!grade.has_unambiguous_corrector_input(op));
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade = Some(grade);
+        let repeated = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            repeated.tap(point).is_none(),
+            "operator-only inspection must reject ambiguous graph instances"
+        );
+        let point_for = |node, operator| match point {
+            ScopeTapPoint::NativeQualifierInput { clip, .. } => {
+                ScopeTapPoint::NativeGraphQualifierInput {
+                    clip,
+                    node,
+                    op: operator,
+                }
+            }
+            ScopeTapPoint::NativeCurveInput { clip, .. } => ScopeTapPoint::NativeGraphCurveInput {
+                clip,
+                node,
+                op: operator,
+            },
+            _ => unreachable!(),
+        };
+        let first = repeated
+            .tap(point_for(corrector, op))
+            .expect("explicit original instance input");
+        let second = repeated
+            .tap(point_for(duplicate, op))
+            .expect("explicit repeated instance input");
+        assert_ne!(
+            repeated.graph.nodes[first.0 as usize].content_hash,
+            repeated.graph.nodes[second.0 as usize].content_hash
+        );
+        assert!(
+            repeated
+                .tap(point_for(duplicate, GradeOpId::new()))
+                .is_none(),
+            "replaced operators cannot satisfy a stale node request"
+        );
+    }
+
+    #[test]
+    fn native_curve_input_tap_excludes_own_and_later_corrections() {
+        let (mut project, sequence, _, _) = native_group_look_fixture();
+        let clip_id = project.sequences[&sequence].video_tracks[0].clips[0].id;
+        let clip = project.sequences.get_mut(&sequence).unwrap().video_tracks[0]
+            .clips
+            .iter_mut()
+            .find(|clip| clip.id == clip_id)
+            .unwrap();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.7 },
+        ));
+        let key = GradeOp::new(
+            GradeOpKind::Curves,
+            GradeOpParams::Curves {
+                master: vec![],
+                red: vec![],
+                green: vec![],
+                blue: vec![],
+                hue_vs_hue: vec![],
+                hue_vs_sat: vec![],
+                hue_vs_luma: vec![],
+                luma_vs_sat: vec![],
+                sat_vs_sat: vec![],
+            },
+        );
+        let op = key.id;
+        grade.ops.push(key);
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: -0.3 },
+        ));
+        clip.grade = Some(grade.clone());
+        let frame = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            frame
+                .diagnostics
+                .iter()
+                .all(|d| d.severity != DiagSeverity::Error),
+            "{:?}",
+            frame.diagnostics
+        );
+        let point = ScopeTapPoint::NativeCurveInput { clip: clip_id, op };
+        let input = frame
+            .tap(point)
+            .expect("neutral curve still has an exact input tap");
+        assert!(
+            matches!(frame.graph.nodes[input.0 as usize].op, IrOp::NativeExposure { stops } if stops == 0.7)
+        );
+        assert_eq!(
+            frame.graph.node_color_encoding(input).unwrap(),
+            crate::graph::ir::FrameColorEncoding::SceneLinearAcescg
+        );
+        assert!(!frame
+            .graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, IrOp::NativeLogCurves { .. })));
+        assert_eq!(frame.resolve_tap(point), Some((point, input)));
+        assert!(frame
+            .tap(ScopeTapPoint::NativeCurveInput {
+                clip: clip_id,
+                op: GradeOpId::new()
+            })
+            .is_none());
+        assert_eq!(
+            frame
+                .resolve_tap(ScopeTapPoint::NativeCurveInput {
+                    clip: clip_id,
+                    op: GradeOpId::new()
+                })
+                .unwrap()
+                .0,
+            ScopeTapPoint::Program
+        );
+        grade.convert_to_graph();
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(grade.clone());
+        let serial = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        let serial_input = serial
+            .tap(point)
+            .expect("serial graph corrector has its upstream input");
+        assert!(
+            matches!(serial.graph.nodes[serial_input.0 as usize].op, IrOp::NativeExposure { stops } if stops == 0.7)
+        );
+        let graph = grade.graph.as_mut().unwrap();
+        let corrector = graph
+            .nodes
+            .iter()
+            .find_map(|(&id, node)| {
+                matches!(node, GradeGraphNode::Corrector { op: candidate, .. } if *candidate == op)
+                    .then_some(id)
+            })
+            .unwrap();
+        graph
+            .nodes
+            .get_mut(&corrector)
+            .unwrap()
+            .set_input("image", 0)
+            .unwrap();
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade =
+            Some(grade.clone());
+        let rewired = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        let rewired_input = rewired.tap(point).expect("rewired graph has an input");
+        assert!(
+            !matches!(rewired.graph.nodes[rewired_input.0 as usize].op, IrOp::NativeExposure { stops } if stops == 0.7)
+        );
+        assert_ne!(
+            serial.graph.nodes[serial_input.0 as usize].content_hash,
+            rewired.graph.nodes[rewired_input.0 as usize].content_hash
+        );
+        let graph = grade.graph.as_mut().unwrap();
+        let duplicate = graph.next_id;
+        graph.next_id += 2;
+        graph.nodes.insert(
+            duplicate,
+            GradeGraphNode::Corrector {
+                input: 1,
+                op,
+                label: "Repeated operator".into(),
+            },
+        );
+        let old_output = match graph.nodes[&graph.output] {
+            GradeGraphNode::Output { input } => input,
+            _ => unreachable!(),
+        };
+        graph.nodes.insert(
+            duplicate + 1,
+            GradeGraphNode::LayerMixer {
+                top: duplicate,
+                bottom: old_output,
+                opacity: 0.5,
+                label: String::new(),
+            },
+        );
+        graph
+            .nodes
+            .get_mut(&graph.output)
+            .unwrap()
+            .set_input("image", duplicate + 1)
+            .unwrap();
+        assert_eq!(graph.validate(&grade.ops), Ok(()));
+        assert!(!grade.has_unambiguous_corrector_input(op));
+        project.sequences.get_mut(&sequence).unwrap().video_tracks[0].clips[0].grade = Some(grade);
+        let repeated = compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            repeated.tap(point).is_none(),
+            "operator-only inspection must reject ambiguous graph instances"
+        );
+        let point_for = |node, operator| match point {
+            ScopeTapPoint::NativeQualifierInput { clip, .. } => {
+                ScopeTapPoint::NativeGraphQualifierInput {
+                    clip,
+                    node,
+                    op: operator,
+                }
+            }
+            ScopeTapPoint::NativeCurveInput { clip, .. } => ScopeTapPoint::NativeGraphCurveInput {
+                clip,
+                node,
+                op: operator,
+            },
+            _ => unreachable!(),
+        };
+        let first = repeated
+            .tap(point_for(corrector, op))
+            .expect("explicit original instance input");
+        let second = repeated
+            .tap(point_for(duplicate, op))
+            .expect("explicit repeated instance input");
+        assert_ne!(
+            repeated.graph.nodes[first.0 as usize].content_hash,
+            repeated.graph.nodes[second.0 as usize].content_hash
+        );
+        assert!(
+            repeated
+                .tap(point_for(duplicate, GradeOpId::new()))
+                .is_none(),
+            "replaced operators cannot satisfy a stale node request"
+        );
+    }
+
+    #[test]
+    fn native_unsupported_shared_look_refuses_both_outputs() {
+        let (mut project, sequence, _, look) = native_group_look_fixture();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::WhiteBalance,
+            GradeOpParams::WhiteBalance {
+                temp: 2.0,
+                tint: 0.0,
+            },
+        ));
+        let op_id = grade.ops[0].id;
+        grade.graph = Some(timeline::GradeGraph::from_stack(&grade.ops));
+        project.shared_looks.get_mut(&look).unwrap().grade = grade;
+        for compiled in [
+            compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+            compile_native_delivery(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+        ] {
+            assert!(compiled
+                .diagnostics
+                .iter()
+                .any(|d| d.severity == DiagSeverity::Error && d.message.contains("Shared look")));
+            let diagnostic = compiled
+                .diagnostics
+                .iter()
+                .find_map(|d| d.grade.as_ref())
+                .unwrap();
+            assert_eq!(diagnostic.op, op_id);
+            assert_eq!(diagnostic.sequence_path, [sequence]);
+            assert!(diagnostic.graph_node.is_some());
+            assert_eq!(
+                diagnostic.stage,
+                Some(photonic_render::grade::GradeStage::SharedLook { id: look })
+            );
+            assert!(matches!(
+                diagnostic.issue,
+                photonic_render::grade::GradeIssue::NativeCorrectionUnavailable(_)
+            ));
+            let wire = serde_json::to_string(diagnostic).unwrap();
+            assert_eq!(
+                serde_json::from_str::<photonic_render::grade::GradeDiagnostic>(&wire).unwrap(),
+                *diagnostic
+            );
+            assert!(!compiled
+                .graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        }
+    }
+
+    #[test]
+    fn native_group_ancestry_errors_refuse_rendering() {
+        let (project, sequence, group, _) = native_group_look_fixture();
+        for parent in [Some(group), Some(timeline::GroupId::new())] {
+            let mut project = project.clone();
+            project
+                .sequences
+                .get_mut(&sequence)
+                .unwrap()
+                .groups
+                .get_mut(&group)
+                .unwrap()
+                .parent = parent;
+            for compiled in [
+                compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+                compile_native_delivery(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+            ] {
+                assert!(compiled
+                    .diagnostics
+                    .iter()
+                    .any(|d| d.severity == DiagSeverity::Error
+                        && d.message.contains("group reference")));
+                assert!(!compiled
+                    .graph
+                    .nodes
+                    .iter()
+                    .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+            }
+        }
+    }
+
+    #[test]
+    fn native_missing_shared_look_retains_provenance_and_refuses_rendering() {
+        let (mut project, sequence, _, look) = native_group_look_fixture();
+        project.shared_looks.remove(&look);
+        for compiled in [
+            compile_native_preview(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+            compile_native_delivery(&project, sequence, 0, Tick::ZERO, Quality::FULL),
+        ] {
+            assert!(compiled.diagnostics.iter().any(|d| d.grade.as_ref().is_some_and(|grade|
+                grade.sequence_path == [sequence] && matches!(grade.issue, photonic_render::grade::GradeIssue::MissingSharedLook(id) if id == look)
+            )));
+            assert!(!compiled
+                .graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        }
+    }
+
+    #[test]
+    fn native_timeline_preview_renders_only_qualified_clip() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+            NativeManagedColorConfig, SequenceColorConfig,
+        };
+        let mut project = TimelineProject::new();
+        let mut asset = MediaAsset::from_file(AssetKind::Video, "/tmp/native-preview.mp4");
+        let asset_id = asset.id;
+        asset.native_input_color = Some(NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        });
+        project.media.insert(asset);
+        let mut seq = Sequence::new("native", FrameRate::FPS_30, 640, 360);
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let seq_id = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.clips.push(Clip::new(
+            ClipSource::Asset { asset: asset_id },
+            Tick::ZERO,
+            Tick(1_000_000),
+        ));
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        let preview = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
+        assert!(preview.graph.validate_working_color_domain().is_ok());
+        assert_eq!(
+            preview.graph.output_color_encoding(),
+            Ok(crate::graph::ir::FrameColorEncoding::SrgbDisplay)
+        );
+        let clip_id = project.sequences[&seq_id].video_tracks[0].clips[0].id;
+        let program_tap = preview.tap(ScopeTapPoint::Program).unwrap();
+        let clip_tap = preview.tap(ScopeTapPoint::Clip(clip_id)).unwrap();
+        assert_eq!(
+            preview.graph.node_color_encoding(program_tap),
+            Ok(crate::graph::ir::FrameColorEncoding::SrgbDisplay)
+        );
+        assert_eq!(
+            preview.graph.node_color_encoding(clip_tap),
+            Ok(crate::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+        );
+        assert!(preview
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        let mut serial = Grade::new();
+        serial.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        serial.graph = Some(timeline::GradeGraph::from_stack(&serial.ops));
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0].grade = Some(serial);
+        let graphed = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(graphed.diagnostics.is_empty(), "{:?}", graphed.diagnostics);
+        assert!(graphed
+            .graph
+            .nodes
+            .iter()
+            .any(|node| { matches!(node.op, IrOp::NativeExposure { stops } if stops == 1.0) }));
+        let original_source = project.media.assets[&asset_id].source.clone();
+        project.media.assets.get_mut(&asset_id).unwrap().source = timeline::AssetSource::File {
+            path: std::env::temp_dir()
+                .join(format!("photonic-native-missing-{}", uuid::Uuid::new_v4())),
+            rel_path: None,
+        };
+        let offline = compile_native_preview_live(&project, seq_id, 0, Tick::ZERO, Quality::FULL);
+        assert!(offline.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == Some(CompileCode::ColorPipelineUnavailable)
+                && diagnostic.message.contains("offline")
+        }));
+        assert!(!offline
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        let live_path =
+            std::env::temp_dir().join(format!("photonic-native-live-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&live_path, b"source placeholder").unwrap();
+        project.media.assets.get_mut(&asset_id).unwrap().source = timeline::AssetSource::File {
+            path: live_path.clone(),
+            rel_path: None,
+        };
+        let unprobed = compile_native_preview_live(&project, seq_id, 0, Tick::ZERO, Quality::FULL);
+        assert!(unprobed.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("probed source pixel format")
+                && diagnostic.code == Some(CompileCode::ColorPipelineUnavailable)
+        }));
+        let mut valid_probe = timeline::MediaProbe::basic(Tick(1_000_000), "mov", "test");
+        valid_probe.pixel_format = Some("yuv444p".into());
+        project.media.assets.get_mut(&asset_id).unwrap().probe = Some(valid_probe);
+        let live = compile_native_preview_live(&project, seq_id, 0, Tick::ZERO, Quality::FULL);
+        assert!(live.diagnostics.is_empty(), "{:?}", live.diagnostics);
+        let mut unsupported_probe = timeline::MediaProbe::basic(Tick(1_000_000), "mov", "test");
+        unsupported_probe.pixel_format = Some("gbrp".into());
+        project.media.assets.get_mut(&asset_id).unwrap().probe = Some(unsupported_probe);
+        let unsupported =
+            compile_native_preview_live(&project, seq_id, 0, Tick::ZERO, Quality::FULL);
+        assert!(unsupported.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("gbrp")
+                && diagnostic.code == Some(CompileCode::ColorPipelineUnavailable)
+        }));
+        assert!(!unsupported
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        project.media.assets.get_mut(&asset_id).unwrap().probe = None;
+        std::fs::remove_file(&live_path).unwrap();
+        project.media.assets.get_mut(&asset_id).unwrap().source = original_source;
+        let delivery = compile_native_delivery(&project, seq_id, 0, Tick::ZERO, Quality::FULL);
+        assert!(
+            delivery.diagnostics.is_empty(),
+            "{:?}",
+            delivery.diagnostics
+        );
+        assert!(delivery.graph.validate_working_color_domain().is_ok());
+        assert_eq!(
+            delivery.graph.output_color_encoding(),
+            Ok(crate::graph::ir::FrameColorEncoding::Bt709Video)
+        );
+        assert!(matches!(
+            delivery.graph.nodes.last().unwrap().op,
+            IrOp::NativeSdrVideoOutput
+        ));
+        let gap = compile_native_delivery(&project, seq_id, 0, Tick(2_000_000), Quality::FULL);
+        assert!(gap.diagnostics.is_empty());
+        assert_eq!(
+            gap.graph.output_color_encoding(),
+            Ok(crate::graph::ir::FrameColorEncoding::Bt709Video)
+        );
+        if let SequenceColorConfig::NativeManaged(config) =
+            &mut project.sequences.get_mut(&seq_id).unwrap().color
+        {
+            config.export = photonic_core::timeline::color::NativeOutputTransform::SrgbSdr;
+        }
+        let wrong_output = compile_native_delivery(&project, seq_id, 0, Tick::ZERO, Quality::FULL);
+        assert!(wrong_output
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+        assert!(!wrong_output
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        if let SequenceColorConfig::NativeManaged(config) =
+            &mut project.sequences.get_mut(&seq_id).unwrap().color
+        {
+            config.export = photonic_core::timeline::color::NativeOutputTransform::Bt709VideoSdr;
+        }
+
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0].grade = Some(grade);
+        let graded = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(graded.diagnostics.is_empty(), "{:?}", graded.diagnostics);
+        assert!(graded
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeExposure { stops } if stops == 1.0)));
+
+        let exposure = |stops| {
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops },
+            ));
+            grade
+        };
+        project.media.assets.get_mut(&asset_id).unwrap().grade = Some(exposure(2.0));
+        let seq = project.sequences.get_mut(&seq_id).unwrap();
+        seq.video_tracks[0].grade = Some(exposure(3.0));
+        seq.master_grade = Some(exposure(4.0));
+        let scoped = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(scoped.diagnostics.is_empty(), "{:?}", scoped.diagnostics);
+        let stops: Vec<_> = scoped
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match node.op {
+                IrOp::NativeExposure { stops } => Some(stops),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, [2.0, 1.0, 3.0, 4.0]);
+
+        let mut upper = Track::new(TrackKind::Video, "V2");
+        upper.clips.push(Clip::new(
+            ClipSource::Asset { asset: asset_id },
+            Tick::ZERO,
+            Tick(1_000_000),
+        ));
+        project
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks
+            .push(upper);
+        let layered = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(layered.diagnostics.is_empty(), "{:?}", layered.diagnostics);
+        assert!(layered.graph.validate_working_color_domain().is_ok());
+        assert_eq!(layered.clip_taps.len(), 2);
+        assert!(layered.graph.nodes.iter().any(|node| matches!(
+            node.op,
+            IrOp::Merge {
+                mode: BlendMode::Normal,
+                ..
+            }
+        )));
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[1].opacity = 0.5;
+        let mixed = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(mixed.diagnostics.is_empty(), "{:?}", mixed.diagnostics);
+        assert!(mixed.graph.nodes.iter().any(|node| matches!(node.op, IrOp::Merge { mode: BlendMode::Normal, opacity } if opacity == 0.5)));
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[1].blend = BlendMode::Multiply;
+        let unsupported_blend =
+            compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(unsupported_blend
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+        assert!(!unsupported_blend
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        project
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks
+            .pop();
+
+        let mut adjustment_track = Track::new(TrackKind::Video, "Adjustment");
+        let mut adjustment = Clip::new(ClipSource::Adjustment, Tick::ZERO, Tick(1_000_000));
+        adjustment.grade = Some(exposure(0.25));
+        adjustment_track.clips.push(adjustment);
+        project
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks
+            .push(adjustment_track);
+        let adjusted = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(
+            adjusted.diagnostics.is_empty(),
+            "{:?}",
+            adjusted.diagnostics
+        );
+        let order: Vec<_> = adjusted
+            .graph
+            .nodes
+            .iter()
+            .filter_map(|node| match node.op {
+                IrOp::NativeExposure { stops } => Some(stops),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, [2.0, 1.0, 3.0, 0.25, 4.0]);
+        project
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks
+            .pop();
+
+        project.sequences.get_mut(&seq_id).unwrap().master_grade = Some(exposure(100.0));
+        let unsupported = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(unsupported
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+        assert!(!unsupported
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+        project.sequences.get_mut(&seq_id).unwrap().master_grade = Some(exposure(4.0));
+
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0]
+            .transform
+            .base
+            .x = 2.0;
+        let reframed = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(
+            reframed.diagnostics.is_empty(),
+            "{:?}",
+            reframed.diagnostics
+        );
+        assert!(reframed
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::Transform2DTransparent { .. })));
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0]
+            .transform
+            .base
+            .opacity = 0.5;
+        let translucent = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(
+            translucent.diagnostics.is_empty(),
+            "{:?}",
+            translucent.diagnostics
+        );
+        assert!(translucent.graph.nodes.iter().any(|node| matches!(node.op, IrOp::Merge { mode: BlendMode::Normal, opacity } if opacity == 0.5)));
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0]
+            .transform
+            .base
+            .opacity = f64::NAN;
+        let refused = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(refused
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+        assert!(!refused
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0]
+            .transform
+            .base
+            .x = 0.0;
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0]
+            .transform
+            .base
+            .opacity = 1.0;
+        project
+            .media
+            .assets
+            .get_mut(&asset_id)
+            .unwrap()
+            .native_input_color = None;
+        let missing = compile_native_preview(&project, seq_id, 0, Tick::ZERO, Quality::PREVIEW);
+        assert!(missing
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)));
+        assert!(!missing
+            .graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeDecodeVideo { .. })));
+    }
+
+    #[test]
     fn compile_is_deterministic_across_runs() {
         let (mut project, seq_id) = base_project();
         let tk = add_video_track(&mut project, seq_id);
@@ -4960,13 +10143,36 @@ mod tests {
     fn op_name(op: &IrOp) -> &'static str {
         match op {
             IrOp::DecodeVideo { .. } => "DecodeVideo",
+            IrOp::NativeDecodeVideo { .. } => "NativeDecodeVideo",
+            IrOp::NativeDecodeStill { .. } => "NativeDecodeStill",
             IrOp::DecodeStill { .. } => "DecodeStill",
             IrOp::RasterVector { .. } => "RasterVector",
             IrOp::SolidColor { .. } => "SolidColor",
             IrOp::Transform2D { .. } => "Transform2D",
+            IrOp::Transform2DTransparent { .. } => "Transform2DTransparent",
             IrOp::StabilizeWarp { .. } => "StabilizeWarp",
             IrOp::Effect { .. } => "Effect",
             IrOp::Grade { .. } => "Grade",
+            IrOp::NativeExposure { .. } => "NativeExposure",
+            IrOp::NativeLinearOffset { .. } => "NativeLinearOffset",
+            IrOp::NativePrinterLights { .. } => "NativePrinterLights",
+            IrOp::NativeHighlightRolloff { .. } => "NativeHighlightRolloff",
+            IrOp::NativeLogContrast { .. } => "NativeLogContrast",
+            IrOp::NativeLogCdl { .. } => "NativeLogCdl",
+            IrOp::QualifierMatte { .. } => "QualifierMatte",
+            IrOp::GradeKeyMix { .. } => "GradeKeyMix",
+            IrOp::GradeMatteRefine { .. } => "GradeMatteRefine",
+            IrOp::GradeMatteApply => "GradeMatteApply",
+            IrOp::GradeMatteConstant { .. } => "GradeMatteConstant",
+            IrOp::GradeLayerMix { .. } => "GradeLayerMix",
+            IrOp::NativeLogQualifier { .. } => "NativeLogQualifier",
+            IrOp::NativeLogCurves { .. } => "NativeLogCurves",
+            IrOp::NativeSaturationVibrance { .. } => "NativeSaturationVibrance",
+            IrOp::NativeLut3d { .. } => "NativeLut3d",
+            IrOp::NativeMaskMix { .. } => "NativeMaskMix",
+            IrOp::NativeAcescct { .. } => "NativeAcescct",
+            IrOp::NativeSdrOutput => "NativeSdrOutput",
+            IrOp::NativeSdrVideoOutput => "NativeSdrVideoOutput",
             IrOp::Merge { .. } => "Merge",
             IrOp::WipeMix { .. } => "WipeMix",
             IrOp::PushMix { .. } => "PushMix",
@@ -6023,6 +11229,36 @@ mod tests {
 
     // ── K-0.5: LUT provider threading ────────────────────────────────────────
 
+    #[test]
+    fn one_dimensional_shaper_changes_grade_cache_key() {
+        use photonic_render::{
+            grade::{ResolvedGradeOp, ResolvedGradePayload, ResolvedLut3d},
+            Lut3d,
+        };
+        let digest = |shaper: Option<Vec<[f32; 3]>>| {
+            let mut table = Lut3d::identity(2);
+            table.shaper = shaper;
+            let mut hash = xxhash_rust::xxh3::Xxh3::new();
+            hash_resolved_grade_op(
+                &mut hash,
+                &ResolvedGradeOp {
+                    payload: ResolvedGradePayload::Lut3d(ResolvedLut3d {
+                        table: std::sync::Arc::new(table),
+                        intensity: 1.0,
+                        tetrahedral: false,
+                    }),
+                    mask: None,
+                },
+            );
+            hash.digest()
+        };
+        assert_ne!(digest(None), digest(Some(vec![[0.0; 3], [1.0; 3]])));
+        assert_ne!(
+            digest(Some(vec![[0.0; 3], [1.0; 3]])),
+            digest(Some(vec![[0.0; 3], [0.5; 3]]))
+        );
+    }
+
     /// A stub [`LutProvider`] returning one fixed table for any asset.
     struct StubLut(std::sync::Arc<photonic_render::Lut3d>);
     impl LutProvider for StubLut {
@@ -6090,8 +11326,16 @@ mod tests {
             other => panic!("expected a resolved Lut3d op, got {other:?}"),
         }
 
+        assert!(with.diagnostics.is_empty());
+
         // No provider ⇒ the LUT op is inert ⇒ dropped to identity ⇒ no Grade node.
         let without = compile(&project, seq_id, 0, Tick(0), Quality::FULL, None);
+        assert!(without
+            .diagnostics
+            .iter()
+            .any(|d| d.code == Some(CompileCode::GradeUnresolved)
+                && d.severity == DiagSeverity::Error
+                && d.grade.is_some()));
         assert!(
             !without
                 .graph
@@ -6100,6 +11344,59 @@ mod tests {
                 .any(|n| matches!(n.op, IrOp::Grade { .. })),
             "the Lut3d op drops to identity with no provider"
         );
+    }
+
+    #[test]
+    fn unresolved_grade_diagnostics_identify_clip_track_and_master() {
+        let (mut project, seq_id) = lut_grade_project();
+        let seq = project.sequences.get_mut(&seq_id).unwrap();
+        let track_id = seq.video_tracks[0].id;
+        let clip_id = seq.video_tracks[0].clips[0].id;
+        let same_grade = seq.video_tracks[0].clips[0].grade.clone();
+        seq.video_tracks[0].grade = same_grade.clone();
+        seq.master_grade = same_grade;
+
+        let compiled = compile(&project, seq_id, 0, Tick(0), Quality::FULL, None);
+        let owners: Vec<_> = compiled
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| diagnostic.grade.as_ref().and_then(|grade| grade.owner))
+            .collect();
+        assert!(owners.contains(&VfxOwner::Clip(clip_id)));
+        assert!(owners.contains(&VfxOwner::Track(track_id)));
+        assert!(owners.contains(&VfxOwner::Master(seq_id)));
+        assert_eq!(owners.len(), 3);
+    }
+
+    #[test]
+    fn nested_grade_diagnostics_include_the_full_sequence_path() {
+        let (mut project, inner_id) = lut_grade_project();
+        let inner_clip = project.sequences[&inner_id].video_tracks[0].clips[0].id;
+        let mut parent = inner_id;
+        let mut path = Vec::new();
+        for name in ["middle", "outer"] {
+            let mut sequence = Sequence::new(name, FrameRate::FPS_30, 4, 4);
+            let id = sequence.id;
+            let mut track = Track::new(TrackKind::Video, "V1");
+            track.clips.push(Clip::new(
+                ClipSource::NestedSequence { sequence: parent },
+                Tick::ZERO,
+                Tick::from_seconds(2),
+            ));
+            sequence.video_tracks.push(track);
+            project.insert_sequence(sequence);
+            path.push(id);
+            parent = id;
+        }
+        let compiled = compile(&project, parent, 0, Tick::ZERO, Quality::FULL, None);
+        let grade = compiled
+            .diagnostics
+            .iter()
+            .filter_map(|diagnostic| diagnostic.grade.as_ref())
+            .find(|grade| grade.owner == Some(VfxOwner::Clip(inner_clip)))
+            .expect("nested LUT failure is reported");
+        assert_eq!(grade.sequence_path, [path[1], path[0], inner_id]);
+        assert!(grade.to_string().contains("Nested sequence path"));
     }
 
     // ── K-0.4: directional Wipe / Push lowering ──────────────────────────────

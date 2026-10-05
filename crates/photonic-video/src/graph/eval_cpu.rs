@@ -47,6 +47,16 @@ pub trait FrameProvider {
         w: u32,
         h: u32,
     ) -> Image;
+    fn decode_native_video(
+        &mut self,
+        _asset: AssetId,
+        _src_time: Tick,
+        _input: &photonic_core::timeline::color::NativeInputColorInterpretation,
+        w: u32,
+        h: u32,
+    ) -> Image {
+        Image::new(w, h)
+    }
     fn decode_still(&mut self, asset: AssetId, w: u32, h: u32) -> Image;
     fn raster_vector(&mut self, vref: VectorRef, key: VectorStateKey, w: u32, h: u32) -> Image;
 }
@@ -86,12 +96,15 @@ pub fn evaluate_at(
     node: Option<crate::graph::ir::IrNodeId>,
 ) -> Image {
     let (cw, ch) = (canvas.0.max(1), canvas.1.max(1));
+    if graph.validate_working_color_domain().is_err() {
+        return Image::new(cw, ch);
+    }
     let canvas_scale = graph.canvas_scale((cw, ch));
     let native = graph.native_video_sources();
     let mut results: Vec<Option<Image>> = (0..graph.nodes.len()).map(|_| None).collect();
 
     for (i, node) in graph.nodes.iter().enumerate() {
-        let img = {
+        let mut img = {
             let inputs: Vec<&Image> = node
                 .inputs
                 .iter()
@@ -110,6 +123,15 @@ pub fn evaluate_at(
                 native[i],
             )
         };
+        if graph.working_color_domain != crate::graph::ir::WorkingColorDomain::LegacyLinearRec709 {
+            // Native graph nodes store premultiplied RGB in RGBA16F textures.
+            // Keep the scalar reference within that finite storage range too.
+            for pixel in &mut img.pixels {
+                for channel in &mut pixel[..3] {
+                    *channel = channel.clamp(-65504.0, 65504.0);
+                }
+            }
+        }
         results[i] = Some(img);
     }
 
@@ -147,6 +169,108 @@ fn eval_op(
     };
 
     match op {
+        IrOp::GradeMatteConstant { weight } => {
+            let mut image = Image::new(cw, ch);
+            image.pixels.fill([*weight, *weight, *weight, 1.0]);
+            image
+        }
+        IrOp::QualifierMatte {
+            qualifier,
+            mask,
+            native,
+        } => {
+            let mut image = in0();
+            for (index, pixel) in image.pixels.iter_mut().enumerate() {
+                let mut weight = if pixel[3] > 0.0 {
+                    photonic_render::grade::qualifier_key_weight(
+                        qualifier,
+                        [
+                            pixel[0] / pixel[3],
+                            pixel[1] / pixel[3],
+                            pixel[2] / pixel[3],
+                        ],
+                        *native,
+                    )
+                } else {
+                    0.0
+                };
+                if let Some(mask) = mask {
+                    weight *= mask.weight(
+                        (index as u32 % image.width) as f32 / image.width as f32
+                            + 0.5 / image.width as f32,
+                        (index as u32 / image.width) as f32 / image.height as f32
+                            + 0.5 / image.height as f32,
+                    );
+                }
+                *pixel = [weight, weight, weight, 1.0];
+            }
+            image
+        }
+        IrOp::GradeMatteRefine { refinement } => {
+            let mut image = in0();
+            if photonic_render::grade_graph::refine_matte_cpu(
+                &mut image.pixels,
+                image.width,
+                image.height,
+                *refinement,
+            )
+            .is_err()
+            {
+                image.pixels.fill([0.0, 0.0, 0.0, 1.0]);
+            }
+            image
+        }
+        IrOp::GradeKeyMix { mode } => {
+            let mut image = in0();
+            if let Some(second) = inputs.get(1) {
+                for (pixel, other) in image.pixels.iter_mut().zip(&second.pixels) {
+                    let a = pixel[0].clamp(0.0, 1.0);
+                    let b = other[0].clamp(0.0, 1.0);
+                    let weight = match mode {
+                        photonic_core::timeline::GradeKeyMixMode::Union => a.max(b),
+                        photonic_core::timeline::GradeKeyMixMode::Intersect => a.min(b),
+                        photonic_core::timeline::GradeKeyMixMode::Subtract => (a - b).max(0.0),
+                        photonic_core::timeline::GradeKeyMixMode::Multiply => a * b,
+                    };
+                    *pixel = [weight, weight, weight, 1.0];
+                }
+            }
+            image
+        }
+        IrOp::GradeMatteApply | IrOp::GradeLayerMix { .. } => {
+            let Some(original) = inputs.get(1) else {
+                return Image::new(cw, ch);
+            };
+            let mut image = (*original).clone();
+            if let Some(corrected) = inputs.first() {
+                for (index, (pixel, top)) in
+                    image.pixels.iter_mut().zip(&corrected.pixels).enumerate()
+                {
+                    let weight = match op {
+                        IrOp::GradeLayerMix { opacity } => *opacity,
+                        _ => inputs
+                            .get(2)
+                            .and_then(|matte| matte.pixels.get(index))
+                            .map_or(0.0, |p| p[0]),
+                    }
+                    .clamp(0.0, 1.0);
+                    if pixel[3] <= 0.0 {
+                        *pixel = [0.0; 4];
+                        continue;
+                    }
+                    for channel in 0..3 {
+                        let value = if top[3] > 0.0 {
+                            top[channel] * pixel[3] / top[3]
+                        } else {
+                            0.0
+                        };
+                        pixel[channel] = (pixel[channel] + (value - pixel[channel]) * weight)
+                            .clamp(-65504.0, 65504.0);
+                    }
+                }
+            }
+            image
+        }
         IrOp::DecodeVideo {
             asset,
             src_time,
@@ -158,6 +282,37 @@ fn eval_op(
             } else {
                 normalize_source(image, cw, ch)
             }
+        }
+        IrOp::NativeDecodeVideo {
+            asset,
+            src_time,
+            input,
+        } => {
+            let image = provider.decode_native_video(*asset, *src_time, input, cw, ch);
+            if native_video {
+                image
+            } else {
+                normalize_source(image, cw, ch)
+            }
+        }
+        IrOp::NativeDecodeStill { asset } => {
+            let mut image = normalize_source(provider.decode_still(*asset, cw, ch), cw, ch);
+            let matrix = crate::color::native::linear_srgb_to_ap1();
+            for pixel in &mut image.pixels {
+                if pixel[3] <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let mapped = matrix.transform([
+                    f64::from(pixel[0]),
+                    f64::from(pixel[1]),
+                    f64::from(pixel[2]),
+                ]);
+                for channel in 0..3 {
+                    pixel[channel] = mapped[channel] as f32;
+                }
+            }
+            image
         }
         IrOp::DecodeStill { asset } => {
             normalize_source(provider.decode_still(*asset, cw, ch), cw, ch)
@@ -171,6 +326,12 @@ fn eval_op(
         IrOp::SolidColor { color } => ops::solid(cw, ch, *color),
         IrOp::Transform2D { mat, sampling } => match inputs.first() {
             Some(input) => ops::transform2d_to_canvas(input, *mat, *sampling, cw, ch),
+            None => Image::new(cw, ch),
+        },
+        IrOp::Transform2DTransparent { mat, sampling } => match inputs.first() {
+            Some(input) => {
+                ops::transform2d_to_canvas_with_border(input, *mat, *sampling, cw, ch, true)
+            }
             None => Image::new(cw, ch),
         },
         IrOp::StabilizeWarp { warp, sampling } => match inputs.first() {
@@ -279,6 +440,238 @@ fn eval_op(
         },
         // Real kernel: the resolved grade stack (07 §3), the GPU-parity golden.
         IrOp::Grade { ops: grade_ops } => apply_grade_cpu_image(in0(), grade_ops),
+        IrOp::NativeExposure { stops } => {
+            let gain = stops.exp2();
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                for channel in &mut pixel[..3] {
+                    *channel *= gain;
+                }
+            }
+            image
+        }
+        IrOp::NativeLinearOffset { rgb } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                for channel in 0..3 {
+                    pixel[channel] += rgb[channel] * pixel[3];
+                }
+            }
+            image
+        }
+        IrOp::NativePrinterLights { points } => {
+            let gains = points.map(|point| (point / 12.0).exp2());
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                for channel in 0..3 {
+                    pixel[channel] *= gains[channel];
+                }
+            }
+            image
+        }
+        IrOp::NativeHighlightRolloff { knee, strength } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                let alpha = pixel[3];
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let straight = [pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha];
+                let mapped =
+                    photonic_render::grade::apply_highlight_rolloff(straight, *knee, *strength);
+                for channel in 0..3 {
+                    pixel[channel] = mapped[channel] * alpha;
+                }
+            }
+            image
+        }
+        IrOp::NativeMaskMix { mask } => {
+            if inputs[0].width != inputs[1].width || inputs[0].height != inputs[1].height {
+                return Image::new(cw, ch);
+            }
+            let mut image = inputs[1].clone();
+            for (i, pixel) in image.pixels.iter_mut().enumerate() {
+                let w = mask.weight(
+                    (i as u32 % cw) as f32 / cw as f32 + 0.5 / cw as f32,
+                    (i as u32 / cw) as f32 / ch as f32 + 0.5 / ch as f32,
+                );
+                for channel in 0..4 {
+                    pixel[channel] += (inputs[0].pixels[i][channel] - pixel[channel]) * w;
+                }
+            }
+            image
+        }
+        IrOp::NativeLut3d { lut } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                if pixel[3] <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let rgb = [
+                    pixel[0] / pixel[3],
+                    pixel[1] / pixel[3],
+                    pixel[2] / pixel[3],
+                ];
+                let sampled = if lut.tetrahedral {
+                    lut.table.sample_tetrahedral(rgb)
+                } else {
+                    lut.table.sample_trilinear(rgb)
+                };
+                for channel in 0..3 {
+                    pixel[channel] = (rgb[channel]
+                        + (sampled[channel] - rgb[channel]) * lut.intensity)
+                        * pixel[3];
+                }
+            }
+            image
+        }
+        IrOp::NativeLogCurves { curves } => {
+            let mut image = in0();
+            for p in &mut image.pixels {
+                let a = p[3];
+                if a <= 0.0 {
+                    *p = [0.0; 4];
+                    continue;
+                }
+                let rgb = photonic_render::native_transfer::curves_acescct(
+                    [p[0] / a, p[1] / a, p[2] / a],
+                    curves,
+                );
+                for c in 0..3 {
+                    p[c] = rgb[c] * a;
+                }
+            }
+            image
+        }
+        IrOp::NativeLogQualifier { qualifier } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                let a = pixel[3];
+                if a <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let rgb = photonic_render::native_transfer::qualifier_acescct(
+                    [pixel[0] / a, pixel[1] / a, pixel[2] / a],
+                    qualifier,
+                );
+                for c in 0..3 {
+                    pixel[c] = rgb[c] * a;
+                }
+            }
+            image
+        }
+        IrOp::NativeLogCdl { cdl } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                let a = pixel[3];
+                if a <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let rgb = photonic_render::native_transfer::cdl_no_clamp(
+                    [pixel[0] / a, pixel[1] / a, pixel[2] / a],
+                    *cdl,
+                );
+                for c in 0..3 {
+                    pixel[c] = rgb[c] * a;
+                }
+            }
+            image
+        }
+        IrOp::NativeLogContrast { pivot, amount } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                if pixel[3] <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                if *amount == 0.0 {
+                    continue;
+                }
+                for channel in 0..3 {
+                    pixel[channel] =
+                        (pivot + (pixel[channel] / pixel[3] - pivot) * amount.exp2()) * pixel[3];
+                }
+            }
+            image
+        }
+        IrOp::NativeSaturationVibrance {
+            saturation,
+            vibrance,
+        } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                if pixel[3] <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let rgb = [
+                    pixel[0] / pixel[3],
+                    pixel[1] / pixel[3],
+                    pixel[2] / pixel[3],
+                ];
+                let mapped = photonic_render::native_transfer::saturation_vibrance_ap1(
+                    rgb,
+                    *saturation,
+                    *vibrance,
+                );
+                for channel in 0..3 {
+                    pixel[channel] = mapped[channel] * pixel[3];
+                }
+            }
+            image
+        }
+        IrOp::NativeAcescct { direction } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                let alpha = f64::from(pixel[3]);
+                if alpha <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let straight = [pixel[0], pixel[1], pixel[2]].map(|v| f64::from(v) / alpha);
+                let converted = match direction {
+                    photonic_render::native_transfer::AcescctDirection::Encode => {
+                        crate::color::native::acescg_to_acescct(straight)
+                    }
+                    photonic_render::native_transfer::AcescctDirection::Decode => {
+                        crate::color::native::acescct_to_acescg(straight)
+                    }
+                };
+                for channel in 0..3 {
+                    pixel[channel] = (converted[channel] * alpha) as f32;
+                }
+            }
+            image
+        }
+        IrOp::NativeSdrOutput => {
+            let mut image = in0();
+            let Ok(transform) = crate::color::native_output::Aces2SdrOutput::shared() else {
+                return Image::new(cw, ch);
+            };
+            for pixel in &mut image.pixels {
+                *pixel = transform
+                    .map_premultiplied(pixel.map(f64::from))
+                    .map(|mapped| mapped.map(|value| value as f32))
+                    .unwrap_or([0.0; 4]);
+            }
+            image
+        }
+        IrOp::NativeSdrVideoOutput => {
+            let mut image = in0();
+            let Ok(transform) = crate::color::native_output::Aces2SdrOutput::shared() else {
+                return Image::new(cw, ch);
+            };
+            for pixel in &mut image.pixels {
+                *pixel = transform
+                    .map_premultiplied_video(pixel.map(f64::from))
+                    .map(|mapped| mapped.map(|value| value as f32))
+                    .unwrap_or([0.0; 4]);
+            }
+            image
+        }
         IrOp::CaptionOverlay { .. } => in0(), // GPU-only glyph composite (see header); CPU passes through
         IrOp::MatteExtract { .. } => in0(),   // P8 U²-Net inference
         IrOp::ChannelSplit { .. } => in0(),
@@ -385,13 +778,101 @@ pub fn merge_mode(op: &IrOp) -> Option<BlendMode> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_grade_image_mix_preserves_original_alpha_known_vector() {
+        use super::*;
+        let original = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![[0.125, -0.25, 1.0, 0.5]],
+        };
+        let corrected = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![[0.75, 0.5, 2.0, 0.25]],
+        };
+        let matte = Image {
+            width: 1,
+            height: 1,
+            pixels: vec![[0.25; 4]],
+        };
+        let output = eval_op(
+            &IrOp::GradeMatteApply,
+            &[&corrected, &original, &matte],
+            1,
+            1,
+            &mut EmptyProvider,
+            false,
+        );
+        assert_eq!(output.pixels[0], [0.46875, 0.0625, 1.75, 0.5]);
+        let output = eval_op(
+            &IrOp::GradeLayerMix { opacity: 0.25 },
+            &[&corrected, &original],
+            1,
+            1,
+            &mut EmptyProvider,
+            false,
+        );
+        assert_eq!(output.pixels[0], [0.46875, 0.0625, 1.75, 0.5]);
+        let zero = Image::new(1, 1);
+        assert_eq!(
+            eval_op(
+                &IrOp::GradeMatteApply,
+                &[&corrected, &zero, &matte],
+                1,
+                1,
+                &mut EmptyProvider,
+                false
+            )
+            .pixels[0],
+            [0.0; 4]
+        );
+    }
+
     use super::*;
     use crate::graph::compile::{compile, Quality};
-    use crate::graph::ir::LinearColor;
+    use crate::graph::ir::{
+        ContentHash, IrNode, IrNodeId, LinearColor, OutPort, WorkingColorDomain,
+    };
     use photonic_core::timeline::{
         Clip, ClipSource, FrameRate, Sequence, SequenceId, TimelineProject, Track, TrackKind,
     };
     use photonic_core::Color;
+
+    #[test]
+    fn managed_domain_fails_closed_before_legacy_grade_evaluation() {
+        let source = IrNode {
+            op: IrOp::SolidColor {
+                color: LinearColor {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                },
+            },
+            inputs: vec![],
+            content_hash: ContentHash(1),
+        };
+        let grade = IrNode {
+            op: IrOp::Grade { ops: vec![] },
+            inputs: vec![(IrNodeId(0), OutPort::default())],
+            content_hash: ContentHash(2),
+        };
+        let mut graph = FrameGraph {
+            nodes: vec![source, grade],
+            output: Some(IrNodeId(1)),
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(&graph, (2, 2), &mut EmptyProvider).pixels[0][0],
+            1.0
+        );
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        assert!(evaluate(&graph, (2, 2), &mut EmptyProvider)
+            .pixels
+            .iter()
+            .all(|pixel| *pixel == [0.0; 4]));
+    }
 
     fn project_with_two_solids(
         top: Color,

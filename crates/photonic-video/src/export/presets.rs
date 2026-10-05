@@ -315,8 +315,8 @@ fn prores_mezzanine() -> ExportPreset {
         name: "ProRes Mezzanine".to_string(),
         container: Container::Mov,
         // ProRes has no CRF-style knob in this catalog; `Lossless` is the
-        // sentinel meaning "encoder.rs applies the fixed 4444 profile,
-        // no rate control choice exposed."
+        // sentinel meaning "encoder.rs applies a fixed ProRes profile (4444
+        // with alpha, HQ 4:2:2 without), no rate control choice exposed."
         video: Some(VideoEncodeSpec {
             codec: VideoCodec::ProResLikeMezzanine,
             quality: QualityMode::Lossless,

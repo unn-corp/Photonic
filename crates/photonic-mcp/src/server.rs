@@ -70,6 +70,39 @@ impl ToolOutput {
     }
 }
 
+/// Exact document/history state successfully written by an MCP save.
+#[derive(Clone, Debug)]
+pub struct DocumentSaveReceipt {
+    pub document: photonic_core::DocumentId,
+    pub node: u64,
+    pub path: PathBuf,
+}
+
+/// Serialize MCP saves and retain bounded host notifications, including headless runs.
+#[derive(Default)]
+pub struct DocumentSaveState {
+    pub(crate) gate: Mutex<()>,
+    notifications: StdMutex<std::collections::VecDeque<DocumentSaveReceipt>>,
+}
+
+impl DocumentSaveState {
+    pub(crate) fn record(&self, receipt: DocumentSaveReceipt) {
+        if let Ok(mut notifications) = self.notifications.lock() {
+            if notifications.len() == 64 {
+                notifications.pop_front();
+            }
+            notifications.push_back(receipt);
+        }
+    }
+
+    pub fn take_notifications(&self) -> Vec<DocumentSaveReceipt> {
+        self.notifications
+            .lock()
+            .map(|mut queue| queue.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
+
 /// Shared application state injected into all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -77,6 +110,7 @@ pub struct AppState {
     pub history: Arc<Mutex<CommandHistory>>,
     /// Last native document path used by MCP save/save-as.
     pub document_path: Arc<StdMutex<Option<PathBuf>>>,
+    pub document_saves: Arc<DocumentSaveState>,
     /// Sends screenshot requests to the render thread.
     /// Uses std::sync::mpsc so the render thread can poll synchronously.
     pub capture_tx: Arc<StdMutex<std::sync::mpsc::Sender<oneshot::Sender<Vec<u8>>>>>,
@@ -120,6 +154,7 @@ impl AppState {
             document: Arc::new(Mutex::new(Document::new("t", 1920.0, 1080.0))),
             history: Arc::new(Mutex::new(CommandHistory::new(200))),
             document_path: Arc::new(StdMutex::new(None)),
+            document_saves: Default::default(),
             capture_tx: Arc::new(StdMutex::new(capture_tx)),
             config: McpServerConfig::default(),
             path_policy: PathPolicy::desktop_default(),
@@ -152,6 +187,7 @@ impl McpServer {
                 document,
                 history,
                 document_path: Arc::new(StdMutex::new(None)),
+                document_saves: Default::default(),
                 capture_tx: Arc::new(StdMutex::new(capture_tx)),
                 config,
                 path_policy: PathPolicy::desktop_default(),
@@ -168,6 +204,11 @@ impl McpServer {
     /// pathless `save_document` has the same save target as an opened file.
     pub fn with_document_path(mut self, document_path: Arc<StdMutex<Option<PathBuf>>>) -> Self {
         self.state.document_path = document_path;
+        self
+    }
+
+    pub fn with_document_saves(mut self, saves: Arc<DocumentSaveState>) -> Self {
+        self.state.document_saves = saves;
         self
     }
 
@@ -467,6 +508,7 @@ mod tests {
             document: Arc::new(Mutex::new(Document::new("auth test", 200.0, 100.0))),
             history: Arc::new(Mutex::new(CommandHistory::new(100))),
             document_path: Arc::new(StdMutex::new(None)),
+            document_saves: Default::default(),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig {
                 port: 7842,

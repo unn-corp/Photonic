@@ -192,6 +192,7 @@ mod tests {
             document: Arc::new(Mutex::new(Document::new("t", 512.0, 512.0))),
             history: Arc::new(Mutex::new(CommandHistory::new(100))),
             document_path: Arc::new(StdMutex::new(None)),
+            document_saves: Default::default(),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
             path_policy: photonic_core::PathPolicy::test_default(),

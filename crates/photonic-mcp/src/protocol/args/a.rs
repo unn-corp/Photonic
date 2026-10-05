@@ -12,6 +12,12 @@ pub struct SaveDocumentArgs {
     pub path: Option<String>,
 }
 
+/// Destination folder for a portable archive of the current project.
+#[derive(Debug, Deserialize)]
+pub struct ArchiveProjectArgs {
+    pub path: String,
+}
+
 /// Arguments for `copy_nodes_to_clipboard` tool
 #[derive(Debug, Deserialize)]
 pub struct CopyNodesToClipboardArgs {

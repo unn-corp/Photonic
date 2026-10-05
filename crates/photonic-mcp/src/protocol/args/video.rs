@@ -16,9 +16,9 @@
 //! `timeline/ops.rs` fn, which does take explicit ids.
 
 use photonic_core::timeline::{
-    AssetId, BinId, ChannelMap, ClipId, ClipTransform, CueId, FadeShape, FrameRate, GraphId,
-    GraphNodeId, Interp, MarkerCategoryId, MarkerGlyph, MarkerId, PropValue, SequenceFormat,
-    SequenceId, TrackId, TrackKind, TransitionKind, TransitionParams,
+    AssetId, BinId, ChannelMap, ClipId, ClipTransform, CueId, FadeShape, FrameRate, GradeOpId,
+    GraphId, GraphNodeId, Interp, MarkerCategoryId, MarkerGlyph, MarkerId, PropValue,
+    SequenceFormat, SequenceId, SharedLookId, TrackId, TrackKind, TransitionKind, TransitionParams,
 };
 use serde::Deserialize;
 
@@ -959,6 +959,10 @@ pub enum EffectStackOp {
     Reorder,
     SetParam,
     SetGrade,
+    ConvertGradeGraph,
+    AddGradeGraphNode,
+    AddGradeGraphUtility,
+    RemoveGradeGraphNode,
 }
 
 /// One verb for every scope of the video effect stack. `clip` is included so a
@@ -1002,6 +1006,18 @@ pub struct EffectStackArgs {
     /// `op=set_grade`: a `Grade` object, or `null` to clear it.
     #[serde(default)]
     pub grade: Option<serde_json::Value>,
+    /// `op=add_grade_graph_node`: complete corrector payload.
+    #[serde(default)]
+    pub grade_op: Option<photonic_core::timeline::GradeOp>,
+    /// `op=add_grade_graph_node`: start a new branch and mix it over the current output.
+    #[serde(default)]
+    pub parallel: Option<bool>,
+    /// Typed key utility payload for add_grade_graph_utility.
+    #[serde(default)]
+    pub grade_graph_node: Option<photonic_core::timeline::GradeGraphNode>,
+    /// `op=remove_grade_graph_node`: local graph node id.
+    #[serde(default)]
+    pub node_id: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1245,6 +1261,35 @@ pub struct RelinkMediaArgs {
     pub allow_hash_mismatch: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SetLutInterpretationArgs {
+    pub asset_id: AssetId,
+    pub interpretation: photonic_core::timeline::color::LutColorInterpretation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum InputColorTargetArg {
+    Asset { asset_id: AssetId },
+    Clip { clip_id: ClipId },
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetInputColorArgs {
+    #[serde(flatten)]
+    pub target: InputColorTargetArg,
+    /// Null clears this override, allowing inheritance from the asset or
+    /// sequence policy. The selected color runtime still requires a resolvable input.
+    /// Value, rather than Option, requires the caller to explicitly send null
+    /// when clearing instead of silently clearing on a missing argument.
+    pub interpretation: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateNativeColorDraftArgs {
+    pub sequence_id: SequenceId,
+}
+
 /// No arguments — the whole pool is inspected (26 K-C6).
 #[derive(Debug, Deserialize, Default)]
 pub struct FindOfflineMediaArgs {}
@@ -1477,6 +1522,9 @@ pub enum TranscodePresetArg {
 
 #[derive(Debug, Deserialize)]
 pub struct ExportSequenceArgs {
+    /// Write an adjacent reproducibility sidecar after successful encoding.
+    #[serde(default)]
+    pub write_manifest: bool,
     /// Reject export if the live document has changed since inspection.
     #[serde(default)]
     pub expected_revision: Option<u64>,
@@ -1767,6 +1815,121 @@ pub struct SetGradeArgs {
     pub grade: Option<serde_json::Value>,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupGradeStageArg {
+    Pre,
+    Post,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupGradeOpArg {
+    Get,
+    Set,
+}
+
+/// Inspect or replace a shared group pre/post grade. `grade: null` clears it.
+#[derive(Debug, Deserialize)]
+pub struct GroupGradeArgs {
+    pub group_id: photonic_core::timeline::GroupId,
+    pub stage: GroupGradeStageArg,
+    pub op: GroupGradeOpArg,
+    #[serde(default)]
+    pub grade: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeVersionOp {
+    List,
+    Add,
+    Activate,
+    Rename,
+    Remove,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GradeVersionArgs {
+    pub clip_id: ClipId,
+    pub op: GradeVersionOp,
+    #[serde(default)]
+    pub version_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedLookOp {
+    List,
+    Create,
+    Update,
+    Remove,
+    Link,
+    MakeIndependent,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SharedLookArgs {
+    pub op: SharedLookOp,
+    #[serde(default)]
+    pub look_id: Option<SharedLookId>,
+    #[serde(default)]
+    pub clip_id: Option<ClipId>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub grade: Option<serde_json::Value>,
+}
+
+/// Read the Color workspace's saved gallery entries for one sequence.
+#[derive(Debug, Deserialize)]
+pub struct ListReferenceStillsArgs {
+    #[serde(default)]
+    pub sequence_id: Option<SequenceId>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveReferenceStillArgs {
+    #[serde(default)]
+    pub sequence_id: Option<SequenceId>,
+    pub still_id: uuid::Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CaptureReferenceStillArgs {
+    #[serde(default)]
+    pub sequence_id: Option<SequenceId>,
+    pub at_ticks: i64,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub source_clip_id: Option<ClipId>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CompareReferenceStillArgs {
+    #[serde(default)]
+    pub sequence_id: Option<SequenceId>,
+    pub still_id: uuid::Uuid,
+    /// Defaults to the still's source time.
+    #[serde(default)]
+    pub at_ticks: Option<i64>,
+}
+
+/// Accept the currently reproducible suggestion from compare_reference_still.
+/// The expected frame stamp prevents a stale preview from editing a new grade.
+#[derive(Debug, Deserialize)]
+pub struct ApplyShotMatchArgs {
+    pub clip_id: ClipId,
+    #[serde(default)]
+    pub sequence_id: Option<SequenceId>,
+    pub still_id: uuid::Uuid,
+    pub at_ticks: i64,
+    pub expected_revision: u64,
+}
+
 /// Attach (or, with `lut_path` omitted/`null`, remove) a 3D LUT as part of the
 /// clip's grade stack.
 #[derive(Debug, Deserialize)]
@@ -1783,6 +1946,13 @@ pub struct ApplyLutArgs {
 pub struct CopyGradeArgs {
     pub source_clip_id: ClipId,
     pub target_clip_ids: Vec<ClipId>,
+    /// Omit for the whole grade; supply IDs to copy only those correctors.
+    #[serde(default)]
+    pub op_ids: Option<Vec<GradeOpId>>,
+    /// Append selected correctors to each target's current grade. Full-grade
+    /// copy replaces by default.
+    #[serde(default)]
+    pub append: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1802,6 +1972,42 @@ pub struct GradePresetArgs {
     pub name: Option<String>,
 }
 
+/// Read a selected qualifier's isolation matte from its exact grading input.
+#[derive(Debug, Deserialize)]
+pub struct InspectQualifierArgs {
+    pub clip_id: ClipId,
+    pub op_id: photonic_core::timeline::GradeOpId,
+    #[serde(default)]
+    pub graph_node_id: Option<u32>,
+    #[serde(default)]
+    pub at_ticks: Option<i64>,
+    #[serde(default)]
+    pub at_tc: Option<String>,
+    #[serde(default)]
+    pub at_seconds: Option<f64>,
+    #[serde(default)]
+    pub format_index: Option<usize>,
+}
+
+/// Sample bounded ACEScct/AP1 input coordinates before a native corrector.
+#[derive(Debug, Deserialize)]
+pub struct SampleGradeInputArgs {
+    pub clip_id: ClipId,
+    pub op_id: photonic_core::timeline::GradeOpId,
+    #[serde(default)]
+    pub graph_node_id: Option<u32>,
+    pub x: f64,
+    pub y: f64,
+    #[serde(default)]
+    pub at_ticks: Option<i64>,
+    #[serde(default)]
+    pub at_tc: Option<String>,
+    #[serde(default)]
+    pub at_seconds: Option<f64>,
+    #[serde(default)]
+    pub format_index: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GetScopesArgs {
     pub clip_id: ClipId,
@@ -1819,6 +2025,17 @@ pub struct GetScopesArgs {
     /// instead (still pre-`CaptionOverlay`).
     #[serde(default)]
     pub tap: ScopeTap,
+    /// Matrix used to bin the vectorscope. The source signal remains Legacy SDR.
+    #[serde(default)]
+    pub vectorscope_matrix: VectorscopeMatrix,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VectorscopeMatrix {
+    #[default]
+    Bt709,
+    Bt601,
 }
 
 /// Which texture `get_scopes` measures (K-E2).

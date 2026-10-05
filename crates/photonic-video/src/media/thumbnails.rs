@@ -484,6 +484,63 @@ fn planes_to_rgba(planes: &crate::decode::DecodedPlanes) -> RgbaThumb {
                 }
             }
         }
+        DecodedPlanes::Yuv422 { .. } => {
+            let (y, cb, cr) = (planes.y(), planes.cb(), planes.cr());
+            let cw = wu.div_ceil(2);
+            for py in 0..hu {
+                let crow = py * cw;
+                for px in 0..wu {
+                    let ci = crow + px / 2;
+                    let (r, g, b) = yuv_to_rgb(y[py * wu + px], cb[ci], cr[ci]);
+                    let o = (py * wu + px) * 4;
+                    rgba[o] = r;
+                    rgba[o + 1] = g;
+                    rgba[o + 2] = b;
+                    rgba[o + 3] = 255;
+                }
+            }
+        }
+        DecodedPlanes::Yuv444 { .. } => {
+            let (y, cb, cr) = (planes.y(), planes.cb(), planes.cr());
+            for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+                let (r, g, b) = yuv_to_rgb(y[index], cb[index], cr[index]);
+                pixel.copy_from_slice(&[r, g, b, 255]);
+            }
+        }
+        DecodedPlanes::Yuv420P16 { .. } => {
+            let (y, cb, cr) = (planes.y(), planes.cb(), planes.cr());
+            let cw = wu.div_ceil(2);
+            for py in 0..hu {
+                let crow = (py / 2) * cw;
+                for px in 0..wu {
+                    let ci = crow + px / 2;
+                    let (r, g, b) =
+                        yuv_to_rgb(y[(py * wu + px) * 2 + 1], cb[ci * 2 + 1], cr[ci * 2 + 1]);
+                    let o = (py * wu + px) * 4;
+                    rgba[o] = r;
+                    rgba[o + 1] = g;
+                    rgba[o + 2] = b;
+                    rgba[o + 3] = 255;
+                }
+            }
+        }
+        DecodedPlanes::Yuv422P16 { .. } => {
+            let (y, cb, cr) = (planes.y(), planes.cb(), planes.cr());
+            let cw = wu.div_ceil(2);
+            for py in 0..hu {
+                let crow = py * cw;
+                for px in 0..wu {
+                    let ci = crow + px / 2;
+                    let (r, g, b) =
+                        yuv_to_rgb(y[(py * wu + px) * 2 + 1], cb[ci * 2 + 1], cr[ci * 2 + 1]);
+                    let o = (py * wu + px) * 4;
+                    rgba[o] = r;
+                    rgba[o + 1] = g;
+                    rgba[o + 2] = b;
+                    rgba[o + 3] = 255;
+                }
+            }
+        }
         DecodedPlanes::Yuva444 { .. } => {
             let (y, cb, cr, a) = (
                 planes.y(),
@@ -497,6 +554,16 @@ fn planes_to_rgba(planes: &crate::decode::DecodedPlanes) -> RgbaThumb {
                 chunk[1] = g;
                 chunk[2] = b;
                 chunk[3] = a[i];
+            }
+        }
+        DecodedPlanes::Yuv444P16 { .. } | DecodedPlanes::Yuva444P16 { .. } => {
+            let (y, cb, cr, a) = (planes.y(), planes.cb(), planes.cr(), planes.a());
+            for (i, chunk) in rgba.chunks_exact_mut(4).enumerate() {
+                let (r, g, b) = yuv_to_rgb(y[i * 2 + 1], cb[i * 2 + 1], cr[i * 2 + 1]);
+                chunk[0] = r;
+                chunk[1] = g;
+                chunk[2] = b;
+                chunk[3] = a.map_or(255, |alpha| alpha[i * 2 + 1]);
             }
         }
     }

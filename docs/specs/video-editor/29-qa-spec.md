@@ -201,7 +201,7 @@ The AS-1/2/3 script-vs-GUI pairs (§3) are the headline CAP-019 gate, but they d
 |---|---|---|---|---|
 | `generate_proxies` on a 4K-class fixture, then scrub | integration | a synthetically-tagged "high-res" fixture (real 4K media out of fixture-size budget — see §7 gap below) | scrubbing reads the proxy file, not the original (assert via file-handle/path introspection, not just visually) | **P3** |
 | `set_proxy_mode(ForceOriginal)` while a proxy exists | integration | same fixture | playback/scrub reads the original despite a proxy being present | **P3** |
-| `remove_proxy` | integration | same fixture | proxy file deleted, mode falls back to original, no dangling reference in the asset's `MediaProbe`/proxy fields | P3 |
+| `remove_proxy` | integration | same fixture | proxy detached in one undoable edit, mode falls back to original, cache file retained so undo can restore the proxy | P3 |
 | Export always uses originals regardless of proxy mode | export-verify | same fixture | exported frame quality/bytes trace to the original, not the proxy (spot-check via resolution or a marked pixel difference) | P3/P4 |
 
 ### CAP-015 — Color grade: exposure/wheels/curves/HSL/LUT + scopes

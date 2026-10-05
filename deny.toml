@@ -1,11 +1,13 @@
 # cargo-deny configuration — license & supply-chain gate.
 # Install:  cargo install cargo-deny --locked
 # Run:      cargo deny check licenses
-# Intended to run in CI so a new dependency under a non-permissive license fails
-# the build instead of silently shipping in an MIT-licensed binary.
+# License baseline gate. A pass is not a complete commercial release review:
+# check bundled assets, optional/native dependencies, exact FFmpeg build, and
+# the obligations recorded in docs/implementation/commercial-license-review.md.
 
 [licenses]
-# Only allow licenses compatible with redistributing under MIT.
+# Permissive licenses may be used commercially when their conditions are met.
+# Per-crate exceptions below still need their recorded obligations fulfilled.
 allow = [
     "MIT",
     "Apache-2.0",

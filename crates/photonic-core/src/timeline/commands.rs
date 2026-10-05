@@ -146,8 +146,8 @@ pub enum FxOwner {
 /// resolves through `active_sequence`; a video master stack is per-sequence and
 /// must stay addressable while another sequence is active, e.g. from MCP).
 ///
-/// Ordering of the four stacks at evaluation time (35 §2, applied by
-/// `photonic-video`'s `graph::compile`): asset → clip → track → master.
+/// Ordering at evaluation time (`photonic-video`'s `graph::compile`): asset →
+/// clip effects → group pre → clip grade → group post → track → master.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VfxOwner {
@@ -155,6 +155,8 @@ pub enum VfxOwner {
     Track(TrackId),
     Master(SequenceId),
     Asset(AssetId),
+    GroupPre(GroupId),
+    GroupPost(GroupId),
 }
 
 impl VfxOwner {
@@ -165,6 +167,8 @@ impl VfxOwner {
             VfxOwner::Track(_) => "track",
             VfxOwner::Master(_) => "master",
             VfxOwner::Asset(_) => "asset",
+            VfxOwner::GroupPre(_) => "group pre",
+            VfxOwner::GroupPost(_) => "group post",
         }
     }
 }
@@ -433,6 +437,30 @@ pub enum TimelineCmd {
         old_hash: Option<String>,
         new_hash: Option<String>,
     },
+    /// Pin the full bytes of a creative LUT independently of the sampled
+    /// media relink identity.
+    SetAssetLutHash {
+        asset: AssetId,
+        old: Option<String>,
+        new: Option<String>,
+    },
+    /// Declare a creative/technical LUT's input and output signal spaces.
+    SetAssetLutColor {
+        asset: AssetId,
+        old: Option<super::color::LutColorInterpretation>,
+        new: Option<super::color::LutColorInterpretation>,
+    },
+    /// Explicit input interpretation, independent of technical probe metadata.
+    SetAssetInputColor {
+        asset: AssetId,
+        old: Option<super::color::InputColorInterpretation>,
+        new: Option<super::color::InputColorInterpretation>,
+    },
+    SetAssetNativeInputColor {
+        asset: AssetId,
+        old: Option<super::color::NativeInputColorInterpretation>,
+        new: Option<super::color::NativeInputColorInterpretation>,
+    },
     /// K-C2 star rating (1–5) or clear (`None`).
     SetAssetRating {
         asset: AssetId,
@@ -475,6 +503,12 @@ pub enum TimelineCmd {
     },
     AddSequence {
         sequence: Box<Sequence>,
+    },
+    /// Replace a sequence gallery as one undoable edit.
+    SetReferenceStills {
+        seq: SequenceId,
+        old: Vec<super::sequence::ReferenceStill>,
+        new: Vec<super::sequence::ReferenceStill>,
     },
     RemoveSequence {
         sequence: Box<Sequence>,
@@ -659,6 +693,12 @@ pub enum TimelineCmd {
         old: Option<Box<Grade>>,
         new: Option<Box<Grade>>,
     },
+    /// Add, edit, or remove one project-wide reusable grade.
+    SetSharedLook {
+        id: super::ids::SharedLookId,
+        old: Option<Box<super::grade::SharedLook>>,
+        new: Option<Box<super::grade::SharedLook>>,
+    },
     /// Add a graph to the arena (08 §4 composition lifecycle).
     AddGraph {
         graph: Box<super::graph::NodeGraph>,
@@ -823,6 +863,7 @@ fn effect_stack_mut<'a>(
         VfxOwner::Track(t) => find_track_mut(proj, *t).map(|t| &mut t.effects),
         VfxOwner::Master(s) => proj.sequences.get_mut(s).map(|s| &mut s.master_effects),
         VfxOwner::Asset(a) => proj.media.assets.get_mut(a).map(|a| &mut a.effects),
+        VfxOwner::GroupPre(_) | VfxOwner::GroupPost(_) => None,
     }
 }
 
@@ -836,6 +877,16 @@ fn grade_slot_mut<'a>(
         VfxOwner::Track(t) => find_track_mut(proj, *t).map(|t| &mut t.grade),
         VfxOwner::Master(s) => proj.sequences.get_mut(s).map(|s| &mut s.master_grade),
         VfxOwner::Asset(a) => proj.media.assets.get_mut(a).map(|a| &mut a.grade),
+        VfxOwner::GroupPre(g) => proj
+            .sequences
+            .values_mut()
+            .find_map(|sequence| sequence.groups.get_mut(g).map(|group| &mut group.pre_grade)),
+        VfxOwner::GroupPost(g) => proj.sequences.values_mut().find_map(|sequence| {
+            sequence
+                .groups
+                .get_mut(g)
+                .map(|group| &mut group.post_grade)
+        }),
     }
 }
 
@@ -1748,6 +1799,7 @@ impl TimelineCmd {
             TimelineCmd::AddAsset { asset } | TimelineCmd::RemoveAsset { asset } => json_len(asset),
             TimelineCmd::AddSequence { sequence }
             | TimelineCmd::RemoveSequence { sequence, .. } => json_len(sequence),
+            TimelineCmd::SetReferenceStills { old, new, .. } => json_len(old) + json_len(new),
             TimelineCmd::AddTrack { track, .. } | TimelineCmd::RemoveTrack { track, .. } => {
                 json_len(track)
             }
@@ -1755,7 +1807,12 @@ impl TimelineCmd {
                 json_len(clip)
             }
             TimelineCmd::SetClipProp { old, new, .. } => json_len(old) + json_len(new),
+            TimelineCmd::SetAssetInputColor { old, new, .. } => json_len(old) + json_len(new),
+            TimelineCmd::SetAssetNativeInputColor { old, new, .. } => json_len(old) + json_len(new),
             TimelineCmd::SetGrade { old, new, .. } => {
+                old.as_ref().map_or(0, json_len) + new.as_ref().map_or(0, json_len)
+            }
+            TimelineCmd::SetSharedLook { old, new, .. } => {
                 old.as_ref().map_or(0, json_len) + new.as_ref().map_or(0, json_len)
             }
             TimelineCmd::AddEffect { effect, .. } | TimelineCmd::RemoveEffect { effect, .. } => {
@@ -1777,7 +1834,11 @@ impl TimelineCmd {
             TimelineCmd::RelinkAsset { .. } => "Relink media".into(),
             TimelineCmd::SetAssetProxy { .. } => "Update media proxy".into(),
             TimelineCmd::SetAssetMeta { .. } => "Update media metadata".into(),
+            TimelineCmd::SetAssetLutHash { .. } => "Pin LUT content".into(),
+            TimelineCmd::SetAssetLutColor { .. } => "Set LUT interpretation".into(),
             TimelineCmd::SetAssetRating { .. } => "Rate media".into(),
+            TimelineCmd::SetAssetInputColor { .. } => "Interpret input color".into(),
+            TimelineCmd::SetAssetNativeInputColor { .. } => "Interpret native input color".into(),
             TimelineCmd::SetAssetTags { .. } => "Tag media".into(),
             TimelineCmd::SetAssetTagIds { .. } => "Tag media (ids)".into(),
             TimelineCmd::AddMediaTag { .. } => "Add media tag".into(),
@@ -1791,6 +1852,7 @@ impl TimelineCmd {
                 }
             }
             TimelineCmd::AddSequence { sequence } => format!("Add sequence \"{}\"", sequence.name),
+            TimelineCmd::SetReferenceStills { .. } => "Edit reference stills".into(),
             TimelineCmd::RemoveSequence { .. } => "Remove sequence".into(),
             TimelineCmd::RenameSequence { new, .. } => format!("Rename sequence \"{new}\""),
             TimelineCmd::SetSequenceStartTimecode { .. } => "Set sequence start timecode".into(),
@@ -1827,6 +1889,7 @@ impl TimelineCmd {
                 format!("Edit {} effect", owner.scope_noun())
             }
             TimelineCmd::SetGrade { owner, .. } => format!("Edit {} grade", owner.scope_noun()),
+            TimelineCmd::SetSharedLook { .. } => "Edit shared look".into(),
             TimelineCmd::AddGraph { .. } => "Add composition".into(),
             TimelineCmd::RemoveGraph { .. } => "Remove composition".into(),
             TimelineCmd::SetClipComposition { .. } => "Set composition".into(),
@@ -1914,6 +1977,26 @@ impl TimelineCmd {
                     a.content_hash = new_hash.clone();
                 }
             }
+            TimelineCmd::SetAssetLutHash { asset, new, .. } => {
+                if let Some(a) = p.media.assets.get_mut(asset) {
+                    a.lut_full_hash = new.clone();
+                }
+            }
+            TimelineCmd::SetAssetLutColor { asset, new, .. } => {
+                if let Some(a) = p.media.assets.get_mut(asset) {
+                    a.lut_color = new.clone();
+                }
+            }
+            TimelineCmd::SetAssetInputColor { asset, new, .. } => {
+                if let Some(a) = p.media.assets.get_mut(asset) {
+                    a.input_color = new.clone();
+                }
+            }
+            TimelineCmd::SetAssetNativeInputColor { asset, new, .. } => {
+                if let Some(a) = p.media.assets.get_mut(asset) {
+                    a.native_input_color = new.clone();
+                }
+            }
             TimelineCmd::SetAssetRating { asset, new, .. } => {
                 if let Some(a) = p.media.assets.get_mut(asset) {
                     a.rating = *new;
@@ -1954,6 +2037,11 @@ impl TimelineCmd {
                 }
                 if p.active_sequence.is_none() {
                     p.active_sequence = Some(id);
+                }
+            }
+            TimelineCmd::SetReferenceStills { seq, new, .. } => {
+                if let Some(sequence) = p.sequences.get_mut(seq) {
+                    sequence.reference_stills = new.clone();
                 }
             }
             TimelineCmd::RemoveSequence {
@@ -2188,7 +2276,15 @@ impl TimelineCmd {
             TimelineCmd::SetClipProp { track, new, .. } => {
                 if let Some(t) = find_track_mut(p, *track) {
                     if let Some(slot) = t.clips.iter_mut().find(|c| c.id == new.id) {
-                        *slot = (**new).clone();
+                        let mut edited = (**new).clone();
+                        if let Some(active) = edited.active_grade_version {
+                            if let Some(version) =
+                                edited.grade_versions.iter_mut().find(|v| v.id == active)
+                            {
+                                version.grade = edited.grade.clone();
+                            }
+                        }
+                        *slot = edited;
                         t.clips.sort_by_key(|c| c.start.0);
                     }
                 }
@@ -2258,10 +2354,30 @@ impl TimelineCmd {
                 }
             }
             TimelineCmd::SetGrade { owner, new, .. } => {
-                if let Some(slot) = grade_slot_mut(p, owner) {
-                    *slot = new.as_ref().map(|g| (**g).clone());
+                let grade = new.as_ref().map(|g| (**g).clone());
+                if let VfxOwner::Clip(id) = owner {
+                    if let Some(clip) = find_clip_mut(p, *id) {
+                        clip.grade = grade.clone();
+                        if let Some(active) = clip.active_grade_version {
+                            if let Some(version) =
+                                clip.grade_versions.iter_mut().find(|v| v.id == active)
+                            {
+                                version.grade = grade;
+                            }
+                        }
+                    }
+                } else if let Some(slot) = grade_slot_mut(p, owner) {
+                    *slot = grade;
                 }
             }
+            TimelineCmd::SetSharedLook { id, new, .. } => match new {
+                Some(look) => {
+                    p.shared_looks.insert(*id, (**look).clone());
+                }
+                None => {
+                    p.shared_looks.remove(id);
+                }
+            },
             TimelineCmd::AddGraph { graph } => {
                 p.graphs.insert(graph.id, (**graph).clone());
             }
@@ -2408,6 +2524,30 @@ impl TimelineCmd {
                 old_hash: new_hash.clone(),
                 new_hash: old_hash.clone(),
             },
+            TimelineCmd::SetAssetLutHash { asset, old, new } => TimelineCmd::SetAssetLutHash {
+                asset: *asset,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            TimelineCmd::SetAssetLutColor { asset, old, new } => TimelineCmd::SetAssetLutColor {
+                asset: *asset,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            TimelineCmd::SetAssetInputColor { asset, old, new } => {
+                TimelineCmd::SetAssetInputColor {
+                    asset: *asset,
+                    old: new.clone(),
+                    new: old.clone(),
+                }
+            }
+            TimelineCmd::SetAssetNativeInputColor { asset, old, new } => {
+                TimelineCmd::SetAssetNativeInputColor {
+                    asset: *asset,
+                    old: new.clone(),
+                    new: old.clone(),
+                }
+            }
             TimelineCmd::SetAssetRating { asset, old, new } => TimelineCmd::SetAssetRating {
                 asset: *asset,
                 old: *new,
@@ -2446,6 +2586,11 @@ impl TimelineCmd {
                 sequence: sequence.clone(),
                 order_index: 0,
                 was_active: false,
+            },
+            TimelineCmd::SetReferenceStills { seq, old, new } => TimelineCmd::SetReferenceStills {
+                seq: *seq,
+                old: new.clone(),
+                new: old.clone(),
             },
             TimelineCmd::RemoveSequence { sequence, .. } => TimelineCmd::AddSequence {
                 sequence: sequence.clone(),
@@ -2717,6 +2862,11 @@ impl TimelineCmd {
                 old: new.clone(),
                 new: old.clone(),
             },
+            TimelineCmd::SetSharedLook { id, old, new } => TimelineCmd::SetSharedLook {
+                id: *id,
+                old: new.clone(),
+                new: old.clone(),
+            },
             TimelineCmd::AddGraph { graph } => TimelineCmd::RemoveGraph {
                 graph: graph.clone(),
             },
@@ -2894,6 +3044,22 @@ impl TimelineCmd {
                 new: incoming.clone(),
             }),
             (
+                SetSharedLook {
+                    id,
+                    old: Some(old),
+                    new: Some(_),
+                },
+                SetSharedLook {
+                    id: next_id,
+                    new: Some(incoming),
+                    ..
+                },
+            ) if id == next_id => Some(SetSharedLook {
+                id: *id,
+                old: Some(old.clone()),
+                new: Some(incoming.clone()),
+            }),
+            (
                 SetKeyframe {
                     target,
                     path,
@@ -2932,6 +3098,18 @@ impl TimelineCmd {
                 index: *index,
                 old: old.clone(),
                 new: incoming.clone(),
+            }),
+            (
+                SetGrade { owner, old, .. },
+                SetGrade {
+                    owner: next_owner,
+                    new,
+                    ..
+                },
+            ) if owner == next_owner => Some(SetGrade {
+                owner: *owner,
+                old: old.clone(),
+                new: new.clone(),
             }),
             (GraphEdit(a), GraphEdit(b)) => GraphCmd::coalesce(a, b).map(GraphEdit),
             (AudioEdit(a), AudioEdit(b)) => AudioCmd::coalesce(a, b).map(AudioEdit),

@@ -38,7 +38,10 @@ pub use motion::{
     MotionMetadataAdapter, MotionSeries,
 };
 pub use poster::{ensure_poster, poster_cache_dir, poster_cache_path, poster_ready, PosterError};
-pub use probe::{content_hash, probe_asset, probe_details, ProbeDetails, ProbeError};
+pub use probe::{
+    content_hash, full_content_hash, full_content_hash_bytes, probe_asset, probe_details,
+    ProbeDetails, ProbeError,
+};
 pub use proxy::{
     generate_proxy, proxy_cache_dir, proxy_cache_path, resolve_decode_input,
     should_auto_generate_proxy, validate_attach, AttachError, AttachValidation, ProxyError,

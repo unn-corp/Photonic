@@ -1,6 +1,35 @@
 use super::*;
 
 impl PhotonicApp {
+    /// Move the grading session to a clip without touching document history.
+    /// Resolve its start from the current document so a queued action cannot
+    /// seek to a stale timeline position after an intervening edit.
+    pub(super) fn select_grade_clip(
+        &mut self,
+        doc: &Document,
+        clip_id: photonic_core::timeline::ClipId,
+    ) -> bool {
+        let Some(sequence) = doc.timeline.as_ref().and_then(|project| {
+            project
+                .active_sequence
+                .and_then(|id| project.sequences.get(&id))
+        }) else {
+            return false;
+        };
+        let Some(clip) = sequence
+            .video_tracks
+            .iter()
+            .flat_map(|track| &track.clips)
+            .find(|clip| clip.id == clip_id)
+        else {
+            return false;
+        };
+        self.timeline_selection = vec![clip_id];
+        self.selected_grade_op = None;
+        self.playhead = clip.start.max(photonic_core::timeline::Tick::ZERO);
+        true
+    }
+
     fn retain_existing_timeline_selection(&mut self, doc: &Document) {
         let sequence = doc.timeline.as_ref().and_then(|project| {
             project
@@ -30,6 +59,41 @@ impl PhotonicApp {
         // to &self/&mut self methods (build_shape_with_tool, do_group_selected).
         'actions: for action in std::mem::take(&mut self.pending_panel_actions) {
             match action {
+                PanelAction::GradeInputSelectionChanged {
+                    seq,
+                    track,
+                    clip,
+                    op,
+                    graph_node,
+                } => {
+                    self.change_grade_input_selection(
+                        ctx,
+                        doc,
+                        super::QualifierMatteTarget {
+                            sequence: seq,
+                            track,
+                            clip,
+                            op,
+                            graph_node,
+                        },
+                    );
+                }
+                PanelAction::ToggleQualifierMatte {
+                    seq,
+                    track,
+                    clip,
+                    op,
+                    graph_node,
+                } => {
+                    let target = super::QualifierMatteTarget {
+                        sequence: seq,
+                        track,
+                        clip,
+                        op,
+                        graph_node,
+                    };
+                    self.toggle_qualifier_matte(ctx, doc, target);
+                }
                 PanelAction::SelectNode { node_id } => {
                     if doc.nodes.contains_key(&node_id) {
                         self.selected_id = Some(node_id);
@@ -151,13 +215,131 @@ impl PhotonicApp {
                 }
                 PanelAction::MediaRelink { asset } => {
                     use photonic_core::timeline::ops;
-                    let dialog = rfd::FileDialog::new().set_title("Relink media");
+                    let is_lut = doc
+                        .timeline
+                        .as_ref()
+                        .and_then(|p| p.media.assets.get(&asset))
+                        .is_some_and(|a| a.kind == photonic_core::timeline::AssetKind::Lut3d);
+                    let dialog = rfd::FileDialog::new().set_title(if is_lut {
+                        "Replace / repin LUT"
+                    } else {
+                        "Relink media"
+                    });
                     let picked = super::run_file_dialog(move || dialog.pick_file());
                     if let Some(new_path) = picked {
                         if let Some(p) = doc.timeline.as_ref() {
-                            if let Ok(cmd) = ops::relink_asset(p, asset, new_path) {
+                            if is_lut {
+                                let result = (|| -> Result<Vec<Command>, String> {
+                                    let bytes =
+                                        std::fs::read(&new_path).map_err(|e| e.to_string())?;
+                                    let source =
+                                        std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
+                                    photonic_render::parse_cube(source)
+                                        .map_err(|e| e.to_string())?;
+                                    let pin =
+                                        photonic_video::media::full_content_hash_bytes(&bytes);
+                                    let sampled = photonic_video::media::content_hash(&new_path)
+                                        .map_err(|e| e.to_string())?;
+                                    if photonic_video::media::full_content_hash(&new_path)
+                                        .map_err(|e| e.to_string())?
+                                        != pin
+                                    {
+                                        return Err(
+                                            "LUT changed while it was being inspected".into()
+                                        );
+                                    }
+                                    let old = p
+                                        .media
+                                        .assets
+                                        .get(&asset)
+                                        .ok_or("LUT asset disappeared")?;
+                                    let mut commands = Vec::new();
+                                    if !matches!(&old.source, photonic_core::timeline::AssetSource::File { path, .. } if path == &new_path)
+                                    {
+                                        commands.push(Command::Timeline(
+                                            ops::relink_asset(p, asset, new_path.clone())
+                                                .map_err(|e| e.to_string())?,
+                                        ));
+                                    }
+                                    if old.content_hash.as_deref() != Some(sampled.as_str()) {
+                                        commands.push(Command::Timeline(
+                                            ops::set_asset_meta(p, asset, None, Some(sampled))
+                                                .map_err(|e| e.to_string())?,
+                                        ));
+                                    }
+                                    if old.lut_full_hash.as_deref() != Some(pin.as_str()) {
+                                        commands.push(Command::Timeline(
+                                            ops::set_asset_lut_hash(p, asset, Some(pin))
+                                                .map_err(|e| e.to_string())?,
+                                        ));
+                                    }
+                                    Ok(commands)
+                                })();
+                                match result {
+                                    Ok(commands) if !commands.is_empty() => {
+                                        history.execute_discrete(Command::Batch(commands), doc);
+                                        self.file_status =
+                                            Some("LUT bytes accepted and pinned".into());
+                                        doc_modified = true;
+                                    }
+                                    Ok(_) => {
+                                        self.file_status =
+                                            Some("LUT already matches its pin".into())
+                                    }
+                                    Err(error) => {
+                                        self.file_status =
+                                            Some(format!("LUT replacement failed: {error}"))
+                                    }
+                                }
+                            } else if let Ok(cmd) = ops::relink_asset(p, asset, new_path) {
                                 history.execute_discrete(Command::Timeline(cmd), doc);
                                 doc_modified = true;
+                            }
+                        }
+                    }
+                }
+                PanelAction::MediaSetLutColor { asset, value } => {
+                    if let Some(project) = doc.timeline.as_ref() {
+                        match photonic_core::timeline::ops::set_asset_lut_color(
+                            project,
+                            asset,
+                            Some(value),
+                        ) {
+                            Ok(command) => {
+                                history.execute_discrete(Command::Timeline(command), doc);
+                                doc_modified = true;
+                            }
+                            Err(error) => {
+                                self.file_status =
+                                    Some(format!("LUT interpretation failed: {error}"))
+                            }
+                        }
+                    }
+                }
+                PanelAction::MediaSetLutPurpose { asset, technical } => {
+                    use photonic_core::timeline::{
+                        color::{LutColorInterpretation, LutPurpose},
+                        ops,
+                    };
+                    if let Some(project) = doc.timeline.as_ref() {
+                        let mut value = project
+                            .media
+                            .assets
+                            .get(&asset)
+                            .and_then(|item| item.lut_color.clone())
+                            .unwrap_or_else(LutColorInterpretation::legacy_creative);
+                        if technical {
+                            value.purpose = LutPurpose::Technical;
+                        } else {
+                            value = LutColorInterpretation::legacy_creative();
+                        }
+                        match ops::set_asset_lut_color(project, asset, Some(value)) {
+                            Ok(command) => {
+                                history.execute_discrete(Command::Timeline(command), doc);
+                                doc_modified = true;
+                            }
+                            Err(error) => {
+                                self.file_status = Some(format!("LUT purpose failed: {error}"))
                             }
                         }
                     }
@@ -308,6 +490,9 @@ impl PhotonicApp {
                 // disagreement with `bridge.agreed_playhead` and issues the seek.
                 PanelAction::SeekPlayhead { at } => {
                     self.playhead = at.max(photonic_core::timeline::Tick::ZERO);
+                }
+                PanelAction::SelectGradeClip { clip } => {
+                    self.select_grade_clip(doc, clip);
                 }
                 // ── Clip inspector / effects browser (video mode) ────────────
                 PanelAction::ClipEditDiscrete(cmd) => {
@@ -7420,5 +7605,29 @@ mod video_selection_tests {
         app.timeline_selection = vec![photonic_core::timeline::ClipId::new(), id];
         app.retain_existing_timeline_selection(&doc);
         assert_eq!(app.timeline_selection, vec![id]);
+    }
+
+    #[test]
+    fn grade_navigation_selects_and_seeks_without_editing_document() {
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("test", FrameRate::FPS_30, 1920, 1080);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let first = Clip::new(ClipSource::Adjustment, Tick::ZERO, Tick(100));
+        let second = Clip::new(ClipSource::Adjustment, Tick(100), Tick(100));
+        let second_id = second.id;
+        track.clips = vec![first, second];
+        sequence.video_tracks.push(track);
+        project.active_sequence = Some(project.insert_sequence(sequence));
+        let mut doc = Document::new("test", 1920.0, 1080.0);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut app = PhotonicApp::default();
+        app.selected_grade_op = Some(photonic_core::timeline::GradeOpId::new());
+        assert!(app.select_grade_clip(&doc, second_id));
+        assert_eq!(app.timeline_selection, vec![second_id]);
+        assert_eq!(app.playhead, Tick(100));
+        assert!(app.selected_grade_op.is_none());
+        assert!(!app.select_grade_clip(&doc, photonic_core::timeline::ClipId::new()));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
     }
 }

@@ -109,6 +109,18 @@ pub fn working_pixel_to_yuv_codes(rgba_premult: [f32; 4], target: Colorimetry) -
     let [r, g, b, a] = rgba_premult;
     let lin = unpremultiply([r, g, b], a);
     let signal = [bt709_oetf(lin[0]), bt709_oetf(lin[1]), bt709_oetf(lin[2])];
+    signal_to_yuv_codes(signal, a, target)
+}
+
+/// Premultiplied BT.709 video-signal RGB to normalized Y′CbCr codes. This is
+/// the packing stage after a managed SDR video output transform; applying the
+/// legacy working-pixel converter here would run the BT.709 OETF twice.
+pub fn video_signal_pixel_to_yuv_codes(rgba_premult: [f32; 4], target: Colorimetry) -> [f32; 4] {
+    let [r, g, b, a] = rgba_premult;
+    signal_to_yuv_codes(unpremultiply([r, g, b], a), a, target)
+}
+
+fn signal_to_yuv_codes(signal: [f32; 3], a: f32, target: Colorimetry) -> [f32; 4] {
     let (yp, cb, cr) = rgb_to_ycbcr(signal, target.matrix);
     let (y, cb, cr) = range_compress(yp, cb, cr, target.range);
     [
@@ -139,6 +151,158 @@ fn quantize(v: f32) -> u8 {
     (v.clamp(0.0, 1.0) * CODE_MAX).round() as u8
 }
 
+#[inline]
+fn quantize_12(code: f32) -> [u8; 2] {
+    (code.clamp(0.0, 4095.0).round() as u16).to_le_bytes()
+}
+
+#[inline]
+fn quantize_10(code: f32) -> [u8; 2] {
+    (code.clamp(0.0, 1023.0).round() as u16).to_le_bytes()
+}
+
+/// Floating working frame → 10-bit 4:2:2 planar YUV for opaque ProRes HQ.
+/// Chroma is averaged over each horizontal pixel pair before quantization;
+/// odd final columns keep their own sample. No 8-bit intermediate is used.
+pub fn working_frame_to_yuv422p10(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+) -> EncodePlanes {
+    frame_to_yuv422p10(rgba_premult, width, height, target, true)
+}
+
+/// 10-bit 4:2:2 plane packing for already BT.709-encoded video pixels.
+pub fn video_signal_frame_to_yuv422p10(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+) -> EncodePlanes {
+    frame_to_yuv422p10(rgba_premult, width, height, target, false)
+}
+
+fn frame_to_yuv422p10(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+    apply_oetf: bool,
+) -> EncodePlanes {
+    let (w, h) = (width as usize, height as usize);
+    assert_eq!(rgba_premult.len(), w * h * 4, "rgba buffer size mismatch");
+    let mut y = Vec::with_capacity(w * h * 2);
+    let mut cb = Vec::with_capacity(w.div_ceil(2) * h * 2);
+    let mut cr = Vec::with_capacity(w.div_ceil(2) * h * 2);
+    for row in 0..h {
+        let mut row_cb = Vec::with_capacity(w);
+        let mut row_cr = Vec::with_capacity(w);
+        for col in 0..w {
+            let offset = (row * w + col) * 4;
+            let rgba = &rgba_premult[offset..offset + 4];
+            let linear = unpremultiply([rgba[0], rgba[1], rgba[2]], rgba[3]);
+            let signal = if apply_oetf {
+                linear.map(bt709_oetf)
+            } else {
+                linear
+            };
+            let (luma, blue, red) = rgb_to_ycbcr(signal, target.matrix);
+            let (yc, bc, rc) = match target.range {
+                Range::Limited => (
+                    64.0 + 876.0 * luma,
+                    64.0 + 896.0 * (blue + 0.5),
+                    64.0 + 896.0 * (red + 0.5),
+                ),
+                Range::Full => (1023.0 * luma, 1023.0 * (blue + 0.5), 1023.0 * (red + 0.5)),
+            };
+            y.extend_from_slice(&quantize_10(yc));
+            row_cb.push(bc);
+            row_cr.push(rc);
+        }
+        for pair in 0..w.div_ceil(2) {
+            let first = pair * 2;
+            let last = (first + 1).min(w - 1);
+            cb.extend_from_slice(&quantize_10((row_cb[first] + row_cb[last]) * 0.5));
+            cr.extend_from_slice(&quantize_10((row_cr[first] + row_cr[last]) * 0.5));
+        }
+    }
+    EncodePlanes::Yuv422P10 {
+        width,
+        height,
+        y,
+        cb,
+        cr,
+    }
+}
+
+/// Quantize straight from the floating working image to 12-bit planar 4:4:4
+/// YUVA. Limited-range video uses 256–3760 luma and 256–3840 chroma codes, with
+/// full-range alpha. No intermediate 8-bit quantization occurs.
+pub fn working_frame_to_yuva444p12(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+) -> EncodePlanes {
+    frame_to_yuva444p12(rgba_premult, width, height, target, true)
+}
+
+/// 12-bit 4:4:4:4 plane packing for already BT.709-encoded video pixels.
+pub fn video_signal_frame_to_yuva444p12(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+) -> EncodePlanes {
+    frame_to_yuva444p12(rgba_premult, width, height, target, false)
+}
+
+fn frame_to_yuva444p12(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+    apply_oetf: bool,
+) -> EncodePlanes {
+    let pixels = width as usize * height as usize;
+    assert_eq!(rgba_premult.len(), pixels * 4, "rgba buffer size mismatch");
+    let mut y = Vec::with_capacity(pixels * 2);
+    let mut cb = Vec::with_capacity(pixels * 2);
+    let mut cr = Vec::with_capacity(pixels * 2);
+    let mut a = Vec::with_capacity(pixels * 2);
+    for rgba in rgba_premult.chunks_exact(4) {
+        let alpha = rgba[3].clamp(0.0, 1.0);
+        let linear = unpremultiply([rgba[0], rgba[1], rgba[2]], alpha);
+        let signal = if apply_oetf {
+            linear.map(bt709_oetf)
+        } else {
+            linear
+        };
+        let (luma, blue, red) = rgb_to_ycbcr(signal, target.matrix);
+        let (yc, bc, rc) = match target.range {
+            Range::Limited => (
+                256.0 + 3504.0 * luma,
+                256.0 + 3584.0 * (blue + 0.5),
+                256.0 + 3584.0 * (red + 0.5),
+            ),
+            Range::Full => (4095.0 * luma, 4095.0 * (blue + 0.5), 4095.0 * (red + 0.5)),
+        };
+        y.extend_from_slice(&quantize_12(yc));
+        cb.extend_from_slice(&quantize_12(bc));
+        cr.extend_from_slice(&quantize_12(rc));
+        a.extend_from_slice(&quantize_12(4095.0 * alpha));
+    }
+    EncodePlanes::Yuva444P12 {
+        width,
+        height,
+        y,
+        cb,
+        cr,
+        a,
+    }
+}
+
 /// Encoder-ready plane data for one frame. Mirrors
 /// [`crate::decode::DecodedPlanes`]'s `Yuv420`/`Yuva444` shapes (decode's
 /// `PixFmt` enum only distinguishes those two), plus two variants decode has
@@ -151,6 +315,14 @@ fn quantize(v: f32) -> u8 {
 pub enum EncodePlanes {
     /// 4:2:0, no alpha (H.264, AV1, GIF-intermediate).
     Yuv420 {
+        width: u32,
+        height: u32,
+        y: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+    },
+    /// Planar 10-bit 4:2:2, little-endian u16 samples for opaque ProRes HQ.
+    Yuv422P10 {
         width: u32,
         height: u32,
         y: Vec<u8>,
@@ -175,6 +347,16 @@ pub enum EncodePlanes {
         cr: Vec<u8>,
         a: Vec<u8>,
     },
+    /// Planar 12-bit 4:4:4 + alpha, little-endian u16 samples for ProRes 4444.
+    /// Each sample stores a right-aligned code in 0..4095.
+    Yuva444P12 {
+        width: u32,
+        height: u32,
+        y: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+        a: Vec<u8>,
+    },
     /// Straight-alpha sRGB RGBA8, interleaved (PNG/APNG).
     Rgba8 {
         width: u32,
@@ -187,12 +369,14 @@ impl EncodePlanes {
     /// Stream planes in FFmpeg wire order without allocating a combined copy.
     pub fn write_to(&self, writer: &mut impl std::io::Write) -> std::io::Result<()> {
         match self {
-            Self::Yuv420 { y, cb, cr, .. } => {
+            Self::Yuv420 { y, cb, cr, .. } | Self::Yuv422P10 { y, cb, cr, .. } => {
                 writer.write_all(y)?;
                 writer.write_all(cb)?;
                 writer.write_all(cr)
             }
-            Self::Yuva420 { y, cb, cr, a, .. } | Self::Yuva444 { y, cb, cr, a, .. } => {
+            Self::Yuva420 { y, cb, cr, a, .. }
+            | Self::Yuva444 { y, cb, cr, a, .. }
+            | Self::Yuva444P12 { y, cb, cr, a, .. } => {
                 writer.write_all(y)?;
                 writer.write_all(cb)?;
                 writer.write_all(cr)?;
@@ -205,8 +389,10 @@ impl EncodePlanes {
     pub fn dims(&self) -> (u32, u32) {
         match *self {
             EncodePlanes::Yuv420 { width, height, .. }
+            | EncodePlanes::Yuv422P10 { width, height, .. }
             | EncodePlanes::Yuva420 { width, height, .. }
             | EncodePlanes::Yuva444 { width, height, .. }
+            | EncodePlanes::Yuva444P12 { width, height, .. }
             | EncodePlanes::Rgba8 { width, height, .. } => (width, height),
         }
     }
@@ -216,7 +402,7 @@ impl EncodePlanes {
     /// Y/Cb/Cr(/A) otherwise).
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            EncodePlanes::Yuv420 { y, cb, cr, .. } => {
+            EncodePlanes::Yuv420 { y, cb, cr, .. } | EncodePlanes::Yuv422P10 { y, cb, cr, .. } => {
                 let mut out = Vec::with_capacity(y.len() + cb.len() + cr.len());
                 out.extend_from_slice(y);
                 out.extend_from_slice(cb);
@@ -231,7 +417,8 @@ impl EncodePlanes {
                 out.extend_from_slice(a);
                 out
             }
-            EncodePlanes::Yuva444 { y, cb, cr, a, .. } => {
+            EncodePlanes::Yuva444 { y, cb, cr, a, .. }
+            | EncodePlanes::Yuva444P12 { y, cb, cr, a, .. } => {
                 let mut out = Vec::with_capacity(y.len() + cb.len() + cr.len() + a.len());
                 out.extend_from_slice(y);
                 out.extend_from_slice(cb);
@@ -247,8 +434,10 @@ impl EncodePlanes {
     pub fn ffmpeg_pix_fmt(&self) -> &'static str {
         match self {
             EncodePlanes::Yuv420 { .. } => "yuv420p",
+            EncodePlanes::Yuv422P10 { .. } => "yuv422p10le",
             EncodePlanes::Yuva420 { .. } => "yuva420p",
             EncodePlanes::Yuva444 { .. } => "yuva444p",
+            EncodePlanes::Yuva444P12 { .. } => "yuva444p12le",
             EncodePlanes::Rgba8 { .. } => "rgba",
         }
     }
@@ -303,6 +492,47 @@ pub fn working_frame_to_yuv_planes(
     alpha: bool,
     alpha_444: bool,
 ) -> EncodePlanes {
+    frame_to_yuv_planes(
+        rgba_premult,
+        width,
+        height,
+        target,
+        alpha,
+        alpha_444,
+        working_pixel_to_yuv_codes,
+    )
+}
+
+/// 8-bit YUV plane packing for premultiplied BT.709 video-signal pixels.
+/// This is an isolated managed export component, not active export dispatch.
+pub fn video_signal_frame_to_yuv_planes(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+    alpha: bool,
+    alpha_444: bool,
+) -> EncodePlanes {
+    frame_to_yuv_planes(
+        rgba_premult,
+        width,
+        height,
+        target,
+        alpha,
+        alpha_444,
+        video_signal_pixel_to_yuv_codes,
+    )
+}
+
+fn frame_to_yuv_planes(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    target: Colorimetry,
+    alpha: bool,
+    alpha_444: bool,
+    convert_pixel: fn([f32; 4], Colorimetry) -> [f32; 4],
+) -> EncodePlanes {
     let (w, h) = (width as usize, height as usize);
     assert_eq!(
         rgba_premult.len(),
@@ -325,7 +555,7 @@ pub fn working_frame_to_yuv_planes(
             rgba_premult[i * 4 + 2],
             rgba_premult[i * 4 + 3],
         ];
-        let [yc, cbc, crc, ac] = working_pixel_to_yuv_codes(px, target);
+        let [yc, cbc, crc, ac] = convert_pixel(px, target);
         y_plane[i] = quantize(yc);
         cb_full[i] = cbc;
         cr_full[i] = crc;
@@ -376,6 +606,16 @@ pub fn working_frame_to_yuv_planes(
 
 /// Full working-frame → straight sRGB RGBA8 (PNG/APNG path, no YUV).
 pub fn working_frame_to_rgba8(rgba_premult: &[f32], width: u32, height: u32) -> EncodePlanes {
+    frame_to_rgba8(rgba_premult, width, height, true)
+}
+
+/// Pack premultiplied sRGB display code values as straight RGBA8 without a
+/// second sRGB OETF. PNG export must request an sRGB display graph output.
+pub fn srgb_display_frame_to_rgba8(rgba_premult: &[f32], width: u32, height: u32) -> EncodePlanes {
+    frame_to_rgba8(rgba_premult, width, height, false)
+}
+
+fn frame_to_rgba8(rgba_premult: &[f32], width: u32, height: u32, apply_oetf: bool) -> EncodePlanes {
     let (w, h) = (width as usize, height as usize);
     assert_eq!(rgba_premult.len(), w * h * 4, "rgba buffer size mismatch");
     let mut rgba = vec![0u8; w * h * 4];
@@ -386,7 +626,13 @@ pub fn working_frame_to_rgba8(rgba_premult: &[f32], width: u32, height: u32) -> 
             rgba_premult[i * 4 + 2],
             rgba_premult[i * 4 + 3],
         ];
-        let out = working_pixel_to_srgb_rgba(px);
+        let out = if apply_oetf {
+            working_pixel_to_srgb_rgba(px)
+        } else {
+            let alpha = px[3];
+            let straight = unpremultiply([px[0], px[1], px[2]], alpha);
+            [straight[0], straight[1], straight[2], alpha]
+        };
         rgba[i * 4] = quantize(out[0]);
         rgba[i * 4 + 1] = quantize(out[1]);
         rgba[i * 4 + 2] = quantize(out[2]);
@@ -403,6 +649,104 @@ pub fn working_frame_to_rgba8(rgba_premult: &[f32], width: u32, height: u32) -> 
 mod tests {
     use super::*;
     use photonic_render::color::{range_expand, yuv_to_working};
+
+    #[test]
+    fn managed_video_signal_packing_skips_second_transfer() {
+        let target = Colorimetry {
+            matrix: Matrix::Bt709,
+            range: Range::Limited,
+        };
+        let alpha = 0.5;
+        let linear = [0.18_f32, 0.06, 0.8];
+        let encoded = linear.map(bt709_oetf);
+        let legacy = working_pixel_to_yuv_codes(
+            [
+                linear[0] * alpha,
+                linear[1] * alpha,
+                linear[2] * alpha,
+                alpha,
+            ],
+            target,
+        );
+        let managed = video_signal_pixel_to_yuv_codes(
+            [
+                encoded[0] * alpha,
+                encoded[1] * alpha,
+                encoded[2] * alpha,
+                alpha,
+            ],
+            target,
+        );
+        for (a, b) in managed.iter().zip(legacy) {
+            assert!((a - b).abs() < 1e-6);
+        }
+        let doubled = working_pixel_to_yuv_codes(
+            [
+                encoded[0] * alpha,
+                encoded[1] * alpha,
+                encoded[2] * alpha,
+                alpha,
+            ],
+            target,
+        );
+        assert!((managed[0] - doubled[0]).abs() > 0.1);
+        assert_eq!(video_signal_pixel_to_yuv_codes([0.0; 4], target)[3], 0.0);
+    }
+
+    #[test]
+    fn managed_video_8bit_plane_packing_matches_legacy_signal_once() {
+        let target = Colorimetry::BT709_LIMITED;
+        let linear: Vec<f32> = [
+            [0.0, 0.0, 0.0, 1.0],
+            [0.09, 0.015, 0.4, 0.5],
+            [0.8, 0.2, 0.01, 1.0],
+            [0.025, 0.175, 0.05, 0.25],
+            [0.0, 0.0, 0.0, 0.0],
+            [0.2, 0.2, 0.2, 1.0],
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut encoded = Vec::with_capacity(linear.len());
+        for pixel in linear.chunks_exact(4) {
+            let alpha = pixel[3];
+            encoded.extend(
+                pixel[..3]
+                    .iter()
+                    .map(|value| bt709_oetf(*value / alpha.max(1e-4)) * alpha),
+            );
+            encoded.push(alpha);
+        }
+        for (alpha, alpha_444) in [(false, false), (true, false), (true, true)] {
+            let legacy = working_frame_to_yuv_planes(&linear, 3, 2, target, alpha, alpha_444);
+            let managed =
+                video_signal_frame_to_yuv_planes(&encoded, 3, 2, target, alpha, alpha_444);
+            assert_eq!(managed.to_bytes(), legacy.to_bytes());
+            assert_eq!(managed.ffmpeg_pix_fmt(), legacy.ffmpeg_pix_fmt());
+        }
+        let legacy_10 = working_frame_to_yuv422p10(&linear, 3, 2, target);
+        let managed_10 = video_signal_frame_to_yuv422p10(&encoded, 3, 2, target);
+        assert_eq!(managed_10.to_bytes(), legacy_10.to_bytes());
+        assert_eq!(managed_10.ffmpeg_pix_fmt(), "yuv422p10le");
+        let legacy_12 = working_frame_to_yuva444p12(&linear, 3, 2, target);
+        let managed_12 = video_signal_frame_to_yuva444p12(&encoded, 3, 2, target);
+        assert_eq!(managed_12.to_bytes(), legacy_12.to_bytes());
+        assert_eq!(managed_12.ffmpeg_pix_fmt(), "yuva444p12le");
+        let mut srgb = Vec::with_capacity(linear.len());
+        for pixel in linear.chunks_exact(4) {
+            let alpha = pixel[3];
+            srgb.extend(
+                pixel[..3]
+                    .iter()
+                    .map(|value| srgb_oetf(*value / alpha.max(1e-4)) * alpha),
+            );
+            srgb.push(alpha);
+        }
+        assert_eq!(
+            srgb_display_frame_to_rgba8(&srgb, 3, 2).to_bytes(),
+            working_frame_to_rgba8(&linear, 3, 2).to_bytes()
+        );
+    }
 
     #[test]
     fn unpremultiply_zero_alpha_is_black() {
@@ -622,6 +966,17 @@ mod tests {
             "yuv420p"
         );
         assert_eq!(
+            EncodePlanes::Yuv422P10 {
+                width: 1,
+                height: 1,
+                y: dummy(2),
+                cb: dummy(2),
+                cr: dummy(2)
+            }
+            .ffmpeg_pix_fmt(),
+            "yuv422p10le"
+        );
+        assert_eq!(
             EncodePlanes::Yuva420 {
                 width: 1,
                 height: 1,
@@ -646,6 +1001,18 @@ mod tests {
             "yuva444p"
         );
         assert_eq!(
+            EncodePlanes::Yuva444P12 {
+                width: 1,
+                height: 1,
+                y: dummy(2),
+                cb: dummy(2),
+                cr: dummy(2),
+                a: dummy(2)
+            }
+            .ffmpeg_pix_fmt(),
+            "yuva444p12le"
+        );
+        assert_eq!(
             EncodePlanes::Rgba8 {
                 width: 1,
                 height: 1,
@@ -661,14 +1028,93 @@ mod tests {
         let rgba = [0.1, 0.2, 0.3, 0.5].repeat(15);
         let cases = [
             working_frame_to_rgba8(&rgba, 5, 3),
+            working_frame_to_yuv422p10(&rgba, 5, 3, Colorimetry::BT709_LIMITED),
             working_frame_to_yuv_planes(&rgba, 5, 3, Colorimetry::BT709_LIMITED, false, false),
             working_frame_to_yuv_planes(&rgba, 5, 3, Colorimetry::BT709_LIMITED, true, false),
             working_frame_to_yuv_planes(&rgba, 5, 3, Colorimetry::BT709_LIMITED, true, true),
+            working_frame_to_yuva444p12(&rgba, 5, 3, Colorimetry::BT709_LIMITED),
         ];
         for planes in cases {
             let mut bytes = Vec::new();
             planes.write_to(&mut bytes).unwrap();
             assert_eq!(bytes, planes.to_bytes());
         }
+    }
+
+    #[test]
+    fn prores_422_uses_10_bit_codes_and_odd_width_chroma() {
+        let width = 513u32;
+        let mut rgba = Vec::with_capacity(width as usize * 4);
+        for index in 0..width {
+            let value = index as f32 / (width - 1) as f32;
+            rgba.extend_from_slice(&[value, value, value, 1.0]);
+        }
+        let EncodePlanes::Yuv422P10 { y, cb, cr, .. } =
+            working_frame_to_yuv422p10(&rgba, width, 1, Colorimetry::BT709_LIMITED)
+        else {
+            panic!("10-bit 4:2:2 planes")
+        };
+        assert_eq!(y.len(), width as usize * 2);
+        assert_eq!(cb.len(), width.div_ceil(2) as usize * 2);
+        assert_eq!(cr.len(), cb.len());
+        let codes: Vec<_> = y
+            .chunks_exact(2)
+            .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+            .collect();
+        assert_eq!(codes[0], 64);
+        assert_eq!(*codes.last().unwrap(), 940);
+        assert!(
+            codes
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 256
+        );
+        assert!(cb
+            .chunks_exact(2)
+            .all(|sample| u16::from_le_bytes([sample[0], sample[1]]) == 512));
+    }
+
+    #[test]
+    fn twelve_bit_yuva_uses_video_codes_without_eight_bit_quantization() {
+        let mut rgba = Vec::new();
+        for index in 0..512 {
+            let value = index as f32 / 511.0;
+            rgba.extend_from_slice(&[value, value, value, 1.0]);
+        }
+        let EncodePlanes::Yuva444P12 { y, cb, cr, a, .. } =
+            working_frame_to_yuva444p12(&rgba, 512, 1, Colorimetry::BT709_LIMITED)
+        else {
+            panic!("expected twelve-bit planes")
+        };
+        let codes: Vec<u16> = y
+            .chunks_exact(2)
+            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+            .collect();
+        assert_eq!(codes[0], 256);
+        assert_eq!(codes[511], 3760);
+        assert!(codes.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            codes
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 256
+        );
+        for plane in [&cb, &cr] {
+            assert!(plane
+                .chunks_exact(2)
+                .all(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) == 2048));
+        }
+        assert!(a
+            .chunks_exact(2)
+            .all(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) == 4095));
+        let EncodePlanes::Yuva444P12 { a, .. } =
+            working_frame_to_yuva444p12(&[0.25, 0.25, 0.25, 0.5], 1, 1, Colorimetry::BT709_LIMITED)
+        else {
+            unreachable!()
+        };
+        assert_eq!(u16::from_le_bytes([a[0], a[1]]), 2048);
     }
 }

@@ -15,6 +15,7 @@ pub mod anim;
 pub mod audio;
 pub mod captions;
 pub mod clip;
+pub mod color;
 pub mod commands;
 pub mod effect_kind;
 pub mod effect_manifest;
@@ -51,13 +52,13 @@ pub use captions::{
     KaraokeMode, KaraokeStyle,
 };
 pub use clip::{
-    AnchorSpace, Clip, ClipEffect, ClipSource, ClipTransform, EaseCurve, LumaWipeMap, Ratio,
-    SpeedKey, SpeedMap, SpeedMapError, TextClipContent, Transition, TransitionKind,
+    AnchorSpace, Clip, ClipEffect, ClipSource, ClipTransform, EaseCurve, GradeVersion, LumaWipeMap,
+    Ratio, SpeedKey, SpeedMap, SpeedMapError, TextClipContent, Transition, TransitionKind,
     TransitionParams, WipeDirection,
 };
 pub use commands::{
     AnimTarget, AudioCmd, CaptionCmd, ClipTiming, FadeEdge, FormatOp, FxOwner, GraphCmd,
-    StyleTarget, TimelineCmd, TrackSettings, TtsCmd,
+    StyleTarget, TimelineCmd, TrackSettings, TtsCmd, VfxOwner,
 };
 pub use effect_kind::{EffectKind, EffectParams};
 pub use stabilization::{
@@ -78,8 +79,10 @@ pub use effect_preset::{
     EffectPreset, EffectPresetError, EffectPresetLibrary, LibraryLoad, LibraryStoreError,
 };
 pub use grade::{
-    parse_cdl_xml, write_cdl_xml, CdlParams, CdlXmlError, Grade, GradeMask, GradeOp, GradeOpKind,
-    GradeOpParams, LutInterp, MaskRef, WindowShape,
+    parse_cdl_xml, write_cdl_xml, CdlParams, CdlXmlError, ClipLook, Grade, GradeGraph,
+    GradeGraphInputPort, GradeGraphNode, GradeGraphPortType, GradeKeyMixMode, GradeMask,
+    GradeMatteRefinement, GradeOp, GradeOpKind, GradeOpParams, LutInterp, MaskRef, QualifierKey,
+    QualifierKeyMode, SharedLook, WindowShape, MAX_QUALIFIER_KEYS,
 };
 pub use graph::{
     FitMode, GraphEdge, GraphNode, GraphNodeParams, GraphOp, InPort, MaskShapeKind, NodeGraph,
@@ -87,7 +90,7 @@ pub use graph::{
 };
 pub use ids::{
     AssetId, BinId, ClipId, CueId, GradeOpId, GraphId, GraphNodeId, GroupId, MarkerCategoryId,
-    MarkerId, SequenceId, TagId, TrackId,
+    MarkerId, SequenceId, SharedLookId, TagId, TrackId,
 };
 pub use media::{
     triage_max_severity, triage_probe, AssetKind, AssetSource, AudioStreamInfo, MediaAsset,
@@ -103,8 +106,8 @@ pub use scale::{
 };
 pub use sequence::{
     GroupKind, GroupNode, Marker, MarkerAnchor, MarkerCategory, MarkerGlyph, MarkerRef,
-    MarkerRetarget, PreviewZone, ProjectVideoSettings, Sequence, SequenceFormat, TimelineProject,
-    Track, TrackKind, ValidationError,
+    MarkerRetarget, PreviewZone, ProjectVideoSettings, ReferenceStill, Sequence, SequenceFormat,
+    TimelineProject, Track, TrackKind, ValidationError,
 };
 pub use time::{FrameRate, Tick, Timecode, TICKS_PER_SECOND};
 pub use unknown::UnknownTag;

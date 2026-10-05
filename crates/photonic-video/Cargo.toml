@@ -2,7 +2,7 @@
 name = "photonic-video"
 version.workspace = true
 edition = "2021"
-license.workspace = true
+license = "MIT AND Apache-2.0"
 description = "Video engine for Photonic: frame-graph IR, decode, playback, audio, export (docs/specs/video-editor/02-engine.md)"
 
 [dependencies]

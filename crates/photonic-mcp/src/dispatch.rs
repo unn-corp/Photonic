@@ -1194,6 +1194,15 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::document::save_document(state, a).await,
             ))
         }
+        "archive_project" => {
+            let a: ArchiveProjectArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::document::archive_project(state, a).await,
+            ))
+        }
+        "get_project_dependencies" => Ok(ToolOutput::readonly(
+            handlers::document::get_project_dependencies(state).await,
+        )),
         "undo" => {
             let a: UndoRedoArgs = serde_json::from_value(args).unwrap_or_default();
             let (result, moved) = handlers::document::undo(state, a).await;
@@ -2949,6 +2958,32 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::video::relink_media(state, a).await,
             ))
         }
+        "set_lut_interpretation" => {
+            let a: SetLutInterpretationArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_lut_interpretation(state, a).await,
+            ))
+        }
+        "set_input_color" => {
+            let a: SetInputColorArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_input_color(state, a).await,
+            ))
+        }
+        "set_native_input_color" => {
+            let a: SetInputColorArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_native_input_color(state, a).await,
+            ))
+        }
+        "create_native_color_draft" => {
+            let a: CreateNativeColorDraftArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::create_native_color_draft(state, a).await,
+            ))
+        }
         "find_offline_media" => {
             let a: FindOfflineMediaArgs = serde_json::from_value(args).unwrap_or_default();
             Ok(ToolOutput::readonly(
@@ -3056,6 +3091,9 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::video::get_engine_status(state, a).await,
             ))
         }
+        "get_media_toolchain_status" => Ok(ToolOutput::readonly(
+            handlers::video::get_media_toolchain_status(),
+        )),
 
         // Render (10 §3.14 / §4)
         "render_frame_at" => {
@@ -3243,6 +3281,70 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::video::set_grade(state, a).await,
             ))
         }
+        "group_grade" => {
+            let a: GroupGradeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let readonly = matches!(a.op, GroupGradeOpArg::Get);
+            let result = handlers::video::group_grade(state, a).await;
+            Ok(if readonly {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
+        }
+        "grade_version" => {
+            let a: GradeVersionArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let readonly = matches!(a.op, GradeVersionOp::List);
+            let result = handlers::video::grade_version(state, a).await;
+            Ok(if readonly {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
+        }
+        "shared_look" => {
+            let a: SharedLookArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            let readonly = matches!(a.op, SharedLookOp::List);
+            let result = handlers::video::shared_look(state, a).await;
+            Ok(if readonly {
+                ToolOutput::readonly(result)
+            } else {
+                ToolOutput::mutating(result)
+            })
+        }
+        "list_reference_stills" => {
+            let a: ListReferenceStillsArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::list_reference_stills(state, a).await,
+            ))
+        }
+        "remove_reference_still" => {
+            let a: RemoveReferenceStillArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::remove_reference_still(state, a).await,
+            ))
+        }
+        "capture_reference_still" => {
+            let a: CaptureReferenceStillArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::capture_reference_still(state, a).await,
+            ))
+        }
+        "compare_reference_still" => {
+            let a: CompareReferenceStillArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::compare_reference_still(state, a).await,
+            ))
+        }
+        "apply_shot_match" => {
+            let a: ApplyShotMatchArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::apply_shot_match(state, a).await,
+            ))
+        }
         "apply_lut" => {
             let a: ApplyLutArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
@@ -3259,6 +3361,33 @@ pub(crate) async fn dispatch_tool_inner(
             let a: GradePresetArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::video::grade_preset(state, a).await,
+            ))
+        }
+        "inspect_render_manifest" => {
+            let a: handlers::video_export::InspectRenderManifestArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video_export::inspect_render_manifest(state, a).await,
+            ))
+        }
+        "measure_scopes" => {
+            let a: GetScopesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::measure_scopes(state, a).await,
+            ))
+        }
+        "sample_grade_input" => {
+            let a: SampleGradeInputArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::sample_grade_input(state, a).await,
+            ))
+        }
+        "inspect_qualifier" => {
+            let a: InspectQualifierArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::inspect_qualifier(state, a).await,
             ))
         }
         "get_scopes" => {
@@ -3408,6 +3537,7 @@ mod tests {
             document: Arc::new(Mutex::new(Document::new("history test", 200.0, 100.0))),
             history: Arc::new(Mutex::new(photonic_core::CommandHistory::new(100))),
             document_path: Arc::new(StdMutex::new(None)),
+            document_saves: Default::default(),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
             path_policy: photonic_core::PathPolicy::test_default(),
@@ -3828,6 +3958,11 @@ mod tests {
             Some(canonical_path.as_path())
         );
 
+        let receipts = state.document_saves.take_notifications();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].document, loaded.id);
+        assert_eq!(receipts[0].node, state.history.lock().await.current_node());
+        assert_eq!(receipts[0].path, canonical_path);
         let repeat = dispatch_tool(&state, "save_document", json!({}))
             .await
             .unwrap();
@@ -3837,6 +3972,101 @@ mod tests {
             "pathless save should use the remembered path"
         );
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    async fn archive_project_collects_media_without_changing_open_document() {
+        use photonic_core::timeline::{AssetKind, MediaAsset, TimelineProject};
+
+        let state = test_state();
+        assert!(crate::schema_gen::tool_list()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "archive_project"));
+        let root =
+            std::env::temp_dir().join(format!("photonic-mcp-archive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let media = root.join("source.mov");
+        std::fs::write(&media, b"frames").unwrap();
+        {
+            let mut doc = state.document.lock().await;
+            let mut project = TimelineProject::new();
+            project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Video, &media));
+            doc.timeline = Some(project);
+        }
+        let before = state.document.lock().await.clone();
+        let destination = root.join("portable");
+        let result = dispatch_tool(&state, "archive_project", json!({ "path": destination }))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(destination.join("portable.photon").exists());
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
+        assert!(state.document_path.lock().unwrap().is_none());
+        let repeat = dispatch_tool(&state, "archive_project", json!({ "path": destination }))
+            .await
+            .unwrap();
+        assert_eq!(repeat.is_error, Some(true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_dependency_report_is_read_only_and_detects_missing_media() {
+        use photonic_core::timeline::{AssetKind, MediaAsset, TimelineProject};
+
+        let state = test_state();
+        assert!(crate::schema_gen::tool_list()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "get_project_dependencies"));
+        let missing = std::env::temp_dir().join(format!(
+            "photonic-missing-media-{}.mov",
+            uuid::Uuid::new_v4()
+        ));
+        {
+            let mut doc = state.document.lock().await;
+            let mut project = TimelineProject::new();
+            project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Video, &missing));
+            doc.timeline = Some(project);
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let result = dispatch_tool(&state, "get_project_dependencies", json!({}))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(result.structured_content.as_ref().unwrap()["ready"], false);
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["files"][0]["status"],
+            "missing"
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn media_toolchain_status_is_available_without_a_video_engine() {
+        let state = test_state();
+        assert!(crate::schema_gen::tool_list()
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "get_media_toolchain_status"));
+        let result = dispatch_tool(&state, "get_media_toolchain_status", json!({}))
+            .await
+            .unwrap();
+        assert_ne!(result.is_error, Some(true));
+        assert!(result.structured_content.as_ref().unwrap()["available"].is_boolean());
     }
 
     #[cfg(unix)]
@@ -3861,6 +4091,10 @@ mod tests {
 
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.is_error, Some(true));
+        assert!(
+            state.document_saves.take_notifications().is_empty(),
+            "failed writes must not mark GUI history as saved"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), original);
         assert!(
             state.document_path.lock().unwrap().is_none(),

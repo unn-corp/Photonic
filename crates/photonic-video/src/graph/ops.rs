@@ -87,6 +87,10 @@ impl Image {
     /// Operates directly on premultiplied values — correct because premultiplied
     /// linear is closed under linear interpolation (no fringing).
     pub fn sample_bilinear(&self, px: f32, py: f32) -> [f32; 4] {
+        self.sample_bilinear_with_border(px, py, false)
+    }
+
+    fn sample_bilinear_with_border(&self, px: f32, py: f32, transparent: bool) -> [f32; 4] {
         let w = self.width as i32;
         let h = self.height as i32;
         let x = px - 0.5;
@@ -96,6 +100,9 @@ impl Image {
         let fx = x - x0 as f32;
         let fy = y - y0 as f32;
         let at = |ix: i32, iy: i32| -> [f32; 4] {
+            if transparent && (ix < 0 || ix >= w || iy < 0 || iy >= h) {
+                return [0.0; 4];
+            }
             let cx = ix.clamp(0, w - 1) as u32;
             let cy = iy.clamp(0, h - 1) as u32;
             self.pixel(cx, cy)
@@ -133,6 +140,17 @@ pub(crate) fn transform2d_to_canvas(
     width: u32,
     height: u32,
 ) -> Image {
+    transform2d_to_canvas_with_border(input, mat, sampling, width, height, false)
+}
+
+pub(crate) fn transform2d_to_canvas_with_border(
+    input: &Image,
+    mat: Mat3,
+    sampling: Sampling,
+    width: u32,
+    height: u32,
+    transparent_border: bool,
+) -> Image {
     if !transform_matrix_is_valid(mat) {
         return Image::new(width, height);
     }
@@ -150,8 +168,19 @@ pub(crate) fn transform2d_to_canvas(
             let dst = Vec2::new(x as f32 + 0.5, y as f32 + 0.5);
             let src = inv.transform_point2(dst) * source_scale;
             let v = match sampling {
-                Sampling::Bilinear => input.sample_bilinear(src.x, src.y),
+                Sampling::Bilinear => {
+                    input.sample_bilinear_with_border(src.x, src.y, transparent_border)
+                }
                 Sampling::Nearest => {
+                    if transparent_border
+                        && (src.x < 0.0
+                            || src.x >= input.width as f32
+                            || src.y < 0.0
+                            || src.y >= input.height as f32)
+                    {
+                        out.set(x, y, [0.0; 4]);
+                        continue;
+                    }
                     let sx = (src.x.floor() as i32).clamp(0, input.width as i32 - 1) as u32;
                     let sy = (src.y.floor() as i32).clamp(0, input.height as i32 - 1) as u32;
                     input.pixel(sx, sy)
@@ -1364,6 +1393,36 @@ pub fn repremultiply(rgb: [f32; 3], a: f32) -> [f32; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_transform_border_does_not_change_legacy_clamp() {
+        let image = Image::filled(
+            2,
+            1,
+            LinearColor {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+        );
+        let moved = Mat3::from_translation(Vec2::new(1.0, 0.0));
+        let legacy = transform2d_to_canvas(&image, moved, Sampling::Nearest, 2, 1);
+        let native =
+            transform2d_to_canvas_with_border(&image, moved, Sampling::Nearest, 2, 1, true);
+        assert_eq!(legacy.pixel(0, 0), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(native.pixel(0, 0), [0.0; 4]);
+        assert_eq!(native.pixel(1, 0), [1.0, 0.0, 0.0, 1.0]);
+        let bilinear = transform2d_to_canvas_with_border(
+            &image,
+            Mat3::from_translation(Vec2::new(0.5, 0.0)),
+            Sampling::Bilinear,
+            2,
+            1,
+            true,
+        );
+        assert_eq!(bilinear.pixel(0, 0), [0.5, 0.0, 0.0, 0.5]);
+    }
 
     fn premult(r: f32, g: f32, b: f32, a: f32) -> [f32; 4] {
         [r * a, g * a, b * a, a]

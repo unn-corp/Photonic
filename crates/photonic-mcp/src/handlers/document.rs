@@ -1,4 +1,4 @@
-use crate::protocol::{PlayActionArgs, SaveDocumentArgs, ToolResult};
+use crate::protocol::{ArchiveProjectArgs, PlayActionArgs, SaveDocumentArgs, ToolResult};
 use crate::server::AppState;
 use serde_json::json;
 use std::path::PathBuf;
@@ -46,6 +46,7 @@ pub use crate::handlers::doc_swatches::{
 /// `.photon` container used by the GUI's File → Save command.
 pub async fn save_document(state: &AppState, args: SaveDocumentArgs) -> ToolResult {
     tracing::debug!("tool: save_document");
+    let _save_gate = state.document_saves.gate.lock().await;
     let requested_path = match args.path {
         Some(path) if !path.trim().is_empty() => PathBuf::from(path),
         Some(_) => return ToolResult::error("path must not be empty"),
@@ -80,14 +81,22 @@ pub async fn save_document(state: &AppState, args: SaveDocumentArgs) -> ToolResu
             return ToolResult::error(format!("Could not create save directory: {error}"));
         }
     }
-    let (json, bytes) = {
+    let (json, bytes, receipt) = {
         let doc = state.document.lock().await;
         let mut history = state.history.lock().await;
         history.enforce_size();
         match photonic_core::save_photon(&doc, Some(&history.snapshot_state())) {
             Ok(json) => {
                 let bytes = json.len();
-                (json, bytes)
+                (
+                    json,
+                    bytes,
+                    crate::server::DocumentSaveReceipt {
+                        document: doc.id,
+                        node: history.current_node(),
+                        path: path.clone(),
+                    },
+                )
             }
             Err(error) => {
                 return ToolResult::error(format!("Could not serialize document: {error}"))
@@ -97,11 +106,129 @@ pub async fn save_document(state: &AppState, args: SaveDocumentArgs) -> ToolResu
     if let Err(error) = photonic_core::write_atomic_file(&path, json.as_bytes()) {
         return ToolResult::error(format!("Could not save document: {error}"));
     }
-    if let Ok(mut current_path) = state.document_path.lock() {
-        *current_path = Some(path.clone());
+    {
+        let doc = state.document.lock().await;
+        if doc.id == receipt.document {
+            if let Ok(mut current_path) = state.document_path.lock() {
+                *current_path = Some(path.clone());
+            }
+        }
+        state.document_saves.record(receipt);
     }
     ToolResult::text(format!("Saved {}", path.display()))
         .with_data(json!({ "path": path, "bytes": bytes }))
+}
+
+/// Write a separate portable project folder without changing the open document
+/// or its history. Large media copies run off the async runtime.
+pub async fn archive_project(state: &AppState, args: ArchiveProjectArgs) -> ToolResult {
+    if args.path.trim().is_empty() {
+        return ToolResult::error("path must not be empty");
+    }
+    let requested = PathBuf::from(args.path);
+    let requested = if requested.is_absolute() {
+        requested
+    } else {
+        match std::env::current_dir() {
+            Ok(dir) => dir.join(requested),
+            Err(error) => return ToolResult::error(format!("Could not resolve path: {error}")),
+        }
+    };
+    let destination =
+        match crate::path_guard::check_path(state, &requested, photonic_core::PathAccess::Write) {
+            Ok(path) => path,
+            Err(error) => return error,
+        };
+    let source = match state.document_path.lock() {
+        Ok(path) => path.clone(),
+        Err(_) => return ToolResult::error("Could not read the current document path"),
+    };
+    let document = state.document.lock().await.clone();
+    if let Some(project) = document.timeline.as_ref() {
+        for asset in project.media.assets.values() {
+            let photonic_core::timeline::AssetSource::File { path, rel_path } = &asset.source
+            else {
+                continue;
+            };
+            let local = rel_path.as_ref().and_then(|relative| {
+                source
+                    .as_ref()
+                    .and_then(|project_file| project_file.parent())
+                    .map(|dir| dir.join(relative))
+            });
+            let selected = local
+                .as_deref()
+                .filter(|candidate| candidate.is_file())
+                .unwrap_or(path);
+            if let Err(error) =
+                crate::path_guard::check_path(state, selected, photonic_core::PathAccess::Read)
+            {
+                return error;
+            }
+        }
+    }
+    match tokio::task::spawn_blocking(move || {
+        photonic_video::project::archive::archive_project(
+            &document,
+            source.as_deref(),
+            &destination,
+        )
+    })
+    .await
+    {
+        Ok(Ok(path)) => ToolResult::text(format!("Archived {}", path.display()))
+            .with_data(json!({ "path": path })),
+        Ok(Err(error)) => ToolResult::error(format!("Archive failed: {error}")),
+        Err(error) => ToolResult::error(format!("Archive worker failed: {error}")),
+    }
+}
+
+/// Inspect project file dependencies without changing the document or history.
+/// Full-byte hashes are checked for pinned LUTs and captured reference stills.
+pub async fn get_project_dependencies(state: &AppState) -> ToolResult {
+    let source = match state.document_path.lock() {
+        Ok(path) => path.clone(),
+        Err(_) => return ToolResult::error("Could not read the current document path"),
+    };
+    let document = state.document.lock().await.clone();
+    if let Some(project) = document.timeline.as_ref() {
+        for asset in project.media.assets.values() {
+            let photonic_core::timeline::AssetSource::File { path, rel_path } = &asset.source
+            else {
+                continue;
+            };
+            let local = rel_path.as_ref().and_then(|relative| {
+                source
+                    .as_ref()
+                    .and_then(|project_file| project_file.parent())
+                    .map(|dir| dir.join(relative))
+            });
+            let selected = local
+                .as_deref()
+                .filter(|candidate| candidate.is_file())
+                .unwrap_or(path);
+            if selected.is_file() {
+                if let Err(error) =
+                    crate::path_guard::check_path(state, selected, photonic_core::PathAccess::Read)
+                {
+                    return error;
+                }
+            }
+        }
+    }
+    match tokio::task::spawn_blocking(move || {
+        photonic_video::project::dependencies::inspect_dependencies(&document, source.as_deref())
+    })
+    .await
+    {
+        Ok(report) => ToolResult::text(if report.ready {
+            "Project dependencies are available"
+        } else {
+            "Project has missing or changed dependencies"
+        })
+        .with_data(json!(report)),
+        Err(error) => ToolResult::error(format!("Dependency inspection failed: {error}")),
+    }
 }
 
 // ─── Variable Width Profiles ─────────────────────────────────────────────────

@@ -9,10 +9,11 @@
 //! rule.
 
 use super::anim::{AnimProps, PropSet};
-use super::ids::{AssetId, GradeOpId, GraphId, GraphNodeId};
+use super::ids::{AssetId, GradeOpId, GraphId, GraphNodeId, SharedLookId};
 use super::prop_registry::PropTargetKind;
 use super::unknown::UnknownTag;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 
 /// An ordered grade stack applied to a clip (or embedded in a `GraphOp::Grade`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -22,6 +23,28 @@ pub struct Grade {
     /// Global grade bypass (color-page toggle); `false` = active.
     #[serde(default)]
     pub bypass: bool,
+    /// Optional image graph evaluated at this scope's grade stage. Corrector
+    /// nodes refer to `ops`, which remain the single editable op store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<GradeGraph>,
+}
+
+/// Project-wide reusable look. The grade executes after each linked clip's own
+/// grade and before group post-grade; changes propagate to every linked shot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SharedLook {
+    pub id: SharedLookId,
+    pub name: String,
+    pub grade: Grade,
+}
+
+/// A clip's optional look stage. `Local` is the exact snapshot produced by
+/// Make Independent, so detaching never shifts the look's render position.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ClipLook {
+    Shared(SharedLookId),
+    Local(Box<Grade>),
 }
 
 impl Grade {
@@ -29,13 +52,916 @@ impl Grade {
         Grade {
             ops: Vec::new(),
             bypass: false,
+            graph: None,
         }
+    }
+
+    /// Enable serial graph evaluation for this existing stack. Idempotent so
+    /// callers can expose conversion as one undoable whole-grade edit.
+    pub fn convert_to_graph(&mut self) {
+        if self.graph.is_none() {
+            self.graph = Some(GradeGraph::from_stack(&self.ops));
+        }
+    }
+
+    /// Insert a corrector at the graph output, either serially or as a new
+    /// parallel branch over the current output. The operation is atomic.
+    pub fn add_graph_corrector(&mut self, op: GradeOp, parallel: bool) -> Result<(), &'static str> {
+        let mut graph = self.graph.clone().ok_or("grade has no graph")?;
+        let mut ops = self.ops.clone();
+        if ops.iter().any(|existing| existing.id == op.id) {
+            return Err("grading graph corrector id is duplicated");
+        }
+        graph.append_corrector(op.id, parallel)?;
+        ops.push(op);
+        graph.validate(&ops)?;
+        self.ops = ops;
+        self.graph = Some(graph);
+        Ok(())
+    }
+
+    /// Add a typed utility node. Image utilities become the grade output;
+    /// matte utilities remain available for routing without changing pixels.
+    /// An operator-only input request must not silently choose a graph branch.
+    /// Qualifier key utilities reference an operator without being its image corrector.
+    pub fn has_grade_input(&self, op: GradeOpId, node: Option<u32>) -> bool {
+        match node {
+            Some(node) => self.graph.as_ref().is_some_and(|graph| matches!(graph.nodes.get(&node), Some(GradeGraphNode::Corrector { op: candidate, .. } | GradeGraphNode::QualifierMatte { op: candidate, .. }) if *candidate == op)),
+            None => self.has_unambiguous_corrector_input(op),
+        }
+    }
+
+    pub fn has_unambiguous_corrector_input(&self, op: GradeOpId) -> bool {
+        self.graph.as_ref().is_none_or(|graph| {
+            graph.nodes.values().filter(|node| matches!(node, GradeGraphNode::Corrector { op: candidate, .. } if *candidate == op)).count() == 1
+        })
+    }
+
+    pub fn add_graph_utility(&mut self, node: GradeGraphNode) -> Result<u32, &'static str> {
+        if !matches!(
+            node,
+            GradeGraphNode::QualifierMatte { .. }
+                | GradeGraphNode::KeyMixer { .. }
+                | GradeGraphNode::MatteApply { .. }
+                | GradeGraphNode::MatteRefine { .. }
+        ) {
+            return Err("expected a matte source, key mixer, matte refinement or matte apply node");
+        }
+        let mut graph = self.graph.clone().ok_or("grade has no graph")?;
+        let after_max = graph
+            .nodes
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("grading graph has too many nodes")?;
+        let id = graph.next_id.max(after_max);
+        graph.next_id = id
+            .checked_add(1)
+            .ok_or("grading graph has too many nodes")?;
+        let image = node.output_type() == GradeGraphPortType::Image;
+        graph.nodes.insert(id, node);
+        if image {
+            graph
+                .nodes
+                .insert(graph.output, GradeGraphNode::Output { input: id });
+        }
+        graph.validate(&self.ops)?;
+        self.graph = Some(graph);
+        Ok(id)
+    }
+
+    /// Remove a graph node without leaving dangling ports. A corrector is
+    /// replaced by its input; a mixer is replaced by its bottom branch. Nodes
+    /// and operators that become unreachable are pruned together.
+    pub fn remove_graph_node(&mut self, id: u32) -> Result<(), &'static str> {
+        let mut graph = self.graph.clone().ok_or("grade has no graph")?;
+        graph.validate(&self.ops)?;
+        graph.remove_node(id)?;
+        let used_ops: HashSet<_> = graph
+            .nodes
+            .values()
+            .filter_map(|node| match node {
+                GradeGraphNode::Corrector { op, .. }
+                | GradeGraphNode::QualifierMatte { op, .. } => Some(*op),
+                _ => None,
+            })
+            .collect();
+        let ops: Vec<_> = self
+            .ops
+            .iter()
+            .filter(|op| used_ops.contains(&op.id))
+            .cloned()
+            .collect();
+        graph.validate(&ops)?;
+        self.ops = ops;
+        self.graph = Some(graph);
+        Ok(())
+    }
+}
+
+/// A small typed image graph for serial and parallel corrections. Node ids are
+/// stable within the grade; the graph never changes the enclosing scope order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GradeGraph {
+    pub nodes: BTreeMap<u32, GradeGraphNode>,
+    pub output: u32,
+    /// Allocation cursor; retained across deletions so stale node IDs are not
+    /// accidentally reused. Older graphs default to zero and recover on add.
+    #[serde(default)]
+    pub next_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GradeGraphNode {
+    Input,
+    Corrector {
+        input: u32,
+        op: GradeOpId,
+        label: String,
+    },
+    LayerMixer {
+        top: u32,
+        bottom: u32,
+        opacity: f32,
+        label: String,
+    },
+    /// A qualifier key only; its CDL does not contribute to the matte.
+    QualifierMatte {
+        input: u32,
+        op: GradeOpId,
+        label: String,
+    },
+    MatteRefine {
+        input: u32,
+        #[serde(default)]
+        refinement: GradeMatteRefinement,
+        label: String,
+    },
+    KeyMixer {
+        top: u32,
+        bottom: u32,
+        mode: GradeKeyMixMode,
+        label: String,
+    },
+    /// Apply corrected straight color using an unassociated matte weight.
+    MatteApply {
+        original: u32,
+        corrected: u32,
+        matte: u32,
+        label: String,
+    },
+    Output {
+        input: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GradeKeyMixMode {
+    Union,
+    Intersect,
+    Subtract,
+    Multiply,
+}
+
+/// Spatial key refinement. Grow and Gaussian sigma are fractions of the
+/// logical frame's shorter dimension; denoise is a 3x3 processing-pixel median.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GradeMatteRefinement {
+    pub denoise: bool,
+    pub grow: f32,
+    pub blur: f32,
+    pub matte_levels: [f32; 2],
+}
+
+impl GradeMatteRefinement {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !self.grow.is_finite()
+            || !(-0.02..=0.02).contains(&self.grow)
+            || !self.blur.is_finite()
+            || !(0.0..=0.02).contains(&self.blur)
+            || self
+                .matte_levels
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..1.0).contains(value))
+            || self.matte_levels[0] + self.matte_levels[1] >= 1.0
+        {
+            return Err("matte refinement requires finite grow within ±2%, blur within 0..=2%, and valid clean thresholds");
+        }
+        Ok(())
+    }
+
+    pub fn is_neutral(&self) -> bool {
+        !self.denoise && self.grow == 0.0 && self.blur == 0.0 && self.matte_levels == [0.0; 2]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GradeGraphPortType {
+    Image,
+    Matte,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GradeGraphInputPort {
+    pub node: u32,
+    pub kind: GradeGraphPortType,
+    pub label: &'static str,
+}
+
+impl GradeGraphNode {
+    pub fn output_type(&self) -> GradeGraphPortType {
+        match self {
+            Self::QualifierMatte { .. } | Self::KeyMixer { .. } | Self::MatteRefine { .. } => {
+                GradeGraphPortType::Matte
+            }
+            _ => GradeGraphPortType::Image,
+        }
+    }
+
+    /// Fixed-size ports avoid per-node allocation during frame validation.
+    pub fn input_ports(&self) -> [Option<GradeGraphInputPort>; 3] {
+        use GradeGraphPortType::{Image, Matte};
+        let port = |node, kind, label| Some(GradeGraphInputPort { node, kind, label });
+        match self {
+            Self::Input => [None; 3],
+            Self::Corrector { input, .. }
+            | Self::QualifierMatte { input, .. }
+            | Self::Output { input } => [port(*input, Image, "image"), None, None],
+            Self::LayerMixer { top, bottom, .. } => [
+                port(*top, Image, "top"),
+                port(*bottom, Image, "bottom"),
+                None,
+            ],
+            Self::MatteRefine { input, .. } => [port(*input, Matte, "matte"), None, None],
+            Self::KeyMixer { top, bottom, .. } => [
+                port(*top, Matte, "top"),
+                port(*bottom, Matte, "bottom"),
+                None,
+            ],
+            Self::MatteApply {
+                original,
+                corrected,
+                matte,
+                ..
+            } => [
+                port(*original, Image, "original"),
+                port(*corrected, Image, "corrected"),
+                port(*matte, Matte, "matte"),
+            ],
+        }
+    }
+
+    pub fn set_input(&mut self, port: &str, source: u32) -> Result<(), &'static str> {
+        let slot = match self {
+            Self::Corrector { input, .. }
+            | Self::QualifierMatte { input, .. }
+            | Self::Output { input }
+                if port == "image" =>
+            {
+                input
+            }
+            Self::MatteRefine { input, .. } if port == "matte" => input,
+            Self::LayerMixer { top, .. } | Self::KeyMixer { top, .. } if port == "top" => top,
+            Self::LayerMixer { bottom, .. } | Self::KeyMixer { bottom, .. } if port == "bottom" => {
+                bottom
+            }
+            Self::MatteApply { original, .. } if port == "original" => original,
+            Self::MatteApply { corrected, .. } if port == "corrected" => corrected,
+            Self::MatteApply { matte, .. } if port == "matte" => matte,
+            _ => return Err("grading graph input port does not exist"),
+        };
+        *slot = source;
+        Ok(())
+    }
+}
+
+impl GradeGraph {
+    /// Convert an ordered stack to a serial graph without changing op ids,
+    /// animation, masks, or order. A bypassed grade remains bypassed.
+    pub fn from_stack(ops: &[GradeOp]) -> Self {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(0, GradeGraphNode::Input);
+        let mut previous = 0;
+        for (index, op) in ops.iter().enumerate() {
+            let id = index as u32 + 1;
+            nodes.insert(
+                id,
+                GradeGraphNode::Corrector {
+                    input: previous,
+                    op: op.id,
+                    label: String::new(),
+                },
+            );
+            previous = id;
+        }
+        let output = previous + 1;
+        nodes.insert(output, GradeGraphNode::Output { input: previous });
+        Self {
+            nodes,
+            output,
+            next_id: output.saturating_add(1),
+        }
+    }
+
+    fn append_corrector(&mut self, op: GradeOpId, parallel: bool) -> Result<(), &'static str> {
+        let upstream = match self.nodes.get(&self.output) {
+            Some(GradeGraphNode::Output { input }) => *input,
+            _ => return Err("grading graph has no output node"),
+        };
+        let after_max = self
+            .nodes
+            .keys()
+            .next_back()
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("grading graph has too many nodes")?;
+        let next = self.next_id.max(after_max);
+        let input = if parallel {
+            self.nodes
+                .iter()
+                .find_map(|(id, node)| matches!(node, GradeGraphNode::Input).then_some(*id))
+                .ok_or("grading graph has no input node")?
+        } else {
+            upstream
+        };
+        let mixer_id = if parallel {
+            Some(
+                next.checked_add(1)
+                    .ok_or("grading graph has too many nodes")?,
+            )
+        } else {
+            None
+        };
+        self.nodes.insert(
+            next,
+            GradeGraphNode::Corrector {
+                input,
+                op,
+                label: String::new(),
+            },
+        );
+        let new_output = if let Some(mixer_id) = mixer_id {
+            self.nodes.insert(
+                mixer_id,
+                GradeGraphNode::LayerMixer {
+                    top: next,
+                    bottom: upstream,
+                    opacity: 0.5,
+                    label: String::new(),
+                },
+            );
+            mixer_id
+        } else {
+            next
+        };
+        self.nodes
+            .insert(self.output, GradeGraphNode::Output { input: new_output });
+        self.next_id = new_output.checked_add(1).unwrap_or(u32::MAX);
+        Ok(())
+    }
+
+    fn remove_node(&mut self, id: u32) -> Result<(), &'static str> {
+        let reachable_before = self.reachable_nodes()?;
+        let replacement = match self.nodes.get(&id) {
+            Some(
+                GradeGraphNode::Corrector { input, .. } | GradeGraphNode::MatteRefine { input, .. },
+            ) => *input,
+            Some(
+                GradeGraphNode::LayerMixer { bottom, .. } | GradeGraphNode::KeyMixer { bottom, .. },
+            ) => *bottom,
+            Some(GradeGraphNode::MatteApply { original, .. }) => *original,
+            Some(GradeGraphNode::QualifierMatte { .. }) => {
+                if self.nodes.values().any(|node| {
+                    node.input_ports()
+                        .into_iter()
+                        .flatten()
+                        .any(|port| port.node == id)
+                }) {
+                    return Err("disconnect the matte source before removing it");
+                }
+                0 // Unconnected source: no port will use this replacement.
+            }
+            Some(GradeGraphNode::Input | GradeGraphNode::Output { .. }) => {
+                return Err("cannot remove grading graph input or output")
+            }
+            None => return Err("grading graph node does not exist"),
+        };
+        for node in self.nodes.values_mut() {
+            for port in node.input_ports().into_iter().flatten() {
+                if port.node == id {
+                    node.set_input(port.label, replacement)?;
+                }
+            }
+        }
+        self.nodes.remove(&id);
+        let reachable_after = self.reachable_nodes()?;
+        // Keep nodes that were already disconnected before this edit: they may
+        // be parked alternatives. Only prune the branch this removal orphaned.
+        self.nodes.retain(|node_id, _| {
+            !reachable_before.contains(node_id) || reachable_after.contains(node_id)
+        });
+        Ok(())
+    }
+
+    fn reachable_nodes(&self) -> Result<HashSet<u32>, &'static str> {
+        let mut reachable = HashSet::new();
+        let mut stack = vec![self.output];
+        while let Some(current) = stack.pop() {
+            if !reachable.insert(current) {
+                continue;
+            }
+            let node = self
+                .nodes
+                .get(&current)
+                .ok_or("grading graph references a missing node")?;
+            stack.extend(
+                node.input_ports()
+                    .into_iter()
+                    .flatten()
+                    .map(|port| port.node),
+            );
+        }
+        Ok(reachable)
+    }
+
+    /// Validate image/matte connections and cycles, including parked nodes.
+    pub fn validate(&self, ops: &[GradeOp]) -> Result<(), &'static str> {
+        let mut op_ids = HashSet::new();
+        if ops.iter().any(|op| !op_ids.insert(op.id)) {
+            return Err("grading graph corrector id is duplicated");
+        }
+        fn visit(
+            graph: &GradeGraph,
+            id: u32,
+            ops: &[GradeOp],
+            visiting: &mut HashSet<u32>,
+            visited: &mut HashSet<u32>,
+        ) -> Result<(), &'static str> {
+            if visited.contains(&id) {
+                return Ok(());
+            }
+            if !visiting.insert(id) {
+                return Err("grading graph contains a cycle");
+            }
+            let node = graph
+                .nodes
+                .get(&id)
+                .ok_or("grading graph references a missing node")?;
+            match node {
+                GradeGraphNode::Corrector { op, .. }
+                | GradeGraphNode::QualifierMatte { op, .. } => {
+                    let corrector = ops
+                        .iter()
+                        .find(|candidate| candidate.id == *op)
+                        .ok_or("grading graph references a missing corrector")?;
+                    if matches!(node, GradeGraphNode::QualifierMatte { .. })
+                        && (corrector.kind != GradeOpKind::HslQualifier
+                            || !matches!(corrector.params.base, GradeOpParams::HslQualifier { .. }))
+                    {
+                        return Err("matte source requires an HSL qualifier");
+                    }
+                }
+                GradeGraphNode::MatteRefine { refinement, .. } => refinement.validate()?,
+                GradeGraphNode::LayerMixer { opacity, .. }
+                    if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) =>
+                {
+                    return Err("grading graph mixer opacity is out of range")
+                }
+                _ => {}
+            }
+            for port in node.input_ports().into_iter().flatten() {
+                let source = graph
+                    .nodes
+                    .get(&port.node)
+                    .ok_or("grading graph references a missing node")?;
+                if source.output_type() != port.kind {
+                    return Err(match port.kind {
+                        GradeGraphPortType::Image => "image input cannot receive a matte",
+                        GradeGraphPortType::Matte => "matte input cannot receive an image",
+                    });
+                }
+                visit(graph, port.node, ops, visiting, visited)?;
+            }
+            visiting.remove(&id);
+            visited.insert(id);
+            Ok(())
+        }
+        if !matches!(
+            self.nodes.get(&self.output),
+            Some(GradeGraphNode::Output { .. })
+        ) {
+            return Err("grading graph has no output node");
+        }
+        let mut visited = HashSet::new();
+        for id in self.nodes.keys().copied() {
+            visit(self, id, ops, &mut HashSet::new(), &mut visited)?;
+        }
+        Ok(())
     }
 }
 
 impl Default for Grade {
     fn default() -> Self {
         Grade::new()
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    #[test]
+    fn typed_matte_utilities_round_trip_and_reject_wrong_ports_atomically() {
+        let mut grade = Grade::new();
+        let exposure = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let exposure_id = exposure.id;
+        let qualifier = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::identity(),
+                keys: vec![],
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        let qualifier_id = qualifier.id;
+        grade.ops.extend([exposure, qualifier]);
+        grade.convert_to_graph();
+        let before = grade.clone();
+        assert!(grade
+            .add_graph_utility(GradeGraphNode::QualifierMatte {
+                input: 1,
+                op: exposure_id,
+                label: String::new()
+            })
+            .is_err());
+        assert_eq!(grade, before);
+        let matte = grade
+            .add_graph_utility(GradeGraphNode::QualifierMatte {
+                input: 1,
+                op: qualifier_id,
+                label: "Key".into(),
+            })
+            .unwrap();
+        assert!(
+            grade.has_unambiguous_corrector_input(qualifier_id),
+            "a key-only utility is not a second image corrector"
+        );
+        let key = grade
+            .add_graph_utility(GradeGraphNode::KeyMixer {
+                top: matte,
+                bottom: matte,
+                mode: GradeKeyMixMode::Subtract,
+                label: "Exclude".into(),
+            })
+            .unwrap();
+        let apply = grade
+            .add_graph_utility(GradeGraphNode::MatteApply {
+                original: 1,
+                corrected: 2,
+                matte: key,
+                label: "Apply".into(),
+            })
+            .unwrap();
+        let graph = grade.graph.as_ref().unwrap();
+        assert_eq!(graph.validate(&grade.ops), Ok(()));
+        assert_eq!(graph.nodes[&matte].output_type(), GradeGraphPortType::Matte);
+        assert_eq!(graph.nodes[&apply].output_type(), GradeGraphPortType::Image);
+        let ports = graph.nodes[&apply].input_ports();
+        assert_eq!(ports[2].unwrap().kind, GradeGraphPortType::Matte);
+        assert_eq!(
+            serde_json::from_value::<Grade>(serde_json::to_value(&grade).unwrap()).unwrap(),
+            grade
+        );
+        let mut bad = graph.clone();
+        bad.nodes
+            .get_mut(&apply)
+            .unwrap()
+            .set_input("matte", 1)
+            .unwrap();
+        assert_eq!(
+            bad.validate(&grade.ops),
+            Err("matte input cannot receive an image")
+        );
+        let mut bad = graph.clone();
+        bad.nodes
+            .get_mut(&graph.output)
+            .unwrap()
+            .set_input("image", matte)
+            .unwrap();
+        assert_eq!(
+            bad.validate(&grade.ops),
+            Err("image input cannot receive a matte")
+        );
+        let mut bad = graph.clone();
+        bad.nodes
+            .get_mut(&matte)
+            .unwrap()
+            .set_input("image", apply)
+            .unwrap();
+        assert_eq!(
+            bad.validate(&grade.ops),
+            Err("grading graph contains a cycle")
+        );
+        let mut bad = graph.clone();
+        bad.nodes.insert(
+            999,
+            GradeGraphNode::Corrector {
+                input: 1000,
+                op: exposure_id,
+                label: String::new(),
+            },
+        );
+        assert_eq!(
+            bad.validate(&grade.ops),
+            Err("grading graph references a missing node")
+        );
+        let before = grade.clone();
+        assert!(grade.remove_graph_node(matte).is_err());
+        assert_eq!(grade, before);
+        grade.remove_graph_node(apply).unwrap();
+        assert_eq!(grade.graph.as_ref().unwrap().validate(&grade.ops), Ok(()));
+        assert!(matches!(
+            grade.graph.as_ref().unwrap().nodes[&grade.graph.as_ref().unwrap().output],
+            GradeGraphNode::Output { input: 1 }
+        ));
+    }
+
+    #[test]
+    fn matte_refinement_validation_is_atomic_and_removal_reconnects_consumers() {
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::identity(),
+                keys: vec![],
+                matte_levels: [0.0; 2],
+            },
+        ));
+        let op = grade.ops[0].id;
+        grade.convert_to_graph();
+        let matte = grade
+            .add_graph_utility(GradeGraphNode::QualifierMatte {
+                input: 0,
+                op,
+                label: String::new(),
+            })
+            .unwrap();
+        let before = grade.clone();
+        for refinement in [
+            GradeMatteRefinement {
+                grow: 0.021,
+                ..Default::default()
+            },
+            GradeMatteRefinement {
+                matte_levels: [0.5; 2],
+                ..Default::default()
+            },
+        ] {
+            assert!(grade
+                .add_graph_utility(GradeGraphNode::MatteRefine {
+                    input: matte,
+                    refinement,
+                    label: String::new()
+                })
+                .is_err());
+            assert_eq!(grade, before);
+        }
+        assert!(grade
+            .add_graph_utility(GradeGraphNode::MatteRefine {
+                input: 0,
+                refinement: Default::default(),
+                label: String::new()
+            })
+            .is_err());
+        assert_eq!(grade, before);
+        let refined = grade
+            .add_graph_utility(GradeGraphNode::MatteRefine {
+                input: matte,
+                refinement: GradeMatteRefinement {
+                    denoise: true,
+                    grow: -0.01,
+                    blur: 0.005,
+                    matte_levels: [0.1, 0.2],
+                },
+                label: "Refine".into(),
+            })
+            .unwrap();
+        let mix = grade
+            .add_graph_utility(GradeGraphNode::KeyMixer {
+                top: refined,
+                bottom: matte,
+                mode: GradeKeyMixMode::Multiply,
+                label: String::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<Grade>(serde_json::to_value(&grade).unwrap()).unwrap(),
+            grade
+        );
+        grade.remove_graph_node(refined).unwrap();
+        assert!(
+            matches!(grade.graph.as_ref().unwrap().nodes[&mix], GradeGraphNode::KeyMixer { top, .. } if top == matte)
+        );
+        assert_eq!(grade.graph.as_ref().unwrap().validate(&grade.ops), Ok(()));
+    }
+
+    #[test]
+    fn ordered_stack_converts_to_valid_serial_graph_and_round_trips() {
+        let ops = vec![
+            GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 1.0 },
+            ),
+            GradeOp::new(
+                GradeOpKind::Contrast,
+                GradeOpParams::Contrast {
+                    pivot: 0.5,
+                    amount: 1.2,
+                },
+            ),
+        ];
+        let graph = GradeGraph::from_stack(&ops);
+        assert_eq!(graph.validate(&ops), Ok(()));
+        let grade = Grade {
+            ops,
+            bypass: false,
+            graph: Some(graph),
+        };
+        let json = serde_json::to_string(&grade).unwrap();
+        assert_eq!(serde_json::from_str::<Grade>(&json).unwrap(), grade);
+    }
+
+    #[test]
+    fn graph_rejects_missing_corrector_and_cycle() {
+        let op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let mut graph = GradeGraph::from_stack(std::slice::from_ref(&op));
+        assert_eq!(
+            graph.validate(&[]),
+            Err("grading graph references a missing corrector")
+        );
+        graph.nodes.insert(
+            1,
+            GradeGraphNode::Corrector {
+                input: 1,
+                op: op.id,
+                label: String::new(),
+            },
+        );
+        assert_eq!(graph.validate(&[op]), Err("grading graph contains a cycle"));
+    }
+
+    #[test]
+    fn graph_adds_serial_and_parallel_correctors_atomically() {
+        let first = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let second = GradeOp::new(
+            GradeOpKind::Contrast,
+            GradeOpParams::Contrast {
+                pivot: 0.5,
+                amount: 1.2,
+            },
+        );
+        let third = GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [0.1, 0.0, 0.0],
+            },
+        );
+        let mut grade = Grade {
+            ops: vec![first],
+            bypass: false,
+            graph: None,
+        };
+        grade.convert_to_graph();
+        grade.add_graph_corrector(second, false).unwrap();
+        grade.add_graph_corrector(third.clone(), true).unwrap();
+        let graph = grade.graph.as_ref().unwrap();
+        assert_eq!(graph.validate(&grade.ops), Ok(()));
+        let mixer = graph
+            .nodes
+            .values()
+            .find_map(|node| match node {
+                GradeGraphNode::LayerMixer {
+                    top,
+                    bottom,
+                    opacity,
+                    ..
+                } => Some((*top, *bottom, *opacity)),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(mixer.2, 0.5);
+        assert!(
+            matches!(graph.nodes[&mixer.0], GradeGraphNode::Corrector { op, .. } if op == third.id)
+        );
+        let before = grade.clone();
+        assert!(grade.add_graph_corrector(third, false).is_err());
+        assert_eq!(grade, before);
+    }
+
+    #[test]
+    fn graph_removal_rewires_serial_nodes_and_prunes_parallel_branch() {
+        let first = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let second = GradeOp::new(
+            GradeOpKind::Contrast,
+            GradeOpParams::Contrast {
+                pivot: 0.5,
+                amount: 1.2,
+            },
+        );
+        let branch = GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [0.1, 0.0, 0.0],
+            },
+        );
+        let mut grade = Grade {
+            ops: vec![first.clone(), second.clone()],
+            bypass: false,
+            graph: None,
+        };
+        grade.convert_to_graph();
+        let second_node = grade
+            .graph
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .find_map(|(id, node)| {
+                matches!(node, GradeGraphNode::Corrector { op, .. } if *op == second.id)
+                    .then_some(*id)
+            })
+            .unwrap();
+        grade.remove_graph_node(second_node).unwrap();
+        assert_eq!(
+            grade.ops.iter().map(|op| op.id).collect::<Vec<_>>(),
+            vec![first.id]
+        );
+        let previous_cursor = grade.graph.as_ref().unwrap().next_id;
+        grade.add_graph_corrector(branch.clone(), true).unwrap();
+        let graph = grade.graph.as_ref().unwrap();
+        let mixer_id = graph
+            .nodes
+            .iter()
+            .find_map(|(id, node)| matches!(node, GradeGraphNode::LayerMixer { .. }).then_some(*id))
+            .unwrap();
+        assert!(mixer_id >= previous_cursor);
+        let parked = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: -0.5 },
+        );
+        grade.ops.push(parked.clone());
+        grade.graph.as_mut().unwrap().nodes.insert(
+            99,
+            GradeGraphNode::Corrector {
+                input: 0,
+                op: parked.id,
+                label: "Parked look".into(),
+            },
+        );
+        grade.graph.as_mut().unwrap().next_id = 100;
+        grade.remove_graph_node(mixer_id).unwrap();
+        assert_eq!(
+            grade.ops.iter().map(|op| op.id).collect::<Vec<_>>(),
+            vec![first.id, parked.id]
+        );
+        assert!(grade.graph.as_ref().unwrap().nodes.contains_key(&99));
+        assert!(grade
+            .graph
+            .as_ref()
+            .unwrap()
+            .nodes
+            .values()
+            .all(|node| !matches!(node, GradeGraphNode::LayerMixer { .. })));
+        assert_eq!(grade.graph.as_ref().unwrap().validate(&grade.ops), Ok(()));
+        let before = grade.clone();
+        assert!(grade.remove_graph_node(0).is_err());
+        assert_eq!(grade, before);
     }
 }
 
@@ -79,6 +1005,15 @@ impl GradeOp {
 #[non_exhaustive]
 pub enum GradeOpKind {
     Exposure,
+    /// Add per-channel scene-linear light; a distinct versioned operator so
+    /// existing CDL/wheel documents retain their prior arithmetic.
+    LinearOffset,
+    /// Independent red/green/blue printer-light points; 12 points = one stop.
+    PrinterLights,
+    /// Hue-preserving scene-linear highlight compression above a knee.
+    HighlightRolloff,
+    /// Linked scene-linear saturation with selective vibrance.
+    SaturationVibrance,
     Contrast,
     WhiteBalance,
     Cdl,
@@ -151,8 +1086,8 @@ impl Default for CdlParams {
     }
 }
 
-/// Per-kind grade parameters. Every field is a plain scalar/array — animation is
-/// supplied entirely by the surrounding `AnimProps` (07 §1). Forward-compat is
+/// Per-kind grade parameters. Animatable scalar fields use the surrounding
+/// `AnimProps` (07 §1); sampled qualifier regions remain authored data. Forward-compat is
 /// carried by the `#[serde(other)] Unknown` catch-all: a newer binary's op kind
 /// loads inert and flagged, never dropped.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -160,6 +1095,20 @@ impl Default for CdlParams {
 pub enum GradeOpParams {
     Exposure {
         stops: f32,
+    },
+    LinearOffset {
+        rgb: [f32; 3],
+    },
+    PrinterLights {
+        points: [f32; 3],
+    },
+    HighlightRolloff {
+        knee: f32,
+        strength: f32,
+    },
+    SaturationVibrance {
+        saturation: f32,
+        vibrance: f32,
     },
     Contrast {
         pivot: f32,
@@ -188,6 +1137,14 @@ pub enum GradeOpParams {
         blue: Vec<(f32, f32)>,
         hue_vs_hue: Vec<(f32, f32)>,
         hue_vs_sat: Vec<(f32, f32)>,
+        /// Optional new curve families. Empty means disabled; omit on save so
+        /// legacy grades retain their serialized shape and look.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hue_vs_luma: Vec<(f32, f32)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        luma_vs_sat: Vec<(f32, f32)>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sat_vs_sat: Vec<(f32, f32)>,
     },
     HslQualifier {
         hue: [f32; 2],
@@ -195,6 +1152,13 @@ pub enum GradeOpParams {
         lum: [f32; 2],
         softness: f32,
         correction: CdlParams,
+        /// Additional disjoint inclusions and sampled exclusions. Empty in
+        /// legacy projects, preserving their serialized shape and output.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keys: Vec<QualifierKey>,
+        /// Low/high matte thresholds. Neutral values keep legacy output.
+        #[serde(default, skip_serializing_if = "matte_levels_neutral")]
+        matte_levels: [f32; 2],
     },
     Lut3d {
         asset: AssetId,
@@ -210,11 +1174,57 @@ pub enum GradeOpParams {
     Unknown(serde_json::Map<String, serde_json::Value>),
 }
 
+fn matte_levels_neutral(levels: &[f32; 2]) -> bool {
+    *levels == [0.0, 0.0]
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QualifierKeyMode {
+    Add,
+    Subtract,
+}
+
+/// Maximum additional HSL key regions supported by the GPU qualifier kernel.
+/// Loaded grades above the limit are diagnosed and bypassed, never truncated.
+pub const MAX_QUALIFIER_KEYS: usize = 16;
+
+/// One sampled HSL neighborhood. Hue bounds may extend across the 0/1 seam;
+/// saturation and luminance remain in the normalized interval.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct QualifierKey {
+    pub mode: QualifierKeyMode,
+    pub hue: [f32; 2],
+    pub sat: [f32; 2],
+    pub lum: [f32; 2],
+    pub softness: f32,
+}
+
+impl QualifierKey {
+    /// The executable domain shared by edit validation and render resolution.
+    pub fn is_valid(&self) -> bool {
+        self.hue.iter().all(|value| value.is_finite())
+            && self.hue[0] >= -1.0
+            && self.hue[1] <= 2.0
+            && self.hue[0] <= self.hue[1]
+            && self.sat.iter().all(|value| (0.0..=1.0).contains(value))
+            && self.sat[0] <= self.sat[1]
+            && self.lum.iter().all(|value| (0.0..=1.0).contains(value))
+            && self.lum[0] <= self.lum[1]
+            && self.softness.is_finite()
+            && (0.0..=1.0).contains(&self.softness)
+    }
+}
+
 impl GradeOpParams {
     /// The op kind this param payload corresponds to, or `None` for `Unknown`.
     pub fn kind(&self) -> Option<GradeOpKind> {
         Some(match self {
             GradeOpParams::Exposure { .. } => GradeOpKind::Exposure,
+            GradeOpParams::LinearOffset { .. } => GradeOpKind::LinearOffset,
+            GradeOpParams::PrinterLights { .. } => GradeOpKind::PrinterLights,
+            GradeOpParams::HighlightRolloff { .. } => GradeOpKind::HighlightRolloff,
+            GradeOpParams::SaturationVibrance { .. } => GradeOpKind::SaturationVibrance,
             GradeOpParams::Contrast { .. } => GradeOpKind::Contrast,
             GradeOpParams::WhiteBalance { .. } => GradeOpKind::WhiteBalance,
             GradeOpParams::Cdl { .. } => GradeOpKind::Cdl,
@@ -268,6 +1278,8 @@ pub enum GradeMask {
 pub enum WindowShape {
     Ellipse,
     Rectangle,
+    /// Directional transition across the window's local Y axis.
+    Gradient,
 }
 
 /// Reference to a mask-producing source for `GradeMask::RotoMatte` (07 §4.2).
@@ -424,6 +1436,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn qualifier_add_subtract_keys_roundtrip_without_changing_legacy_shape() {
+        let legacy = GradeOpParams::HslQualifier {
+            hue: [0.0, 1.0],
+            sat: [0.0, 1.0],
+            lum: [0.0, 1.0],
+            softness: 0.1,
+            correction: CdlParams::default(),
+            keys: Vec::new(),
+            matte_levels: [0.0, 0.0],
+        };
+        let legacy_json = serde_json::to_value(&legacy).unwrap();
+        assert!(legacy_json.get("keys").is_none());
+        assert!(legacy_json.get("matte_levels").is_none());
+        assert_eq!(
+            serde_json::from_value::<GradeOpParams>(legacy_json).unwrap(),
+            legacy
+        );
+
+        let mut authored = legacy;
+        if let GradeOpParams::HslQualifier { keys, .. } = &mut authored {
+            keys.push(QualifierKey {
+                mode: QualifierKeyMode::Subtract,
+                hue: [-0.04, 0.07],
+                sat: [0.4, 1.0],
+                lum: [0.2, 0.8],
+                softness: 0.05,
+            });
+        }
+        if let GradeOpParams::HslQualifier { matte_levels, .. } = &mut authored {
+            *matte_levels = [0.1, 0.2];
+        }
+        let encoded = serde_json::to_value(&authored).unwrap();
+        assert_eq!(encoded["keys"][0]["mode"], "subtract");
+        assert_eq!(
+            encoded["matte_levels"],
+            serde_json::to_value([0.1_f32, 0.2_f32]).unwrap()
+        );
+        assert_eq!(
+            serde_json::from_value::<GradeOpParams>(encoded).unwrap(),
+            authored
+        );
+    }
+
+    #[test]
+    fn gradient_window_roundtrips_without_changing_legacy_window_tags() {
+        let mask = GradeMask::PowerWindow {
+            shape: WindowShape::Gradient,
+            center: [0.5, 0.5],
+            size: [0.25, 0.3],
+            rotation: 0.2,
+            softness: 0.1,
+            invert: false,
+        };
+        let value = serde_json::to_value(&mask).unwrap();
+        assert_eq!(value["shape"], "gradient");
+        assert_eq!(serde_json::from_value::<GradeMask>(value).unwrap(), mask);
+        assert_eq!(
+            serde_json::to_value(WindowShape::Ellipse).unwrap(),
+            "ellipse"
+        );
+        assert_eq!(
+            serde_json::to_value(WindowShape::Rectangle).unwrap(),
+            "rectangle"
+        );
+    }
+
+    #[test]
+    fn legacy_curves_omit_new_optional_families_on_roundtrip() {
+        let legacy = serde_json::json!({
+            "kind": "curves",
+            "master": [[0.0, 0.0], [1.0, 1.0]],
+            "red": [], "green": [], "blue": [],
+            "hue_vs_hue": [], "hue_vs_sat": []
+        });
+        let parsed: GradeOpParams = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), legacy);
+        if let GradeOpParams::Curves {
+            hue_vs_luma,
+            luma_vs_sat,
+            sat_vs_sat,
+            ..
+        } = parsed
+        {
+            assert!(hue_vs_luma.is_empty());
+            assert!(luma_vs_sat.is_empty());
+            assert!(sat_vs_sat.is_empty());
+        } else {
+            panic!("legacy curve payload changed kind");
+        }
+    }
+
+    #[test]
     fn grade_op_params_forward_compat_unknown() {
         // A payload tagged with an op kind this build doesn't know loads as
         // Unknown, preserving the WHOLE object verbatim (39 §2.2 rule 1) — the
@@ -476,6 +1580,20 @@ mod tests {
     fn grade_op_params_roundtrip_each_kind() {
         let samples = vec![
             GradeOpParams::Exposure { stops: 1.5 },
+            GradeOpParams::LinearOffset {
+                rgb: [0.1, 0.0, -0.1],
+            },
+            GradeOpParams::PrinterLights {
+                points: [3.0, 0.0, -3.0],
+            },
+            GradeOpParams::HighlightRolloff {
+                knee: 1.0,
+                strength: 0.75,
+            },
+            GradeOpParams::SaturationVibrance {
+                saturation: 1.2,
+                vibrance: 0.3,
+            },
             GradeOpParams::Cdl {
                 slope: [1.1, 1.0, 0.9],
                 offset: [0.0, 0.01, -0.02],

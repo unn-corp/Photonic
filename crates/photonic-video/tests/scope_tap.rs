@@ -8,6 +8,8 @@
 //!
 //! - [`ScopeTapPoint::Clip`] — the clip's node after its own `Grade`, **before**
 //!   the track fold (07 §5);
+//! - [`ScopeTapPoint::ClipPreGrade`] — the input to the clip's own grade, for
+//!   exact qualifier-matte inspection;
 //! - [`ScopeTapPoint::Program`] — the folded program after the master stack,
 //!   **before** `CaptionOverlay` (03 §3.6); also the 13 §10.2 fallback.
 //!
@@ -226,6 +228,85 @@ fn clip_tap_is_taken_after_the_clips_own_grade() {
         mean_rgb(&after)
     );
     assert!(differ(&plain, &after), "the grade must reach the tap");
+}
+
+#[test]
+fn pre_grade_tap_is_before_clip_correction_but_after_upstream_processing() {
+    let (graded, clip) = compiled(Tick(0), |seq| {
+        seq.video_tracks[0].clips[0].grade = Some(half_red_cdl());
+        opaque_green_track_above(seq);
+    });
+    let before = eval_tap(&graded, ScopeTapPoint::ClipPreGrade(clip));
+    let after = eval_tap(&graded, ScopeTapPoint::Clip(clip));
+    assert!(approx(mean_rgb(&before), [1.0, 0.0, 0.0]));
+    assert!(mean_rgb(&after)[0] < 0.9);
+    assert!(differ(&before, &after));
+    assert!(differ(&before, &eval_output(&graded)));
+    assert_eq!(
+        graded
+            .resolve_tap(ScopeTapPoint::ClipPreGrade(clip))
+            .map(|(point, _)| point),
+        Some(ScopeTapPoint::ClipPreGrade(clip)),
+    );
+    let (off, _) = compiled(Tick(5000), |seq| {
+        let mut v2 = Track::new(TrackKind::Video, "V2");
+        v2.clips.push(Clip::new(
+            ClipSource::SolidColor { color: GREEN },
+            Tick(0),
+            Tick(10_000),
+        ));
+        seq.video_tracks.push(v2);
+    });
+    assert!(off.tap(ScopeTapPoint::ClipPreGrade(clip)).is_none());
+    assert_eq!(
+        off.resolve_tap(ScopeTapPoint::ClipPreGrade(clip))
+            .map(|(point, _)| point),
+        Some(ScopeTapPoint::Program),
+    );
+}
+
+#[test]
+fn clip_inspection_keeps_resolved_corrector_ids_for_matte_preview() {
+    let mut exposure_id = None;
+    let mut qualifier_id = None;
+    let (compiled, clip) = compiled(Tick(0), |seq| {
+        let exposure = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let qualifier = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: photonic_core::timeline::CdlParams::default(),
+                keys: Vec::new(),
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        exposure_id = Some(exposure.id);
+        qualifier_id = Some(qualifier.id);
+        let mut grade = Grade::default();
+        grade.ops.extend([exposure, qualifier]);
+        seq.video_tracks[0].clips[0].grade = Some(grade);
+    });
+    let inspection = compiled
+        .clip_grade_inspections
+        .iter()
+        .find(|inspection| inspection.clip == clip)
+        .expect("clip inspection");
+    assert_eq!(inspection.ops.len(), 2);
+    assert_eq!(inspection.ops[0].0, exposure_id.unwrap());
+    assert_eq!(inspection.ops[1].0, qualifier_id.unwrap());
+    assert!(matches!(inspection.ops[0].1.payload,
+        photonic_render::grade::ResolvedGradePayload::Exposure { stops } if stops == 1.0));
+    assert!(matches!(
+        inspection.ops[1].1.payload,
+        photonic_render::grade::ResolvedGradePayload::HslQualifier(_)
+    ));
+    assert!(compiled.tap(ScopeTapPoint::ClipPreGrade(clip)).is_some());
 }
 
 /// 07 §5: "before the track fold". Halving the clip's TRACK opacity changes the

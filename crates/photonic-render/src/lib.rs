@@ -15,8 +15,11 @@ pub mod compositor;
 pub mod gpu_state;
 pub mod grade;
 pub mod grade_gpu;
+pub mod grade_graph;
 pub mod headless;
 pub mod lut;
+pub mod native_display;
+pub mod native_transfer;
 pub mod pipeline;
 pub mod renderer;
 pub mod scopes;
@@ -36,7 +39,7 @@ pub use grade::{
     apply_grade_cpu, resolve, ResolvedCdl, ResolvedCurves, ResolvedGradeOp, ResolvedGradePayload,
     ResolvedHslQualifier, ResolvedLut3d, ResolvedMask,
 };
-pub use grade_gpu::{apply_grade_op_gpu, apply_grade_stack_gpu};
+pub use grade_gpu::{apply_grade_op_gpu, apply_grade_stack_gpu, qualifier_matte_gpu};
 pub use headless::{
     document_needs_cpu_compositor, ExportBackground, ExportOptions, HeadlessRenderer,
 };

@@ -122,12 +122,45 @@ pub enum EyedropperTarget {
         track: photonic_core::timeline::TrackId,
         clip: photonic_core::timeline::ClipId,
         op: photonic_core::timeline::GradeOpId,
+        graph_node: Option<u32>,
+        mode: QualifierSampleMode,
     },
+    /// Add an anchor to a grade curve from a program-monitor pixel.
+    GradeCurve {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        op: photonic_core::timeline::GradeOpId,
+        graph_node: Option<u32>,
+        channel: usize,
+    },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum QualifierSampleMode {
+    Replace,
+    Add,
+    Subtract,
 }
 
 /// An action requested by a panel widget, to be processed by the main draw loop.
 #[derive(Debug)]
 pub enum PanelAction {
+    GradeInputSelectionChanged {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        op: photonic_core::timeline::GradeOpId,
+        graph_node: Option<u32>,
+    },
+    /// Toggle the program-monitor isolation matte for a clip corrector.
+    ToggleQualifierMatte {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        op: photonic_core::timeline::GradeOpId,
+        graph_node: Option<u32>,
+    },
     /// Reorder a node in z-order.
     ReorderNode { node_id: NodeId, op: ZOrderOp },
     /// Select a single node (e.g. clicked in the Layers tree).
@@ -912,6 +945,14 @@ pub enum PanelAction {
     MediaRelink {
         asset: photonic_core::timeline::AssetId,
     },
+    MediaSetLutColor {
+        asset: photonic_core::timeline::AssetId,
+        value: photonic_core::timeline::color::LutColorInterpretation,
+    },
+    MediaSetLutPurpose {
+        asset: photonic_core::timeline::AssetId,
+        technical: bool,
+    },
     /// Engine-wide proxy playback mode (05 §4; `EngineCmd::SetProxyMode`).
     MediaSetProxyMode { mode: photonic_video::ProxyMode },
     /// Build reusable editing proxies for every file-backed video in the pool.
@@ -963,6 +1004,11 @@ pub enum PanelAction {
     /// off `PhotonicApp::playhead` in `app/monitor.rs`, so a panel cannot seek
     /// directly — it queues this and the main loop assigns the field.
     SeekPlayhead { at: photonic_core::timeline::Tick },
+    /// Navigate Color Controls to a clip in the active sequence and seek to
+    /// its start. Selection and playhead are session state, not undoable edits.
+    SelectGradeClip {
+        clip: photonic_core::timeline::ClipId,
+    },
     /// Committed as ONE non-folding undo step (button/toggle actions: add/
     /// remove/reorder effect, enable toggle, "Reset reframe", etc.).
     ClipEditDiscrete(photonic_core::timeline::TimelineCmd),
@@ -1736,7 +1782,8 @@ pub fn draw_audit_panel(
             // ── Filter bar ────────────────────────────────────────────────
             ui.horizontal(|ui| {
                 ui.label("Filter:");
-                ui.text_edit_singleline(filter);
+                let width = (ui.available_width() - 170.0).clamp(80.0, 280.0);
+                ui.add(egui::TextEdit::singleline(filter).desired_width(width));
                 if ui.small_button(ph::X).clicked() {
                     filter.clear();
                 }
@@ -1759,80 +1806,137 @@ pub fn draw_audit_panel(
 
             if entries.is_empty() {
                 ui.centered_and_justified(|ui| {
-                    ui.weak("No audit entries yet — make an MCP tool call to see it here.");
+                    ui.weak(if filter_lower.is_empty() {
+                        "No audit entries yet — make an MCP tool call to see it here."
+                    } else {
+                        "No calls match this filter."
+                    });
                 });
                 return;
             }
 
-            // ── Header row ────────────────────────────────────────────────
-            egui::Grid::new("audit_header")
-                .num_columns(4)
-                .min_col_width(40.0)
-                .show(ui, |ui| {
-                    ui.strong("#");
-                    ui.strong("Time");
-                    ui.strong("Tool");
-                    ui.strong("ms");
-                    ui.end_row();
-                });
-            ui.separator();
-
-            // ── Scrollable rows ───────────────────────────────────────────
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    egui::Grid::new("audit_entries")
-                        .num_columns(4)
-                        .striped(true)
-                        .min_col_width(40.0)
-                        .show(ui, |ui| {
-                            for entry in &entries {
-                                // ID
-                                ui.weak(format!("{}", entry.id));
-
-                                // Timestamp — show HH:MM:SS only
-                                let ts_short =
-                                    entry.timestamp.get(11..19).unwrap_or(&entry.timestamp);
-                                ui.weak(ts_short);
-
-                                // Tool name — color by error status
-                                if entry.is_error {
-                                    ui.colored_label(
-                                        Color32::from_rgb(220, 80, 80),
-                                        &entry.tool_name,
-                                    );
-                                } else {
-                                    ui.colored_label(
-                                        Color32::from_rgb(100, 200, 120),
-                                        &entry.tool_name,
-                                    );
-                                }
-
-                                // Duration
-                                ui.weak(format!("{}ms", entry.duration_ms));
-
-                                ui.end_row();
-
-                                // Result summary (spans all columns)
-                                if !entry.result_summary.is_empty() {
-                                    ui.label(""); // id col
-                                    let summary = if entry.result_summary.len() > 120 {
-                                        format!("{}…", &entry.result_summary[..120])
-                                    } else {
-                                        entry.result_summary.clone()
-                                    };
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(summary).weak().italics().size(10.5),
+                    for entry in &entries {
+                        ui.push_id(entry.id, |ui| {
+                            egui::Frame::none()
+                                .fill(ui.visuals().faint_bg_color)
+                                .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        ui.weak(format!("#{}", entry.id));
+                                        ui.weak(
+                                            entry.timestamp.get(11..19).unwrap_or(&entry.timestamp),
+                                        );
+                                        let color = if entry.is_error {
+                                            Color32::from_rgb(220, 80, 80)
+                                        } else {
+                                            Color32::from_rgb(100, 200, 120)
+                                        };
+                                        let name_width = (ui.available_width() - 100.0).max(80.0);
+                                        ui.add_sized(
+                                            [name_width, 18.0],
+                                            egui::Label::new(
+                                                RichText::new(&entry.tool_name)
+                                                    .strong()
+                                                    .color(color),
+                                            )
+                                            .truncate(),
                                         )
-                                        .wrap(),
-                                    );
-                                    ui.label("");
-                                    ui.label("");
-                                    ui.end_row();
-                                }
-                            }
+                                        .on_hover_text(&entry.tool_name);
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.weak(format!("{} ms", entry.duration_ms));
+                                                ui.label(
+                                                    RichText::new(if entry.is_error {
+                                                        "Error"
+                                                    } else {
+                                                        "OK"
+                                                    })
+                                                    .color(color)
+                                                    .small(),
+                                                );
+                                            },
+                                        );
+                                    });
+                                    if !entry.result_summary.is_empty() {
+                                        ui.add(
+                                            egui::Label::new(audit_summary_preview(
+                                                &entry.result_summary,
+                                            ))
+                                            .wrap(),
+                                        )
+                                        .on_hover_text(&entry.result_summary);
+                                    }
+                                    ui.collapsing("Arguments", |ui| {
+                                        let arguments = serde_json::to_string_pretty(&entry.args)
+                                            .unwrap_or_default();
+                                        if ui.small_button("Copy arguments").clicked() {
+                                            ui.output_mut(|output| {
+                                                output.copied_text = arguments.clone()
+                                            });
+                                        }
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(arguments).monospace().small(),
+                                            )
+                                            .wrap(),
+                                        );
+                                    });
+                                });
                         });
+                        ui.add_space(4.0);
+                    }
                 });
         });
+}
+
+fn audit_summary_preview(summary: &str) -> String {
+    let mut characters = summary.chars();
+    let mut preview: String = characters.by_ref().take(120).collect();
+    if characters.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[test]
+    fn audit_panel_displays_multibyte_results_without_mutating_records() {
+        let mut log = photonic_core::AuditLog::new();
+        let summary = format!("a{}", "€".repeat(100));
+        assert!(!summary.is_char_boundary(120));
+        log.record(photonic_core::AuditEntry {
+            id: 0,
+            timestamp: "2026-10-04T22:00:00Z".into(),
+            tool_name: "inspect_render_manifest".into(),
+            args: serde_json::json!({"path":"映像.mov"}),
+            result_summary: summary.clone(),
+            duration_ms: 27,
+            is_error: false,
+        });
+        let log = std::sync::Arc::new(std::sync::Mutex::new(log));
+        let context = egui::Context::default();
+        let mut open = true;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |context| draw_audit_panel(context, &Some(log.clone()), &mut open, &mut String::new()),
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.entries().len(), 1);
+        assert_eq!(log.entries()[0].result_summary, summary);
+        assert_eq!(log.entries()[0].args["path"], "映像.mov");
+    }
 }

@@ -171,6 +171,7 @@ mod tests {
             document: Arc::new(Mutex::new(Document::new("audit test", 200.0, 100.0))),
             history: Arc::new(Mutex::new(CommandHistory::new(100))),
             document_path: Arc::new(StdMutex::new(None)),
+            document_saves: Default::default(),
             capture_tx: Arc::new(StdMutex::new(capture_tx)),
             config: McpServerConfig::default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),

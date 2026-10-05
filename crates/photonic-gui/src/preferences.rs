@@ -1,7 +1,12 @@
 use crate::commands::KeyBinding;
 use crate::hotbar::{HotbarBucket, HotbarMode};
+use crate::panels::video::{
+    color_page::{TapMode, VectorscopeTargets},
+    ScopeKind,
+};
 use crate::panels::{DrawerGroup, RightDrawerGroup};
 use crate::tools::Tool;
+use photonic_render::scopes::ScopeScale;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,6 +40,122 @@ impl ThemeMode {
             ThemeMode::Dark => egui::ThemePreference::Dark,
             ThemeMode::Light => egui::ThemePreference::Light,
         }
+    }
+}
+
+/// Local arrangement and measurement controls for the floating Scopes panel.
+/// The rectangle is screen-space logical pixels and never enters project history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScopeWindowPreferences {
+    #[serde(default)]
+    pub(crate) open: bool,
+    #[serde(default)]
+    pub(crate) docked: bool,
+    #[serde(default = "default_scope_dock_height")]
+    pub(crate) dock_height: f32,
+    #[serde(default)]
+    pub(crate) kind: ScopeKind,
+    #[serde(default)]
+    pub(crate) tap: TapMode,
+    #[serde(default)]
+    pub(crate) scale: ScopeScale,
+    #[serde(default)]
+    pub(crate) vectorscope_601: bool,
+    #[serde(default)]
+    pub(crate) vectorscope_targets: VectorscopeTargets,
+    /// [left, top, width, height]. Old installations leave this unset.
+    #[serde(default)]
+    pub(crate) rect: Option<[f32; 4]>,
+    /// Additional simultaneous scope views, each with a stable analysis ID.
+    #[serde(default)]
+    pub(crate) additional: Vec<AdditionalScopePreferences>,
+    #[serde(default = "default_next_scope_window_id")]
+    pub(crate) next_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdditionalScopePreferences {
+    pub(crate) id: u32,
+    #[serde(default)]
+    pub(crate) kind: ScopeKind,
+    #[serde(default)]
+    pub(crate) scale: ScopeScale,
+    #[serde(default)]
+    pub(crate) vectorscope_601: bool,
+    #[serde(default)]
+    pub(crate) vectorscope_targets: VectorscopeTargets,
+    #[serde(default)]
+    pub(crate) rect: Option<[f32; 4]>,
+}
+
+fn default_scope_dock_height() -> f32 {
+    280.0
+}
+
+fn default_next_scope_window_id() -> u32 {
+    1
+}
+
+impl Default for ScopeWindowPreferences {
+    fn default() -> Self {
+        Self {
+            open: false,
+            docked: false,
+            dock_height: default_scope_dock_height(),
+            kind: ScopeKind::default(),
+            tap: TapMode::default(),
+            scale: ScopeScale::default(),
+            vectorscope_601: false,
+            vectorscope_targets: VectorscopeTargets::default(),
+            rect: None,
+            additional: Vec::new(),
+            next_id: default_next_scope_window_id(),
+        }
+    }
+}
+
+impl ScopeWindowPreferences {
+    pub(crate) fn normalize(&mut self) {
+        self.dock_height = if self.dock_height.is_finite() {
+            self.dock_height.clamp(160.0, 560.0)
+        } else {
+            default_scope_dock_height()
+        };
+        let mut seen = std::collections::HashSet::new();
+        self.additional
+            .retain(|window| window.id != 0 && seen.insert(window.id));
+        self.additional.truncate(3);
+        self.next_id = self
+            .additional
+            .iter()
+            .map(|window| window.id.saturating_add(1))
+            .max()
+            .unwrap_or(1)
+            .max(self.next_id)
+            .max(1);
+    }
+
+    pub(crate) fn add_scope(&mut self) {
+        self.normalize();
+        if self.additional.len() >= 3 {
+            return;
+        }
+        let mut id = self.next_id.max(1);
+        while self.additional.iter().any(|window| window.id == id) {
+            let Some(next) = id.checked_add(1) else {
+                return;
+            };
+            id = next;
+        }
+        self.next_id = id.saturating_add(1);
+        self.additional.push(AdditionalScopePreferences {
+            id,
+            kind: ScopeKind::Parade,
+            scale: self.scale,
+            vectorscope_601: self.vectorscope_601,
+            vectorscope_targets: self.vectorscope_targets,
+            rect: None,
+        });
     }
 }
 
@@ -180,6 +301,23 @@ pub struct AppPreferences {
     /// regardless of this flag — it only gates the *automatic* first showing.
     #[serde(default)]
     pub video_shortcuts_intro_shown: bool,
+    /// Restore the compact Color workspace when entering Video mode.
+    /// A local UI preference, never part of a project or undo history.
+    #[serde(default)]
+    pub color_workspace_open: bool,
+    /// Use the full Color Controls stack rather than the compact primary view.
+    /// A local workspace preference, not part of the project grade.
+    #[serde(default = "default_true")]
+    pub color_advanced_controls: bool,
+    /// Width of the reference gallery in the Color workspace (logical px).
+    #[serde(default = "default_color_gallery_width")]
+    pub color_gallery_width: f32,
+    /// Height of the shot strip in the Color workspace (logical px).
+    #[serde(default = "default_color_shot_strip_height")]
+    pub color_shot_strip_height: f32,
+    /// Floating scopes arrangement; local to this installation.
+    #[serde(default)]
+    pub scope_window: ScopeWindowPreferences,
 
     // HOTBAR — the always-on adaptive second toolbar row (#154 Phase 4).
     /// Static (curated default order) or Adaptive (ranked by the user's usage).
@@ -323,6 +461,14 @@ fn default_right_drawer_width() -> f32 {
     280.0
 }
 
+fn default_color_gallery_width() -> f32 {
+    178.0
+}
+
+fn default_color_shot_strip_height() -> f32 {
+    104.0
+}
+
 /// How the project-history retention limit is measured.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum HistoryLimitMode {
@@ -398,6 +544,11 @@ impl Default for AppPreferences {
             timeline_snap_enabled: true,
             video_hint_dismissed: false,
             video_shortcuts_intro_shown: false,
+            color_workspace_open: false,
+            color_advanced_controls: true,
+            color_gallery_width: default_color_gallery_width(),
+            color_shot_strip_height: default_color_shot_strip_height(),
+            scope_window: ScopeWindowPreferences::default(),
             hotbar_mode: HotbarMode::default(),
             hotbar_usage: HashMap::new(),
             keymap: HashMap::new(),
@@ -682,6 +833,148 @@ mod tests {
         let loaded: AppPreferences =
             serde_json::from_value(old_preferences).expect("older preferences deserialize");
         assert!(!loaded.force_x11_backend);
+    }
+
+    #[test]
+    fn color_workspace_preference_roundtrips_and_defaults_off() {
+        let mut prefs = AppPreferences {
+            color_workspace_open: true,
+            color_advanced_controls: false,
+            color_gallery_width: 260.0,
+            color_shot_strip_height: 138.0,
+            scope_window: ScopeWindowPreferences {
+                open: true,
+                docked: true,
+                dock_height: 320.0,
+                kind: ScopeKind::Parade,
+                tap: TapMode::Program,
+                scale: ScopeScale::VideoLegal,
+                vectorscope_601: true,
+                vectorscope_targets: VectorscopeTargets::Pct100,
+                rect: Some([24.0, 48.0, 640.0, 400.0]),
+                additional: vec![AdditionalScopePreferences {
+                    id: 7,
+                    kind: ScopeKind::Vectorscope,
+                    scale: ScopeScale::Full,
+                    vectorscope_601: false,
+                    vectorscope_targets: VectorscopeTargets::Pct75,
+                    rect: Some([680.0, 48.0, 360.0, 400.0]),
+                }],
+                next_id: 8,
+            },
+            ..AppPreferences::default()
+        };
+        let saved = serde_json::to_value(&prefs).unwrap();
+        prefs = serde_json::from_value(saved.clone()).unwrap();
+        assert!(prefs.color_workspace_open);
+        assert!(!prefs.color_advanced_controls);
+        assert_eq!(prefs.color_gallery_width, 260.0);
+        assert_eq!(prefs.color_shot_strip_height, 138.0);
+        assert!(prefs.scope_window.open);
+        assert!(prefs.scope_window.docked);
+        assert_eq!(prefs.scope_window.dock_height, 320.0);
+        assert_eq!(prefs.scope_window.kind, ScopeKind::Parade);
+        assert_eq!(prefs.scope_window.tap, TapMode::Program);
+        assert_eq!(prefs.scope_window.scale, ScopeScale::VideoLegal);
+        assert!(prefs.scope_window.vectorscope_601);
+        assert_eq!(
+            prefs.scope_window.vectorscope_targets,
+            VectorscopeTargets::Pct100
+        );
+        assert_eq!(prefs.scope_window.rect, Some([24.0, 48.0, 640.0, 400.0]));
+        assert_eq!(prefs.scope_window.additional.len(), 1);
+        assert_eq!(prefs.scope_window.additional[0].id, 7);
+        assert_eq!(
+            prefs.scope_window.additional[0].vectorscope_targets,
+            VectorscopeTargets::Pct75
+        );
+        assert_eq!(prefs.scope_window.next_id, 8);
+
+        let mut previous_scope = saved["scope_window"].clone();
+        previous_scope
+            .as_object_mut()
+            .unwrap()
+            .remove("vectorscope_601");
+        previous_scope
+            .as_object_mut()
+            .unwrap()
+            .remove("vectorscope_targets");
+        for scope in previous_scope["additional"].as_array_mut().unwrap() {
+            scope.as_object_mut().unwrap().remove("vectorscope_601");
+            scope.as_object_mut().unwrap().remove("vectorscope_targets");
+        }
+        for key in ["open", "docked", "dock_height"] {
+            previous_scope.as_object_mut().unwrap().remove(key);
+        }
+        let previous: ScopeWindowPreferences = serde_json::from_value(previous_scope).unwrap();
+        assert!(!previous.open);
+        assert!(!previous.docked);
+        assert_eq!(previous.dock_height, 280.0);
+        assert!(!previous.vectorscope_601);
+        assert_eq!(previous.vectorscope_targets, VectorscopeTargets::Pct75);
+        assert_eq!(
+            previous.additional[0].vectorscope_targets,
+            VectorscopeTargets::Pct75
+        );
+
+        let mut older = saved;
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("color_workspace_open");
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("color_advanced_controls");
+        older.as_object_mut().unwrap().remove("color_gallery_width");
+        older
+            .as_object_mut()
+            .unwrap()
+            .remove("color_shot_strip_height");
+        older.as_object_mut().unwrap().remove("scope_window");
+        let restored: AppPreferences = serde_json::from_value(older).unwrap();
+        assert!(!restored.color_workspace_open);
+        assert!(restored.color_advanced_controls);
+        assert_eq!(restored.color_gallery_width, 178.0);
+        assert_eq!(restored.color_shot_strip_height, 104.0);
+        assert_eq!(restored.scope_window, ScopeWindowPreferences::default());
+    }
+
+    #[test]
+    fn additional_scopes_have_unique_bounded_persistent_ids() {
+        let mut settings = ScopeWindowPreferences::default();
+        for _ in 0..4 {
+            settings.add_scope();
+        }
+        assert_eq!(settings.additional.len(), 3);
+        assert_eq!(
+            settings.additional.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        settings.additional.remove(1);
+        settings.add_scope();
+        assert_eq!(
+            settings.additional.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+
+        let mut restored: ScopeWindowPreferences =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        restored.additional.push(restored.additional[0].clone());
+        restored.additional.push(AdditionalScopePreferences {
+            id: 0,
+            kind: ScopeKind::Histogram,
+            scale: ScopeScale::Full,
+            vectorscope_601: false,
+            vectorscope_targets: VectorscopeTargets::Pct75,
+            rect: None,
+        });
+        restored.normalize();
+        assert_eq!(
+            restored.additional.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+        assert_eq!(restored.next_id, 5);
     }
 
     #[test]

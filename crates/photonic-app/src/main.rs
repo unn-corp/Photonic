@@ -329,6 +329,7 @@ fn main() -> Result<()> {
     }
 
     // ── GUI mode: winit on the main thread; MCP starts after GPU initialization ─
+    let document_saves = Arc::new(photonic_mcp::server::DocumentSaveState::default());
     let mcp_running = Arc::new(AtomicBool::new(false));
     let mcp_restart_requested = Arc::new(AtomicBool::new(false));
     let mcp_state = spawn_mcp_server(
@@ -339,6 +340,7 @@ fn main() -> Result<()> {
         Arc::clone(&mcp_running),
         Arc::clone(&audit_log),
         Arc::clone(&mcp_document_path),
+        document_saves,
     );
 
     // winit 0.30's Wayland backend does not emit file-drop events. Keep the
@@ -535,9 +537,11 @@ fn spawn_mcp_server(
     running_flag: Arc<AtomicBool>,
     audit: Arc<std::sync::Mutex<AuditLog>>,
     document_path: Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    document_saves: Arc<photonic_mcp::server::DocumentSaveState>,
 ) -> AppState {
     let server = McpServer::new(document, history, capture_tx, config, running_flag, audit)
-        .with_document_path(document_path);
+        .with_document_path(document_path)
+        .with_document_saves(document_saves);
     let state = server.state.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -572,6 +576,7 @@ impl PhotonicWinitApp {
                 Arc::clone(&self.mcp_running),
                 Arc::clone(&self.audit_log),
                 Arc::clone(&self.mcp_document_path),
+                Arc::clone(&self.mcp_state.document_saves),
             );
         }
     }
@@ -777,6 +782,7 @@ impl ApplicationHandler for PhotonicWinitApp {
         };
         gui.audit.log = Some(Arc::clone(&self.audit_log));
         gui.mcp_restart_requested = Some(Arc::clone(&self.mcp_restart_requested));
+        gui.mcp_port = self.mcp_config.port;
 
         // ── Video engine (video-editor 02 §1) ─────────────────────────────────
         // One engine per process, sharing the winit renderer's wgpu device and
@@ -918,6 +924,7 @@ impl PhotonicWinitApp {
         // take a mutable borrow of `self.state` for the frame.
         self.maybe_restart_mcp();
         let mcp_document_path = Arc::clone(&self.mcp_document_path);
+        let document_saves = Arc::clone(&self.mcp_state.document_saves);
         let Some(state) = &mut self.state else {
             return Ok(None);
         };
@@ -999,6 +1006,15 @@ impl PhotonicWinitApp {
                         mcp_ok,
                         &mut hist,
                     );
+                    for receipt in document_saves.take_notifications() {
+                        state.gui.acknowledge_external_save(
+                            &doc,
+                            &hist,
+                            receipt.document,
+                            receipt.node,
+                            receipt.path,
+                        );
+                    }
                     state.renderer.view = view;
                 }
             }
@@ -1178,12 +1194,14 @@ impl PhotonicWinitApp {
             state.egui_renderer.render(&mut rpass, &tris, &screen_desc);
         }
 
+        // 7. Submit + present while every egui texture referenced by this
+        // frame is still alive. A handle dropped during UI construction can
+        // appear in both this frame's draw commands and textures_delta.free.
+        state.renderer.finish_frame(frame);
+
         for id in &full_output.textures_delta.free {
             state.egui_renderer.free_texture(id);
         }
-
-        // 7. Submit + present
-        state.renderer.finish_frame(frame);
 
         // 8. Service screenshot requests
         state.renderer.service_captures(&verts, &idxs);

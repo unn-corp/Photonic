@@ -24,8 +24,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
-use photonic_core::timeline::FrameRate;
-use photonic_render::color::Colorimetry;
+use photonic_core::timeline::{FrameRate, Tick};
+use photonic_render::{
+    color::{Colorimetry, Range},
+    video::{NativeChromaLocation, NativeYuvInput, YuvConverter},
+};
+use photonic_video::decode::scheduler::{PtsKind, SourceParams};
+use photonic_video::decode::{DecodeSource, PixFmt, SharedRing};
 use photonic_video::export::convert::{working_frame_to_rgba8, working_frame_to_yuv_planes};
 use photonic_video::export::encoder::{
     plane_kind_for, AudioStreamSpec, EncoderCapabilities, PlaneKind,
@@ -33,6 +38,11 @@ use photonic_video::export::encoder::{
 use photonic_video::export::presets::built_in_presets;
 use photonic_video::export::render_loop::{export_frames, ExportEvent, Frame, ResolvedExport};
 use photonic_video::media::ffmpeg_locate::{locate_for_test, FfmpegTools};
+use photonic_video::media::{keyframe_index::KeyframeIndex, probe::probe_details};
+use photonic_video::{
+    color::native::{decode_video_sample_to_ap1, NativeVideoInput},
+    graph::eval::{read_texture_rgba16f, GpuContext},
+};
 
 macro_rules! tools_or_skip {
     () => {
@@ -89,6 +99,7 @@ fn synthetic_frame(i: u64, w: u32, h: u32) -> Frame {
         width: w,
         height: h,
         rgba_premult: rgba,
+        encoding: photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709,
     }
 }
 
@@ -114,6 +125,30 @@ fn synthetic_alpha_frame(i: u64, w: u32, h: u32) -> Frame {
         width: w,
         height: h,
         rgba_premult: rgba,
+        encoding: photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709,
+    }
+}
+
+fn synthetic_prores_ramp_frame(_i: u64, w: u32, h: u32) -> Frame {
+    let mut rgba = vec![0.0f32; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let pixel = (y * w + x) as usize;
+            let value = pixel as f32 / (w * h - 1) as f32;
+            let alpha = x as f32 / (w - 1) as f32;
+            rgba[pixel * 4..pixel * 4 + 4].copy_from_slice(&[
+                value * alpha,
+                value * alpha,
+                value * alpha,
+                alpha,
+            ]);
+        }
+    }
+    Frame {
+        width: w,
+        height: h,
+        rgba_premult: rgba,
+        encoding: photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709,
     }
 }
 
@@ -165,6 +200,18 @@ fn build_reference_raw(
         let f = frame_fn(i, w, h);
         let planes = match plane_kind {
             PlaneKind::Rgba8 => working_frame_to_rgba8(&f.rgba_premult, w, h),
+            PlaneKind::Yuv422P10 => photonic_video::export::convert::working_frame_to_yuv422p10(
+                &f.rgba_premult,
+                w,
+                h,
+                Colorimetry::BT709_LIMITED,
+            ),
+            PlaneKind::Yuva444P12 => photonic_video::export::convert::working_frame_to_yuva444p12(
+                &f.rgba_premult,
+                w,
+                h,
+                Colorimetry::BT709_LIMITED,
+            ),
             _ => working_frame_to_yuv_planes(
                 &f.rgba_premult,
                 w,
@@ -513,27 +560,429 @@ fn export_prores_mezzanine_e2e_ffprobe() {
     let preset = preset_by_name("ProRes Mezzanine");
     let out = tmp_path("prores.mov");
 
-    run_export(&tools, &preset, &out, N, synthetic_alpha_frame, true);
+    run_export(&tools, &preset, &out, N, synthetic_prores_ramp_frame, true);
 
     let json = ffprobe_json(&tools, &out);
     let v = video_stream(&json);
     assert_eq!(v["codec_name"], "prores");
     assert_eq!(v["width"], W);
     assert_eq!(v["height"], H);
+    assert_eq!(v["pix_fmt"], "yuva444p12le");
+    let decoded = Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&out)
+        .args([
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuva444p12le",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .output()
+        .expect("decode ProRes samples");
     assert!(
-        v["pix_fmt"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("yuva"),
-        "expected an alpha-carrying pix_fmt, got {:?}",
-        v["pix_fmt"]
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
     );
+    assert_eq!(decoded.stdout.len(), (W * H * 8) as usize);
+    let y_samples = &decoded.stdout[..(W * H * 2) as usize];
+    let unique_y = y_samples
+        .chunks_exact(2)
+        .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        unique_y.len() > 256,
+        "decoded ProRes has only {} luma codes",
+        unique_y.len()
+    );
+    let alpha_start = (W * H * 6) as usize;
+    let alpha = &decoded.stdout[alpha_start..];
+    let alpha_at = |x: usize| u16::from_le_bytes([alpha[x * 2], alpha[x * 2 + 1]]);
+    assert!(alpha_at(0) < 128, "transparent end gained alpha");
+    assert!(alpha_at((W - 1) as usize) > 3967, "opaque end lost alpha");
+    let details = probe_details(&tools, &out).expect("probe encoded source");
+    let format = PixFmt::for_source(details.pixel_format.as_deref(), details.has_alpha);
+    assert_eq!(format, PixFmt::Yuva444p16le);
+    let keyframes = KeyframeIndex::build(&tools, &out).expect("keyframe index");
+    let params = SourceParams {
+        input: out.clone(),
+        width: W,
+        height: H,
+        pix_fmt: format,
+        pts_kind: PtsKind::Cfr(FPS),
+        keyframes,
+    };
+    let mut source = DecodeSource::new(tools.clone(), params, SharedRing::preview());
+    let frame = source.seek(Tick::ZERO).expect("decode high-depth source");
+    let distinct = frame
+        .planes
+        .y()
+        .chunks_exact(2)
+        .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        distinct.len() > 256,
+        "sidecar decoded only {} luma levels",
+        distinct.len()
+    );
+    let decoded_y = frame.planes.y();
+    let code_at =
+        |pixel: usize| u16::from_le_bytes([decoded_y[pixel * 2], decoded_y[pixel * 2 + 1]]);
+    assert!((code_at(0) as i32 - 4096).abs() < 512);
+    assert!((code_at((W * H - 1) as usize) as i32 - 60160).abs() < 512);
     let has_pcm = json["streams"].as_array().unwrap().iter().any(|s| {
         s["codec_type"] == "audio" && s["codec_name"].as_str().unwrap_or("").starts_with("pcm")
     });
     assert!(has_pcm, "expected a PCM audio stream");
 
     let _ = std::fs::remove_file(&out);
+}
+
+#[test]
+fn export_opaque_prores_hq_decodes_more_than_8_bit_luma() {
+    let tools = tools_or_skip!();
+    let mut preset = preset_by_name("ProRes Mezzanine");
+    preset.alpha = false;
+    let out = tmp_path("prores_opaque_hq.mov");
+    run_export(&tools, &preset, &out, 1, synthetic_prores_ramp_frame, false);
+
+    let probe = ffprobe_json(&tools, &out);
+    let stream = video_stream(&probe);
+    assert_eq!(stream["codec_name"], "prores");
+    assert_eq!(stream["pix_fmt"], "yuv422p10le");
+    let decoded = Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&out)
+        .args([
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv422p10le",
+            "-f",
+            "rawvideo",
+            "-",
+        ])
+        .output()
+        .expect("decode opaque ProRes samples");
+    assert!(
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    let y = &decoded.stdout[..(W * H * 2) as usize];
+    let unique = y
+        .chunks_exact(2)
+        .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        unique.len() > 256,
+        "opaque ProRes retained only {} luma codes",
+        unique.len()
+    );
+    let _ = std::fs::remove_file(out);
+}
+
+#[test]
+fn lossless_sixteen_bit_420_decode_retains_subsampled_plane_codes() {
+    lossless_sixteen_bit_subsampled_decode_retains_codes("yuv420p16le", PixFmt::Yuv420p16le);
+}
+
+#[test]
+fn lossless_sixteen_bit_422_decode_retains_subsampled_plane_codes() {
+    lossless_sixteen_bit_subsampled_decode_retains_codes("yuv422p16le", PixFmt::Yuv422p16le);
+}
+
+#[test]
+fn lossless_sixteen_bit_444_decode_retains_full_resolution_plane_codes() {
+    lossless_sixteen_bit_subsampled_decode_retains_codes("yuv444p16le", PixFmt::Yuv444p16le);
+}
+
+#[test]
+fn ten_bit_420_source_expands_codes_without_eight_bit_quantization() {
+    ten_bit_source_expands_codes("yuv420p10le", PixFmt::Yuv420p16le, 4);
+}
+
+#[test]
+fn ten_bit_422_source_expands_codes_without_eight_bit_quantization() {
+    ten_bit_source_expands_codes("yuv422p10le", PixFmt::Yuv422p16le, 2);
+}
+
+#[test]
+fn ten_bit_444_source_expands_codes_without_eight_bit_quantization() {
+    ten_bit_source_expands_codes("yuv444p10le", PixFmt::Yuv444p16le, 1);
+}
+
+fn ten_bit_source_expands_codes(pixel_format: &str, expected: PixFmt, chroma_divisor: u32) {
+    let tools = tools_or_skip!();
+    let raw = tmp_path(&format!("native_{pixel_format}.raw"));
+    let encoded = tmp_path(&format!("native_{pixel_format}.mkv"));
+    let (width, height) = (64u32, 64u32);
+    let y: Vec<u16> = (0..width * height)
+        .map(|index| 64 + (index % 877) as u16)
+        .collect();
+    let chroma_len = (width * height / chroma_divisor) as usize;
+    let cb: Vec<u16> = (0..chroma_len)
+        .map(|index| 64 + (index % 897) as u16)
+        .collect();
+    let cr = vec![512u16; chroma_len];
+    let codes: Vec<u16> = y.iter().chain(&cb).chain(&cr).copied().collect();
+    std::fs::write(
+        &raw,
+        codes
+            .iter()
+            .flat_map(|code| code.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let output = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo"])
+        .args(["-pixel_format", pixel_format, "-video_size", "64x64"])
+        .args(["-framerate", "10", "-i"])
+        .arg(&raw)
+        .args(["-frames:v", "1", "-c:v", "ffv1", "-pix_fmt", pixel_format])
+        .arg(&encoded)
+        .output()
+        .expect("encode lossless 10-bit source");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let details = probe_details(&tools, &encoded).unwrap();
+    assert_eq!(details.pixel_format.as_deref(), Some(pixel_format));
+    assert!(PixFmt::supports_native_source(pixel_format));
+    let format = PixFmt::for_source(details.pixel_format.as_deref(), details.has_alpha);
+    assert_eq!(format, expected);
+    let params = SourceParams {
+        input: encoded.clone(),
+        width,
+        height,
+        pix_fmt: format,
+        pts_kind: PtsKind::Cfr(FPS),
+        keyframes: KeyframeIndex::build(&tools, &encoded).unwrap(),
+    };
+    let mut decoder = DecodeSource::new(tools, params, SharedRing::preview());
+    let frame = decoder.seek(Tick::ZERO).unwrap();
+    let decoded: Vec<u16> = frame
+        .planes
+        .y()
+        .iter()
+        .chain(frame.planes.cb())
+        .chain(frame.planes.cr())
+        .copied()
+        .collect::<Vec<_>>()
+        .chunks_exact(2)
+        .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+        .collect();
+    assert_eq!(decoded.len(), codes.len());
+    for (source, expanded) in codes.iter().zip(decoded.iter()) {
+        assert_eq!(*expanded, *source << 6, "10-bit code {source}");
+    }
+    if let Some(gpu) = GpuContext::request_blocking() {
+        let converter = YuvConverter::new(gpu.device());
+        let texture = converter.convert_native(
+            gpu.device(),
+            gpu.queue(),
+            &frame.planes.as_yuv_planes(),
+            NativeYuvInput::Bt709Scene,
+            Range::Limited,
+            NativeChromaLocation::TopLeft,
+        );
+        let first = read_texture_rgba16f(&gpu, &texture, width, height)[0];
+        let reference = decode_video_sample_to_ap1(
+            [y[0] << 6, cb[0] << 6, cr[0] << 6],
+            16,
+            true,
+            NativeVideoInput::Bt709,
+        )
+        .unwrap();
+        for channel in 0..3 {
+            assert!((f64::from(first[channel]) - reference[channel]).abs() < 0.004);
+        }
+    }
+    let _ = std::fs::remove_file(raw);
+    let _ = std::fs::remove_file(encoded);
+}
+
+#[test]
+fn lossless_eight_bit_422_decode_keeps_full_height_chroma() {
+    lossless_eight_bit_decode_keeps_native_chroma("yuv422p", PixFmt::Yuv422p);
+}
+
+#[test]
+fn lossless_eight_bit_444_decode_keeps_full_resolution_chroma() {
+    lossless_eight_bit_decode_keeps_native_chroma("yuv444p", PixFmt::Yuv444p);
+}
+
+fn lossless_eight_bit_decode_keeps_native_chroma(pixel_format: &str, expected: PixFmt) {
+    let tools = tools_or_skip!();
+    let raw = tmp_path(&format!("native_{pixel_format}.raw"));
+    let encoded = tmp_path(&format!("native_{pixel_format}.mkv"));
+    let (width, height) = (64u32, 64u32);
+    let chroma_samples = width * height / if expected == PixFmt::Yuv422p { 2 } else { 1 };
+    let y = vec![128_u8; (width * height) as usize];
+    let cb: Vec<u8> = (0..chroma_samples)
+        .map(|index| [16_u8, 128, 240][index as usize % 3])
+        .collect();
+    let cr = vec![128_u8; chroma_samples as usize];
+    std::fs::write(&raw, [y.as_slice(), cb.as_slice(), cr.as_slice()].concat()).unwrap();
+    let output = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo"])
+        .args(["-pixel_format", pixel_format, "-video_size", "64x64"])
+        .args(["-framerate", "10", "-i"])
+        .arg(&raw)
+        .args(["-frames:v", "1", "-c:v", "ffv1", "-pix_fmt", pixel_format])
+        .arg(&encoded)
+        .output()
+        .expect("encode lossless 8-bit fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let details = probe_details(&tools, &encoded).expect("probe lossless source");
+    let format = PixFmt::for_source(details.pixel_format.as_deref(), details.has_alpha);
+    assert_eq!(format, expected);
+    let keyframes = KeyframeIndex::build(&tools, &encoded).expect("keyframe index");
+    let params = SourceParams {
+        input: encoded.clone(),
+        width,
+        height,
+        pix_fmt: format,
+        pts_kind: PtsKind::Cfr(FPS),
+        keyframes,
+    };
+    let mut decoder = DecodeSource::new(tools, params, SharedRing::preview());
+    let frame = decoder.seek(Tick::ZERO).expect("decode 8-bit source");
+    assert!(matches!(
+        (&frame.planes, expected),
+        (
+            photonic_video::decode::DecodedPlanes::Yuv422 { .. },
+            PixFmt::Yuv422p
+        ) | (
+            photonic_video::decode::DecodedPlanes::Yuv444 { .. },
+            PixFmt::Yuv444p
+        )
+    ));
+    assert_eq!(frame.planes.y(), y);
+    assert_eq!(frame.planes.cb(), cb);
+    assert_eq!(frame.planes.cr(), cr);
+    let _ = std::fs::remove_file(raw);
+    let _ = std::fs::remove_file(encoded);
+}
+
+fn lossless_sixteen_bit_subsampled_decode_retains_codes(pixel_format: &str, expected: PixFmt) {
+    let tools = tools_or_skip!();
+    let raw = tmp_path(&format!("native_{pixel_format}.raw"));
+    let encoded = tmp_path(&format!("native_{pixel_format}.mkv"));
+    let (width, height) = (64u32, 64u32);
+    let chroma_divisor = match expected {
+        PixFmt::Yuv420p16le => 4,
+        PixFmt::Yuv422p16le => 2,
+        PixFmt::Yuv444p16le => 1,
+        _ => unreachable!("16-bit planar fixture uses a supported sampling layout"),
+    };
+    let chroma_samples = (width * height / chroma_divisor) as usize;
+    let y: Vec<u16> = (0..width * height)
+        .map(|index| 4096 + ((index * 13) % 56064) as u16)
+        .collect();
+    let cb: Vec<u16> = (0..chroma_samples)
+        .map(|index| [4096_u16, 32768, 60160, 4097][index % 4])
+        .collect();
+    let cr = vec![32768_u16; chroma_samples];
+    let source_codes: Vec<u16> = y.iter().chain(&cb).chain(&cr).copied().collect();
+    let source: Vec<u8> = source_codes
+        .iter()
+        .flat_map(|code| code.to_le_bytes())
+        .collect();
+    std::fs::write(&raw, &source).expect("write native subsampled source");
+    let output = Command::new(&tools.ffmpeg)
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo"])
+        .args(["-pixel_format", pixel_format, "-video_size", "64x64"])
+        .args(["-framerate", "10", "-i"])
+        .arg(&raw)
+        .args([
+            "-frames:v",
+            "1",
+            "-c:v",
+            "ffv1",
+            "-slices",
+            "4",
+            "-pix_fmt",
+            pixel_format,
+        ])
+        .arg(&encoded)
+        .output()
+        .expect("encode lossless 16-bit subsampled fixture");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let details = probe_details(&tools, &encoded).expect("probe lossless source");
+    let format = PixFmt::for_source(details.pixel_format.as_deref(), details.has_alpha);
+    assert_eq!(format, expected);
+    let keyframes = KeyframeIndex::build(&tools, &encoded).expect("keyframe index");
+    let params = SourceParams {
+        input: encoded.clone(),
+        width,
+        height,
+        pix_fmt: format,
+        pts_kind: PtsKind::Cfr(FPS),
+        keyframes,
+    };
+    let mut decoder = DecodeSource::new(tools, params, SharedRing::preview());
+    let frame = decoder
+        .seek(Tick::ZERO)
+        .expect("decode 16-bit 4:2:0 source");
+    assert!(matches!(
+        (&frame.planes, expected),
+        (
+            photonic_video::decode::DecodedPlanes::Yuv420P16 { .. },
+            PixFmt::Yuv420p16le
+        ) | (
+            photonic_video::decode::DecodedPlanes::Yuv422P16 { .. },
+            PixFmt::Yuv422p16le
+        ) | (
+            photonic_video::decode::DecodedPlanes::Yuv444P16 { .. },
+            PixFmt::Yuv444p16le
+        )
+    ));
+    let decoded: Vec<u16> = frame
+        .planes
+        .y()
+        .iter()
+        .chain(frame.planes.cb())
+        .chain(frame.planes.cr())
+        .copied()
+        .collect::<Vec<_>>()
+        .chunks_exact(2)
+        .map(|sample| u16::from_le_bytes([sample[0], sample[1]]))
+        .collect();
+    assert_eq!(decoded, source_codes);
+    if let Some(gpu) = GpuContext::request_blocking() {
+        let converter = YuvConverter::new(gpu.device());
+        let texture = converter.convert_native(
+            gpu.device(),
+            gpu.queue(),
+            &frame.planes.as_yuv_planes(),
+            NativeYuvInput::Bt709Scene,
+            Range::Limited,
+            NativeChromaLocation::TopLeft,
+        );
+        let first = read_texture_rgba16f(&gpu, &texture, width, height)[0];
+        let expected =
+            decode_video_sample_to_ap1([y[0], cb[0], cr[0]], 16, true, NativeVideoInput::Bt709)
+                .unwrap();
+        for channel in 0..3 {
+            assert!((f64::from(first[channel]) - expected[channel]).abs() < 0.004);
+        }
+    }
+    let _ = std::fs::remove_file(raw);
+    let _ = std::fs::remove_file(encoded);
 }
 
 // ── GIF (paletted) ────────────────────────────────────────────────────────────

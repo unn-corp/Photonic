@@ -24,10 +24,13 @@ use photonic_render::color::Colorimetry;
 
 use super::encoder::{validate_encode_options, AudioStreamSpec};
 use super::offline_audio::{self, DEFAULT_EXPORT_SAMPLE_RATE};
-use super::presets::{self, ExportPreset, FrameRatePolicy, ResolutionSpec};
+use super::presets::{
+    self, Container, ExportPreset, FrameRatePolicy, QualityMode, ResolutionSpec, VideoCodec,
+};
 use super::render_loop::{self, ExportError, ExportEvent, ExportTarget, Frame, ResolvedExport};
 use crate::graph::compile::{fit_long_edge, DRAFT_MAX_LONG_EDGE};
 use crate::graph::eval::{read_texture_rgba16f, GpuContext};
+use crate::graph::ir::FrameColorEncoding;
 use crate::media::ffmpeg_locate::FfmpegTools;
 use crate::session::{EngineCmd, EngineFrame, ExportJob, ProxyMode, RenderSnapshot, VideoEngine};
 
@@ -108,11 +111,59 @@ pub fn resolve_export_job(
     project: &TimelineProject,
     job: &ExportJob,
 ) -> Result<ResolvedExportJob, ExportError> {
+    resolve_export_job_impl(project, job, true)
+}
+
+/// Fast settings-only preflight for interactive UI. Does not read LUT files,
+/// compile source graphs or qualify media; final submission still resolves all of those.
+pub fn validate_export_job_settings(
+    project: &TimelineProject,
+    job: &ExportJob,
+) -> Result<ResolvedExportJob, ExportError> {
+    resolve_export_job_impl(project, job, false)
+}
+
+fn resolve_export_job_impl(
+    project: &TimelineProject,
+    job: &ExportJob,
+    qualify_sources: bool,
+) -> Result<ResolvedExportJob, ExportError> {
     validate_encode_options(job.options.two_pass)?;
     let seq = project
         .sequences
         .get(&job.sequence)
         .ok_or_else(|| ExportError::Resolve(format!("sequence {} not found", job.sequence)))?;
+    match &seq.color {
+        photonic_core::timeline::color::SequenceColorConfig::LegacySdr => {}
+        photonic_core::timeline::color::SequenceColorConfig::Managed(_) => {
+            crate::color::ensure_supported(seq).map_err(ExportError::Resolve)?;
+        }
+        photonic_core::timeline::color::SequenceColorConfig::NativeManaged(config) => {
+            config.validate().map_err(ExportError::Resolve)?;
+            if config.export != photonic_core::timeline::color::NativeOutputTransform::Bt709VideoSdr
+            {
+                return Err(ExportError::Resolve(
+                    "native SDR export requires the BT.709 video-signal output transform".into(),
+                ));
+            }
+            if job.preset.container != Container::Mov
+                || job.preset.video.as_ref().is_none_or(|video| {
+                    video.codec != VideoCodec::ProResLikeMezzanine
+                        || video.quality != QualityMode::Lossless
+                })
+                || job.options.use_proxies
+                || job.options.preview_resolution
+                || job.options.prefer_hardware
+                || !job.options.raw_encoder_args.is_empty()
+                || job.options.encoder_speed.is_some()
+                || job.options.burn_in_timecode
+                || !matches!(job.preset.resolution, ResolutionSpec::SourceFormat)
+                || !matches!(job.preset.frame_rate, FrameRatePolicy::MatchSequence)
+            {
+                return Err(ExportError::Resolve("native SDR delivery currently requires full-resolution, original-media ProRes MOV at the sequence frame rate without hardware, burn-in, speed, or raw encoder overrides".into()));
+            }
+        }
+    }
     let seq_rate = seq.frame_rate;
     if seq.formats.is_empty() {
         return Err(ExportError::Resolve(format!(
@@ -180,6 +231,41 @@ pub fn resolve_export_job(
 
     let tpf_out = out_rate.ticks_per_frame().0.max(1);
     let total_frames = ((end.0 - start.0 + tpf_out - 1) / tpf_out).max(1) as u64;
+    if qualify_sources
+        && matches!(
+            seq.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        )
+    {
+        let first = seq_rate.frame_start(seq_rate.frame_at(start));
+        let mut luts = crate::session::LutCache::default();
+        luts.warm(project);
+        let compiled = crate::graph::compile::compile_native_delivery_with_luts(
+            project,
+            job.sequence,
+            format_index,
+            first,
+            crate::graph::compile::Quality::FULL,
+            &luts,
+        );
+        if let Some(error) = compiled
+            .diagnostics
+            .iter()
+            .find(|d| d.severity == crate::graph::compile::DiagSeverity::Error)
+        {
+            return Err(ExportError::Resolve(format!(
+                "native delivery first frame is unavailable: {}",
+                error.message
+            )));
+        }
+        if compiled.graph.output_color_encoding() != Ok(FrameColorEncoding::Bt709Video) {
+            return Err(ExportError::Resolve(
+                "native delivery first frame lacks BT.709 video-signal output".into(),
+            ));
+        }
+        native_delivery_sources_online(project, job.sequence, first)
+            .map_err(ExportError::Resolve)?;
+    }
 
     Ok(ResolvedExportJob {
         format_index,
@@ -413,6 +499,25 @@ fn run_export_group(
     let job = &jobs[indices[0]];
     let r = &resolutions[indices[0]];
 
+    let mut manifests = indices
+        .iter()
+        .map(|&index| {
+            if jobs[index].options.write_manifest {
+                super::manifest::capture(
+                    &project,
+                    snapshot,
+                    &jobs[index],
+                    &resolutions[index],
+                    tools,
+                    cancel,
+                )
+                .map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, ExportError>>()?;
+
     // Frozen shadow project with the export format forced active.
     let mut frozen = (*project).clone();
     if let Some(s) = frozen.sequences.get_mut(&job.sequence) {
@@ -425,6 +530,18 @@ fn run_export_group(
     let expected_revision = snapshot.map_or(history.revision(), |snapshot| snapshot.revision);
     let shadow_history = Arc::new(Mutex::new(history));
     let session = engine.open_session(shadow_doc, shadow_history);
+    if project
+        .sequences
+        .get(&job.sequence)
+        .is_some_and(|sequence| {
+            matches!(
+                sequence.color,
+                photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+            )
+        })
+    {
+        session.send(EngineCmd::SetNativeDelivery(true));
+    }
     let expected_generation = session.publish_snapshot(RenderSnapshot {
         revision: expected_revision,
         project: Some(Arc::new(frozen)),
@@ -514,6 +631,15 @@ fn run_export_group(
     let start = r.start;
     let seq_rate = r.seq_rate;
     let tpf_out = r.out_rate.ticks_per_frame().0.max(1);
+    let native_delivery = project
+        .sequences
+        .get(&job.sequence)
+        .is_some_and(|sequence| {
+            matches!(
+                sequence.color,
+                photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+            )
+        });
 
     let mut prev = session.latest_frame();
     let mut frame_fail: Option<ExportError> = None;
@@ -522,6 +648,18 @@ fn run_export_group(
         // presents exact sequence-grid ticks, so snap the output-grid tick).
         let t = Tick(start.0 + i as i64 * tpf_out);
         let snapped = seq_rate.frame_start(seq_rate.frame_at(t));
+        if native_delivery {
+            if let Err(error) = native_delivery_sources_online(&project, seq_id, snapped) {
+                frame_fail = Some(ExportError::Resolve(error));
+                cancel.store(true, Ordering::Relaxed);
+                return Frame {
+                    width: ow,
+                    height: oh,
+                    rgba_premult: Vec::new(),
+                    encoding: FrameColorEncoding::LegacyLinearRec709,
+                };
+            }
+        }
         session.send(EngineCmd::Seek(snapped));
         let deadline = Instant::now() + Duration::from_secs(30);
         let frame = loop {
@@ -550,6 +688,54 @@ fn run_export_group(
         };
         match frame {
             Some(f) => {
+                if !f.color_errors.is_empty() {
+                    frame_fail = Some(ExportError::Resolve(f.color_errors.join("; ")));
+                    cancel.store(true, Ordering::Relaxed);
+                    return Frame {
+                        width: ow,
+                        height: oh,
+                        rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
+                    };
+                }
+                if native_delivery && f.output_encoding != FrameColorEncoding::Bt709Video {
+                    frame_fail = Some(ExportError::Resolve(
+                        "native delivery frame is missing its BT.709 video-signal transform".into(),
+                    ));
+                    cancel.store(true, Ordering::Relaxed);
+                    return Frame {
+                        width: ow,
+                        height: oh,
+                        rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
+                    };
+                }
+                if let Err(error) = validate_export_frame_color(f.output_encoding) {
+                    frame_fail = Some(error);
+                    cancel.store(true, Ordering::Relaxed);
+                    return Frame {
+                        width: ow,
+                        height: oh,
+                        rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
+                    };
+                }
+                if !f.grading_errors.is_empty() {
+                    frame_fail = Some(ExportError::Resolve(
+                        f.grading_errors
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    ));
+                    cancel.store(true, Ordering::Relaxed);
+                    return Frame {
+                        width: ow,
+                        height: oh,
+                        rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
+                    };
+                }
                 if f.cached_preview {
                     frame_fail = Some(ExportError::Resolve(
                         "native export refused a cached playback preview".into(),
@@ -559,6 +745,7 @@ fn run_export_group(
                         width: ow,
                         height: oh,
                         rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
                     };
                 }
                 prev = Some(Arc::clone(&f));
@@ -572,6 +759,7 @@ fn run_export_group(
                         width: ow,
                         height: oh,
                         rgba_premult: Vec::new(),
+                        encoding: FrameColorEncoding::LegacyLinearRec709,
                     };
                 }
                 let px = if (ow, oh) == (render_w, render_h) {
@@ -583,6 +771,7 @@ fn run_export_group(
                     width: ow,
                     height: oh,
                     rgba_premult: px.into_flattened(),
+                    encoding: f.output_encoding,
                 }
             }
             None => {
@@ -600,6 +789,7 @@ fn run_export_group(
                     width: ow,
                     height: oh,
                     rgba_premult: Vec::new(),
+                    encoding: FrameColorEncoding::LegacyLinearRec709,
                 }
             }
         }
@@ -654,12 +844,66 @@ fn run_export_group(
                             r.preset.loudness_target.as_ref(),
                         )?;
                     }
+                    if let Some(manifest) = manifests[output_index].take() {
+                        super::manifest::publish(manifest, &project, &r.out_path, cancel)?;
+                    }
                     on_event(output_index, ExportEvent::Done);
                 }
             }
             Ok(())
         }
     }
+}
+
+/// Recheck the exact visible native sources at every output frame. A clip that
+/// starts after the first frame, or a file that goes offline mid-job, must not
+/// turn into a silently transparent delivery frame.
+fn native_delivery_sources_online(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    tick: Tick,
+) -> Result<(), String> {
+    let seq = project
+        .sequences
+        .get(&sequence)
+        .ok_or_else(|| format!("native delivery sequence {sequence} is unavailable"))?;
+    for clip in seq
+        .video_tracks
+        .iter()
+        .filter(|track| track.enabled && track.kind.is_visual())
+        .filter_map(|track| {
+            track
+                .clips
+                .iter()
+                .find(|clip| clip.start <= tick && tick < clip.end())
+        })
+        .filter(|clip| clip.enabled)
+    {
+        let photonic_core::timeline::ClipSource::Asset { asset } = clip.source else {
+            continue;
+        };
+        let Some(photonic_core::timeline::AssetSource::File { path, .. }) =
+            project.media.assets.get(&asset).map(|media| &media.source)
+        else {
+            return Err(format!("native delivery source {asset} is unavailable"));
+        };
+        if !path.is_file() {
+            return Err(format!(
+                "native delivery source {asset} is offline at tick {}: {}",
+                tick.0,
+                path.display()
+            ));
+        }
+        if let Some(diagnostic) =
+            crate::color::inspect_input(project, seq, clip).and_then(|finding| finding.diagnostic)
+        {
+            return Err(format!(
+                "native delivery source {asset} is unresolved at tick {}: {diagnostic}",
+                tick.0
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Area-average box downscale of a linear-premultiplied RGBA buffer from
@@ -694,10 +938,37 @@ fn box_downscale(src: &[[f32; 4]], w: u32, h: u32, ow: u32, oh: u32) -> Vec<[f32
     out
 }
 
+fn validate_export_frame_color(encoding: FrameColorEncoding) -> Result<(), ExportError> {
+    match encoding {
+        FrameColorEncoding::LegacyLinearRec709 | FrameColorEncoding::Bt709Video => Ok(()),
+        FrameColorEncoding::MatteWeight | FrameColorEncoding::SceneLinearAcescg | FrameColorEncoding::Acescct | FrameColorEncoding::SrgbDisplay => {
+            Err(ExportError::Resolve(
+                "export encoder requires linear Rec.709 working pixels; managed output needs a dedicated export transform".into(),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use photonic_core::timeline::{Sequence, SequenceFormat};
+
+    #[test]
+    fn export_encoder_rejects_unqualified_managed_pixel_domains() {
+        assert!(validate_export_frame_color(FrameColorEncoding::LegacyLinearRec709).is_ok());
+        assert!(validate_export_frame_color(FrameColorEncoding::Bt709Video).is_ok());
+        for encoding in [
+            FrameColorEncoding::SceneLinearAcescg,
+            FrameColorEncoding::Acescct,
+            FrameColorEncoding::SrgbDisplay,
+        ] {
+            assert!(matches!(
+                validate_export_frame_color(encoding),
+                Err(ExportError::Resolve(message)) if message.contains("dedicated export transform")
+            ));
+        }
+    }
 
     fn project_and_job() -> (TimelineProject, ExportJob) {
         let mut project = TimelineProject::new();

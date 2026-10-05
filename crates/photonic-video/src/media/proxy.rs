@@ -35,6 +35,8 @@ pub enum ProxyError {
     Io(#[source] std::io::Error),
     #[error("proxy generation cancelled")]
     Cancelled,
+    #[error("source changed during proxy generation")]
+    SourceChanged,
 }
 
 /// Failure reasons for attaching a user-supplied proxy file (G-15A).
@@ -287,6 +289,18 @@ pub fn generate_proxy(
     output: &Path,
     cancel: &dyn Fn() -> bool,
 ) -> Result<(), ProxyError> {
+    generate_proxy_checked(tools, input, output, cancel, &|| true)
+}
+
+/// Generate a proxy while validating its source before publishing the staged
+/// file. A failed validation leaves any previous cache entry untouched.
+pub fn generate_proxy_checked(
+    tools: &FfmpegTools,
+    input: &Path,
+    output: &Path,
+    cancel: &dyn Fn() -> bool,
+    source_is_current: &dyn Fn() -> bool,
+) -> Result<(), ProxyError> {
     if let Some(dir) = output.parent() {
         std::fs::create_dir_all(dir).map_err(ProxyError::Io)?;
     }
@@ -326,6 +340,10 @@ pub fn generate_proxy(
     };
 
     if status.success() {
+        if !source_is_current() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ProxyError::SourceChanged);
+        }
         std::fs::rename(&tmp, output).map_err(ProxyError::Io)?;
         Ok(())
     } else {
@@ -593,6 +611,44 @@ mod tests {
         assert_eq!(mk(&sel_proxy).input_path(), out.as_path());
         assert_eq!(mk(&sel_orig).input_path(), input.as_path());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn source_change_before_publish_preserves_existing_proxy() {
+        let Some(tools) = locate_for_test() else {
+            eprintln!("skip: ffmpeg/ffprobe not found");
+            return;
+        };
+        let dir = unique_tmp_dir("source-change");
+        let input = dir.join("input.mp4");
+        let out = dir.join("cached.mp4");
+        let made = Command::new(&tools.ffmpeg)
+            .args([
+                "-y",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=size=64x64:rate=5:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&input)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            eprintln!("skip: could not synthesize proxy fixture");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        std::fs::write(&out, b"previous cache entry").unwrap();
+        let error = generate_proxy_checked(&tools, &input, &out, &|| false, &|| false)
+            .expect_err("changed source must not be published");
+        assert!(matches!(error, ProxyError::SourceChanged));
+        assert_eq!(std::fs::read(&out).unwrap(), b"previous cache entry");
+        assert!(!staging_path(&out).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

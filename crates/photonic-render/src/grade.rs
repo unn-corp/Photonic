@@ -251,12 +251,36 @@ pub struct ResolvedGradeOp {
 /// [`ResolvedGradePayload::Cdl`] at resolve time (07 §3.5).
 #[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedGradePayload {
-    Exposure { stops: f32 },
-    Contrast { pivot: f32, amount: f32 },
-    WhiteBalance { temp: f32, tint: f32 },
+    Exposure {
+        stops: f32,
+    },
+    LinearOffset {
+        rgb: [f32; 3],
+    },
+    PrinterLights {
+        points: [f32; 3],
+    },
+    HighlightRolloff {
+        knee: f32,
+        strength: f32,
+    },
+    SaturationVibrance {
+        saturation: f32,
+        vibrance: f32,
+    },
+    Contrast {
+        pivot: f32,
+        amount: f32,
+    },
+    WhiteBalance {
+        temp: f32,
+        tint: f32,
+    },
     Cdl(ResolvedCdl),
     Curves(Box<ResolvedCurves>),
-    HslQualifier(ResolvedHslQualifier),
+    /// The fixed-capacity sampled-key array lives out of line so common
+    /// primary operators remain cheap to move through the render graph.
+    HslQualifier(Box<ResolvedHslQualifier>),
     Lut3d(ResolvedLut3d),
 }
 
@@ -302,9 +326,7 @@ impl From<CdlParams> for ResolvedCdl {
     }
 }
 
-/// Resolved curves (07 §3.6): master + per-channel 256-entry LUTs, plus the two
-/// optional HSL curves (hue-vs-hue, hue-vs-sat) as 256-entry LUTs sampled by
-/// normalized hue.
+/// Resolved curves: master/channel LUTs and optional hue/luma/saturation LUTs.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedCurves {
     pub master: [f32; 256],
@@ -313,6 +335,9 @@ pub struct ResolvedCurves {
     pub blue: [f32; 256],
     pub hue_vs_hue: Option<[f32; 256]>,
     pub hue_vs_sat: Option<[f32; 256]>,
+    pub hue_vs_luma: Option<[f32; 256]>,
+    pub luma_vs_sat: Option<[f32; 256]>,
+    pub sat_vs_sat: Option<[f32; 256]>,
 }
 
 /// Resolved HSL qualifier (07 §3.7): three soft range gates + a CDL secondary.
@@ -323,7 +348,46 @@ pub struct ResolvedHslQualifier {
     pub sat: [f32; 2],
     pub lum: [f32; 2],
     pub softness: f32,
+    pub matte_levels: [f32; 2],
     pub correction: ResolvedCdl,
+    pub keys: [ResolvedQualifierKey; photonic_core::timeline::MAX_QUALIFIER_KEYS],
+    pub key_count: u32,
+}
+
+impl Default for ResolvedHslQualifier {
+    fn default() -> Self {
+        Self {
+            hue: [0.0, 1.0],
+            sat: [0.0, 1.0],
+            lum: [0.0, 1.0],
+            softness: 0.0,
+            matte_levels: [0.0, 0.0],
+            correction: CdlParams::default().into(),
+            keys: [ResolvedQualifierKey::default(); photonic_core::timeline::MAX_QUALIFIER_KEYS],
+            key_count: 0,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct ResolvedQualifierKey {
+    pub hue: [f32; 2],
+    pub sat: [f32; 2],
+    pub lum: [f32; 2],
+    pub softness: f32,
+    pub subtract: bool,
+}
+
+impl Default for ResolvedQualifierKey {
+    fn default() -> Self {
+        Self {
+            hue: [0.0; 2],
+            sat: [0.0; 2],
+            lum: [0.0; 2],
+            softness: 0.0,
+            subtract: false,
+        }
+    }
 }
 
 /// Resolved 3D LUT op (07 §3.8): a shared parsed table + intensity + interp.
@@ -334,11 +398,10 @@ pub struct ResolvedLut3d {
     pub tetrahedral: bool,
 }
 
-/// Resolved power-window mask (07 §4.1). `RotoMatte` masks resolve away (to
-/// `None`) in v1 — no roto source exists yet (07 §4.2).
+/// Resolved power-window mask. Unsupported masks bypass the entire corrector.
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ResolvedMask {
-    pub rectangle: bool,
+    pub shape: WindowShape,
     pub center: [f32; 2],
     pub size: [f32; 2],
     pub rotation: f32,
@@ -358,13 +421,18 @@ impl ResolvedMask {
         let yl = -dx * s + dy * co;
         let sx = self.size[0].max(1e-4);
         let sy = self.size[1].max(1e-4);
-        let d = if self.rectangle {
-            (xl / sx).abs().max((yl / sy).abs())
-        } else {
-            ((xl / sx).powi(2) + (yl / sy).powi(2)).sqrt()
+        let w = match self.shape {
+            WindowShape::Gradient => 1.0 - smoothstep(-sy, sy, yl),
+            WindowShape::Rectangle | WindowShape::Ellipse => {
+                let d = if self.shape == WindowShape::Rectangle {
+                    (xl / sx).abs().max((yl / sy).abs())
+                } else {
+                    ((xl / sx).powi(2) + (yl / sy).powi(2)).sqrt()
+                };
+                let soft = self.softness.max(0.0);
+                1.0 - smoothstep(1.0 - soft, 1.0 + soft, d)
+            }
         };
-        let soft = self.softness.max(0.0);
-        let w = 1.0 - smoothstep(1.0 - soft, 1.0 + soft, d);
         if self.invert {
             1.0 - w
         } else {
@@ -375,28 +443,225 @@ impl ResolvedMask {
 
 // ── resolve (authoring Grade → resolved ops at a tick) ──────────────────────
 
-/// Resolve a [`Grade`] at `tick` into the ordered resolved op stack (07 §2).
-///
-/// Disabled ops and a bypassed grade contribute nothing. `Lut3d` ops call
-/// `lut_provider(asset)`; a `None` result (offline/unresolvable asset) drops the
-/// op (identity), matching the offline-placeholder asset rule (07 §1). `Unknown`
-/// forward-compat ops are skipped (loaded inert, never applied).
+/// An enabled corrector could not be evaluated. Preview bypasses that entire
+/// corrector; final output must reject these diagnostics.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GradeDiagnostic {
+    pub op: photonic_core::timeline::GradeOpId,
+    /// Root-to-leaf sequence path when compiled from a timeline, including
+    /// nested sequences. Empty for standalone grade evaluation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sequence_path: Vec<photonic_core::timeline::SequenceId>,
+    /// Node that invoked this corrector in a grading graph, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_node: Option<u32>,
+    /// Origin of a timeline grade. Standalone/graph grades may not have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<photonic_core::timeline::VfxOwner>,
+    /// Identifies a separate look stage on the owning clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<GradeStage>,
+    pub issue: GradeIssue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GradeStage {
+    LocalLook,
+    SharedLook {
+        id: photonic_core::timeline::SharedLookId,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "code", content = "asset", rename_all = "snake_case")]
+pub enum GradeIssue {
+    MissingLut(AssetId),
+    MissingSharedLook(photonic_core::timeline::SharedLookId),
+    UnsupportedOperator,
+    /// A resolved correction cannot execute in the selected native color domain.
+    NativeCorrectionUnavailable(String),
+    UnresolvedMask,
+    InvalidQualifierKeys,
+    InvalidQualifierMatteLevels,
+}
+
+impl std::fmt::Display for GradeDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use photonic_core::timeline::VfxOwner;
+        if self.sequence_path.len() > 1 {
+            write!(f, "Nested sequence path ")?;
+            for (index, sequence) in self.sequence_path.iter().enumerate() {
+                if index != 0 {
+                    write!(f, " → ")?;
+                }
+                write!(f, "{sequence}")?;
+            }
+            write!(f, " · ")?;
+        }
+        if let GradeIssue::MissingSharedLook(id) = &self.issue {
+            return write!(
+                f,
+                "Shared look {id} is unavailable. Relink or detach it before export."
+            );
+        }
+        if let Some(node) = self.graph_node {
+            write!(f, "Graph node {node} · ")?;
+        }
+        match &self.stage {
+            Some(GradeStage::LocalLook) => write!(f, "Independent look on ")?,
+            Some(GradeStage::SharedLook { id }) => write!(f, "Shared look {id} on ")?,
+            None => {}
+        }
+        match self.owner {
+            Some(VfxOwner::Clip(id)) => write!(f, "Clip {id} corrector {} bypassed: ", self.op)?,
+            Some(VfxOwner::Track(id)) => write!(f, "Track {id} corrector {} bypassed: ", self.op)?,
+            Some(VfxOwner::Master(id)) => {
+                write!(f, "Sequence {id} master corrector {} bypassed: ", self.op)?
+            }
+            Some(VfxOwner::Asset(id)) => write!(f, "Asset {id} corrector {} bypassed: ", self.op)?,
+            Some(VfxOwner::GroupPre(id)) => {
+                write!(f, "Group {id} pre-grade corrector {} bypassed: ", self.op)?
+            }
+            Some(VfxOwner::GroupPost(id)) => {
+                write!(f, "Group {id} post-grade corrector {} bypassed: ", self.op)?
+            }
+            None => write!(f, "Corrector {} bypassed: ", self.op)?,
+        }
+        match &self.issue {
+            GradeIssue::MissingLut(asset) => write!(f, "LUT {asset} is unavailable")?,
+            GradeIssue::MissingSharedLook(_) => unreachable!(),
+            GradeIssue::UnsupportedOperator => write!(f, "unsupported grading operator")?,
+            GradeIssue::NativeCorrectionUnavailable(reason) => write!(f, "{reason}")?,
+            GradeIssue::UnresolvedMask => write!(f, "mask cannot be resolved")?,
+            GradeIssue::InvalidQualifierKeys => write!(
+                f,
+                "qualifier key list is invalid or exceeds the supported limit"
+            )?,
+            GradeIssue::InvalidQualifierMatteLevels => {
+                write!(f, "qualifier matte thresholds are outside 0..=0.49")?
+            }
+        }
+        write!(
+            f,
+            ". Resolve the dependency or disable the corrector before export."
+        )
+    }
+}
+
+/// Preview convenience API. Export callers must use the diagnostic result.
 pub fn resolve(
     grade: &Grade,
     tick: Tick,
     lut_provider: impl Fn(AssetId) -> Option<Arc<Lut3d>>,
 ) -> Vec<ResolvedGradeOp> {
+    resolve_with_diagnostics(grade, tick, lut_provider).0
+}
+
+/// Resolve supported correctors and report every enabled unresolved dependency.
+pub fn resolve_with_diagnostics(
+    grade: &Grade,
+    tick: Tick,
+    lut_provider: impl Fn(AssetId) -> Option<Arc<Lut3d>>,
+) -> (Vec<ResolvedGradeOp>, Vec<GradeDiagnostic>) {
+    let (ops, diagnostics) = resolve_with_ids_and_diagnostics(grade, tick, lut_provider);
+    (ops.into_iter().map(|(_, op)| op).collect(), diagnostics)
+}
+
+/// Resolve while retaining the authoring ID of each surviving corrector. A
+/// diagnostic may remove an unsupported corrector, so callers must not infer
+/// IDs from vector positions after resolution.
+pub fn resolve_with_ids_and_diagnostics(
+    grade: &Grade,
+    tick: Tick,
+    lut_provider: impl Fn(AssetId) -> Option<Arc<Lut3d>>,
+) -> (
+    Vec<(photonic_core::timeline::GradeOpId, ResolvedGradeOp)>,
+    Vec<GradeDiagnostic>,
+) {
     if grade.bypass {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let mut out = Vec::new();
+    let mut diagnostics = Vec::new();
     for op in &grade.ops {
         if !op.enabled {
             continue;
         }
+        if op.kind.is_unknown() {
+            diagnostics.push(GradeDiagnostic {
+                op: op.id,
+                sequence_path: Vec::new(),
+                graph_node: None,
+                owner: None,
+                stage: None,
+                issue: GradeIssue::UnsupportedOperator,
+            });
+            continue;
+        }
+        if matches!(op.mask, Some(GradeMask::RotoMatte { .. })) {
+            diagnostics.push(GradeDiagnostic {
+                op: op.id,
+                sequence_path: Vec::new(),
+                graph_node: None,
+                owner: None,
+                stage: None,
+                issue: GradeIssue::UnresolvedMask,
+            });
+            continue;
+        }
         let params = eval_params(&op.params, tick);
+        if let GradeOpParams::HslQualifier {
+            keys, matte_levels, ..
+        } = &params
+        {
+            if matte_levels
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=0.49).contains(value))
+            {
+                diagnostics.push(GradeDiagnostic {
+                    op: op.id,
+                    sequence_path: Vec::new(),
+                    graph_node: None,
+                    owner: None,
+                    stage: None,
+                    issue: GradeIssue::InvalidQualifierMatteLevels,
+                });
+                continue;
+            }
+            let valid = keys.len() <= photonic_core::timeline::MAX_QUALIFIER_KEYS
+                && keys.iter().all(|key| key.is_valid());
+            if !valid {
+                diagnostics.push(GradeDiagnostic {
+                    op: op.id,
+                    sequence_path: Vec::new(),
+                    graph_node: None,
+                    owner: None,
+                    stage: None,
+                    issue: GradeIssue::InvalidQualifierKeys,
+                });
+                continue;
+            }
+        }
         let payload = match &params {
             GradeOpParams::Exposure { stops } => ResolvedGradePayload::Exposure { stops: *stops },
+            GradeOpParams::LinearOffset { rgb } => ResolvedGradePayload::LinearOffset { rgb: *rgb },
+            GradeOpParams::PrinterLights { points } => {
+                ResolvedGradePayload::PrinterLights { points: *points }
+            }
+            GradeOpParams::HighlightRolloff { knee, strength } => {
+                ResolvedGradePayload::HighlightRolloff {
+                    knee: *knee,
+                    strength: *strength,
+                }
+            }
+            GradeOpParams::SaturationVibrance {
+                saturation,
+                vibrance,
+            } => ResolvedGradePayload::SaturationVibrance {
+                saturation: *saturation,
+                vibrance: *vibrance,
+            },
             GradeOpParams::Contrast { pivot, amount } => ResolvedGradePayload::Contrast {
                 pivot: *pivot,
                 amount: *amount,
@@ -429,6 +694,9 @@ pub fn resolve(
                 blue,
                 hue_vs_hue,
                 hue_vs_sat,
+                hue_vs_luma,
+                luma_vs_sat,
+                sat_vs_sat,
             } => ResolvedGradePayload::Curves(Box::new(ResolvedCurves {
                 master: curve_lut(master),
                 red: curve_lut(red),
@@ -436,6 +704,9 @@ pub fn resolve(
                 blue: curve_lut(blue),
                 hue_vs_hue: (!hue_vs_hue.is_empty()).then(|| curve_lut(hue_vs_hue)),
                 hue_vs_sat: (!hue_vs_sat.is_empty()).then(|| curve_lut(hue_vs_sat)),
+                hue_vs_luma: (!hue_vs_luma.is_empty()).then(|| curve_lut(hue_vs_luma)),
+                luma_vs_sat: (!luma_vs_sat.is_empty()).then(|| curve_lut(luma_vs_sat)),
+                sat_vs_sat: (!sat_vs_sat.is_empty()).then(|| curve_lut(sat_vs_sat)),
             })),
             GradeOpParams::HslQualifier {
                 hue,
@@ -443,13 +714,32 @@ pub fn resolve(
                 lum,
                 softness,
                 correction,
-            } => ResolvedGradePayload::HslQualifier(ResolvedHslQualifier {
+                keys,
+                matte_levels,
+            } => ResolvedGradePayload::HslQualifier(Box::new(ResolvedHslQualifier {
                 hue: *hue,
                 sat: *sat,
                 lum: *lum,
                 softness: *softness,
+                matte_levels: *matte_levels,
                 correction: (*correction).into(),
-            }),
+                keys: {
+                    let mut resolved = [ResolvedQualifierKey::default();
+                        photonic_core::timeline::MAX_QUALIFIER_KEYS];
+                    for (index, key) in keys.iter().enumerate() {
+                        resolved[index] = ResolvedQualifierKey {
+                            hue: key.hue,
+                            sat: key.sat,
+                            lum: key.lum,
+                            softness: key.softness,
+                            subtract: key.mode
+                                == photonic_core::timeline::QualifierKeyMode::Subtract,
+                        };
+                    }
+                    resolved
+                },
+                key_count: keys.len() as u32,
+            })),
             GradeOpParams::Lut3d {
                 asset,
                 intensity,
@@ -460,20 +750,43 @@ pub fn resolve(
                     intensity: *intensity,
                     tetrahedral: matches!(interp, LutInterp::Tetrahedral),
                 }),
-                None => continue, // offline LUT asset → op is inert this frame
+                None => {
+                    diagnostics.push(GradeDiagnostic {
+                        op: op.id,
+                        sequence_path: Vec::new(),
+                        graph_node: None,
+                        owner: None,
+                        stage: None,
+                        issue: GradeIssue::MissingLut(*asset),
+                    });
+                    continue;
+                }
             },
-            GradeOpParams::Unknown(_) => continue, // forward-compat inert op
+            GradeOpParams::Unknown(_) => {
+                diagnostics.push(GradeDiagnostic {
+                    op: op.id,
+                    sequence_path: Vec::new(),
+                    graph_node: None,
+                    owner: None,
+                    stage: None,
+                    issue: GradeIssue::UnsupportedOperator,
+                });
+                continue;
+            }
         };
-        out.push(ResolvedGradeOp {
-            payload,
-            mask: resolve_mask(op.mask.as_ref()),
-        });
+        out.push((
+            op.id,
+            ResolvedGradeOp {
+                payload,
+                mask: resolve_mask(op.mask.as_ref()),
+            },
+        ));
     }
-    out
+    (out, diagnostics)
 }
 
 /// Resolve an op's `GradeMask`. Only `PowerWindow` is real in v1 (07 §4.1);
-/// `RotoMatte` resolves to `None` (full frame) since no roto source exists yet.
+/// Unresolved roto masks are rejected before this helper is called.
 fn resolve_mask(mask: Option<&GradeMask>) -> Option<ResolvedMask> {
     match mask? {
         GradeMask::PowerWindow {
@@ -484,7 +797,7 @@ fn resolve_mask(mask: Option<&GradeMask>) -> Option<ResolvedMask> {
             softness,
             invert,
         } => Some(ResolvedMask {
-            rectangle: matches!(shape, WindowShape::Rectangle),
+            shape: *shape,
             center: *center,
             size: *size,
             rotation: *rotation,
@@ -523,6 +836,31 @@ fn scalar_field_mut<'a>(p: &'a mut GradeOpParams, path: &str) -> Option<&'a mut 
     use GradeOpParams::*;
     match p {
         Exposure { stops } => (path == "params.stops").then_some(stops),
+        LinearOffset { rgb } => match path {
+            "params.rgb[0]" => Some(&mut rgb[0]),
+            "params.rgb[1]" => Some(&mut rgb[1]),
+            "params.rgb[2]" => Some(&mut rgb[2]),
+            _ => None,
+        },
+        PrinterLights { points } => match path {
+            "params.points[0]" => Some(&mut points[0]),
+            "params.points[1]" => Some(&mut points[1]),
+            "params.points[2]" => Some(&mut points[2]),
+            _ => None,
+        },
+        HighlightRolloff { knee, strength } => match path {
+            "params.knee" => Some(knee),
+            "params.strength" => Some(strength),
+            _ => None,
+        },
+        SaturationVibrance {
+            saturation,
+            vibrance,
+        } => match path {
+            "params.saturation" => Some(saturation),
+            "params.vibrance" => Some(vibrance),
+            _ => None,
+        },
         Contrast { pivot, amount } => match path {
             "params.pivot" => Some(pivot),
             "params.amount" => Some(amount),
@@ -641,6 +979,46 @@ pub fn apply_grade_cpu(pixels: &mut [f32], width: u32, height: u32, ops: &[Resol
     }
 }
 
+/// Evaluate the isolation matte of a qualifier at its actual position in a
+/// resolved grade stack. Earlier correctors are applied before the key is
+/// measured; later correctors and the qualifier's CDL do not affect the matte.
+/// Source alpha and the qualifier's power window are included. Returns `None`
+/// when `target` is not a qualifier or the input dimensions are invalid.
+pub fn qualifier_matte_cpu(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    ops: &[ResolvedGradeOp],
+    target: usize,
+) -> Option<Vec<f32>> {
+    let ResolvedGradePayload::HslQualifier(qualifier) = &ops.get(target)?.payload else {
+        return None;
+    };
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(4))?;
+    if width == 0 || height == 0 || pixels.len() != expected_len {
+        return None;
+    }
+    let mut source = pixels.to_vec();
+    apply_grade_cpu(&mut source, width, height, &ops[..target]);
+    let mut matte = Vec::with_capacity(width as usize * height as usize);
+    for (index, rgba) in source.chunks_exact(4).enumerate() {
+        let Some(rgb) = unpremultiply3(&[rgba[0], rgba[1], rgba[2], rgba[3]]) else {
+            matte.push(0.0);
+            continue;
+        };
+        let x = ((index % width as usize) as f32 + 0.5) / width as f32;
+        let y = ((index / width as usize) as f32 + 0.5) / height as f32;
+        let window = ops[target]
+            .mask
+            .map(|mask| mask.weight(x, y))
+            .unwrap_or(1.0);
+        matte.push((qualifier_gate(qualifier, rgb) * window * rgba[3]).clamp(0.0, 1.0));
+    }
+    Some(matte)
+}
+
 /// Final per-pixel color for one resolved op, already blended by the mask weight
 /// (and, for the qualifier, its own gate). `mask_w == 1.0` when the op has no
 /// mask.
@@ -654,6 +1032,19 @@ pub fn apply_op(payload: &ResolvedGradePayload, rgb: [f32; 3], mask_w: f32) -> [
         _ => {
             let corrected = match payload {
                 ResolvedGradePayload::Exposure { stops } => apply_exposure(rgb, *stops),
+                ResolvedGradePayload::LinearOffset { rgb: offset } => {
+                    [rgb[0] + offset[0], rgb[1] + offset[1], rgb[2] + offset[2]]
+                }
+                ResolvedGradePayload::PrinterLights { points } => {
+                    apply_printer_lights(rgb, *points)
+                }
+                ResolvedGradePayload::HighlightRolloff { knee, strength } => {
+                    apply_highlight_rolloff(rgb, *knee, *strength)
+                }
+                ResolvedGradePayload::SaturationVibrance {
+                    saturation,
+                    vibrance,
+                } => apply_saturation_vibrance(rgb, *saturation, *vibrance),
                 ResolvedGradePayload::Contrast { pivot, amount } => {
                     apply_contrast(rgb, *pivot, *amount)
                 }
@@ -687,6 +1078,56 @@ fn lerp3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 pub fn apply_exposure(rgb: [f32; 3], stops: f32) -> [f32; 3] {
     let f = 2f32.powf(stops);
     [rgb[0] * f, rgb[1] * f, rgb[2] * f]
+}
+
+/// Film-style printer-light trim in scene-linear light. Twelve points are one
+/// stop on each channel. Zero points is exact identity; negative and highlight
+/// values remain in floating point rather than being clipped to display range.
+#[inline]
+pub fn apply_printer_lights(rgb: [f32; 3], points: [f32; 3]) -> [f32; 3] {
+    [
+        rgb[0] * 2f32.powf(points[0] / 12.0),
+        rgb[1] * 2f32.powf(points[1] / 12.0),
+        rgb[2] * 2f32.powf(points[2] / 12.0),
+    ]
+}
+
+/// Compress the positive RGB peak above `knee` while scaling every channel by
+/// the same factor. This preserves hue ratios and negative channel detail; it
+/// never clips extended-range values to 0–1. `strength = 0` is exact identity.
+#[inline]
+pub fn apply_highlight_rolloff(rgb: [f32; 3], knee: f32, strength: f32) -> [f32; 3] {
+    let knee = knee.max(0.0);
+    let strength = strength.max(0.0);
+    let peak = rgb[0].max(rgb[1]).max(rgb[2]);
+    if strength == 0.0 || peak <= knee || peak <= 0.0 {
+        return rgb;
+    }
+    let excess = peak - knee;
+    let mapped_peak = knee + excess / (1.0 + strength * excess);
+    let scale = mapped_peak / peak;
+    [rgb[0] * scale, rgb[1] * scale, rgb[2] * scale]
+}
+
+/// Linked saturation and selective vibrance in scene-linear RGB. Neutral gray
+/// stays neutral; no 0–1 clamp discards negative or extended-range detail.
+#[inline]
+pub fn apply_saturation_vibrance(rgb: [f32; 3], saturation: f32, vibrance: f32) -> [f32; 3] {
+    if saturation == 1.0 && vibrance == 0.0 {
+        return rgb;
+    }
+    let luma = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+    let peak = rgb[0].max(rgb[1]).max(rgb[2]);
+    let trough = rgb[0].min(rgb[1]).min(rgb[2]);
+    let reference = rgb[0].abs().max(rgb[1].abs()).max(rgb[2].abs()).max(0.001);
+    let colorfulness = ((peak - trough) / reference).clamp(0.0, 1.0);
+    let factor =
+        saturation.max(0.0) * (1.0 + vibrance.clamp(-1.0, 1.0) * (1.0 - colorfulness)).max(0.0);
+    [
+        luma + (rgb[0] - luma) * factor,
+        luma + (rgb[1] - luma) * factor,
+        luma + (rgb[2] - luma) * factor,
+    ]
 }
 
 /// 07 §3.2 — contrast in encoded space; same slope formula as
@@ -737,8 +1178,8 @@ pub fn apply_cdl(rgb: [f32; 3], c: &ResolvedCdl) -> [f32; 3] {
     out
 }
 
-/// 07 §3.6 — master then per-channel LUTs (sampled in the linear working value),
-/// then the optional hue-vs-hue / hue-vs-sat HSL pass.
+/// Master/channel LUTs, then optional hue/luma/saturation controls. The three
+/// newer families are absent on legacy grades, preserving the old math path.
 pub fn apply_curves(rgb: [f32; 3], c: &ResolvedCurves) -> [f32; 3] {
     let mut out = [0.0f32; 3];
     let luts = [&c.red, &c.green, &c.blue];
@@ -746,9 +1187,30 @@ pub fn apply_curves(rgb: [f32; 3], c: &ResolvedCurves) -> [f32; 3] {
         let m = sample_lut256(&c.master, rgb[ch]);
         out[ch] = sample_lut256(luts[ch], m);
     }
-    if c.hue_vs_hue.is_some() || c.hue_vs_sat.is_some() {
+    apply_secondary_curves(out, c, false)
+}
+
+/// Apply perceptual curve families after master/RGB. Native callers provide
+/// bounded log coordinates and restore their extended-value residual outside.
+pub(crate) fn apply_secondary_curves(
+    mut out: [f32; 3],
+    c: &ResolvedCurves,
+    native: bool,
+) -> [f32; 3] {
+    if c.hue_vs_hue.is_some()
+        || c.hue_vs_sat.is_some()
+        || c.hue_vs_luma.is_some()
+        || c.luma_vs_sat.is_some()
+        || c.sat_vs_sat.is_some()
+    {
         let mut hsl = rgb_to_hsl(out);
         let hue_x = hsl[0] / 360.0;
+        let source_luma = if native {
+            out[0] * 0.27222872 + out[1] * 0.67408174 + out[2] * 0.053689517
+        } else {
+            luma709(out)
+        };
+        let source_sat = hsl[1];
         if let Some(hh) = &c.hue_vs_hue {
             let delta = (sample_lut256(hh, hue_x) - 0.5) * 360.0;
             hsl[0] = (hsl[0] + delta).rem_euclid(360.0);
@@ -757,7 +1219,17 @@ pub fn apply_curves(rgb: [f32; 3], c: &ResolvedCurves) -> [f32; 3] {
             let mult = sample_lut256(hs, hue_x) * 2.0;
             hsl[1] = clamp01(hsl[1] * mult);
         }
+        if let Some(ls) = &c.luma_vs_sat {
+            hsl[1] = clamp01(hsl[1] * sample_lut256(ls, source_luma) * 2.0);
+        }
+        if let Some(ss) = &c.sat_vs_sat {
+            hsl[1] = clamp01(hsl[1] * sample_lut256(ss, source_sat) * 2.0);
+        }
         out = hsl_to_rgb(hsl);
+        if let Some(hl) = &c.hue_vs_luma {
+            let delta = sample_lut256(hl, hue_x) - 0.5;
+            out = out.map(|channel| clamp01(channel + delta));
+        }
     }
     out
 }
@@ -780,13 +1252,38 @@ pub fn apply_lut3d(rgb: [f32; 3], l: &ResolvedLut3d) -> [f32; 3] {
 
 /// The `hue*sat*lum` qualifier gate (07 §3.7), computed on the pixel's own HSL.
 /// Ranges are normalized 0..1 (hue = deg/360).
-fn qualifier_gate(q: &ResolvedHslQualifier, rgb: [f32; 3]) -> f32 {
+/// Unassociated qualifier key. Native keys use bounded ACEScct coordinates.
+pub fn qualifier_key_weight(q: &ResolvedHslQualifier, rgb: [f32; 3], native: bool) -> f32 {
+    qualifier_gate(
+        q,
+        if native {
+            rgb.map(|v| v.clamp(0.0, 1.0))
+        } else {
+            rgb
+        },
+    )
+}
+
+pub(crate) fn qualifier_gate(q: &ResolvedHslQualifier, rgb: [f32; 3]) -> f32 {
     let hsl = rgb_to_hsl(rgb);
     let h = hsl[0] / 360.0;
-    let hue_g = hue_gate(h, q.hue[0], q.hue[1], q.softness);
-    let sat_g = range_gate(hsl[1], q.sat[0], q.sat[1], q.softness);
-    let lum_g = range_gate(hsl[2], q.lum[0], q.lum[1], q.softness);
-    hue_g * sat_g * lum_g
+    let gate = |hue: [f32; 2], sat: [f32; 2], lum: [f32; 2], softness: f32| {
+        hue_gate(h, hue[0], hue[1], softness)
+            * range_gate(hsl[1], sat[0], sat[1], softness)
+            * range_gate(hsl[2], lum[0], lum[1], softness)
+    };
+    let mut included = gate(q.hue, q.sat, q.lum, q.softness);
+    let mut excluded: f32 = 0.0;
+    for key in &q.keys[..q.key_count as usize] {
+        let value = gate(key.hue, key.sat, key.lum, key.softness);
+        if key.subtract {
+            excluded = excluded.max(value);
+        } else {
+            included = included.max(value);
+        }
+    }
+    let weight = included * (1.0 - excluded);
+    ((weight - q.matte_levels[0]) / (1.0 - q.matte_levels[0] - q.matte_levels[1])).clamp(0.0, 1.0)
 }
 
 /// Soft-edged range gate: 1 inside `[lo, hi]`, `smoothstep` falloff of width
@@ -802,8 +1299,8 @@ fn range_gate(v: f32, lo: f32, hi: f32, soft: f32) -> f32 {
 }
 
 /// Hue gate on the 0..1 circle: evaluate the range gate at `h` and its ±1
-/// aliases so a band near the 0/1 seam still catches. v1 expects `lo <= hi`
-/// (non-wrapping selection); wrap-around ranges are a v1 limitation (07 §3.7).
+/// aliases so an unwrapped band extending below zero or above one catches
+/// colors on both sides of the seam. Bounds remain ordered (`lo <= hi`).
 #[inline]
 fn hue_gate(h: f32, lo: f32, hi: f32, soft: f32) -> f32 {
     range_gate(h, lo, hi, soft)
@@ -814,6 +1311,11 @@ fn hue_gate(h: f32, lo: f32, hi: f32, soft: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_payload_remains_compact_with_sampled_qualifier_keys() {
+        assert!(std::mem::size_of::<ResolvedGradePayload>() <= 64);
+    }
     use photonic_core::raster::{adjust, image::RasterImage};
     use photonic_core::timeline::{
         anim::{AnimProps, Interp, Keyframe, PropertyTrack},
@@ -825,6 +1327,48 @@ mod tests {
     }
 
     // ── shared math ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn unresolved_correctors_are_diagnosed_and_never_apply_full_frame() {
+        use photonic_core::timeline::{GradeOp, GradeOpKind, GraphId, GraphNodeId, MaskRef};
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 2.0 },
+        );
+        op.mask = Some(GradeMask::RotoMatte {
+            source: MaskRef::GraphNode {
+                graph: GraphId::new(),
+                node: GraphNodeId::new(),
+            },
+            invert: false,
+        });
+        grade.ops.push(op);
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Lut3d,
+            GradeOpParams::Lut3d {
+                asset: AssetId::new(),
+                intensity: 1.0,
+                interp: LutInterp::Trilinear,
+            },
+        ));
+        let (resolved, diagnostics) = resolve_with_diagnostics(&grade, Tick(0), |_| None);
+        assert!(resolved.is_empty());
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].issue, GradeIssue::UnresolvedMask);
+        assert!(matches!(diagnostics[1].issue, GradeIssue::MissingLut(_)));
+        for op in &mut grade.ops {
+            op.enabled = false;
+        }
+        assert!(resolve_with_diagnostics(&grade, Tick(0), |_| None)
+            .1
+            .is_empty());
+        grade.ops[0].enabled = true;
+        grade.bypass = true;
+        assert!(resolve_with_diagnostics(&grade, Tick(0), |_| None)
+            .1
+            .is_empty());
+    }
 
     #[test]
     fn enc_dec_round_trip() {
@@ -851,6 +1395,39 @@ mod tests {
         ));
         grade.bypass = true;
         assert!(resolve(&grade, Tick(0), none_provider).is_empty());
+    }
+
+    #[test]
+    fn resolved_ids_skip_disabled_correctors_without_shifting_inspection_target() {
+        let mut grade = Grade::new();
+        let mut disabled = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 5.0 },
+        );
+        disabled.enabled = false;
+        let qualifier = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: photonic_core::timeline::CdlParams::default(),
+                keys: Vec::new(),
+                matte_levels: [0.0, 0.0],
+            },
+        );
+        let qualifier_id = qualifier.id;
+        grade.ops.extend([disabled, qualifier]);
+        let (resolved, diagnostics) =
+            resolve_with_ids_and_diagnostics(&grade, Tick::ZERO, |_| None);
+        assert!(diagnostics.is_empty());
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].0, qualifier_id);
+        assert!(matches!(
+            resolved[0].1.payload,
+            ResolvedGradePayload::HslQualifier(_)
+        ));
     }
 
     #[test]
@@ -911,6 +1488,152 @@ mod tests {
             }
             _ => panic!("wrong payload"),
         }
+    }
+
+    #[test]
+    fn linear_offset_preserves_extended_range_and_partial_alpha() {
+        let mut grade = Grade::new();
+        let mut params = AnimProps::new(GradeOpParams::LinearOffset {
+            rgb: [0.0, 0.0, 0.0],
+        });
+        let mut red = PropertyTrack::new("params.rgb[0]");
+        red.insert_keyframe(Keyframe::new(
+            Tick(0),
+            PropValue::Float(0.0),
+            Interp::Linear,
+        ));
+        red.insert_keyframe(Keyframe::new(
+            Tick(100),
+            PropValue::Float(0.4),
+            Interp::Linear,
+        ));
+        params.tracks.push(red);
+        grade.ops.push(GradeOp {
+            id: photonic_core::timeline::GradeOpId::new(),
+            enabled: true,
+            kind: GradeOpKind::LinearOffset,
+            params,
+            mask: None,
+        });
+        let ops = resolve(&grade, Tick(50), none_provider);
+        assert_eq!(
+            ops[0].payload,
+            ResolvedGradePayload::LinearOffset {
+                rgb: [0.2, 0.0, 0.0]
+            }
+        );
+        let mut pixels = vec![-0.25, 0.75, 0.5, 0.5, 1.2, 0.0, -0.1, 1.0];
+        apply_grade_cpu(&mut pixels, 2, 1, &ops);
+        assert!((pixels[0] - -0.15).abs() < 1e-6);
+        assert!((pixels[1] - 0.75).abs() < 1e-6);
+        assert_eq!(pixels[3], 0.5);
+        assert!((pixels[4] - 1.4).abs() < 1e-6);
+        assert_eq!(pixels[7], 1.0);
+    }
+
+    #[test]
+    fn printer_lights_are_animatable_and_preserve_extended_range() {
+        let input = [2.0, 0.25, -0.5];
+        assert_eq!(apply_printer_lights(input, [0.0; 3]), input);
+        assert_eq!(
+            apply_printer_lights(input, [12.0, -12.0, 12.0]),
+            [4.0, 0.125, -1.0]
+        );
+
+        let mut props = AnimProps::new(GradeOpParams::PrinterLights { points: [0.0; 3] });
+        let mut red = PropertyTrack::new("params.points[0]");
+        red.insert_keyframe(Keyframe::new(
+            Tick(0),
+            PropValue::Float(0.0),
+            Interp::Linear,
+        ));
+        red.insert_keyframe(Keyframe::new(
+            Tick(100),
+            PropValue::Float(12.0),
+            Interp::Linear,
+        ));
+        props.tracks.push(red);
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp {
+            id: photonic_core::timeline::GradeOpId::new(),
+            enabled: true,
+            kind: GradeOpKind::PrinterLights,
+            params: props,
+            mask: None,
+        });
+        let ops = resolve(&grade, Tick(50), none_provider);
+        assert!(
+            matches!(ops[0].payload, ResolvedGradePayload::PrinterLights { points } if points == [6.0, 0.0, 0.0])
+        );
+        let mut pixel = vec![1.0, 0.125, -0.25, 0.5];
+        apply_grade_cpu(&mut pixel, 1, 1, &ops);
+        assert!((pixel[0] - 2f32.sqrt()).abs() < 1e-6);
+        assert_eq!(pixel[1], 0.125);
+        assert_eq!(pixel[2], -0.25);
+        assert_eq!(pixel[3], 0.5);
+    }
+
+    #[test]
+    fn highlight_rolloff_is_identity_below_knee_and_preserves_hue_above_white() {
+        assert_eq!(
+            apply_highlight_rolloff([-0.2, 0.4, 0.8], 1.0, 4.0),
+            [-0.2, 0.4, 0.8]
+        );
+        assert_eq!(
+            apply_highlight_rolloff([2.0, 0.5, -0.2], 1.0, 0.0),
+            [2.0, 0.5, -0.2]
+        );
+        let input = [2.0, 0.5, -0.2];
+        let out = apply_highlight_rolloff(input, 1.0, 1.0);
+        assert!((out[0] - 1.5).abs() < 1e-6);
+        assert!((out[1] / out[0] - input[1] / input[0]).abs() < 1e-6);
+        assert!((out[2] / out[0] - input[2] / input[0]).abs() < 1e-6);
+        assert!(out[2] < 0.0);
+    }
+
+    #[test]
+    fn saturation_vibrance_preserves_neutrals_and_extended_range() {
+        assert_eq!(apply_saturation_vibrance([0.5; 3], 1.4, 0.8), [0.5; 3]);
+        let input = [2.0, 0.7, -0.2];
+        assert_eq!(apply_saturation_vibrance(input, 1.0, 0.0), input);
+        let desaturated = apply_saturation_vibrance(input, 0.0, 0.0);
+        assert!((desaturated[0] - desaturated[1]).abs() < 1e-6);
+        assert!((desaturated[1] - desaturated[2]).abs() < 1e-6);
+        let boosted = apply_saturation_vibrance([0.8, 0.6, 0.6], 1.0, 0.8);
+        assert!(boosted[0] > 0.8 && boosted[1] < 0.6);
+        assert!(apply_saturation_vibrance([1.0, 0.0, 0.0], 1.0, 0.8)[0] <= 1.0 + 1e-6);
+    }
+
+    #[test]
+    fn keyframed_saturation_vibrance_resolves_both_controls() {
+        let mut props = AnimProps::new(GradeOpParams::SaturationVibrance {
+            saturation: 1.0,
+            vibrance: 0.0,
+        });
+        let mut track = PropertyTrack::new("params.vibrance");
+        track.insert_keyframe(Keyframe::new(
+            Tick(0),
+            PropValue::Float(0.0),
+            Interp::Linear,
+        ));
+        track.insert_keyframe(Keyframe::new(
+            Tick(100),
+            PropValue::Float(1.0),
+            Interp::Linear,
+        ));
+        props.tracks.push(track);
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp {
+            id: photonic_core::timeline::GradeOpId::new(),
+            enabled: true,
+            kind: GradeOpKind::SaturationVibrance,
+            params: props,
+            mask: None,
+        });
+        let resolved = resolve(&grade, Tick(50), none_provider);
+        assert!(matches!(resolved[0].payload,
+            ResolvedGradePayload::SaturationVibrance { saturation, vibrance }
+            if (saturation - 1.0).abs() < 1e-6 && (vibrance - 0.5).abs() < 1e-6));
     }
 
     // ── operand space: straight-alpha round trip (03 §4.5.3) ─────────────────
@@ -1101,6 +1824,9 @@ mod tests {
             blue: curve_lut(&[]),
             hue_vs_hue: None,
             hue_vs_sat: None,
+            hue_vs_luma: None,
+            luma_vs_sat: None,
+            sat_vs_sat: None,
         };
         for i in 0..256u32 {
             let v = i as f32 / 255.0;
@@ -1127,6 +1853,9 @@ mod tests {
             blue: curve_lut(&[]),
             hue_vs_hue: None,
             hue_vs_sat: None,
+            hue_vs_luma: None,
+            luma_vs_sat: None,
+            sat_vs_sat: None,
         };
         for i in 0..256u32 {
             let v = i as f32 / 255.0;
@@ -1138,6 +1867,50 @@ mod tests {
                 "i={i} r got={got_r} want={want_r}"
             );
         }
+    }
+
+    #[test]
+    fn advanced_curves_have_neutral_defaults_and_known_effects() {
+        let identity = curve_lut(&[]);
+        let mut curves = ResolvedCurves {
+            master: identity,
+            red: identity,
+            green: identity,
+            blue: identity,
+            hue_vs_hue: None,
+            hue_vs_sat: None,
+            hue_vs_luma: None,
+            luma_vs_sat: None,
+            sat_vs_sat: None,
+        };
+        let rgb = [0.2, 0.4, 0.6];
+        let neutral = curve_lut(&[(0.0, 0.5), (1.0, 0.5)]);
+        curves.hue_vs_luma = Some(neutral);
+        curves.luma_vs_sat = Some(neutral);
+        curves.sat_vs_sat = Some(neutral);
+        let out = apply_curves(rgb, &curves);
+        for channel in 0..3 {
+            assert!((out[channel] - rgb[channel]).abs() < 1e-5);
+        }
+        curves.hue_vs_luma = Some(curve_lut(&[(0.0, 0.75), (1.0, 0.75)]));
+        curves.luma_vs_sat = None;
+        curves.sat_vs_sat = None;
+        let raised = apply_curves(rgb, &curves);
+        for channel in 0..3 {
+            assert!((raised[channel] - rgb[channel] - 0.25).abs() < 1e-5);
+        }
+        curves.hue_vs_luma = None;
+        curves.luma_vs_sat = Some(curve_lut(&[(0.0, 0.0), (1.0, 0.0)]));
+        let desaturated = apply_curves(rgb, &curves);
+        assert!(desaturated
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 1e-5));
+        curves.luma_vs_sat = None;
+        curves.sat_vs_sat = Some(curve_lut(&[(0.0, 0.0), (1.0, 0.0)]));
+        let desaturated = apply_curves(rgb, &curves);
+        assert!(desaturated
+            .windows(2)
+            .all(|pair| (pair[0] - pair[1]).abs() < 1e-5));
     }
 
     // ── exposure equivalence with raster/adjust.rs exposure model ─────────────
@@ -1176,13 +1949,118 @@ mod tests {
                 power: [1.0; 3],
                 sat: 1.0,
             },
+            ..ResolvedHslQualifier::default()
         };
         let gray = [0.5, 0.5, 0.5];
         assert!((qualifier_gate(&q, gray)).abs() < 1e-6, "gray excluded");
-        let out = apply_op(&ResolvedGradePayload::HslQualifier(q), gray, 1.0);
+        let out = apply_op(&ResolvedGradePayload::HslQualifier(Box::new(q)), gray, 1.0);
         for c in 0..3 {
             assert!((out[c] - gray[c]).abs() < 1e-6, "unchanged {out:?}");
         }
+    }
+
+    #[test]
+    fn qualifier_hue_gate_crosses_red_seam_without_selecting_distant_hues() {
+        let q = ResolvedHslQualifier {
+            hue: [-0.05, 0.07],
+            sat: [0.0, 1.0],
+            lum: [0.0, 1.0],
+            softness: 0.0,
+            correction: ResolvedCdl {
+                slope: [1.0; 3],
+                offset: [0.0; 3],
+                power: [1.0; 3],
+                sat: 1.0,
+            },
+            ..ResolvedHslQualifier::default()
+        };
+        assert_eq!(qualifier_gate(&q, [1.0, 0.06, 0.0]), 1.0);
+        assert_eq!(qualifier_gate(&q, [1.0, 0.0, 0.06]), 1.0);
+        assert_eq!(qualifier_gate(&q, [0.0, 1.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn qualifier_disjoint_add_and_subtract_keys_combine_as_union_minus_exclusion() {
+        let mut q = ResolvedHslQualifier {
+            hue: [-0.05, 0.05],
+            sat: [0.3, 1.0],
+            lum: [0.1, 0.9],
+            ..ResolvedHslQualifier::default()
+        };
+        q.keys[0] = ResolvedQualifierKey {
+            hue: [0.61, 0.72],
+            sat: [0.3, 1.0],
+            lum: [0.1, 0.9],
+            softness: 0.0,
+            subtract: false,
+        };
+        q.keys[1] = ResolvedQualifierKey {
+            hue: [-0.03, 0.03],
+            sat: [0.3, 1.0],
+            lum: [0.1, 0.9],
+            softness: 0.0,
+            subtract: true,
+        };
+        q.key_count = 2;
+        assert_eq!(qualifier_gate(&q, [1.0, 0.0, 0.0]), 0.0);
+        assert_eq!(qualifier_gate(&q, [0.0, 0.0, 1.0]), 1.0);
+        assert_eq!(qualifier_gate(&q, [0.0, 1.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn qualifier_matte_levels_trim_low_values_and_fill_high_values() {
+        let q = ResolvedHslQualifier {
+            hue: [0.0, 0.1],
+            softness: 0.1,
+            matte_levels: [0.2, 0.2],
+            ..ResolvedHslQualifier::default()
+        };
+        assert_eq!(qualifier_gate(&q, hsl_to_rgb([45.0, 1.0, 0.5])), 1.0);
+        assert_eq!(qualifier_gate(&q, hsl_to_rgb([63.0, 1.0, 0.5])), 0.0);
+        assert!((qualifier_gate(&q, hsl_to_rgb([54.0, 1.0, 0.5])) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn excessive_qualifier_keys_bypass_corrector_with_diagnostic() {
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::default(),
+                keys: vec![
+                    photonic_core::timeline::QualifierKey {
+                        mode: photonic_core::timeline::QualifierKeyMode::Add,
+                        hue: [0.0, 0.1],
+                        sat: [0.0, 1.0],
+                        lum: [0.0, 1.0],
+                        softness: 0.0,
+                    };
+                    photonic_core::timeline::MAX_QUALIFIER_KEYS + 1
+                ],
+                matte_levels: [0.0, 0.0],
+            },
+        ));
+        let (resolved, diagnostics) = resolve_with_diagnostics(&grade, Tick::ZERO, none_provider);
+        assert!(resolved.is_empty());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].issue, GradeIssue::InvalidQualifierKeys);
+        if let GradeOpParams::HslQualifier {
+            keys, matte_levels, ..
+        } = &mut grade.ops[0].params.base
+        {
+            keys.clear();
+            *matte_levels = [f32::NAN, 0.0];
+        }
+        let (resolved, diagnostics) = resolve_with_diagnostics(&grade, Tick::ZERO, none_provider);
+        assert!(resolved.is_empty());
+        assert_eq!(
+            diagnostics[0].issue,
+            GradeIssue::InvalidQualifierMatteLevels
+        );
     }
 
     #[test]
@@ -1199,15 +2077,62 @@ mod tests {
                 power: [1.0; 3],
                 sat: 1.0,
             },
+            ..ResolvedHslQualifier::default()
         };
         let px = [0.6, 0.2, 0.3];
         let gate = qualifier_gate(&q, px);
         assert!((gate - 1.0).abs() < 1e-6, "wide open gate {gate}");
-        let out = apply_op(&ResolvedGradePayload::HslQualifier(q), px, 1.0);
+        let out = apply_op(&ResolvedGradePayload::HslQualifier(Box::new(q)), px, 1.0);
         let direct = apply_cdl(px, &q.correction);
         for c in 0..3 {
             assert!((out[c] - direct[c]).abs() < 1e-6, "full corr {out:?}");
         }
+    }
+
+    #[test]
+    fn qualifier_matte_uses_preceding_ops_window_and_alpha() {
+        let q = ResolvedHslQualifier {
+            hue: [0.0, 1.0],
+            sat: [0.5, 1.0],
+            lum: [0.15, 0.3],
+            softness: 0.0,
+            correction: ResolvedCdl {
+                slope: [2.0; 3],
+                offset: [0.0; 3],
+                power: [1.0; 3],
+                sat: 1.0,
+            },
+            ..ResolvedHslQualifier::default()
+        };
+        let ops = vec![
+            ResolvedGradeOp {
+                payload: ResolvedGradePayload::Exposure { stops: 1.0 },
+                mask: None,
+            },
+            ResolvedGradeOp {
+                payload: ResolvedGradePayload::HslQualifier(Box::new(q)),
+                mask: Some(ResolvedMask {
+                    shape: WindowShape::Rectangle,
+                    center: [0.25, 0.5],
+                    size: [0.2, 1.0],
+                    rotation: 0.0,
+                    softness: 0.0,
+                    invert: false,
+                }),
+            },
+            ResolvedGradeOp {
+                payload: ResolvedGradePayload::Exposure { stops: -1.0 },
+                mask: None,
+            },
+        ];
+        let pixels = [0.2, 0.0, 0.0, 1.0, 0.2, 0.0, 0.0, 1.0];
+        let matte = qualifier_matte_cpu(&pixels, 2, 1, &ops, 1).unwrap();
+        assert!((matte[0] - 1.0).abs() < 1e-6, "{matte:?}");
+        assert!(matte[1].abs() < 1e-6, "{matte:?}");
+        let without_preceding = qualifier_matte_cpu(&pixels, 2, 1, &ops[1..], 0).unwrap();
+        assert!(without_preceding[0].abs() < 1e-6);
+        assert!(qualifier_matte_cpu(&pixels, 2, 1, &ops, 0).is_none());
+        assert!(qualifier_matte_cpu(&pixels[..4], 2, 1, &ops, 1).is_none());
     }
 
     // ── power window mask (07 §4.1) ────────────────────────────────────────────
@@ -1215,7 +2140,7 @@ mod tests {
     #[test]
     fn power_window_ellipse_weight() {
         let m = ResolvedMask {
-            rectangle: false,
+            shape: WindowShape::Ellipse,
             center: [0.5, 0.5],
             size: [0.25, 0.25],
             rotation: 0.0,
@@ -1229,7 +2154,7 @@ mod tests {
     #[test]
     fn power_window_invert_flips() {
         let m = ResolvedMask {
-            rectangle: false,
+            shape: WindowShape::Ellipse,
             center: [0.5, 0.5],
             size: [0.25, 0.25],
             rotation: 0.0,
@@ -1241,13 +2166,34 @@ mod tests {
     }
 
     #[test]
+    fn gradient_window_has_directional_transition_and_rotation() {
+        let mut mask = ResolvedMask {
+            shape: WindowShape::Gradient,
+            center: [0.5, 0.5],
+            size: [0.1, 0.25],
+            rotation: 0.0,
+            softness: 0.0,
+            invert: false,
+        };
+        assert!((mask.weight(0.5, 0.1) - 1.0).abs() < 1e-6);
+        assert!((mask.weight(0.5, 0.5) - 0.5).abs() < 1e-6);
+        assert!(mask.weight(0.5, 0.9) < 1e-6);
+        assert!((mask.weight(0.1, 0.5) - 0.5).abs() < 1e-6);
+        mask.rotation = std::f32::consts::FRAC_PI_2;
+        assert!(mask.weight(0.1, 0.5) < 1e-6);
+        assert!((mask.weight(0.9, 0.5) - 1.0).abs() < 1e-6);
+        mask.invert = true;
+        assert!(mask.weight(0.9, 0.5) < 1e-6);
+    }
+
+    #[test]
     fn masked_exposure_only_affects_inside() {
         // A 2×1 image; a tight window over the left pixel only.
         let mut px = vec![0.2, 0.2, 0.2, 1.0, 0.2, 0.2, 0.2, 1.0];
         let op = ResolvedGradeOp {
             payload: ResolvedGradePayload::Exposure { stops: 1.0 },
             mask: Some(ResolvedMask {
-                rectangle: true,
+                shape: WindowShape::Rectangle,
                 center: [0.25, 0.5],
                 size: [0.2, 0.9],
                 rotation: 0.0,
@@ -1295,5 +2241,48 @@ mod tests {
         assert!((out[0] - 0.3).abs() < 1e-3, "{out:?}");
         assert!((out[1] - 0.6).abs() < 1e-3, "{out:?}");
         assert!((out[2] - 0.2).abs() < 1e-3, "{out:?}");
+    }
+
+    #[test]
+    fn grade_diagnostic_owner_is_additive_on_the_wire() {
+        let op = photonic_core::timeline::GradeOpId::new();
+        let old = serde_json::json!({
+            "op": op,
+            "issue": { "code": "unsupported_operator" }
+        });
+        let decoded: GradeDiagnostic = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(decoded.owner, None);
+        assert_eq!(decoded.graph_node, None);
+        assert!(decoded.sequence_path.is_empty());
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+
+        let clip = photonic_core::timeline::ClipId::new();
+        let identified = GradeDiagnostic {
+            owner: Some(photonic_core::timeline::VfxOwner::Clip(clip)),
+            ..decoded
+        };
+        let wire = serde_json::to_value(&identified).unwrap();
+        assert!(wire.get("owner").is_some());
+        assert!(identified.to_string().contains(&clip.to_string()));
+        let in_graph = GradeDiagnostic {
+            graph_node: Some(7),
+            ..identified
+        };
+        let wire = serde_json::to_value(&in_graph).unwrap();
+        assert_eq!(wire["graph_node"], 7);
+        assert!(in_graph.to_string().contains("Graph node 7"));
+        let root = photonic_core::timeline::SequenceId::new();
+        let nested = photonic_core::timeline::SequenceId::new();
+        let nested_diagnostic = GradeDiagnostic {
+            sequence_path: vec![root, nested],
+            ..in_graph
+        };
+        assert_eq!(
+            serde_json::to_value(&nested_diagnostic).unwrap()["sequence_path"],
+            serde_json::json!([root, nested])
+        );
+        assert!(nested_diagnostic
+            .to_string()
+            .contains("Nested sequence path"));
     }
 }

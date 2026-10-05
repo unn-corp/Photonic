@@ -8,7 +8,12 @@ use egui::RichText;
 use photonic_video::export::{QueueJobStatus, RenderQueue};
 
 /// Floating "Render Queue" window. `open` is session state on PhotonicApp.
-pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queue: &RenderQueue) {
+pub(crate) fn draw_render_queue_panel(
+    ctx: &egui::Context,
+    open: &mut bool,
+    queue: &RenderQueue,
+    error: Option<&str>,
+) {
     if !*open {
         return;
     }
@@ -20,6 +25,10 @@ pub(crate) fn draw_render_queue_panel(ctx: &egui::Context, open: &mut bool, queu
         .default_height(280.0)
         .resizable(true)
         .show(ctx, |ui| {
+            if let Some(error) = error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+                ui.separator();
+            }
             let jobs = queue.list();
             if jobs.is_empty() {
                 ui.label(

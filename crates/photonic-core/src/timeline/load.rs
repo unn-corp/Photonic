@@ -328,6 +328,10 @@ pub const KNOWN_CLIP_SOURCE_TAGS: &[&str] = &[
 /// Serialized `kind`-tags of the KNOWN [`GradeOpParams`] variants (grade.rs).
 pub const KNOWN_GRADE_PARAM_TAGS: &[&str] = &[
     "exposure",
+    "linear_offset",
+    "printer_lights",
+    "highlight_rolloff",
+    "saturation_vibrance",
     "contrast",
     "white_balance",
     "cdl",
@@ -381,6 +385,21 @@ pub const KNOWN_GRAPH_OP_TAGS: &[&str] = &[
 /// payload to swallow, so they need no such guard.
 fn reject_corrupt_known_variants(project: &TimelineProject) -> Result<(), LoadError> {
     for seq in project.sequences.values() {
+        for group in seq.groups.values() {
+            for grade in [group.pre_grade.as_ref(), group.post_grade.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                for op in &grade.ops {
+                    if let GradeOpParams::Unknown(map) = &op.params.base {
+                        let tag = map.get("kind").and_then(|v| v.as_str()).unwrap_or_default();
+                        if KNOWN_GRADE_PARAM_TAGS.contains(&tag) {
+                            return Err(LoadError::corrupt("GradeOpParams", tag));
+                        }
+                    }
+                }
+            }
+        }
         for track in seq.video_tracks.iter().chain(seq.audio_tracks.iter()) {
             for clip in &track.clips {
                 if let ClipSource::Unknown(map) = &clip.source {
@@ -453,6 +472,10 @@ pub fn flag_orphaned_property_tracks(project: &mut TimelineProject) {
         }
         // Sequence-master effect/grade scope (35 §2).
         flag_effect_stack(&mut seq.master_effects, seq.master_grade.as_mut());
+        for group in seq.groups.values_mut() {
+            flag_effect_stack(&mut [], group.pre_grade.as_mut());
+            flag_effect_stack(&mut [], group.post_grade.as_mut());
+        }
     }
     // Asset-level effect/grade scope (35 §2): walked once per asset, outside the
     // per-sequence loop.
@@ -929,6 +952,7 @@ mod unknown_scan_tests {
         clip.grade = Some(Grade {
             ops: vec![op],
             bypass: false,
+            graph: None,
         });
 
         let err = finalize_load(&mut project).expect_err("corrupt known grade param must reject");
@@ -939,6 +963,65 @@ mod unknown_scan_tests {
                 tag: "exposure".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn finalize_load_rejects_malformed_extended_grade_params() {
+        use crate::timeline::{Grade, GradeOp, GradeOpKind, GradeOpParams};
+        for (kind, tag, payload) in [
+            (
+                GradeOpKind::LinearOffset,
+                "linear_offset",
+                serde_json::json!({"kind":"linear_offset","rgb":"NOPE"}),
+            ),
+            (
+                GradeOpKind::PrinterLights,
+                "printer_lights",
+                serde_json::json!({"kind":"printer_lights","points":"NOPE"}),
+            ),
+            (
+                GradeOpKind::HighlightRolloff,
+                "highlight_rolloff",
+                serde_json::json!({"kind":"highlight_rolloff","knee":1.0,"strength":"NOPE"}),
+            ),
+            (
+                GradeOpKind::SaturationVibrance,
+                "saturation_vibrance",
+                serde_json::json!({"kind":"saturation_vibrance","saturation":"NOPE","vibrance":0.0}),
+            ),
+        ] {
+            let bad: GradeOpParams = serde_json::from_value(payload).unwrap();
+            assert!(bad.is_unknown());
+            let mut project = project_with_source(ClipSource::Adjustment);
+            let clip = &mut project.sequences.values_mut().next().unwrap().video_tracks[0].clips[0];
+            let valid = match kind {
+                GradeOpKind::LinearOffset => GradeOpParams::LinearOffset { rgb: [0.0; 3] },
+                GradeOpKind::PrinterLights => GradeOpParams::PrinterLights { points: [0.0; 3] },
+                GradeOpKind::HighlightRolloff => GradeOpParams::HighlightRolloff {
+                    knee: 1.0,
+                    strength: 0.0,
+                },
+                GradeOpKind::SaturationVibrance => GradeOpParams::SaturationVibrance {
+                    saturation: 1.0,
+                    vibrance: 0.0,
+                },
+                _ => unreachable!(),
+            };
+            let mut op = GradeOp::new(kind, valid);
+            op.params.base = bad;
+            clip.grade = Some(Grade {
+                ops: vec![op],
+                bypass: false,
+                graph: None,
+            });
+            assert_eq!(
+                finalize_load(&mut project),
+                Err(LoadError::CorruptKnownVariant {
+                    enum_name: "GradeOpParams",
+                    tag: tag.into(),
+                })
+            );
+        }
     }
 
     /// The known-tag constants must stay in lockstep with the enums, otherwise
@@ -1004,12 +1087,21 @@ mod unknown_scan_tests {
             );
         }
 
-        // GradeOpParams likewise.
-        let tag = serde_json::to_value(GradeOpParams::Exposure { stops: 0.0 }).unwrap()["kind"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(KNOWN_GRADE_PARAM_TAGS.contains(&tag.as_str()));
+        // New primary variants must be in the corruption guard as well.
+        for params in [
+            GradeOpParams::Exposure { stops: 0.0 },
+            GradeOpParams::PrinterLights { points: [0.0; 3] },
+            GradeOpParams::SaturationVibrance {
+                saturation: 1.0,
+                vibrance: 0.0,
+            },
+        ] {
+            let tag = serde_json::to_value(params).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(KNOWN_GRADE_PARAM_TAGS.contains(&tag.as_str()));
+        }
 
         // Genuine unknown tags are deliberately absent from every constant, so a
         // real forward-compat variant is preserved rather than rejected.

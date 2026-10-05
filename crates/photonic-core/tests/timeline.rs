@@ -1636,6 +1636,14 @@ fn variant_exhaustiveness_guard(cmd: &TimelineCmd) {
         TimelineCmd::RelinkAsset { .. } => {}
         TimelineCmd::SetAssetProxy { .. } => {}
         TimelineCmd::SetAssetMeta { .. } => {}
+        // Covered by ops::tests::lut_full_hash_pin_is_undoable_and_rejects_other_media
+        // and lut_interpretation_is_validated_and_undoable.
+        TimelineCmd::SetAssetLutHash { .. } => {}
+        TimelineCmd::SetAssetLutColor { .. } => {}
+        // Covered by ops::tests::managed_color_authoring_is_undoable_and_preserves_the_original.
+        TimelineCmd::SetAssetInputColor { .. } => {}
+        // Covered by ops::tests::native_input_edits_are_undoable_and_respect_locks.
+        TimelineCmd::SetAssetNativeInputColor { .. } => {}
         TimelineCmd::SetAssetRating { .. } => {} // K-C2
         TimelineCmd::SetAssetTags { .. } => {}   // K-C2
         TimelineCmd::SetAssetTagIds { .. } => {} // K-C2 TagId registry
@@ -1675,6 +1683,9 @@ fn variant_exhaustiveness_guard(cmd: &TimelineCmd) {
         TimelineCmd::ReorderEffects { .. } => {}
         TimelineCmd::SetEffect { .. } => {} // K-B1/K-B2 scoped stack param edit
         TimelineCmd::SetGrade { .. } => {}
+        // Covered by ops::tests::shared_look_propagates_and_make_independent_preserves_stage.
+        TimelineCmd::SetSharedLook { .. } => {}
+        TimelineCmd::SetReferenceStills { .. } => {}
         // Graphs / compositions.
         TimelineCmd::AddGraph { .. } => {}
         TimelineCmd::RemoveGraph { .. } => {}
@@ -1791,6 +1802,7 @@ fn fully_populated_project_round_trips() {
                         GradeOpParams::Exposure { stops: 1.0 },
                     )],
                     bypass: false,
+                    graph: None,
                 }),
             )
             .unwrap(),

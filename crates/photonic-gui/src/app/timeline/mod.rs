@@ -1610,7 +1610,12 @@ impl TimelineMediaCaches {
     /// file-backed asset — cheap for a typical pool). Called once per frame
     /// before painting lanes so the resolver closures always see the active
     /// document's media without holding a borrow across the worker threads.
-    fn refresh(&mut self, project_path: Option<&Path>, tab_key: usize, pool: &MediaPool) {
+    pub(crate) fn refresh(
+        &mut self,
+        project_path: Option<&Path>,
+        tab_key: usize,
+        pool: &MediaPool,
+    ) {
         let next = pool
             .assets
             .iter()
@@ -1653,8 +1658,16 @@ impl TimelineMediaCaches {
         *map = next;
     }
 
-    fn has_pending(&self) -> bool {
+    pub(crate) fn has_pending(&self) -> bool {
         self.thumbnails.has_pending() || self.waveforms.has_pending()
+    }
+
+    pub(crate) fn shot_thumbnail(
+        &self,
+        asset: AssetId,
+        source_tick: Tick,
+    ) -> Option<photonic_video::media::ThumbHandle> {
+        self.thumbnails.request(asset, source_tick, 54)
     }
 }
 

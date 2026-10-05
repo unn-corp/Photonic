@@ -78,6 +78,8 @@ id_newtype! {
     CueId,
     /// Identifies a [`GradeOp`](crate::timeline::GradeOp) within a grade stack (07 §1).
     GradeOpId,
+    /// Identifies a project-wide reusable grade stage.
+    SharedLookId,
     /// Identifies a media bin (folder) in the media pool.
     BinId,
     /// Identifies a [`MarkerCategory`](crate::timeline::MarkerCategory) in

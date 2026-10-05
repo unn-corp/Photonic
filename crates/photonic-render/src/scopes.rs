@@ -23,17 +23,78 @@ pub const WAVEFORM_BINS: usize = 256;
 /// Vectorscope plane resolution (Cb × Cr).
 pub const VECTORSCOPE_SIZE: usize = 256;
 
+/// Interpretation of the premultiplied texture supplied to SDR scopes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScopeSignal {
+    #[default]
+    LegacyLinearRec709,
+    /// Display-referred sRGB code values; no second OETF is applied.
+    SrgbDisplay,
+}
+
+/// Vertical signal scale for SDR waveform and parade display. Analysis always
+/// retains the original full-range bins; selecting video legal only remaps the
+/// plot. Values outside legal code levels remain visible at the plot edges and
+/// are counted separately.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeScale {
+    #[default]
+    Full,
+    VideoLegal,
+}
+
+impl ScopeScale {
+    /// Map a full-range 8-bit signal bin to a 0..255 display row. Video-legal
+    /// 16..235 code values map to 0..255; excursions clip to the edge.
+    pub fn display_bin(self, signal_bin: usize) -> usize {
+        let bin = signal_bin.min(255);
+        match self {
+            Self::Full => bin,
+            Self::VideoLegal => ((bin.saturating_sub(16).min(219) * 255 + 109) / 219).min(255),
+        }
+    }
+}
+
+/// Six counts in R/G/B order: below zero, then above reference white.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ClippingCounts {
+    pub below: [u32; 3],
+    pub above: [u32; 3],
+}
+
+/// Count out-of-range straight RGB values before the SDR scope display clamp.
+/// Fully transparent pixels carry no visible signal and are excluded.
+pub fn clipping_cpu(pixels: &[f32], width: u32, height: u32) -> ClippingCounts {
+    let mut counts = ClippingCounts::default();
+    for px in pixels
+        .chunks_exact(4)
+        .take(width as usize * height as usize)
+    {
+        let alpha = px[3];
+        if alpha <= 0.0 || !alpha.is_finite() {
+            continue;
+        }
+        for channel in 0..3 {
+            let value = px[channel] / alpha;
+            counts.below[channel] += u32::from(value < 0.0);
+            counts.above[channel] += u32::from(value > 1.0);
+        }
+    }
+    counts
+}
+
 // ── CPU signal encode ───────────────────────────────────────────────────────
 
 /// Unpremultiply + BT.709 OETF one working pixel into signal-domain R'G'B'.
 #[inline]
-fn signal(px: &[f32]) -> [f32; 3] {
+fn signal(px: &[f32], mode: ScopeSignal) -> [f32; 3] {
     let a = px[3].max(1e-6);
-    [
-        color::bt709_oetf((px[0] / a).clamp(0.0, 1.0)),
-        color::bt709_oetf((px[1] / a).clamp(0.0, 1.0)),
-        color::bt709_oetf((px[2] / a).clamp(0.0, 1.0)),
-    ]
+    let straight = std::array::from_fn(|c| (px[c] / a).clamp(0.0, 1.0));
+    match mode {
+        ScopeSignal::LegacyLinearRec709 => straight.map(color::bt709_oetf),
+        ScopeSignal::SrgbDisplay => straight,
+    }
 }
 
 #[inline]
@@ -76,6 +137,24 @@ impl Waveform {
     pub fn count(&self, x: usize, bin: usize) -> u32 {
         self.data[x * self.bins + bin]
     }
+
+    /// Counts measured samples below code 16 and above code 235. The count is
+    /// derived from unmodified 256-bin signal data, independent of plot scale.
+    pub fn video_legal_excursions(&self) -> (u64, u64) {
+        let mut below = 0;
+        let mut above = 0;
+        for x in 0..self.width {
+            for bin in 0..self.bins {
+                let count = u64::from(self.count(x, bin));
+                if bin < 16 {
+                    below += count;
+                } else if bin > 235 {
+                    above += count;
+                }
+            }
+        }
+        (below, above)
+    }
 }
 
 /// Cb×Cr scatter histogram (07 §5). `count(cb, cr) = data[cr*size + cb]`.
@@ -104,9 +183,18 @@ pub struct Scopes {
 
 /// 256-bin luma + per-channel histogram over an RGBA `f32` buffer.
 pub fn histogram_cpu(pixels: &[f32], _width: u32, _height: u32) -> Histogram {
+    histogram_cpu_signal(pixels, _width, _height, ScopeSignal::LegacyLinearRec709)
+}
+
+pub fn histogram_cpu_signal(
+    pixels: &[f32],
+    _width: u32,
+    _height: u32,
+    mode: ScopeSignal,
+) -> Histogram {
     let mut h = Histogram::default();
     for px in pixels.chunks_exact(4) {
-        let s = signal(px);
+        let s = signal(px, mode);
         h.luma[bin256(luma709(s))] += 1;
         h.red[bin256(s[0])] += 1;
         h.green[bin256(s[1])] += 1;
@@ -117,11 +205,15 @@ pub fn histogram_cpu(pixels: &[f32], _width: u32, _height: u32) -> Histogram {
 
 /// Per-column luma waveform over an RGBA `f32` buffer.
 pub fn waveform_cpu(pixels: &[f32], width: u32, height: u32) -> Waveform {
+    waveform_cpu_signal(pixels, width, height, ScopeSignal::LegacyLinearRec709)
+}
+
+pub fn waveform_cpu_signal(pixels: &[f32], width: u32, height: u32, mode: ScopeSignal) -> Waveform {
     let w = width.max(1) as usize;
     let mut data = vec![0u32; w * WAVEFORM_BINS];
     for (i, px) in pixels.chunks_exact(4).enumerate() {
         let x = i % w;
-        let s = signal(px);
+        let s = signal(px, mode);
         let bin = bin256(luma709(s));
         data[x * WAVEFORM_BINS + bin] += 1;
     }
@@ -133,12 +225,41 @@ pub fn waveform_cpu(pixels: &[f32], width: u32, height: u32) -> Waveform {
     }
 }
 
+/// Spatial RGB parade: one waveform per channel, preserving source columns.
+pub fn parade_cpu(pixels: &[f32], width: u32, height: u32) -> [Waveform; 3] {
+    parade_cpu_signal(pixels, width, height, ScopeSignal::LegacyLinearRec709)
+}
+
+pub fn parade_cpu_signal(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    mode: ScopeSignal,
+) -> [Waveform; 3] {
+    let w = width.max(1) as usize;
+    let mut channels = std::array::from_fn(|_| Waveform {
+        width: w,
+        bins: WAVEFORM_BINS,
+        data: vec![0; w * WAVEFORM_BINS],
+    });
+    for (i, px) in pixels
+        .chunks_exact(4)
+        .take(width as usize * height as usize)
+        .enumerate()
+    {
+        for (channel, value) in signal(px, mode).into_iter().enumerate() {
+            channels[channel].data[(i % w) * WAVEFORM_BINS + bin256(value)] += 1;
+        }
+    }
+    channels
+}
+
 /// Rec.709 Cb×Cr vectorscope over an RGBA `f32` buffer. The YCbCr denominators
 /// reuse `crate::color::{BT709_CB_B, BT709_CR_R}` (07 §5).
 pub fn vectorscope_cpu(pixels: &[f32], _width: u32, _height: u32) -> Vectorscope {
     let mut data = vec![0u32; VECTORSCOPE_SIZE * VECTORSCOPE_SIZE];
     for px in pixels.chunks_exact(4) {
-        let s = signal(px);
+        let s = signal(px, ScopeSignal::LegacyLinearRec709);
         let (cb_bin, cr_bin) = cbcr_bins(s);
         data[cr_bin * VECTORSCOPE_SIZE + cb_bin] += 1;
     }
@@ -180,9 +301,25 @@ pub fn vectorscope_cpu_matrix(
     _height: u32,
     matrix: color::Matrix,
 ) -> Vectorscope {
+    vectorscope_cpu_matrix_signal(
+        pixels,
+        _width,
+        _height,
+        matrix,
+        ScopeSignal::LegacyLinearRec709,
+    )
+}
+
+pub fn vectorscope_cpu_matrix_signal(
+    pixels: &[f32],
+    _width: u32,
+    _height: u32,
+    matrix: color::Matrix,
+    mode: ScopeSignal,
+) -> Vectorscope {
     let mut data = vec![0u32; VECTORSCOPE_SIZE * VECTORSCOPE_SIZE];
     for px in pixels.chunks_exact(4) {
-        let s = signal(px);
+        let s = signal(px, mode);
         let (cb_bin, cr_bin) = cbcr_bins_matrix(s, matrix);
         data[cr_bin * VECTORSCOPE_SIZE + cb_bin] += 1;
     }
@@ -194,10 +331,37 @@ pub fn vectorscope_cpu_matrix(
 
 /// All three CPU scopes for one frame.
 pub fn scopes_from_pixels_cpu(pixels: &[f32], width: u32, height: u32) -> Scopes {
+    scopes_from_pixels_cpu_matrix(pixels, width, height, color::Matrix::Bt709)
+}
+
+/// CPU scope bundle with selectable vectorscope matrix. Histogram and waveform
+/// continue to measure the Legacy SDR BT.709 signal; only Cb/Cr bins change.
+pub fn scopes_from_pixels_cpu_matrix(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    matrix: color::Matrix,
+) -> Scopes {
+    scopes_from_pixels_cpu_matrix_signal(
+        pixels,
+        width,
+        height,
+        matrix,
+        ScopeSignal::LegacyLinearRec709,
+    )
+}
+
+pub fn scopes_from_pixels_cpu_matrix_signal(
+    pixels: &[f32],
+    width: u32,
+    height: u32,
+    matrix: color::Matrix,
+    mode: ScopeSignal,
+) -> Scopes {
     Scopes {
-        histogram: histogram_cpu(pixels, width, height),
-        waveform: waveform_cpu(pixels, width, height),
-        vectorscope: vectorscope_cpu(pixels, width, height),
+        histogram: histogram_cpu_signal(pixels, width, height, mode),
+        waveform: waveform_cpu_signal(pixels, width, height, mode),
+        vectorscope: vectorscope_cpu_matrix_signal(pixels, width, height, matrix, mode),
     }
 }
 
@@ -212,8 +376,8 @@ const COMPUTE_PRELUDE: &str = r#"
 // K-E2: the LOGICAL extent to measure. A working texture out of the node pool is
 // bucket-padded (dimensions rounded up to a 64px multiple, 03 §3.4), and that
 // padding is transparent black — measuring it puts a phantom spike in bin 0 of
-// every scope. `logical.xy` is the real image size; `.zw` is reserved padding to
-// keep the uniform 16-byte aligned.
+// every scope. `logical.xy` is the real image size; `.z` selects vectorscope
+// matrix and `.w` selects source signal interpretation.
 @group(0) @binding(2) var<uniform> logical: vec4<u32>;
 
 // True when this invocation is inside both the logical extent and the texture.
@@ -229,7 +393,8 @@ fn oetf709(e: f32) -> f32 {
 }
 fn signal(px: vec4<f32>) -> vec3<f32> {
     let a = max(px.a, 1e-6);
-    let s = px.rgb / a;
+    let s = clamp(px.rgb / a, vec3<f32>(0.0), vec3<f32>(1.0));
+    if (logical.w == 1u) { return s; }
     return vec3<f32>(oetf709(s.r), oetf709(s.g), oetf709(s.b));
 }
 fn luma709(c: vec3<f32>) -> f32 { return 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b; }
@@ -249,6 +414,13 @@ fn cs_hist(@builtin(global_invocation_id) gid: vec3<u32>) {
     atomicAdd(&bins[256u + bin256(s.r)], 1u);
     atomicAdd(&bins[512u + bin256(s.g)], 1u);
     atomicAdd(&bins[768u + bin256(s.b)], 1u);
+    if (px.a > 0.0) {
+        let straight = px.rgb / px.a;
+        for (var c = 0u; c < 3u; c = c + 1u) {
+            if (straight[c] < 0.0) { atomicAdd(&bins[1024u + c], 1u); }
+            if (straight[c] > 1.0) { atomicAdd(&bins[1027u + c], 1u); }
+        }
+    }
 }
 "#;
 
@@ -262,6 +434,20 @@ fn cs_wave(@builtin(global_invocation_id) gid: vec3<u32>) {
     let px = textureLoad(t_src, vec2<i32>(i32(gid.x), i32(gid.y)), 0);
     let s = signal(px);
     atomicAdd(&bins[gid.x * 256u + bin256(luma709(s))], 1u);
+}
+"#;
+
+/// Channel-major, per-column RGB waveform accumulation.
+pub const PARADE_SHADER: &str = r#"
+__PRELUDE__
+@compute @workgroup_size(8, 8, 1)
+fn cs_parade(@builtin(global_invocation_id) gid: vec3<u32>) {
+    if (!in_scope(gid)) { return; }
+    let s = signal(textureLoad(t_src, vec2<i32>(gid.xy), 0));
+    let width = max(1u, min(logical.x, textureDimensions(t_src).x));
+    for (var c = 0u; c < 3u; c = c + 1u) {
+        atomicAdd(&bins[(c * width + gid.x) * 256u + bin256(s[c])], 1u);
+    }
 }
 "#;
 
@@ -346,6 +532,86 @@ fn run_scope_ex(
     logical: (u32, u32),
     extra_z: u32,
 ) -> Vec<u32> {
+    let request = begin_scope_readback(
+        device, queue, tex, shader_src, entry, out_len, logical, extra_z,
+    );
+    device.poll(wgpu::Maintain::Wait);
+    request.finish().expect("scope readback failed")
+}
+
+/// Submitted GPU scope measurement. Polling never waits for GPU completion.
+pub struct ScopeReadback {
+    staging: wgpu::Buffer,
+    ready: std::sync::mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
+
+impl ScopeReadback {
+    pub fn poll(&self, device: &wgpu::Device) -> Option<Result<Vec<u32>, String>> {
+        device.poll(wgpu::Maintain::Poll);
+        match self.ready.try_recv() {
+            Ok(Ok(())) => Some(Ok(self.read())),
+            Ok(Err(error)) => Some(Err(error.to_string())),
+            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            Err(error) => Some(Err(error.to_string())),
+        }
+    }
+
+    fn read(&self) -> Vec<u32> {
+        let raw = self.staging.slice(..).get_mapped_range();
+        let data = bytemuck::cast_slice(&raw).to_vec();
+        drop(raw);
+        self.staging.unmap();
+        data
+    }
+
+    fn finish(self) -> Result<Vec<u32>, String> {
+        self.ready
+            .recv()
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        Ok(self.read())
+    }
+}
+
+/// Submit a scope kernel and start asynchronous readback. `extra_z` selects
+/// the vectorscope matrix (0 = BT.709, 1 = BT.601).
+#[allow(clippy::too_many_arguments)]
+pub fn begin_scope_readback(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    shader_src: &str,
+    entry: &str,
+    out_len: usize,
+    logical: (u32, u32),
+    extra_z: u32,
+) -> ScopeReadback {
+    begin_scope_readback_signal(
+        device,
+        queue,
+        tex,
+        shader_src,
+        entry,
+        out_len,
+        logical,
+        extra_z,
+        ScopeSignal::LegacyLinearRec709,
+    )
+}
+
+/// Submit a scope readback with an explicit source signal interpretation.
+#[allow(clippy::too_many_arguments)]
+pub fn begin_scope_readback_signal(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    shader_src: &str,
+    entry: &str,
+    out_len: usize,
+    logical: (u32, u32),
+    extra_z: u32,
+    signal: ScopeSignal,
+) -> ScopeReadback {
     let bins = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("scope_bins"),
         contents: bytemuck::cast_slice(&vec![0u32; out_len]),
@@ -353,7 +619,12 @@ fn run_scope_ex(
     });
     let logical_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("scope_logical"),
-        contents: bytemuck::cast_slice(&[logical.0, logical.1, extra_z, 0u32]),
+        contents: bytemuck::cast_slice(&[
+            logical.0,
+            logical.1,
+            extra_z,
+            u32::from(signal == ScopeSignal::SrgbDisplay),
+        ]),
         usage: wgpu::BufferUsages::UNIFORM,
     });
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -457,13 +728,7 @@ fn run_scope_ex(
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
-    device.poll(wgpu::Maintain::Wait);
-    rx.recv().unwrap().unwrap();
-    let raw = slice.get_mapped_range();
-    let out: Vec<u32> = bytemuck::cast_slice(&raw).to_vec();
-    drop(raw);
-    staging.unmap();
-    out
+    ScopeReadback { staging, ready: rx }
 }
 
 /// GPU histogram at the readback point (07 §5), measuring the whole texture.
@@ -488,7 +753,7 @@ pub fn histogram_gpu_logical(
         tex,
         HISTOGRAM_SHADER,
         "cs_hist",
-        HIST_BINS * 4,
+        HIST_BINS * 4 + 6,
         (w, h),
     );
     let mut h = Histogram::default();
@@ -529,6 +794,32 @@ pub fn waveform_gpu_logical(
         bins: WAVEFORM_BINS,
         data,
     }
+}
+
+/// GPU RGB parade over the logical image, excluding pooled texture padding.
+pub fn parade_gpu_logical(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    w: u32,
+    h: u32,
+) -> [Waveform; 3] {
+    let cols = w.min(tex.width()).max(1) as usize;
+    let stride = cols * WAVEFORM_BINS;
+    let data = run_scope(
+        device,
+        queue,
+        tex,
+        PARADE_SHADER,
+        "cs_parade",
+        stride * 3,
+        (w, h),
+    );
+    std::array::from_fn(|channel| Waveform {
+        width: cols,
+        bins: WAVEFORM_BINS,
+        data: data[channel * stride..(channel + 1) * stride].to_vec(),
+    })
 }
 
 /// GPU vectorscope at the readback point (07 §5), measuring the whole texture.
@@ -608,6 +899,79 @@ mod tests {
     use super::*;
     use crate::pipeline::WORKING_FORMAT;
 
+    #[test]
+    fn video_legal_scale_maps_endpoints_and_counts_excursions() {
+        assert_eq!(ScopeScale::Full.display_bin(16), 16);
+        assert_eq!(ScopeScale::VideoLegal.display_bin(0), 0);
+        assert_eq!(ScopeScale::VideoLegal.display_bin(15), 0);
+        assert_eq!(ScopeScale::VideoLegal.display_bin(16), 0);
+        assert_eq!(ScopeScale::VideoLegal.display_bin(235), 255);
+        assert_eq!(ScopeScale::VideoLegal.display_bin(236), 255);
+        assert_eq!(ScopeScale::VideoLegal.display_bin(255), 255);
+        assert!(ScopeScale::VideoLegal.display_bin(125) < ScopeScale::VideoLegal.display_bin(126));
+        let mut waveform = Waveform {
+            width: 2,
+            bins: 256,
+            data: vec![0; 2 * 256],
+        };
+        for (x, bin) in [(0, 0), (0, 15), (0, 16), (1, 235), (1, 236), (1, 255)] {
+            waveform.data[x * 256 + bin] = 1;
+        }
+        assert_eq!(waveform.video_legal_excursions(), (2, 2));
+        assert_eq!(waveform.data.iter().sum::<u32>(), 6);
+    }
+
+    #[test]
+    fn bundled_scope_matrix_changes_only_vectorscope_bins() {
+        let pixels = [0.8, 0.2, 0.1, 1.0, 0.1, 0.8, 0.2, 1.0];
+        let default = scopes_from_pixels_cpu(&pixels, 2, 1);
+        let hd = scopes_from_pixels_cpu_matrix(&pixels, 2, 1, color::Matrix::Bt709);
+        let sd = scopes_from_pixels_cpu_matrix(&pixels, 2, 1, color::Matrix::Bt601);
+        assert_eq!(default, hd);
+        assert_eq!(hd.histogram, sd.histogram);
+        assert_eq!(hd.waveform, sd.waveform);
+        assert_ne!(hd.vectorscope, sd.vectorscope);
+    }
+
+    #[test]
+    fn srgb_scope_signal_preserves_display_code_values() {
+        let pixels = [0.25, 0.25, 0.25, 1.0];
+        let display = histogram_cpu_signal(&pixels, 1, 1, ScopeSignal::SrgbDisplay);
+        let legacy = histogram_cpu(&pixels, 1, 1);
+        assert_eq!(display.red[64], 1);
+        assert_eq!(display.luma[64], 1);
+        assert_eq!(legacy.red[125], 1);
+        assert_eq!(
+            parade_cpu_signal(&pixels, 1, 1, ScopeSignal::SrgbDisplay)[0].count(0, 64),
+            1
+        );
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        let tex = upload(&device, &queue, &pixels, 1, 1);
+        let request = begin_scope_readback_signal(
+            &device,
+            &queue,
+            &tex,
+            HISTOGRAM_SHADER,
+            "cs_hist",
+            1030,
+            (1, 1),
+            0,
+            ScopeSignal::SrgbDisplay,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let bins = loop {
+            if let Some(result) = request.poll(&device) {
+                break result.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert_eq!(bins[64], 1);
+        assert_eq!(bins[256 + 64], 1);
+    }
+
     // ── CPU references (07 §6.3) ────────────────────────────────────────────
 
     /// A gray ramp whose *signal-domain* luma is exactly `i/(N-1)`: pixel i is
@@ -620,6 +984,55 @@ mod tests {
             v.extend_from_slice(&[lin, lin, lin, 1.0]);
         }
         v
+    }
+
+    #[test]
+    fn asynchronous_scope_readback_matches_reference() {
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        let px = [1., 0., 0., 1., 0., 1., 0., 1.];
+        let tex = upload(&device, &queue, &px, 2, 1);
+        let request = begin_scope_readback(
+            &device,
+            &queue,
+            &tex,
+            HISTOGRAM_SHADER,
+            "cs_hist",
+            1030,
+            (2, 1),
+            0,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let bins = loop {
+            if let Some(result) = request.poll(&device) {
+                break result.unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "async scope never completed"
+            );
+            std::thread::yield_now();
+        };
+        let reference = histogram_cpu(&px, 2, 1);
+        assert_eq!(&bins[256..512], &reference.red);
+        assert_eq!(&bins[512..768], &reference.green);
+    }
+
+    #[test]
+    fn parade_preserves_spatial_position_and_channel_separation() {
+        let px = [1., 0., 0., 1., 0., 1., 0., 1., 0., 0., 1., 1.];
+        let channels = parade_cpu(&px, 3, 1);
+        for (channel, waveform) in channels.iter().enumerate() {
+            for x in 0..3 {
+                assert_eq!(waveform.count(x, if x == channel { 255 } else { 0 }), 1);
+            }
+            assert_eq!(waveform.data.iter().sum::<u32>(), 3);
+        }
+        if let Some((device, queue)) = try_device() {
+            let tex = upload(&device, &queue, &px, 3, 1);
+            assert_eq!(parade_gpu_logical(&device, &queue, &tex, 3, 1), channels);
+        }
     }
 
     #[test]
@@ -652,6 +1065,43 @@ mod tests {
         assert_eq!(h.luma[255], 4);
         let total: u32 = h.luma.iter().sum();
         assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn clipping_counts_straight_visible_signal_before_histogram_clamp() {
+        let pixels = [
+            -0.25, 0.75, 0.0, 0.5, // straight R=-0.5, G=1.5
+            0.0, 0.0, 2.0, 1.0, // B=2
+            -1.0, 3.0, 3.0, 0.0, // invisible transparent payload
+        ];
+        assert_eq!(
+            clipping_cpu(&pixels, 3, 1),
+            ClippingCounts {
+                below: [1, 0, 0],
+                above: [0, 1, 1],
+            }
+        );
+    }
+
+    #[test]
+    fn gpu_histogram_reports_unclamped_channel_counts() {
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        let pixels = [-0.25, 0.75, 0.0, 0.5, 0.0, 0.0, 2.0, 1.0];
+        let tex = upload(&device, &queue, &pixels, 2, 1);
+        let bins = run_scope(
+            &device,
+            &queue,
+            &tex,
+            HISTOGRAM_SHADER,
+            "cs_hist",
+            1030,
+            (2, 1),
+        );
+        let expected = clipping_cpu(&pixels, 2, 1);
+        assert_eq!(&bins[1024..1027], &expected.below);
+        assert_eq!(&bins[1027..1030], &expected.above);
     }
 
     #[test]

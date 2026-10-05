@@ -36,8 +36,8 @@ impl PhotonicApp {
         };
 
         // Resolve a target path — prompt Save-As for an untitled document.
-        let path = match existing {
-            Some(p) => p,
+        let path = match existing.as_ref() {
+            Some(p) => p.clone(),
             None => {
                 let default_name = format!("{}.{}", self.tabs[idx].title, PHOTON_FILE_EXTENSION);
                 let dialog = rfd::FileDialog::new()
@@ -58,10 +58,14 @@ impl PhotonicApp {
 
         // Write (active doc uses the live params; parked uses the owned tab state).
         let ok = if active {
-            write_photon_file(&path, doc, history).is_ok()
+            let prepared =
+                existing.is_some() || copy_reference_stills_for_save_as(doc, None, &path).is_ok();
+            prepared && write_photon_file(&path, doc, history).is_ok()
         } else {
             let tab = &mut self.tabs[idx];
-            write_photon_file(&path, &tab.document, &mut tab.history).is_ok()
+            let prepared = existing.is_some()
+                || copy_reference_stills_for_save_as(&tab.document, None, &path).is_ok();
+            prepared && write_photon_file(&path, &tab.document, &mut tab.history).is_ok()
         };
 
         if !ok {

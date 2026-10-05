@@ -122,6 +122,24 @@ const EFFECT_MASKSHAPE: &[PropEntry] = &[
 ];
 
 const GRADE_EXPOSURE: &[PropEntry] = &[f("params.stops", Some((-10.0, 10.0)))];
+const GRADE_LINEAR_OFFSET: &[PropEntry] = &[
+    f("params.rgb[0]", Some((-2.0, 2.0))),
+    f("params.rgb[1]", Some((-2.0, 2.0))),
+    f("params.rgb[2]", Some((-2.0, 2.0))),
+];
+const GRADE_PRINTER_LIGHTS: &[PropEntry] = &[
+    f("params.points[0]", Some((-48.0, 48.0))),
+    f("params.points[1]", Some((-48.0, 48.0))),
+    f("params.points[2]", Some((-48.0, 48.0))),
+];
+const GRADE_HIGHLIGHT_ROLLOFF: &[PropEntry] = &[
+    f("params.knee", Some((0.0, 8.0))),
+    f("params.strength", Some((0.0, 8.0))),
+];
+const GRADE_SATURATION_VIBRANCE: &[PropEntry] = &[
+    f("params.saturation", Some((0.0, 2.0))),
+    f("params.vibrance", Some((-1.0, 1.0))),
+];
 const GRADE_CONTRAST: &[PropEntry] = &[
     f("params.pivot", Some((0.0, 1.0))),
     f("params.amount", Some((-1.0, 1.0))),
@@ -223,6 +241,10 @@ pub fn entries(kind: PropTargetKind) -> &'static [PropEntry] {
         },
         PropTargetKind::GradeOp(g) => match g {
             GradeOpKind::Exposure => GRADE_EXPOSURE,
+            GradeOpKind::LinearOffset => GRADE_LINEAR_OFFSET,
+            GradeOpKind::PrinterLights => GRADE_PRINTER_LIGHTS,
+            GradeOpKind::HighlightRolloff => GRADE_HIGHLIGHT_ROLLOFF,
+            GradeOpKind::SaturationVibrance => GRADE_SATURATION_VIBRANCE,
             GradeOpKind::Contrast => GRADE_CONTRAST,
             GradeOpKind::WhiteBalance => GRADE_WHITEBALANCE,
             GradeOpKind::Cdl => GRADE_CDL,

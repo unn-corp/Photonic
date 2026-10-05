@@ -135,7 +135,7 @@ pub fn float_drag(
         .speed(speed)
         .custom_parser(move |s| eval_in_range(s, &vars_owned, range_for_parser).ok());
     if let Some((lo, hi)) = range {
-        drag = drag.range(lo..=hi);
+        drag = drag.range(lo..=hi).clamp_existing_to_range(false);
     }
     let resp = ui
         .add(drag)

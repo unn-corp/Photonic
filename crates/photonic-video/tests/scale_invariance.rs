@@ -68,6 +68,7 @@ fn geometry_graph(w: u32, h: u32) -> FrameGraph {
     let r = (w.max(h) as f64) * 0.01;
     let radius = r.max(0.5);
     FrameGraph {
+        working_color_domain: Default::default(),
         nodes: vec![
             IrNode {
                 op: IrOp::SolidColor {

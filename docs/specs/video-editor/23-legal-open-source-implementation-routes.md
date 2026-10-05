@@ -52,13 +52,32 @@ This packet proposes a Photonic-owned route for every item. Selected routes avoi
 
 ### 3.2 Default license policy
 
-- Preferred code licenses: `MIT`, `Apache-2.0`, `BSD-2-Clause`, `BSD-3-Clause`, `ISC`, and `Zlib`.
-- `Apache-2.0` is preferred where patent exposure is material because it includes an express contributor patent grant; it is not a complete freedom-to-operate opinion.
-- `LGPL`, `MPL`, `EPL`, `CDDL`, custom, source-available, or ambiguous multi-license offers require written legal and architecture approval before use. An unambiguous `MIT OR Apache-2.0` choice may follow the normal preferred-license intake.
-- `GPL` and `AGPL` code must not be linked, vendored, translated, or copied into Photonic. An executable may be considered only under the SPEC's subprocess rule and a separate distribution decision; no such executable is selected here.
+- Project-owner clarification (2026-09-23): the requirement is the ability to
+  sell Photonic and offer paid services while meeting every adopted component's
+  license conditions; **MIT is not required**. An OSI-approved license can
+  permit commercial use while imposing attribution, source-availability, or
+  other distribution obligations. Check the exact license, enabled features,
+  bundled assets, and intended distribution model before adoption.
+- Preferred low-friction code licenses: `MIT`, `Apache-2.0`, `BSD-2-Clause`,
+  `BSD-3-Clause`, `ISC`, and `Zlib`. Preserve required notices and choose an
+  unambiguous permitted option for dual-license offers. `Apache-2.0` includes
+  an express contributor patent grant; no software license is a complete
+  freedom-to-operate conclusion.
+- `LGPL`, `MPL`, `EPL`, `CDDL`, custom, ambiguous, and other licenses with
+  material distribution conditions require written legal and architecture
+  review before new runtime adoption. `GPL`/`AGPL` components are not approved
+  for product linking or bundling under the current architecture, even though
+  their licenses permit commercial sale; a separate distribution design and
+  explicit approval would be needed. Source-available or noncommercial terms
+  are not treated as open-source commercial permission.
+- A development tool or subprocess is not automatically exempt from review.
+  Distinguish using a separately installed tool from shipping its binary.
+  Existing dependencies are retained while their exact obligations are audited;
+  a failing package or release configuration must be replaced, reconfigured,
+  or omitted before commercial distribution.
 - Repository labels and package-registry metadata are discovery aids, not approval evidence. Intake reads the actual license files, file headers, manifests, submodules, generated-code notices, and enabled-feature dependency graph.
 - Every adopted file retains required copyright, license, and NOTICE text. Use precise SPDX expressions, including `OR`, `AND`, and `WITH`.
-- No Cargo dependency is added until `cargo deny`, advisory, unsafe-code, build-script, reproducibility, and maintenance-owner reviews pass. Native tools and subprocesses require equivalent license, SBOM, build-configuration, packaging, and security review.
+- No Cargo dependency is added until commercial-use and distribution obligations, `cargo deny`, advisory, unsafe-code, build-script, reproducibility, and maintenance-owner reviews pass. Native tools and subprocesses require equivalent license, SBOM, build-configuration, packaging, and security review.
 
 ### 3.3 Required evidence record
 

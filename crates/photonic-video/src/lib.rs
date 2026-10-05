@@ -20,6 +20,7 @@
     clippy::too_many_arguments
 )]
 
+pub mod color;
 pub mod graph;
 
 /// Audio engine host + mixer (02 §1, 09).
@@ -36,8 +37,10 @@ pub mod media;
 pub mod playback;
 /// Content-addressed, bounded disk previews for timeline playback (33).
 pub mod preview;
+pub mod project;
 /// `VideoEngine` facade + per-document `EngineSession` (02 §1).
 pub mod session;
+pub mod shot_match;
 pub mod source_audition;
 
 /// Pooled `Rgba16Float` working-texture allocator (03 §3.4). The P1 renderer /

@@ -33,6 +33,18 @@ cargo run --release
 cargo run --release -- path/to/file.photonic
 ```
 
+Video import and export use a separately installed FFmpeg toolchain. Put
+`ffmpeg` and `ffprobe` together on `PATH`, or point Photonic at one explicit
+installation before launch:
+
+```sh
+PHOTONIC_FFMPEG_DIR=/path/to/ffmpeg/bin cargo run --release
+```
+
+An explicit directory must contain both executables; Photonic will not fall
+back to another system build. Photonic does not bundle the workstation's
+FFmpeg binary. Codec availability depends on the selected installation.
+
 ### Running the MCP server
 
 Photonic embeds an MCP server for AI-assisted editing. Protocol details, PathPolicy,

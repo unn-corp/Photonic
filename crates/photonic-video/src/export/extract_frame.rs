@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use image::RgbaImage;
 
-use super::convert::{working_frame_to_rgba8, EncodePlanes};
+use super::convert::{srgb_display_frame_to_rgba8, working_frame_to_rgba8, EncodePlanes};
+use crate::graph::ir::FrameColorEncoding;
 
 /// Errors from extracting a frame still.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +34,24 @@ pub fn write_frame_png(
     height: u32,
     path: &Path,
 ) -> Result<PathBuf, ExtractFrameError> {
+    write_frame_png_encoded(
+        rgba_premult,
+        width,
+        height,
+        path,
+        FrameColorEncoding::LegacyLinearRec709,
+    )
+}
+
+/// Write a still from the declared preview encoding. Unsupported graph
+/// domains must be transformed by the renderer before PNG extraction.
+pub fn write_frame_png_encoded(
+    rgba_premult: &[f32],
+    width: u32,
+    height: u32,
+    path: &Path,
+    encoding: FrameColorEncoding,
+) -> Result<PathBuf, ExtractFrameError> {
     if width == 0 || height == 0 {
         return Err(ExtractFrameError::Empty);
     }
@@ -44,8 +63,18 @@ pub fn write_frame_png(
             len: rgba_premult.len(),
         });
     }
-    let EncodePlanes::Rgba8 { rgba, .. } = working_frame_to_rgba8(rgba_premult, width, height)
-    else {
+    let planes = match encoding {
+        FrameColorEncoding::LegacyLinearRec709 => {
+            working_frame_to_rgba8(rgba_premult, width, height)
+        }
+        FrameColorEncoding::SrgbDisplay => srgb_display_frame_to_rgba8(rgba_premult, width, height),
+        _ => {
+            return Err(ExtractFrameError::Encode(format!(
+                "unsupported PNG frame encoding: {encoding:?}"
+            )))
+        }
+    };
+    let EncodePlanes::Rgba8 { rgba, .. } = planes else {
         return Err(ExtractFrameError::Encode(
             "unexpected plane kind from convert".into(),
         ));
@@ -106,6 +135,26 @@ mod tests {
         let img = image::open(&path).expect("open").to_rgba8();
         assert_eq!(img.dimensions(), (w, h));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn encoded_srgb_still_does_not_apply_second_transfer() {
+        let dir =
+            std::env::temp_dir().join(format!("photonic-encoded-still-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("frame.png");
+        write_frame_png_encoded(
+            &[0.25, 0.25, 0.25, 1.0],
+            1,
+            1,
+            &path,
+            FrameColorEncoding::SrgbDisplay,
+        )
+        .unwrap();
+        assert_eq!(
+            image::open(&path).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [64, 64, 64, 255]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

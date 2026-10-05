@@ -47,6 +47,7 @@ use photonic_core::document::Document;
 use photonic_core::history::CommandHistory;
 use photonic_core::timeline::{SequenceId, Tick};
 use photonic_render::video::{PresentChannel, VideoPresenter};
+use photonic_video::graph::ir::FrameColorEncoding;
 use photonic_video::{
     EngineCmd, EngineSession, EngineStatus, PreviewQuality, PreviewTarget, ProxyMode, VideoEngine,
 };
@@ -580,6 +581,30 @@ impl EngineBridge {
         let Some(frame) = self.session.latest_frame() else {
             return;
         };
+        if matches!(
+            frame.output_encoding,
+            FrameColorEncoding::MatteWeight
+                | FrameColorEncoding::SceneLinearAcescg
+                | FrameColorEncoding::Acescct
+                | FrameColorEncoding::Bt709Video
+        ) {
+            // Managed frames require an explicit view transform before the
+            // existing sRGB monitor target can display them.
+            for old in [self.target.take(), self.compare_target.take()]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(id) = old.egui_id {
+                    egui_renderer.free_texture(&id);
+                }
+            }
+            self.monitor_tex = None;
+            self.compare_tex = None;
+            self.presented = None;
+            self.presented_frame = None;
+            self.presented_logical_size = None;
+            return;
+        }
         // Include the present channel so toggling alpha view re-presents the
         // same frame through the alpha pipeline (K-B17).
         let clean_ptr = frame
@@ -592,6 +617,7 @@ impl EngineBridge {
             frame.sequence,
             Arc::as_ptr(&frame.texture) as usize
                 ^ (self.present_channel as usize).wrapping_mul(0x9e37_79b9)
+                ^ (frame.output_encoding as usize).wrapping_mul(0x7f4a_7c15)
                 ^ clean_ptr.wrapping_mul(0x85eb_ca6b)
                 ^ (self.compare_effects as usize)
                 ^ (frame.logical_size.0 as usize).wrapping_mul(0x27d4_eb2d)
@@ -617,7 +643,9 @@ impl EngineBridge {
         }
         let size = (frame.texture.width(), frame.texture.height());
         self.ensure_target(device, egui_renderer, size, false);
-        if frame.compare_clean.is_some() {
+        if frame.compare_clean.is_some()
+            && frame.output_encoding == FrameColorEncoding::LegacyLinearRec709
+        {
             self.ensure_target(device, egui_renderer, size, true);
         } else {
             self.compare_tex = None;
@@ -638,6 +666,7 @@ impl EngineBridge {
         let clean_view = frame
             .compare_clean
             .as_ref()
+            .filter(|_| frame.output_encoding == FrameColorEncoding::LegacyLinearRec709)
             .map(|t| t.create_view(&Default::default()));
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("engine_frame_present"),
@@ -645,13 +674,28 @@ impl EngineBridge {
         {
             let presenter = self.presenter.as_ref().expect("presenter set above");
             let target = self.target.as_ref().expect("ensure_target sets target");
-            presenter.present_engine_frame_channel(
-                device,
-                &mut encoder,
-                &src_view,
-                &target.view,
-                channel,
-            );
+            match frame.output_encoding {
+                FrameColorEncoding::LegacyLinearRec709 => presenter.present_engine_frame_channel(
+                    device,
+                    &mut encoder,
+                    &src_view,
+                    &target.view,
+                    channel,
+                ),
+                FrameColorEncoding::SrgbDisplay => presenter.present_encoded_engine_frame_channel(
+                    device,
+                    &mut encoder,
+                    &src_view,
+                    &target.view,
+                    channel,
+                ),
+                FrameColorEncoding::MatteWeight
+                | FrameColorEncoding::SceneLinearAcescg
+                | FrameColorEncoding::Acescct
+                | FrameColorEncoding::Bt709Video => {
+                    unreachable!()
+                }
+            }
             if let (Some(cv), Some(ct)) = (clean_view.as_ref(), self.compare_target.as_ref()) {
                 presenter.present_engine_frame_channel(device, &mut encoder, cv, &ct.view, channel);
             }

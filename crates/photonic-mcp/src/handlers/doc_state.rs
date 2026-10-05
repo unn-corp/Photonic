@@ -1286,6 +1286,7 @@ mod tests {
             document: Arc::new(Mutex::new(Document::new("spatial test", width, height))),
             history: Arc::new(Mutex::new(photonic_core::history::CommandHistory::new(100))),
             document_path: Arc::new(StdMutex::new(None)),
+            document_saves: Default::default(),
             capture_tx: Arc::new(StdMutex::new(tx)),
             config: McpServerConfig::default(),
             audit_log: Arc::new(StdMutex::new(AuditLog::new())),

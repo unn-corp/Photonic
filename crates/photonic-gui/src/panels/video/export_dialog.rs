@@ -85,6 +85,7 @@ struct DialogState {
     add_to_bin: bool,
     two_pass: bool,
     inhibit_sleep: bool,
+    write_manifest: bool,
     save_as_name: String,
     job: Option<JobState>,
 }
@@ -236,9 +237,21 @@ fn fmt_eta(eta: Duration) -> String {
 
 impl DialogState {
     fn seeded(doc: &Document, seq_id: Option<SequenceId>, last_preset_name: &str) -> Self {
-        let preset = find_preset(last_preset_name)
-            .or_else(|| find_preset("Web H.264"))
-            .unwrap_or_else(|| presets::built_in_presets().remove(0));
+        let native = seq_id
+            .and_then(|id| doc.timeline.as_ref()?.sequences.get(&id))
+            .is_some_and(|seq| {
+                matches!(
+                    seq.color,
+                    photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                )
+            });
+        let preset = find_preset(if native {
+            "ProRes Mezzanine"
+        } else {
+            last_preset_name
+        })
+        .or_else(|| find_preset("Web H.264"))
+        .unwrap_or_else(|| presets::built_in_presets().remove(0));
         let (formats_checked, range_start_s, range_end_s) = seq_id
             .and_then(|id| doc.timeline.as_ref()?.sequences.get(&id))
             .map_or((vec![true], 0.0, 0.0), |seq| {
@@ -267,6 +280,7 @@ impl DialogState {
             add_to_bin: false,
             two_pass: false,
             inhibit_sleep: true,
+            write_manifest: false,
             save_as_name: String::new(),
             job: None,
         }
@@ -408,7 +422,7 @@ pub(crate) fn draw_export_dialog(
             draw_range(ui, doc, history, seq_id, &mut state);
             ui.checkbox(
                 &mut state.export_per_marker,
-                "Export each ranged marker as a separate file (K-F2)",
+                "Export each ranged marker as a separate file",
             )
             .on_hover_text(
                 "When checked, every marker with duration > 0 becomes its own \
@@ -420,9 +434,14 @@ pub(crate) fn draw_export_dialog(
             if !offline.is_empty() {
                 draw_preflight_banner(ui, &offline);
             }
+            let settings_error = preflight_export_settings(doc, seq_id, &state);
+            if let Some(error) = &settings_error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
             ui.separator();
             ui.horizontal(|ui| {
-                let can_export = offline.is_empty()
+                let can_export = settings_error.is_none()
+                    && offline.is_empty()
                     && presets::validate(&state.preset).is_ok()
                     && state.formats_checked.iter().any(|&c| c);
                 if ui
@@ -534,11 +553,21 @@ fn draw_progress(ui: &mut egui::Ui, state: &mut DialogState) {
                         .color(crate::theme::section_header_color(ui))
                         .small(),
                 );
+                if state.write_manifest {
+                    ui.label(
+                        RichText::new(format!(
+                            "Manifest: {}",
+                            photonic_video::export::manifest::manifest_path(job.output()).display()
+                        ))
+                        .color(crate::theme::section_header_color(ui))
+                        .small(),
+                    );
+                }
             }
         }
         ExportPhase::Cancelled => {
             ui.label(
-                RichText::new("Export cancelled — no output written.")
+                RichText::new("Export cancelled. Check the destination for completed outputs.")
                     .color(crate::theme::section_header_color(ui)),
             );
         }
@@ -1132,7 +1161,7 @@ fn draw_preflight_banner(ui: &mut egui::Ui, offline: &[String]) {
 
 /// K-F4 job-level options (not preset fields) + K-F5 hardware preference.
 fn draw_job_options(ui: &mut egui::Ui, state: &mut DialogState) {
-    ui.collapsing("Job options (K-F4 / K-F5)", |ui| {
+    ui.collapsing("Job options", |ui| {
         ui.checkbox(&mut state.use_proxies, "Use proxies when available")
             .on_hover_text("Fast verification render via ProxyMode::ForceProxy.");
         ui.checkbox(
@@ -1147,15 +1176,17 @@ fn draw_job_options(ui: &mut egui::Ui, state: &mut DialogState) {
         .on_hover_text(
             "Uses a probed HW encoder (NVENC/VAAPI/VideoToolbox/QSV) when \
              available for this codec. Errors if none is present — never \
-             silently falls back (K-F5 / 23 §10.3).",
+             silently falls back.",
         );
         ui.checkbox(
             &mut state.burn_in_timecode,
             "Burn-in timecode / frame number",
         )
-        .on_hover_text("Overlays sequence timecode on the encode path (K-F polish).");
+        .on_hover_text("Overlays sequence timecode on the exported picture.");
+        ui.checkbox(&mut state.write_manifest, "Write render manifest")
+            .on_hover_text("Writes <output>.photonic-render.json with the frozen grading/color configuration, encoder settings, full-byte project-pool hashes and output hash. Hashing large media adds time; no manifest is published after cancellation or a changed source.");
         ui.checkbox(&mut state.add_to_bin, "Add result to media bin when done")
-            .on_hover_text("Host imports the finished file into the media pool (K-F polish).");
+            .on_hover_text("Imports the finished file into the media pool.");
         state.two_pass = false;
         ui.add_enabled(
             false,
@@ -1199,6 +1230,22 @@ fn draw_job_options(ui: &mut egui::Ui, state: &mut DialogState) {
 }
 
 /// Build one job per selected format × (range OR each ranged marker) (K-F1/F2).
+/// Resolve the same immutable job settings the engine will receive, before submission.
+fn preflight_export_settings(
+    doc: &Document,
+    seq_id: SequenceId,
+    state: &DialogState,
+) -> Option<String> {
+    let project = doc.timeline.as_ref()?;
+    build_export_jobs(doc, seq_id, state)
+        .iter()
+        .find_map(|job| {
+            photonic_video::export::job::validate_export_job_settings(project, job)
+                .err()
+                .map(|e| e.to_string())
+        })
+}
+
 fn build_export_jobs(doc: &Document, seq_id: SequenceId, state: &DialogState) -> Vec<ExportJob> {
     let Some(project) = doc.timeline.as_ref() else {
         return Vec::new();
@@ -1276,6 +1323,7 @@ fn build_export_jobs(doc: &Document, seq_id: SequenceId, state: &DialogState) ->
                     add_to_bin: state.add_to_bin,
                     two_pass: state.two_pass,
                     inhibit_sleep: state.inhibit_sleep,
+                    write_manifest: state.write_manifest,
                 },
             });
         }
@@ -1326,6 +1374,52 @@ fn default_output_path(preset: &ExportPreset, seq_name: &str) -> std::path::Path
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_export_defaults_and_preflight_share_engine_validation() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            Clip, ClipSource, Sequence, TimelineProject, Track, TrackKind,
+        };
+        let mut doc = Document::new("native", 32.0, 32.0);
+        let mut seq = Sequence::new("Native", FrameRate::FPS_30, 32, 32);
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.clips.push(Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::color::Color::BLACK,
+            },
+            Tick::ZERO,
+            Tick(TICKS_PER_SECOND),
+        ));
+        seq.video_tracks.push(track);
+        let id = seq.id;
+        let mut project = TimelineProject::new();
+        project.insert_sequence(seq);
+        doc.timeline = Some(project);
+        let mut state = DialogState::seeded(&doc, Some(id), "Web H.264");
+        assert_eq!(state.preset.name, "ProRes Mezzanine");
+        assert!(preflight_export_settings(&doc, id, &state).is_none());
+        state.prefer_hardware = true;
+        assert!(preflight_export_settings(&doc, id, &state)
+            .unwrap()
+            .contains("original-media ProRes"));
+        state.prefer_hardware = false;
+        state.preset = find_preset("Web H.264").unwrap();
+        assert!(preflight_export_settings(&doc, id, &state).is_some());
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&id)
+            .unwrap()
+            .color = SequenceColorConfig::LegacySdr;
+        assert_eq!(
+            DialogState::seeded(&doc, Some(id), "Web H.264").preset.name,
+            "Web H.264"
+        );
+    }
 
     #[test]
     fn alpha_allowed_matches_the_documented_allow_list() {

@@ -197,6 +197,7 @@ const ALL_BLEND_MODES: [BlendMode; 26] = [
 
 fn merge_graph(top: LinearColor, bottom: LinearColor, mode: BlendMode) -> FrameGraph {
     FrameGraph {
+        working_color_domain: Default::default(),
         nodes: vec![
             IrNode {
                 op: IrOp::SolidColor { color: top },
@@ -380,6 +381,7 @@ fn sampling_cpu_gpu_parity() {
         * glam::Mat3::from_scale(glam::Vec2::new(1.2, 0.8));
     for sampling in ALL_SAMPLING {
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::DecodeStill {
@@ -492,6 +494,7 @@ fn stabilize_warp_cpu_gpu_parity() {
     for (label, warp) in cases {
         for sampling in ALL_SAMPLING {
             let graph = FrameGraph {
+                working_color_domain: Default::default(),
                 nodes: vec![
                     IrNode {
                         op: IrOp::DecodeStill {
@@ -556,6 +559,7 @@ fn fit_mode_cpu_gpu_parity() {
     let image = patterned_image(11, 7);
     for (index, fit) in ALL_FIT_MODES.into_iter().enumerate() {
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::DecodeStill {
@@ -646,6 +650,13 @@ fn single_op_grade(op: GradeOp) -> Grade {
 fn grade_params_for(kind: GradeOpKind) -> Option<GradeOpParams> {
     Some(match kind {
         GradeOpKind::Exposure => GradeOpParams::Exposure { stops: 0.5 },
+        GradeOpKind::LinearOffset => GradeOpParams::LinearOffset {
+            rgb: [0.1, 0.0, -0.05],
+        },
+        GradeOpKind::HighlightRolloff => GradeOpParams::HighlightRolloff {
+            knee: 0.1,
+            strength: 2.0,
+        },
         GradeOpKind::Contrast => GradeOpParams::Contrast {
             pivot: 0.5,
             amount: 0.2,
@@ -673,6 +684,9 @@ fn grade_params_for(kind: GradeOpKind) -> Option<GradeOpParams> {
             blue: vec![(0.0, 0.0), (1.0, 1.0)],
             hue_vs_hue: vec![],
             hue_vs_sat: vec![],
+            hue_vs_luma: vec![],
+            luma_vs_sat: vec![],
+            sat_vs_sat: vec![],
         },
         GradeOpKind::HslQualifier => GradeOpParams::HslQualifier {
             hue: [0.0, 1.0],
@@ -683,6 +697,8 @@ fn grade_params_for(kind: GradeOpKind) -> Option<GradeOpParams> {
                 slope: [1.05, 1.0, 0.95],
                 ..CdlParams::identity()
             },
+            keys: Vec::new(),
+            matte_levels: [0.0, 0.0],
         },
         GradeOpKind::Lut3d => GradeOpParams::Lut3d {
             asset: AssetId::new(),
@@ -694,8 +710,10 @@ fn grade_params_for(kind: GradeOpKind) -> Option<GradeOpParams> {
     })
 }
 
-const KNOWN_GRADE_KINDS: [GradeOpKind; 8] = [
+const KNOWN_GRADE_KINDS: [GradeOpKind; 10] = [
     GradeOpKind::Exposure,
+    GradeOpKind::LinearOffset,
+    GradeOpKind::HighlightRolloff,
     GradeOpKind::Contrast,
     GradeOpKind::WhiteBalance,
     GradeOpKind::Cdl,
@@ -838,6 +856,7 @@ fn util_outline_sdf_cpu_gpu_parity() {
         .push((PropPath::new("params.opacity"), PropValue::Float(1.0)));
 
     let graph = FrameGraph {
+        working_color_domain: Default::default(),
         nodes: vec![
             IrNode {
                 op: IrOp::DecodeStill {
@@ -1037,6 +1056,7 @@ fn centered_reframe_matches_full_when_preview_canvas_is_smaller() {
         * glam::Mat3::from_scale(glam::Vec2::new(3.16, 1.2))
         * glam::Mat3::from_translation(-center);
     let graph = FrameGraph {
+        working_color_domain: Default::default(),
         nodes: vec![
             IrNode {
                 op: IrOp::DecodeStill {
@@ -1115,6 +1135,7 @@ fn title_bounds_match_between_draft_and_full_on_padded_canvas() {
         max_width: 0.8,
     };
     let graph = FrameGraph {
+        working_color_domain: Default::default(),
         nodes: vec![
             IrNode {
                 op: IrOp::TextGen {
@@ -1169,6 +1190,7 @@ fn portrait_crop_preserves_native_video_detail() {
         }
     }
     let graph = FrameGraph {
+        working_color_domain: Default::default(),
         nodes: vec![
             IrNode {
                 op: IrOp::DecodeVideo {

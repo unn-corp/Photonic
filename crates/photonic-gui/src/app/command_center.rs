@@ -1412,7 +1412,9 @@ impl PhotonicApp {
     /// When `to_bin` is true, also import the still into the media pool.
     pub(crate) fn extract_program_frame(&mut self, doc: &mut Document, to_bin: bool) {
         use photonic_core::timeline::{AssetKind, AssetSource, MediaAsset};
-        use photonic_video::export::{default_extract_path, flatten_pixels, write_frame_png};
+        use photonic_video::export::{
+            default_extract_path, flatten_pixels, write_frame_png_encoded,
+        };
         use photonic_video::graph::eval::read_texture_rgba16f;
 
         let Some(bridge) = self.engine.as_ref() else {
@@ -1423,6 +1425,10 @@ impl PhotonicApp {
             self.set_import_status("Extract frame: no program frame yet".into());
             return;
         };
+        if !frame.color_errors.is_empty() || !frame.grading_errors.is_empty() {
+            self.set_import_status("Extract frame: resolve color/grading errors".into());
+            return;
+        }
         let (w, h) = doc
             .timeline
             .as_ref()
@@ -1449,7 +1455,7 @@ impl PhotonicApp {
             })
             .unwrap_or_else(|| "sequence".into());
         let path = default_extract_path(self.current_file.as_deref(), &seq_name, frame.time.0);
-        match write_frame_png(&flat, w, h, &path) {
+        match write_frame_png_encoded(&flat, w, h, &path, frame.output_encoding) {
             Ok(path) => {
                 let msg = format!("Extracted frame → {}", path.display());
                 if to_bin {

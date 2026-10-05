@@ -436,6 +436,9 @@ fn case_grade_curve() -> TimelineProject {
             blue: vec![],
             hue_vs_hue: vec![],
             hue_vs_sat: vec![],
+            hue_vs_luma: vec![],
+            luma_vs_sat: vec![],
+            sat_vs_sat: vec![],
         },
     ));
     clip.grade = Some(grade);

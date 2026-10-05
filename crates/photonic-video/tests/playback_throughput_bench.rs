@@ -9,14 +9,18 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use photonic_core::timeline::color::{
+    InputMatrix, InputSignalRange, NativeChromaLocation, NativeInputColorInterpretation,
+    NativeInputStandard, NativeManagedColorConfig, SequenceColorConfig,
+};
 use photonic_core::timeline::{
     AssetKind, CaptionCue, CaptionTrack, CaptionWord, Clip, ClipAudio, ClipEffect, ClipSource,
-    EffectKind, FrameRate, MediaAsset, PropValue, ProxyRef, Sequence, Tick, TimelineProject, Track,
-    TrackKind,
+    EffectKind, FrameRate, Grade, GradeOp, GradeOpKind, GradeOpParams, MediaAsset, PropValue,
+    ProxyRef, Sequence, Tick, TimelineProject, Track, TrackKind,
 };
 use photonic_core::{CommandHistory, Document};
 use photonic_video::graph::compile::ScopeTapPoint;
-use photonic_video::media::ffmpeg_locate::locate_for_test;
+use photonic_video::media::ffmpeg_locate::{locate_for_test, FfmpegTools};
 use photonic_video::media::proxy::generate_proxy;
 use photonic_video::{
     EngineCmd, EngineSession, GpuContext, PreviewQuality, ProxyMode, VideoEngine,
@@ -89,6 +93,9 @@ struct BenchResult {
     worker_pumped: u64,
     managed_gpu_cache_bytes: u64,
     decoded_ring_bytes: u64,
+    scope_measurements: u64,
+    scope_latency_p95_ms: f64,
+    scope_errors: u64,
 }
 
 #[derive(Default)]
@@ -220,16 +227,39 @@ fn play_and_measure(
     case: &str,
     quality: PreviewQuality,
     seconds: f64,
-    mixed: bool,
+    workload: &str,
+    tools: &FfmpegTools,
 ) -> BenchResult {
+    let mixed = workload == "mixed";
+    let native = workload == "native_grading";
+    let grading = workload == "grading" || native;
     let mut project = TimelineProject::new();
     let mut asset = MediaAsset::from_file(AssetKind::Video, clip.to_path_buf());
+    if native {
+        asset.probe = Some(
+            photonic_video::media::probe::probe_asset(tools, clip)
+                .expect("probe native benchmark source"),
+        );
+        asset.native_input_color = Some(NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: Some(NativeChromaLocation::Left),
+        });
+    }
     if let Some(proxy) = proxy {
         asset.proxy = Some(ProxyRef::ready_generated(proxy.to_path_buf()));
     }
     let asset = project.media.insert(asset);
     let rate = FrameRate::FPS_30;
     let mut sequence = Sequence::new("throughput", rate, w, h);
+    if native {
+        sequence.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+    }
     let sequence_id = sequence.id;
     let mut track = Track::new(TrackKind::Video, "V1");
     track.clips.push(Clip::new(
@@ -237,6 +267,50 @@ fn play_and_measure(
         Tick::ZERO,
         Tick::from_seconds(seconds.ceil() as i64 + 2),
     ));
+    if grading {
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.3 },
+        ));
+        if native {
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::LinearOffset,
+                GradeOpParams::LinearOffset {
+                    rgb: [0.01, 0.0, -0.01],
+                },
+            ));
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::PrinterLights,
+                GradeOpParams::PrinterLights {
+                    points: [0.5, 0.0, -0.5],
+                },
+            ));
+        } else {
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Contrast,
+                GradeOpParams::Contrast {
+                    pivot: 0.45,
+                    amount: 0.18,
+                },
+            ));
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::SaturationVibrance,
+                GradeOpParams::SaturationVibrance {
+                    saturation: 1.08,
+                    vibrance: 0.12,
+                },
+            ));
+        }
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::HighlightRolloff,
+            GradeOpParams::HighlightRolloff {
+                knee: 0.85,
+                strength: 0.25,
+            },
+        ));
+        track.clips[0].grade = Some(grade);
+    }
     if mixed {
         let mut blur = ClipEffect::new(EffectKind::Blur);
         blur.params.base.set("params.radius", PropValue::Float(4.0));
@@ -284,6 +358,18 @@ fn play_and_measure(
         scope_tap: ScopeTapPoint::Program
     }));
     let cold_inspection_ms = wait_inspection(&session, 1).as_secs_f64() * 1000.0;
+    if native {
+        let frame = session.latest_frame().expect("native inspection frame");
+        assert!(
+            frame.color_errors.is_empty(),
+            "native benchmark source: {:?}",
+            frame.color_errors
+        );
+        assert_eq!(
+            frame.output_encoding,
+            photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay
+        );
+    }
     // Record a coherent published baseline after the initial frame/status pair.
     let ready_deadline = Instant::now() + Duration::from_secs(1);
     while session.status().frames_published == 0 && Instant::now() < ready_deadline {
@@ -294,16 +380,60 @@ fn play_and_measure(
     let underruns_before = session.status().audio_xruns;
     let worker_before = photonic_video::decode::worker::worker_stats();
     let mut observed = FrameObservation::with_initial(session.latest_frame().unwrap().time);
+    let mut pending_scope: Option<(Tick, Instant, photonic_render::scopes::ScopeReadback)> = None;
+    let mut last_scoped_tick = None;
+    let mut scope_latencies = Vec::new();
+    let mut scope_errors = 0;
     let started = Instant::now();
     assert!(session.send(EngineCmd::Play));
     while started.elapsed().as_secs_f64() < seconds {
+        if let Some((_, requested, readback)) = pending_scope.as_ref() {
+            if let Some(result) = readback.poll(gpu.device()) {
+                match result {
+                    Ok(bins) if bins.iter().any(|count| *count != 0) => {
+                        scope_latencies.push(requested.elapsed().as_secs_f64() * 1000.0);
+                    }
+                    _ => scope_errors += 1,
+                }
+                pending_scope = None;
+            }
+        }
         if let Some(frame) = session.latest_frame() {
             if frame.sequence == sequence_id
                 && frame.preview_asset.is_none()
                 && frame.preview_quality == quality
                 && frame.proxy_mode == proxy_mode
             {
+                if native {
+                    assert!(
+                        frame.color_errors.is_empty(),
+                        "native grading frame: {:?}",
+                        frame.color_errors
+                    );
+                }
                 observed.observe(frame.time, started.elapsed());
+                if grading && pending_scope.is_none() && last_scoped_tick != Some(frame.time) {
+                    if let Some(tap) = frame.scope_tap.as_ref() {
+                        let columns = tap.width.min(tap.texture.width()).max(1) as usize;
+                        let readback = photonic_render::scopes::begin_scope_readback_signal(
+                            gpu.device(),
+                            gpu.queue(),
+                            tap.texture.as_ref(),
+                            photonic_render::scopes::WAVEFORM_SHADER,
+                            "cs_wave",
+                            columns * 256,
+                            (tap.width, tap.height),
+                            0,
+                            if native {
+                                photonic_render::scopes::ScopeSignal::SrgbDisplay
+                            } else {
+                                photonic_render::scopes::ScopeSignal::LegacyLinearRec709
+                            },
+                        );
+                        pending_scope = Some((frame.time, Instant::now(), readback));
+                        last_scoped_tick = Some(frame.time);
+                    }
+                }
             }
         }
         std::thread::sleep(POLL);
@@ -333,7 +463,7 @@ fn play_and_measure(
     let result = BenchResult {
         case: case.to_owned(),
         source: "generated testsrc2 H264 yuv420p GOP60 B2".into(),
-        workload: if mixed { "mixed" } else { "video" }.into(),
+        workload: workload.into(),
         source_dimensions: [w, h],
         source_fps: 30.0,
         quality: format!("{quality:?}"),
@@ -369,7 +499,20 @@ fn play_and_measure(
         worker_pumped: worker_after.1.saturating_sub(worker_before.1),
         managed_gpu_cache_bytes: status.memory.gpu_cache_bytes,
         decoded_ring_bytes: status.memory.decoded_ring_bytes,
+        scope_measurements: scope_latencies.len() as u64,
+        scope_latency_p95_ms: percentile(&scope_latencies, 0.95),
+        scope_errors,
     };
+    if grading {
+        assert!(
+            result.scope_measurements > 0,
+            "grading benchmark produced no scope measurement"
+        );
+        assert_eq!(
+            result.scope_errors, 0,
+            "grading benchmark scope readback failed"
+        );
+    }
     session.shutdown();
     result
 }
@@ -428,7 +571,10 @@ fn playback_throughput_full_vs_proxy() {
     let selected = std::env::var("PHOTONIC_BENCH_CASE").ok();
     let workload = std::env::var("PHOTONIC_BENCH_WORKLOAD").unwrap_or_else(|_| "video".into());
     assert!(
-        matches!(workload.as_str(), "video" | "mixed"),
+        matches!(
+            workload.as_str(),
+            "video" | "mixed" | "grading" | "native_grading"
+        ),
         "unknown PHOTONIC_BENCH_WORKLOAD"
     );
     let mixed = workload == "mixed";
@@ -470,7 +616,8 @@ fn playback_throughput_full_vs_proxy() {
                 &format!("{resolution}_{suffix}"),
                 quality,
                 seconds,
-                mixed,
+                &workload,
+                &tools,
             );
             println!(
                 "PHOTONIC_PLAYBACK_CASE {}",

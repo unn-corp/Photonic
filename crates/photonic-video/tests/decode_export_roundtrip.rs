@@ -118,6 +118,7 @@ fn planes_to_working_frame(planes: &DecodedPlanes) -> Frame {
         width,
         height,
         rgba_premult: rgba,
+        encoding: photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709,
     }
 }
 

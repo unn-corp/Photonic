@@ -1717,6 +1717,22 @@ pub fn tool_list() -> Value {
                 }
             },
             {
+                "name": "archive_project",
+                "description": "Collect all file-backed media, LUTs, and reference stills into a new portable project folder. Offline or changed dependencies reject the archive. The open document and history are unchanged; the archived copy omits undo history.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "New destination folder; must not already exist." }
+                    },
+                    "required": ["path"]
+                }
+            },
+            {
+                "name": "get_project_dependencies",
+                "description": "Inspect file-backed media, LUTs, and reference stills for missing or changed dependencies before archive or export. Does not change the document.",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] }
+            },
+            {
                 "name": "create_layer",
                 "description": "Create a new layer in the document",
                 "inputSchema": {
@@ -5845,12 +5861,12 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "effect_stack",
-                "description": "Edit any of the four video effect stacks (26 §10 K-B1/K-B2): a timeline `clip`, a whole `track`, the sequence `master`, or a bin `asset` (inherited by every instance of that media). Evaluation order is asset -> clip -> track -> master. `op=list` is read-only; `add`/`remove`/`reorder`/`set_param`/`set_grade` are each one undo step. The clip-only add_effect/remove_effect/reorder_effects/set_effect_param tools remain as shorthand for scope=clip.",
+                "description": "Edit any of the four video effect stacks (26 §10 K-B1/K-B2): a timeline `clip`, a whole `track`, the sequence `master`, or a bin `asset` (inherited by every instance of that media). Evaluation order is asset -> clip -> track -> master. `op=list` is read-only; mutations are each one undo step. `convert_grade_graph` preserves the current corrector order and IDs; graph add/remove verbs edit serial or parallel topology safely. The clip-only add_effect/remove_effect/reorder_effects/set_effect_param tools remain as shorthand for scope=clip.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "scope": { "type": "string", "enum": ["clip","track","master","asset"] },
-                        "op": { "type": "string", "enum": ["list","add","remove","reorder","set_param","set_grade"] },
+                        "op": { "type": "string", "enum": ["list","add","remove","reorder","set_param","set_grade","convert_grade_graph","add_grade_graph_node","add_grade_graph_utility","remove_grade_graph_node"] },
                         "clip_id": { "type": "string", "description": "Required for scope=clip." },
                         "track_id": { "type": "string", "description": "Required for scope=track." },
                         "sequence_id": { "type": "string", "description": "scope=master; defaults to the active sequence." },
@@ -5861,7 +5877,11 @@ pub fn tool_list() -> Value {
                         "new_order": { "type": "array", "items": { "type": "integer" }, "description": "op=reorder: a permutation of 0..len." },
                         "path": { "type": "string", "description": "op=set_param: a registry PropPath (e.g. \"params.radius\"), or the literal \"enabled\"." },
                         "value": { "type": "object", "description": "op=set_param: PropValue - {\"t\":\"float\",\"v\":number} | {\"t\":\"vec2\",\"v\":[number,number]} | {\"t\":\"color\",\"v\":{\"r\":n,\"g\":n,\"b\":n,\"a\":n}} | {\"t\":\"bool\",\"v\":boolean} | {\"t\":\"enum\",\"v\":integer}" },
-                        "grade": { "type": "object", "description": "op=set_grade: a Grade object (07 §1), or null to clear." }
+                        "grade": { "type": "object", "description": "op=set_grade: a Grade object (07 §1), or null to clear." },
+                        "grade_op": { "type": "object", "description": "op=add_grade_graph_node: a complete GradeOp object with id, kind, params, enabled and optional mask." },
+                        "grade_graph_node": { "type": "object", "description": "op=add_grade_graph_utility: GradeGraphNode object tagged by kind: qualifier_matte {input,op,label}, key_mixer {top,bottom,mode,label}, matte_refine {input,refinement,label}, or matte_apply {original,corrected,matte,label}. Refinement: denoise (3x3 median), grow within -0.02..=0.02 and blur within 0..=0.02 as fractions of the logical frame shorter dimension, matte_levels [clean_black,clean_white] each nonnegative with sum below one. Key modes: union, intersect, subtract, multiply. Port types and cycles are validated before one undoable edit." },
+                        "parallel": { "type": "boolean", "description": "op=add_grade_graph_node: add a new branch with a 50% layer mixer instead of appending serially." },
+                        "node_id": { "type": "integer", "minimum": 0, "description": "op=remove_grade_graph_node: local graph node id; removing a mixer keeps its bottom branch." }
                     },
                     "required": ["scope","op"]
                 }
@@ -6123,15 +6143,79 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "relink_media",
-                "description": "Repoint an offline (or any) asset to a new file path. The file must exist (AssetOffline otherwise). If the asset carries a content_hash and the new file's hash differs, the call is refused with HashMismatch unless allow_hash_mismatch is true — a relink to the wrong take is invisible until export. Accepting a byte change records the new hash and clears the stale probe in the same undo step (re-run probe_media). Supports undo.",
+                "description": "Repoint an asset to a file, or explicitly repin a changed LUT by passing its current path. The file must exist. A sampled media-hash or full LUT-hash mismatch is refused unless allow_hash_mismatch is true. Acceptance updates the identities in one undo step; a byte change clears the stale probe. Supports undo.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "asset_id": { "type": "string" },
                         "new_path": { "type": "string" },
-                        "allow_hash_mismatch": { "type": "boolean", "description": "Bind the asset to a file whose bytes differ from its recorded content_hash. Default false." }
+                        "allow_hash_mismatch": { "type": "boolean", "description": "Explicitly accept different bytes, including a changed full-file LUT pin. Default false." }
                     },
                     "required": ["asset_id","new_path"]
+                }
+            },
+            {
+                "name": "set_lut_interpretation",
+                "description": "Declare a LUT asset's versioned creative/technical purpose and input/output color spaces. Legacy SDR grading accepts only creative legacy_srgb_encoded to legacy_srgb_encoded LUTs; other declarations remain stored but render with a diagnostic until their pipeline is supported. One undoable edit.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "asset_id": { "type": "string", "format": "uuid" },
+                        "interpretation": { "type": "object", "description": "LutColorInterpretation: version (1), purpose (creative|technical), input/output ({kind: legacy_srgb_encoded}, {kind: ocio, config_sha256, color_space}, or {kind: native, transform_revision: 1, space: acescg|acescct|srgb_display_encoded})." }
+                    },
+                    "required": ["asset_id", "interpretation"]
+                }
+            },
+            {
+                "name": "set_input_color",
+                "description": "Set or clear a managed input-color interpretation on one asset or clip. A clip override takes precedence over its asset; null clears the override. The configuration SHA-256 must match the managed sequence when rendered. Legacy SDR stores the value but does not use it. One undoable edit; locked clip tracks are rejected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": { "enum": ["asset", "clip"] },
+                        "asset_id": { "type": "string", "format": "uuid", "description": "Required when scope is asset." },
+                        "clip_id": { "type": "string", "format": "uuid", "description": "Required when scope is clip." },
+                        "interpretation": { "type": ["object", "null"], "description": "InputColorInterpretation: config_sha256, color_space, range (from_metadata|full|limited), matrix (from_metadata|rgb|bt601|bt709|bt2020_non_constant). Null inherits." }
+                    },
+                    "required": ["scope", "interpretation"]
+                }
+            },
+            {
+                "name": "set_native_input_color",
+                "description": "Set or clear an explicit Photonic-owned BT.709-scene/BT.2020-scene/BT.2100-PQ-display/BT.2100-HLG-scene video or sRGB-display still input interpretation on an asset or clip. PQ requires reference_white_nits (1..10000), BT.2020 nonconstant matrix, and clips encoded RGB excursions to [0,1] before absolute EOTF; working 1 equals the chosen nits. This does not invert a camera look. HLG scene requires reference_white_nits and hlg_peak_nits (400..2000, white <= peak); inverse OETF uses signed headroom and neutral-white calibration with BT.2100 system gamma, without applying a display OOTF. sRGB stills require full range, RGB matrix, no chroma siting, and qualified PNG/JPEG files. For subsampled video sources, choose chroma_location explicitly; a probed tag is advisory. It is stored separately from OCIO input tags; clip overrides win. Null clears the override. Qualified native SDR paths render through preview and ProRes delivery. One undoable edit; locked source users are rejected.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "scope": { "enum": ["asset", "clip"] },
+                        "asset_id": { "type": "string", "format": "uuid", "description": "Required when scope is asset." },
+                        "clip_id": { "type": "string", "format": "uuid", "description": "Required when scope is clip." },
+                        "interpretation": {
+                            "type": ["object", "null"],
+                            "description": "NativeInputColorInterpretation. Null inherits.",
+                            "properties": {
+                                "version": { "const": 1 },
+                                "standard": { "enum": ["bt709_scene", "bt2020_scene", "bt2100_pq_display", "bt2100_hlg_scene", "srgb_display"] },
+                                "hlg_peak_nits": { "type": "integer", "minimum": 400, "maximum": 2000, "description": "Required only for HLG scene; nominal reference display peak calibrates scene white via BT.2100 system gamma. White must not exceed peak." },
+                                "reference_white_nits": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Required for PQ/HLG. PQ working 1.0 equals this absolute luminance; HLG uses it as the calibrated neutral-white anchor. No default is inferred." },
+                                "range": { "enum": ["full", "limited"] },
+                                "matrix": { "enum": ["bt709", "bt2020_non_constant", "rgb"] },
+                                "chroma_location": { "enum": ["left", "center", "topleft", "top", "bottomleft", "bottom"] }
+                            },
+                            "required": ["version", "standard", "range", "matrix"]
+                        }
+                    },
+                    "required": ["scope", "interpretation"]
+                }
+            },
+            {
+                "name": "create_native_color_draft",
+                "description": "Create a distinct Photonic-owned managed-color SDR draft from a Legacy SDR sequence. The original remains active and unchanged. A qualified native video-track subset can preview and deliver ProRes MOV; other managed stages remain gated. One undoable edit.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sequence_id": { "type": "string", "format": "uuid" }
+                    },
+                    "required": ["sequence_id"]
                 }
             },
             {
@@ -6310,7 +6394,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "get_engine_status",
-                "description": "Engine status snapshot (EngineStatus, 02 §1): playhead tick, playing flag, dropped-frame count, node-cache stats, audio xruns, snapshot doc revision, active sequence, and the most recent engine command error.",
+                "description": "Engine status snapshot: playhead, playback/cache stats, active sequence, latest engine error, color preflight, and the selected user-supplied FFmpeg/ffprobe installation or its lookup error.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6319,8 +6403,13 @@ pub fn tool_list() -> Value {
                 }
             },
             {
+                "name": "get_media_toolchain_status",
+                "description": "Check the selected user-supplied ffmpeg/ffprobe installation without starting the video engine. An explicit PHOTONIC_FFMPEG_DIR never falls back to PATH.",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] }
+            },
+            {
                 "name": "render_frame_at",
-                "description": "Compile + evaluate the frame graph at one tick, headlessly, and return the image (10 §4 — the visual-feedback-loop tool). output_format `png` (default) is 8-bit sRGB for display; `raw_rgba16f` returns base64 linear premultiplied f16 pixels — byte-deterministic, the golden-frame comparison basis. COST WARNINGS: quality \"full\" on an uncached 4K composite can far exceed the preview eval budget — default to quality \"preview\" for iterative loops and \"full\" only for final verification frames; cold seeks pay a DECODE cost (up to ~150 ms per uncached GOP, more for originals) before any GPU work, so a loop scrubbing far-apart ticks is decode-dominated; repeated calls at nearby ticks mostly hit the node-result cache. Each call is independent (no held playback state).",
+                "description": "Compile + evaluate the frame graph at one tick, headlessly, and return the image (10 §4 — the visual-feedback-loop tool). output_format `png` (default) is 8-bit sRGB for display; `raw_rgba16f` returns base64 premultiplied f16 pixels in the reported output_encoding — byte-deterministic, the golden-frame comparison basis. COST WARNINGS: quality \"full\" on an uncached 4K composite can far exceed the preview eval budget — default to quality \"preview\" for iterative loops and \"full\" only for final verification frames; cold seeks pay a DECODE cost (up to ~150 ms per uncached GOP, more for originals) before any GPU work, so a loop scrubbing far-apart ticks is decode-dominated; repeated calls at nearby ticks mostly hit the node-result cache. Each call is independent (no held playback state).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6359,7 +6448,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "remove_proxy",
-                "description": "Detach the proxy from each asset. Generated (cache-owned) proxy files are deleted; Attached user-owned proxy files are never deleted (G-15A). Assets then decode originals regardless of ProxyMode until regenerated (see generate_proxies) or re-attached.",
+                "description": "Detach proxies from assets in one undoable edit. Cache files are retained so undo can restore a usable proxy; attached user files are never deleted. Assets then decode originals regardless of ProxyMode until regenerated or re-attached.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6412,6 +6501,7 @@ pub fn tool_list() -> Value {
                     "type": "object",
                     "properties": {
                         "expected_revision": { "type": "integer", "minimum": 0, "description": "Optional revision precondition from get_timeline_snapshot." },
+                        "write_manifest": { "type": "boolean", "default": false, "description": "Write <output>.photonic-render.json after successful encoding. Records frozen color/grading settings, encoder options, full-byte project-pool hashes and output hash; hashing adds time. Terminal job result includes manifest_path." },
                         "sequence_id": { "type": "string" },
                         "out_path": { "type": "string", "description": "Destination file path. Extension should match the preset container." },
                         "preset": { "type": "string", "description": "Preset name (see list_export_presets). Default \"Web H.264\"." },
@@ -6658,6 +6748,113 @@ pub fn tool_list() -> Value {
                 }
             },
             {
+                "name": "group_grade",
+                "description": "Get or set a shared group pre/post grade. Pre runs before each member clip grade; post runs after it. Changes are undoable and reject locked member tracks.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "group_id": { "type": "string", "format": "uuid" },
+                        "stage": { "type": "string", "enum": ["pre", "post"] },
+                        "op": { "type": "string", "enum": ["get", "set"] },
+                        "grade": { "type": ["object", "null"], "description": "Required for op=set; null clears the stage." }
+                    },
+                    "required": ["group_id", "stage", "op"]
+                }
+            },
+            {
+                "name": "grade_version",
+                "description": "List, save, activate, rename or remove a named clip grade version. Versions are live: edits to the active grade update its saved look. Mutations are one undo step and respect track locks.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "clip_id": { "type": "string" },
+                        "op": { "type": "string", "enum": ["list", "add", "activate", "rename", "remove"] },
+                        "version_id": { "type": "string", "description": "Required for activate, rename and remove." },
+                        "name": { "type": "string", "description": "Required for add and rename." }
+                    },
+                    "required": ["clip_id", "op"]
+                }
+            },
+            {
+                "name": "shared_look",
+                "description": "List, create, edit, remove, link, or detach reusable color looks. A shared look runs after each linked clip grade. Edits propagate to linked shots, respect track locks, and are undoable. Detaching keeps an independent local copy at the same stage.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "op": { "type": "string", "enum": ["list", "create", "update", "remove", "link", "make_independent"] },
+                        "look_id": { "type": "string", "description": "Required for update, remove, and link." },
+                        "clip_id": { "type": "string", "description": "Required for link and make_independent." },
+                        "name": { "type": "string", "description": "Required for create; optional for update." },
+                        "grade": { "type": "object", "description": "Full Grade serde shape for create or update." }
+                    },
+                    "required": ["op"]
+                }
+            },
+            {
+                "name": "list_reference_stills",
+                "description": "Inspect a sequence's captured Color-workspace reference stills and verify their image files. Reports whether each still can be compared with the current sequence color configuration and format.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sequence_id": { "type": "string", "description": "Defaults to the active sequence." }
+                    }
+                }
+            },
+            {
+                "name": "remove_reference_still",
+                "description": "Remove a captured Color-workspace reference still from a sequence as one undoable edit. The image asset remains in the media pool until unused media is removed.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sequence_id": { "type": "string", "description": "Defaults to the active sequence." },
+                        "still_id": { "type": "string" }
+                    },
+                    "required": ["still_id"]
+                }
+            },
+            {
+                "name": "capture_reference_still",
+                "description": "Capture a full-resolution frame from original media into the sequence reference gallery. Requires a saved project; rejects stale frames and color or grading errors. Adds image and still in one undo step.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sequence_id": { "type": "string", "description": "Defaults to the active sequence." },
+                        "at_ticks": { "type": "integer", "minimum": 0 },
+                        "name": { "type": "string" },
+                        "source_clip_id": { "type": "string", "description": "Optional visible clip to associate with this still." }
+                    },
+                    "required": ["at_ticks"]
+                }
+            },
+            {
+                "name": "compare_reference_still",
+                "description": "Compare a verified captured still with a newly rendered full-quality frame. Returns display-referred sRGB error metrics for Legacy SDR or qualified Native Managed preview. Legacy SDR may also return an editable Printer Lights shot-match proposal when enough opaque non-clipped pixels exist. Defaults to the still's source time. Rejects stale frames, mismatched color/format and changed reference images.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sequence_id": { "type": "string", "description": "Defaults to the active sequence." },
+                        "still_id": { "type": "string" },
+                        "at_ticks": { "type": "integer", "minimum": 0, "description": "Defaults to the still's captured time." }
+                    },
+                    "required": ["still_id"]
+                }
+            },
+            {
+                "name": "apply_shot_match",
+                "description": "Recompute and accept the Printer Lights proposal from compare_reference_still as one undoable clip corrector. Requires the exact compared time and revision, an unchanged verified still, and the target as the only visible video clip. The proposed correction remains editable. Legacy SDR only.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "clip_id": { "type": "string", "format": "uuid" },
+                        "sequence_id": { "type": "string", "format": "uuid", "description": "Defaults to active sequence." },
+                        "still_id": { "type": "string", "format": "uuid" },
+                        "at_ticks": { "type": "integer", "minimum": 0 },
+                        "expected_revision": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["clip_id", "still_id", "at_ticks", "expected_revision"]
+                }
+            },
+            {
                 "name": "apply_lut",
                 "description": "Attach a 3D LUT (.cube) to the clip's grade stack, importing it as a LUT asset (07 §3.8). Omit/null lut_path to remove the LUT. Replaces any existing LUT on the clip.",
                 "inputSchema": {
@@ -6672,12 +6869,14 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "copy_grade",
-                "description": "Copy one clip's grade (incl. LUT reference) onto N target clips as a single undo step.",
+                "description": "Copy a full clip grade or selected correctors to N target clips as one undo step. Copied correctors receive new IDs. By default, replace target grades; append preserves each target's current correctors and bypass state.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "source_clip_id": { "type": "string" },
-                        "target_clip_ids": { "type": "array", "items": { "type": "string" } }
+                        "target_clip_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+                        "op_ids": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+                        "append": { "type": "boolean" }
                     },
                     "required": ["source_clip_id","target_clip_ids"]
                 }
@@ -6696,8 +6895,28 @@ pub fn tool_list() -> Value {
                 }
             },
             {
+                "name": "sample_grade_input",
+                "description": "Sample the exact input before an enabled Native Managed clip curve or qualifier from an ordered grade, an unambiguous graph corrector, or an explicit graph_node_id. Returns bounded straight ACEScct/AP1 RGB coordinates, AP1 log luma, source alpha, pixel location and frame provenance. Earlier grades contribute; the selected and later correctors do not. Coordinates x/y are normalized canvas edges in [0,1], with endpoints selecting the first/last pixel. Read-only; missing/inactive inputs, unsupported grade scopes and zero coverage fail instead of sampling program output.",
+                "inputSchema": {"type":"object","properties":{
+                    "clip_id":{"type":"string"},"op_id":{"type":"string"},
+                        "graph_node_id": { "type": "integer", "minimum": 0, "description": "Optional Native Managed clip grading-graph node ID: selects this exact curve/HSL corrector instance or qualifier key source. Must reference op_id. Required when operator-only image input is ambiguous; key source inspection excludes downstream mixing/refinement." },
+                    "x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},
+                    "at_ticks":{"type":"integer"},"at_tc":{"type":"string"},"at_seconds":{"type":"number"},"format_index":{"type":"integer","minimum":0}
+                },"required":["clip_id","op_id","x","y"]}
+            },
+            {
+                "name": "inspect_qualifier",
+                "description": "Render a qualifier isolation matte at an exact frame without editing the document. Returns an opaque grayscale PNG and coverage statistics/provenance. Earlier correctors and the qualifier's key, window, matte thresholds and source alpha contribute; its own CDL and later grades are excluded. Native Managed uses bounded ACEScct/AP1 key coordinates; Legacy uses linear Rec.709 HSL. Requires an enabled qualifier in an enabled clip grade: ordered grades or Native Managed graph input nodes. Multiple image instances require graph_node_id. Key-source utilities can be addressed explicitly; downstream key mixing/refinement is excluded. Missing/inactive inputs fail rather than falling back to program pixels.",
+                "inputSchema": { "type": "object", "properties": {
+                    "clip_id": { "type": "string" }, "op_id": { "type": "string" },
+                        "graph_node_id": { "type": "integer", "minimum": 0, "description": "Optional Native Managed clip grading-graph node ID: selects this exact curve/HSL corrector instance or qualifier key source. Must reference op_id. Required when operator-only image input is ambiguous; key source inspection excludes downstream mixing/refinement." },
+                    "at_ticks": { "type": "integer" }, "at_tc": { "type": "string" }, "at_seconds": { "type": "number" },
+                    "format_index": { "type": "integer", "minimum": 0 }
+                }, "required": ["clip_id", "op_id"] }
+            },
+            {
                 "name": "get_scopes",
-                "description": "Waveform/vectorscope/histogram data for a clip at a tick (07 §5) — data, not an image (the UI/agent renders it). Renders the frame headlessly (requires a GPU adapter, else EngineUnavailable). Reads the K-E2 per-clip tap by default: the clip's own texture after its Grade, before the track fold and CaptionOverlay (03 §3.6), so a clip under a caption track or another video track is measured, not the composite. Returns full luma/RGB histograms, a down-sampled luma waveform, a 32x32 vectorscope grid, and `tap` naming the readback point actually used.",
+                "description": "Waveform/vectorscope/histogram data for a clip at a tick (07 §5) — data, not an image. Renders headlessly (requires a GPU adapter). Reads the clip's post-Grade tap by default, before the track fold, or the requested program tap. Reports the actual tap and signal interpretation. Legacy linear pixels are BT.709 signal-encoded for measurement. For qualified Native Managed preview, request tap=program: its sRGB display pixels are measured directly at full range, with chroma derived from selected BT.709/BT.601 coefficients and no video-legal range claim. Scene-linear clip taps remain gated.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6706,7 +6925,8 @@ pub fn tool_list() -> Value {
                         "at_tc": { "type": "string" },
                         "at_seconds": { "type": "number" },
                         "format_index": { "type": "integer" },
-                        "tap": { "type": "string", "enum": ["clip","program"], "description": "Readback point (K-E2). 'clip' (default) = the clip's post-Grade, pre-fold texture; 'program' = the folded sequence pre-CaptionOverlay. A 'clip' tap the frame does not contain falls back to 'program' and says so in `tap`/`tap_fallback_reason`." }
+                        "tap": { "type": "string", "enum": ["clip","program"], "description": "Readback point (K-E2). 'clip' (default) = the clip's post-Grade, pre-fold texture; 'program' = the folded sequence pre-CaptionOverlay. A 'clip' tap the frame does not contain falls back to 'program' and says so in `tap`/`tap_fallback_reason`." },
+                        "vectorscope_matrix": { "type": "string", "enum": ["bt709","bt601"], "description": "Cb/Cr vectorscope measurement matrix; defaults to bt709. Does not change the source color interpretation." }
                     },
                     "required": ["clip_id"]
                 }
@@ -6917,6 +7137,20 @@ pub fn tool_list() -> Value {
             }
         ]);
     if let Some(definitions) = tools.as_array_mut() {
+        definitions.push(json!({"name":"inspect_render_manifest","description":"Read a Photonic render manifest, validate its frozen project/vector snapshot identities and verify the adjacent output's full-file hash. Returns the recorded snapshot, color/grading state, options, source inventory and encoder identity. Read-only; rejects modified outputs, invalid records and denied paths. Does not re-render or revalidate current source files.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}));
+    }
+    if let Some(definitions) = tools.as_array_mut() {
+        if let Some(mut scope_job) = definitions
+            .iter()
+            .find(|tool| tool["name"] == "get_scopes")
+            .cloned()
+        {
+            scope_job["name"] = json!("measure_scopes");
+            scope_job["description"] = json!("Queue an asynchronous scope measurement with the same taps and signal semantics as get_scopes. Returns job_id and expected document revision. Poll get_job_status for the complete scope payload; cancel_job requests cancellation at the frame boundary. Changes before measurement fail with RevisionConflict. Does not edit the document.");
+            definitions.push(scope_job);
+        }
+    }
+    if let Some(definitions) = tools.as_array_mut() {
         for definition in definitions.iter_mut() {
             let name = definition["name"].as_str().unwrap_or_default();
             let output = known_output_schema(name);
@@ -7073,7 +7307,8 @@ fn engine_status_schema() -> Value {
             "doc_revision": { "type": "integer", "minimum": 0 },
             "active_sequence": { "type": ["string", "null"], "format": "uuid" },
             "last_error": { "type": ["object", "null"] },
-            "snapshot_synced": { "type": "boolean" }
+            "snapshot_synced": { "type": "boolean" },
+            "media_tools": { "type": "object", "description": "Selected user-supplied FFmpeg/ffprobe installation or an actionable lookup error." }
         }),
         &[
             "playhead_ticks",
@@ -7141,9 +7376,53 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "gpu_downscaled",
             ],
         ),
+        "sample_grade_input" => object_schema(
+            json!({
+                "clip_id":{"type":"string"},"op_id":{"type":"string"},"graph_node_id":{"type":["integer","null"],"minimum":0},"tick":{"type":"integer"},"revision":{"type":"integer"},"snapshot_generation":{"type":"integer"},
+                "width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"pixel":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"]},
+                "coordinates":{"type":"string","enum":["acescct_ap1_bounded"]},"rgb":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":3,"maxItems":3},
+                "ap1_log_luma":{"type":"number"},"alpha":{"type":"number"}
+            }),
+            &[
+                "clip_id",
+                "op_id",
+                "tick",
+                "revision",
+                "snapshot_generation",
+                "width",
+                "height",
+                "pixel",
+                "coordinates",
+                "rgb",
+                "ap1_log_luma",
+                "alpha",
+            ],
+        ),
+        "inspect_qualifier" => object_schema(
+            json!({
+                "clip_id": {"type":"string"}, "op_id": {"type":"string"}, "graph_node_id":{"type":["integer","null"],"minimum":0}, "tick": {"type":"integer"},
+                "revision": {"type":"integer"}, "snapshot_generation": {"type":"integer"},
+                "width": {"type":"integer","minimum":1}, "height": {"type":"integer","minimum":1},
+                "key_coordinates": {"type":"string","enum":["acescct_ap1_hsl","linear_rec709_hsl"]},
+                "matte_encoding": {"type":"string","enum":["coverage"]},
+                "coverage": {"type":"object","properties":{"min":{"type":"number"},"max":{"type":"number"},"mean":{"type":"number"}}}
+            }),
+            &[
+                "clip_id",
+                "op_id",
+                "tick",
+                "revision",
+                "snapshot_generation",
+                "width",
+                "height",
+                "key_coordinates",
+                "matte_encoding",
+                "coverage",
+            ],
+        ),
         "get_scopes" => object_schema(
             json!({
-                "tick":{"type":"integer"},"histogram":{"type":"object"},"waveform":{"type":"object"},"vectorscope":{"type":"object"},
+                "tick":{"type":"integer"},"histogram":{"type":"object"},"waveform":{"type":"object"},"vectorscope":{"type":"object","properties":{"matrix":{"type":"string","enum":["bt709","bt601"]}}},
                 "tap":{"type":"string","enum":["clip","program"]},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"tap_fallback_reason":{"type":"string"}
             }),
             &[
@@ -7181,6 +7460,14 @@ fn known_output_schema(name: &str) -> Option<Value> {
         "add_marker" | "add_clip_marker" => id_result("marker_id"),
         "add_marker_category" => id_result("category_id"),
         "probe_media" | "generate_voiceover" => id_result("job_id"),
+        "inspect_render_manifest" => object_schema(
+            json!({"verified":{"type":"boolean"},"manifest":{"type":"object"}}),
+            &["verified", "manifest"],
+        ),
+        "measure_scopes" => object_schema(
+            json!({"job_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":0}}),
+            &["job_id", "expected_revision"],
+        ),
         "set_caption_cue" => {
             let mut schema = id_result("cue_id");
             schema["properties"]["note"] = json!({ "type": ["string", "null"] });
@@ -7199,6 +7486,15 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "path": { "type": "string" }, "bytes": { "type": "integer", "minimum": 0 }
             }),
             &["path", "bytes"],
+        ),
+        "archive_project" => object_schema(json!({ "path": { "type": "string" } }), &["path"]),
+        "get_project_dependencies" => object_schema(
+            json!({
+                "files": { "type": "array", "items": { "type": "object" } },
+                "missing_references": { "type": "array", "items": { "type": "object" } },
+                "ready": { "type": "boolean" }
+            }),
+            &["files", "missing_references", "ready"],
         ),
         "list_artboards" => object_schema(
             json!({
@@ -7264,6 +7560,62 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "selection",
                 "layers",
             ],
+        ),
+        "compare_reference_still" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" },
+                "still_id": { "type": "string", "format": "uuid" },
+                "reference_time_ticks": { "type": "integer" },
+                "reference_revision": { "type": "integer" },
+                "current_time_ticks": { "type": "integer" },
+                "current_revision": { "type": "integer" },
+                "interpretation": { "type": "string" },
+                "metrics": { "type": "object" },
+                "shot_match_suggestion": { "type": ["object", "null"] }
+            }),
+            &[
+                "sequence_id",
+                "still_id",
+                "reference_time_ticks",
+                "reference_revision",
+                "current_time_ticks",
+                "current_revision",
+                "interpretation",
+                "metrics",
+                "shot_match_suggestion",
+            ],
+        ),
+        "apply_shot_match" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" },
+                "clip_id": { "type": "string", "format": "uuid" },
+                "still_id": { "type": "string", "format": "uuid" },
+                "op_id": { "type": "string", "format": "uuid" },
+                "points": { "type": "array", "items": { "type": "number" } },
+                "revision": { "type": "integer" },
+                "method": { "type": "string" }
+            }),
+            &[
+                "sequence_id",
+                "clip_id",
+                "still_id",
+                "op_id",
+                "points",
+                "revision",
+                "method",
+            ],
+        ),
+        "list_reference_stills" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" },
+                "stills": { "type": "array", "items": object_schema(json!({
+                    "reference": { "type": "object" },
+                    "image_status": { "type": "string" },
+                    "comparable": { "type": "boolean" },
+                    "diagnostic": { "type": ["string", "null"] }
+                }), &["reference", "image_status", "comparable", "diagnostic"]) }
+            }),
+            &["sequence_id", "stills"],
         ),
         "list_sequences" => list_result(
             "sequences",
@@ -7437,6 +7789,34 @@ fn known_output_schema(name: &str) -> Option<Value> {
             }),
             &["asset_id", "new_path", "hash"],
         ),
+        "set_lut_interpretation" => object_schema(
+            json!({ "asset_id": { "type": "string", "format": "uuid" } }),
+            &["asset_id"],
+        ),
+        "set_input_color" => object_schema(
+            json!({
+                "scope": { "enum": ["asset", "clip"] },
+                "asset_id": { "type": "string", "format": "uuid" },
+                "clip_id": { "type": "string", "format": "uuid" }
+            }),
+            &["scope"],
+        ),
+        "set_native_input_color" => object_schema(
+            json!({
+                "scope": { "enum": ["asset", "clip"] },
+                "asset_id": { "type": "string", "format": "uuid" },
+                "clip_id": { "type": "string", "format": "uuid" }
+            }),
+            &["scope"],
+        ),
+        "create_native_color_draft" => object_schema(
+            json!({
+                "sequence_id": { "type": "string", "format": "uuid" },
+                "source_sequence_id": { "type": "string", "format": "uuid" },
+                "rendering_available": { "type": "boolean" }
+            }),
+            &["sequence_id", "source_sequence_id", "rendering_available"],
+        ),
         "find_offline_media" => object_schema(
             json!({
                 "offline": { "type": "array", "items": { "type": "object" } },
@@ -7565,6 +7945,16 @@ fn known_output_schema(name: &str) -> Option<Value> {
             &["removed"],
         ),
         "play" | "pause" | "seek" | "step" | "get_engine_status" => engine_status_schema(),
+        "get_media_toolchain_status" => object_schema(
+            json!({
+                "available": { "type": "boolean" },
+                "selection": { "type": "string" },
+                "ffmpeg": { "type": "string" },
+                "ffprobe": { "type": "string" },
+                "error": { "type": "string" }
+            }),
+            &["available"],
+        ),
         "get_job_status" => job_status_schema(),
         "auto_caption" => object_schema(
             json!({
@@ -7660,6 +8050,11 @@ fn known_output_schema(name: &str) -> Option<Value> {
         | "set_caption_word"
         | "set_caption_style"
         | "set_grade"
+        | "group_grade"
+        | "grade_version"
+        | "shared_look"
+        | "remove_reference_still"
+        | "capture_reference_still"
         | "apply_lut"
         | "copy_grade"
         | "remove_graph_node"
@@ -7696,6 +8091,8 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "list_artboards"
         | "screenshot"
         | "list_sequences"
+        | "list_reference_stills"
+        | "compare_reference_still"
         | "list_clips"
         | "get_clip"
         | "list_markers"
@@ -7713,7 +8110,13 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "get_audio_meters"
         | "list_title_templates"
         | "get_stabilization_status" => ReadOnly,
-        "list_export_presets" | "find_offline_media" => ExternalRead,
+        "list_export_presets"
+        | "find_offline_media"
+        | "get_project_dependencies"
+        | "get_media_toolchain_status"
+        | "inspect_render_manifest"
+        | "inspect_qualifier"
+        | "sample_grade_input" => ExternalRead,
         "create_shape"
         | "create_sequence"
         | "add_track"
@@ -7793,6 +8196,11 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "set_caption_word"
         | "set_caption_style"
         | "set_grade"
+        | "group_grade"
+        | "grade_version"
+        | "shared_look"
+        | "remove_reference_still"
+        | "capture_reference_still"
         | "copy_grade"
         | "create_clip_composition"
         | "remove_graph_node"
@@ -7808,8 +8216,14 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "insert_title_template" => Mutation,
         "execute_action"
         | "save_document"
+        | "archive_project"
         | "import_media"
         | "relink_media"
+        | "set_lut_interpretation"
+        | "apply_shot_match"
+        | "set_input_color"
+        | "set_native_input_color"
+        | "create_native_color_draft"
         | "relink_media_batch"
         | "play"
         | "pause"
@@ -7835,6 +8249,7 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "apply_lut"
         | "grade_preset"
         | "get_scopes"
+        | "measure_scopes"
         | "get_waveform"
         | "import_motion_metadata"
         | "analyze_stabilization"
@@ -7847,4 +8262,50 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "effect_favourite_set" => ExternalMutation,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod qualifier_inspection_contract_tests {
+    #[test]
+    fn qualifier_inspection_advertises_read_only_domain_and_provenance() {
+        let tools = super::tool_list();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "inspect_qualifier")
+            .unwrap();
+        let sampler = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "sample_grade_input")
+            .unwrap();
+        assert_eq!(sampler["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            sampler["inputSchema"]["required"],
+            serde_json::json!(["clip_id", "op_id", "x", "y"])
+        );
+        assert_eq!(
+            sampler["outputSchema"]["anyOf"][0]["properties"]["coordinates"]["enum"],
+            serde_json::json!(["acescct_ap1_bounded"])
+        );
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["annotations"]["openWorldHint"], true);
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            serde_json::json!(["clip_id", "op_id"])
+        );
+        assert_eq!(
+            tool["outputSchema"]["anyOf"][0]["properties"]["key_coordinates"]["enum"],
+            serde_json::json!(["acescct_ap1_hsl", "linear_rec709_hsl"])
+        );
+        for name in ["revision", "snapshot_generation", "tick", "coverage"] {
+            assert!(tool["outputSchema"]["anyOf"][0]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == name));
+        }
+    }
 }

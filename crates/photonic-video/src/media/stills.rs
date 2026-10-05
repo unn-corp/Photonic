@@ -29,7 +29,7 @@
 //! | Asset identity | yes | different file, different pixels |
 //! | Requested logical size | yes | it *is* the resample target |
 //! | Preview scale (Draft/Full) | **no, already folded in** | Draft only shrinks the canvas (`preview_canvas`), and the canvas *is* the requested size. Adding it as a separate component would split the cache for a distinction that produces identical bytes |
-//! | Colour conversion | **no** | the still upload path is parameterless: sRGB8 straight → linear-light premultiplied, always. Unlike video there is no per-asset `Colorimetry` to vary it |
+//! | Colour conversion | **no** | the Legacy still upload path is parameterless: sRGB8/16 straight → linear-light premultiplied. Unlike video there is no per-asset `Colorimetry` to vary it |
 //!
 //! An over-specified key silently destroys the hit rate, which is the whole
 //! point of the item — hence the clamp in [`still_target_size`] and the
@@ -283,6 +283,52 @@ pub fn resample_linear_premult(
     }
 }
 
+/// High-depth sibling of [`resample_linear_premult`]. Input samples are tightly
+/// packed straight-alpha RGBA16 in an sRGB-encoded still. Conversion and box
+/// filtering stay in f32 until the caller packs the working-format texture.
+pub fn resample_linear_premult_u16(
+    pixels: &[u16],
+    width: u32,
+    height: u32,
+    tw: u32,
+    th: u32,
+    mut emit: impl FnMut([f32; 4]),
+) {
+    let sw = width.max(1);
+    let sh = height.max(1);
+    let tw = tw.clamp(1, sw);
+    let th = th.clamp(1, sh);
+    for ty in 0..th {
+        let (y0, y1) = span(ty, th, sh);
+        for tx in 0..tw {
+            let (x0, x1) = span(tx, tw, sw);
+            let mut acc = [0.0f32; 4];
+            let mut n = 0.0f32;
+            for sy in y0..y1 {
+                let row = (sy as usize) * (sw as usize) * 4;
+                for sx in x0..x1 {
+                    let i = row + (sx as usize) * 4;
+                    let Some(px) = pixels.get(i..i + 4) else {
+                        continue;
+                    };
+                    let a = px[3] as f32 / 65535.0;
+                    acc[0] += srgb_to_linear(px[0] as f32 / 65535.0) * a;
+                    acc[1] += srgb_to_linear(px[1] as f32 / 65535.0) * a;
+                    acc[2] += srgb_to_linear(px[2] as f32 / 65535.0) * a;
+                    acc[3] += a;
+                    n += 1.0;
+                }
+            }
+            if n > 0.0 {
+                for channel in acc.iter_mut() {
+                    *channel /= n;
+                }
+            }
+            emit(acc);
+        }
+    }
+}
+
 /// Half-open source span `[lo, hi)` covered by target index `t` of `n` over a
 /// `src`-long axis. Always non-empty (`hi > lo`) and never past `src`.
 #[inline]
@@ -295,6 +341,20 @@ fn span(t: u32, n: u32, src: u32) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sixteen_bit_resampling_filters_premultiplied_linear_light() {
+        let pixels = [
+            65535u16, 65535, 65535, 65535, // opaque white
+            65535, 0, 0, 0, // transparent red must not bleed
+        ];
+        let mut output = Vec::new();
+        resample_linear_premult_u16(&pixels, 2, 1, 1, 1, |pixel| output.push(pixel));
+        assert_eq!(output.len(), 1);
+        for channel in output[0] {
+            assert!((channel - 0.5).abs() < 1e-6, "{output:?}");
+        }
+    }
 
     fn asset(n: u128) -> AssetId {
         AssetId(uuid::Uuid::from_u128(n))

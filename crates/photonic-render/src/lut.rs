@@ -2,8 +2,8 @@
 //!
 //! A hand-rolled parser for the Adobe/IRIDAS `.cube` format: a `LUT_3D_SIZE N`
 //! header plus `N³` whitespace-separated float triples, with optional
-//! `LUT_1D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `TITLE`. No external crate is
-//! needed — the grammar is line-oriented and tiny.
+//! `LUT_1D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `TITLE`. A 1D shaper precedes
+//! the 3D table when declared. No external crate is needed.
 //!
 //! **Documented deviation from 07 §3.8:** the spec placed the `.cube` parser
 //! engine-side (`photonic-video`). We keep the parser *and* its trilinear /
@@ -23,6 +23,8 @@ pub struct Lut3d {
     pub size: usize,
     /// `size³` RGB triples, red-fastest order.
     pub data: Vec<[f32; 3]>,
+    /// Optional per-channel 1D shaper, sampled before the 3D table.
+    pub shaper: Option<Vec<[f32; 3]>>,
     /// Per-channel input-domain lower bound (`DOMAIN_MIN`, default 0).
     pub domain_min: [f32; 3],
     /// Per-channel input-domain upper bound (`DOMAIN_MAX`, default 1).
@@ -40,6 +42,10 @@ pub enum CubeError {
     BadTriple(String),
     /// The data-row count did not equal `size³`.
     WrongCount { expected: usize, got: usize },
+    /// Invalid or misplaced 1D shaper header.
+    BadShaper(String),
+    /// Input-domain bounds were non-finite or not strictly increasing.
+    BadDomain,
 }
 
 impl std::fmt::Display for CubeError {
@@ -51,6 +57,8 @@ impl std::fmt::Display for CubeError {
             CubeError::WrongCount { expected, got } => {
                 write!(f, "expected {expected} entries, got {got}")
             }
+            CubeError::BadShaper(s) => write!(f, "bad LUT_1D_SIZE: {s}"),
+            CubeError::BadDomain => write!(f, "invalid LUT input domain"),
         }
     }
 }
@@ -68,24 +76,28 @@ fn parse_triple(s: &str) -> Result<[f32; 3], CubeError> {
             .parse::<f32>()
             .map_err(|_| CubeError::BadTriple(s.to_string()))?;
     }
+    if it.next().is_some() || v.iter().any(|value| !value.is_finite()) {
+        return Err(CubeError::BadTriple(s.to_string()));
+    }
     Ok(v)
 }
 
 /// Parse a `.cube` file body (already read into a string) into a [`Lut3d`].
 ///
-/// `LUT_1D_SIZE` shaper LUTs are recognized (their rows skipped) but not
-/// applied — v1 grades against the 3D table only (07 §3.8). Lines starting with
-/// `#` and blank lines are ignored, as are `TITLE`.
+/// A combined file must declare its 1D table before `LUT_3D_SIZE`; the input
+/// domain maps into the shaper, whose output feeds the 3D grid directly.
+/// Blank/comment lines and trailing `#` comments are ignored, as is `TITLE`.
 pub fn parse_cube(src: &str) -> Result<Lut3d, CubeError> {
     let mut size: Option<usize> = None;
-    let mut lut_1d_size: Option<usize> = None;
+    let mut shaper_size: Option<usize> = None;
+    let mut shaper = Vec::new();
     let mut domain_min = [0.0f32; 3];
     let mut domain_max = [1.0f32; 3];
     let mut data: Vec<[f32; 3]> = Vec::new();
 
     for raw in src.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
             continue;
         }
         // Keyword lines start with an uppercase-letter token.
@@ -93,6 +105,17 @@ pub fn parse_cube(src: &str) -> Result<Lut3d, CubeError> {
         match first {
             "TITLE" => {}
             "LUT_3D_SIZE" => {
+                if size.is_some() {
+                    return Err(CubeError::BadSize("duplicate LUT_3D_SIZE".into()));
+                }
+                if let Some(expected) = shaper_size {
+                    if shaper.len() != expected {
+                        return Err(CubeError::WrongCount {
+                            expected,
+                            got: shaper.len(),
+                        });
+                    }
+                }
                 let n = line
                     .split_whitespace()
                     .nth(1)
@@ -104,26 +127,41 @@ pub fn parse_cube(src: &str) -> Result<Lut3d, CubeError> {
                 size = Some(n);
             }
             "LUT_1D_SIZE" => {
-                lut_1d_size = line.split_whitespace().nth(1).and_then(|t| t.parse().ok());
+                if shaper_size.is_some() || size.is_some() || !data.is_empty() {
+                    return Err(CubeError::BadShaper("duplicate or misplaced header".into()));
+                }
+                let n = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|t| t.parse::<usize>().ok())
+                    .ok_or_else(|| CubeError::BadShaper(line.to_string()))?;
+                if !(2..=65536).contains(&n) || line.split_whitespace().count() != 2 {
+                    return Err(CubeError::BadShaper(line.to_string()));
+                }
+                shaper_size = Some(n);
             }
             "DOMAIN_MIN" => domain_min = parse_triple(&line[first.len()..])?,
             "DOMAIN_MAX" => domain_max = parse_triple(&line[first.len()..])?,
             _ => {
-                // A data row: three floats. Skip 1D-shaper rows if a 1D header
-                // was declared and we have not yet reached the 3D block.
                 let triple = parse_triple(line)?;
-                if let (Some(n1), None) = (lut_1d_size, size) {
-                    // Still inside the 1D block (before LUT_3D_SIZE) — consume
-                    // and discard `n1` rows' worth by tracking count implicitly.
-                    let _ = n1;
-                    continue;
+                if size.is_some() {
+                    data.push(triple);
+                } else if let Some(expected) = shaper_size {
+                    if shaper.len() == expected {
+                        return Err(CubeError::BadShaper("data exceeds declared 1D size".into()));
+                    }
+                    shaper.push(triple);
+                } else {
+                    return Err(CubeError::MissingSize);
                 }
-                data.push(triple);
             }
         }
     }
 
     let size = size.ok_or(CubeError::MissingSize)?;
+    if (0..3).any(|channel| domain_max[channel] <= domain_min[channel]) {
+        return Err(CubeError::BadDomain);
+    }
     let expected = size * size * size;
     if data.len() != expected {
         return Err(CubeError::WrongCount {
@@ -134,6 +172,7 @@ pub fn parse_cube(src: &str) -> Result<Lut3d, CubeError> {
     Ok(Lut3d {
         size,
         data,
+        shaper: shaper_size.map(|_| shaper),
         domain_min,
         domain_max,
     })
@@ -157,6 +196,7 @@ impl Lut3d {
         Lut3d {
             size: n,
             data,
+            shaper: None,
             domain_min: [0.0; 3],
             domain_max: [1.0; 3],
         }
@@ -171,6 +211,9 @@ impl Lut3d {
     /// `[0, size-1]`, clamped.
     #[inline]
     fn grid_coord(&self, v: f32, ch: usize) -> f32 {
+        if self.shaper.is_some() {
+            return v.clamp(0.0, 1.0) * (self.size - 1) as f32;
+        }
         let lo = self.domain_min[ch];
         let hi = self.domain_max[ch];
         let span = (hi - lo).max(1e-9);
@@ -178,9 +221,28 @@ impl Lut3d {
         t * (self.size - 1) as f32
     }
 
+    /// Interpolate each shaper channel after mapping the declared input domain.
+    #[inline]
+    fn shaped(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let Some(shaper) = &self.shaper else {
+            return rgb;
+        };
+        let mut out = [0.0; 3];
+        for c in 0..3 {
+            let t = ((rgb[c] - self.domain_min[c]) / (self.domain_max[c] - self.domain_min[c]))
+                .clamp(0.0, 1.0)
+                * (shaper.len() - 1) as f32;
+            let lo = t.floor() as usize;
+            let hi = (lo + 1).min(shaper.len() - 1);
+            out[c] = shaper[lo][c] + (shaper[hi][c] - shaper[lo][c]) * (t - lo as f32);
+        }
+        out
+    }
+
     /// Trilinear sample at input `rgb` (07 §3.8 baseline). Input in the LUT's
     /// declared domain (typically encoded 0..1).
     pub fn sample_trilinear(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let rgb = self.shaped(rgb);
         let fx = self.grid_coord(rgb[0], 0);
         let fy = self.grid_coord(rgb[1], 1);
         let fz = self.grid_coord(rgb[2], 2);
@@ -219,6 +281,7 @@ impl Lut3d {
     /// accurate than trilinear near LUT-grid edges; identical on the neutral
     /// diagonal. Uses the canonical 6-tetrahedron decomposition of the cell.
     pub fn sample_tetrahedral(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let rgb = self.shaped(rgb);
         let fx = self.grid_coord(rgb[0], 0);
         let fy = self.grid_coord(rgb[1], 1);
         let fz = self.grid_coord(rgb[2], 2);
@@ -329,6 +392,51 @@ DOMAIN_MAX 1.0 1.0 1.0
     #[test]
     fn parse_rejects_missing_size() {
         assert_eq!(parse_cube("0 0 0\n"), Err(CubeError::MissingSize));
+    }
+
+    #[test]
+    fn combined_cube_applies_shaper_before_3d_table() {
+        let with_shaper = format!("LUT_1D_SIZE 2\n0 0 0\n0.5 1 0.25\n{IDENTITY_2}");
+        let lut = parse_cube(&with_shaper).unwrap();
+        for sample in [
+            lut.sample_trilinear([0.4, 0.4, 0.4]),
+            lut.sample_tetrahedral([0.4, 0.4, 0.4]),
+        ] {
+            assert!((sample[0] - 0.2).abs() < 1e-6, "{sample:?}");
+            assert!((sample[1] - 0.4).abs() < 1e-6, "{sample:?}");
+            assert!((sample[2] - 0.1).abs() < 1e-6, "{sample:?}");
+        }
+    }
+
+    #[test]
+    fn combined_cube_rejects_incomplete_or_misordered_shapers() {
+        assert!(matches!(
+            parse_cube(&format!("LUT_1D_SIZE 3\n0 0 0\n1 1 1\n{IDENTITY_2}")),
+            Err(CubeError::WrongCount {
+                expected: 3,
+                got: 2
+            })
+        ));
+        assert!(matches!(
+            parse_cube(&format!("{IDENTITY_2}LUT_1D_SIZE 2\n")),
+            Err(CubeError::BadShaper(_))
+        ));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_domains_and_nonfinite_samples() {
+        let reversed = IDENTITY_2.replace("DOMAIN_MAX 1.0 1.0 1.0", "DOMAIN_MAX 0.0 1.0 1.0");
+        assert_eq!(parse_cube(&reversed), Err(CubeError::BadDomain));
+        let nan = IDENTITY_2.replace("1.0 1.0 1.0\n", "NaN 1.0 1.0\n");
+        assert!(matches!(parse_cube(&nan), Err(CubeError::BadTriple(_))));
+    }
+
+    #[test]
+    fn parse_allows_trailing_comments_without_extra_data_fields() {
+        let annotated = IDENTITY_2.replace("1.0 1.0 1.0\n", "1.0 1.0 1.0 # white\n");
+        assert_eq!(parse_cube(&annotated).unwrap().data[7], [1.0; 3]);
+        let extra = IDENTITY_2.replace("1.0 1.0 1.0\n", "1.0 1.0 1.0 0.5\n");
+        assert!(matches!(parse_cube(&extra), Err(CubeError::BadTriple(_))));
     }
 
     #[test]

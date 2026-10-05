@@ -462,6 +462,7 @@ fn ss3_sync_drift_ten_minute_export_under_one_frame() {
                 width: W,
                 height: H,
                 rgba_premult: rgba,
+                encoding: photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709,
             }
         },
         Some(audio_samples),

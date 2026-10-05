@@ -23,9 +23,13 @@ pub mod encoder;
 pub mod extract_frame;
 pub mod job;
 pub mod job_queue;
+pub mod manifest;
 pub mod offline_audio;
 pub mod presets;
 pub mod render_loop;
 
-pub use extract_frame::{default_extract_path, flatten_pixels, write_frame_png, ExtractFrameError};
+pub use extract_frame::{
+    default_extract_path, flatten_pixels, write_frame_png, write_frame_png_encoded,
+    ExtractFrameError,
+};
 pub use job_queue::{QueueJobId, QueueJobStatus, QueuedExport, RenderQueue};

@@ -291,6 +291,8 @@ fn t005_playing_and_scrub_misses_never_wait_per_source() {
                     matrix: Matrix::Bt709,
                     range: Range::Limited,
                 },
+                pixel_format: Some("yuv420p".into()),
+                file_identity: None,
                 rate: FrameRate::FPS_30,
                 last_used: 0,
             }),

@@ -87,17 +87,40 @@ pub fn source_range_for_op(op: &IrOp, out: Tick) -> FrameRange {
 
         // Present-day pure ops and compile-expanded TimeOffset: identity.
         IrOp::DecodeVideo { .. }
+        | IrOp::NativeDecodeVideo { .. }
         | IrOp::DecodeStill { .. }
+        | IrOp::NativeDecodeStill { .. }
         | IrOp::RasterVector { .. }
         | IrOp::SolidColor { .. }
         | IrOp::Transform2D { .. }
+        | IrOp::Transform2DTransparent { .. }
         // D-12 stabilization corrects *within* a frame — it never reaches for
         // a neighbour. Rolling-shutter correction would still not change this:
         // it samples the orientation curve at sub-frame times, not other
         // frames' pixels.
         | IrOp::StabilizeWarp { .. }
         | IrOp::Effect { .. }
+        | IrOp::QualifierMatte { .. }
+        | IrOp::GradeKeyMix { .. }
+        | IrOp::GradeMatteRefine { .. }
+        | IrOp::GradeMatteApply
+        | IrOp::GradeMatteConstant { .. }
+        | IrOp::GradeLayerMix { .. }
         | IrOp::Grade { .. }
+        | IrOp::NativeExposure { .. }
+        | IrOp::NativeLinearOffset { .. }
+        | IrOp::NativePrinterLights { .. }
+        | IrOp::NativeHighlightRolloff { .. }
+        | IrOp::NativeSaturationVibrance { .. }
+        | IrOp::NativeLogContrast { .. }
+        | IrOp::NativeLogCdl { .. }
+        | IrOp::NativeLogQualifier { .. }
+        | IrOp::NativeLogCurves { .. }
+        | IrOp::NativeLut3d { .. }
+        | IrOp::NativeMaskMix { .. }
+        | IrOp::NativeAcescct { .. }
+        | IrOp::NativeSdrOutput
+        | IrOp::NativeSdrVideoOutput
         | IrOp::Merge { .. }
         | IrOp::WipeMix { .. }
         | IrOp::PushMix { .. }
@@ -155,6 +178,7 @@ mod tests {
     fn graph_of_pure_ops_stays_identity() {
         let out = Tick(42);
         let g = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::SolidColor {

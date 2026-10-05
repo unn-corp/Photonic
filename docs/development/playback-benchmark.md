@@ -8,6 +8,23 @@ The JSON report includes GPU adapter name, backend, driver, OS, architecture, de
 
 Set `PHOTONIC_BENCH_WORKLOAD=mixed` to add a four-pixel blur, caption overlay, and a quiet generated AAC sine source on an audio track. The default `video` workload isolates video. The report states whether a real audio device and feeder were active; a mixed workload with hardware budgets fails if no audio device is available, rather than treating absent audio as zero underruns.
 
+Set `PHOTONIC_BENCH_WORKLOAD=grading` to apply four active color correctors
+(exposure, contrast, saturation/vibrance, and highlight roll-off) and submit an
+asynchronous luma-waveform readback while the sequence plays. The report adds
+completed scope measurements, p95 scope latency, and scope errors alongside
+the same playback, seek, and memory fields. A grading run fails if no scope
+measurement completes or any readback fails. This is a headless measurement;
+GUI interaction latency and calibrated display output still need separate
+qualification.
+
+Set `PHOTONIC_BENCH_WORKLOAD=native_grading` to exercise the qualified Native
+Managed SDR path with a probed YUV source, explicit BT.709 input, four native
+correctors, display output, and asynchronous program waveform. Native preview
+does not use the playback frame cache; each source request checks its on-disk
+identity. This workload measures that path and fails when the first inspected
+frame has a color error. The scope readback treats the output as sRGB display
+components rather than applying a second BT.709 transfer.
+
 To measure a single case:
 
 ```sh

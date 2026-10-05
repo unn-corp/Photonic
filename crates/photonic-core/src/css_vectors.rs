@@ -692,7 +692,7 @@ fn z_index(rules: Option<&Vec<&Rule>>) -> i32 {
         .flat_map(|rule| rule.declarations.iter())
         .filter(|(property, _)| property == "z-index")
         .filter_map(|(_, value)| value.parse::<i32>().ok())
-        .last()
+        .next_back()
         .unwrap_or(0)
 }
 

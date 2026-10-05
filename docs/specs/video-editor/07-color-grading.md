@@ -1,5 +1,25 @@
 # 07 — Color Grading
 
+**Implementation boundary:** this document describes the Legacy SDR grading
+semantics. The approved professional grading roadmap and implementation status
+are tracked in [professional-color-grading.md](../../implementation/professional-color-grading.md).
+Managed ACES/OCIO color, HDR mastering, reference galleries, grading graphs and
+tracking are separate acceptance gates, not capabilities implied by this spec.
+The additive `linear_offset` and `highlight_rolloff` correctors extend the
+Legacy SDR catalog without changing the original operator math. Highlight
+roll-off works in scene-linear light and preserves extended-range RGB and alpha;
+it is not a managed HDR output transform.
+
+**Correctness update:** viewing grading controls never creates or normalizes a
+stored corrector. Parameter gestures coalesce into one undo step; stack changes
+remain discrete; clip and track grade edits respect track locks. An enabled
+corrector with an unavailable LUT, unknown operator or unresolved mask is bypassed
+as a whole in preview with a structured diagnostic. Final export fails on that
+diagnostic unless the dependency is resolved or the corrector is explicitly
+disabled. An unresolved mask must never mean full-frame correction. GUI RGB parade
+uses per-column channel counts and scopes use asynchronous readback with measured
+frame provenance.
+
 **Depends on:** 01-data-model.md, 02-engine.md, 03-render-color-pipeline.md (color-space authority — its §4.2 boundary table governs every transfer-function placement; working space: linear-light Rec.709, premultiplied alpha, `Rgba16Float`, D-09), 04-ui-mode-timeline.md (§4.1 panel map). **Capability:** CAP-015. **Location:** data model in `crates/photonic-core/src/timeline/grade.rs` (new); IR/eval in `crates/photonic-video/src/graph/ops/grade.rs` (new); UI in `photonic-gui` color page (04 §4.1). Scope per 00 §5: grade data model detail, grade operators as IR ops, wheels/curves/HSL/LUT UI, scopes.
 
 ---
@@ -146,6 +166,16 @@ If `hue_vs_hue`/`hue_vs_sat` are non-empty, run a second pass in HSL:
 4. Convert HSL→RGB back (`hsl_to_rgb`, `adjust.rs:141-158`).
 
 **v1 curve set recommendation:** master/RGB + hue-vs-hue + hue-vs-sat only. These two cover the highest-value global corrections (skin-tone hue nudges, selective hue desaturation) without the full custom-curve UI surface (lum-vs-sat, sat-vs-sat). Defer those post-v1 — the `Curves` variant's fields are additive, so adding them later is non-breaking.
+
+**Professional grading increment:** `hue_vs_luma`, `luma_vs_sat`, and
+`sat_vs_sat` are optional curve vectors, omitted on save when empty. Existing
+grades therefore retain their serialized shape and evaluation path. A non-empty
+curve uses y=0.5 as neutral: hue-vs-luma adds `y−0.5` equally to straight RGB
+after the hue/saturation pass (Rec.709 luma changes by that amount until an SDR
+channel clips); luma-vs-sat and sat-vs-sat multiply HSL saturation by `2y`,
+sampled from pre-correction Rec.709 luma and HSL saturation respectively. These
+operators are qualified for the Legacy SDR grading space only; managed grading
+will require its own declared domain semantics.
 
 ### 3.7 HslQualifier
 

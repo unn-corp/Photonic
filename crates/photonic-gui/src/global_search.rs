@@ -242,16 +242,18 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 /// Background semantic search over the (fixed) catalog using a local embedding
-/// model. The worker loads the model (downloading once), embeds the corpus, then
+/// model. On the first nonempty query, the worker loads the model (downloading once), embeds the corpus, then
 /// answers queries with cosine-ranked `(item index, score)` results. Indices map
 /// into `items()` (same deterministic order). Falls back silently to nothing if
 /// the model can't load — the UI then uses keyword/fuzzy matching.
 pub struct SemanticIndex {
-    req_tx: Sender<String>,
+    req_tx: Option<Sender<String>>,
     res_rx: Receiver<Vec<(usize, f32)>>,
     ready: Arc<AtomicBool>,
     last_query: String,
     pub results: Vec<(usize, f32)>,
+    pending: Option<(Vec<String>, Receiver<String>, Sender<Vec<(usize, f32)>>)>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SemanticIndex {
@@ -259,8 +261,23 @@ impl SemanticIndex {
         let (req_tx, req_rx) = channel::<String>();
         let (res_tx, res_rx) = channel::<Vec<(usize, f32)>>();
         let ready = Arc::new(AtomicBool::new(false));
-        let ready_w = Arc::clone(&ready);
-        std::thread::Builder::new()
+        Self {
+            req_tx: Some(req_tx),
+            res_rx,
+            ready,
+            last_query: String::new(),
+            results: Vec::new(),
+            pending: Some((corpus, req_rx, res_tx)),
+            worker: None,
+        }
+    }
+
+    fn start_worker(&mut self) {
+        let Some((corpus, req_rx, res_tx)) = self.pending.take() else {
+            return;
+        };
+        let ready_w = Arc::clone(&self.ready);
+        self.worker = std::thread::Builder::new()
             .name("photonic-embed".into())
             .spawn(move || {
                 let embedder = match photonic_embed::Embedder::new() {
@@ -296,13 +313,6 @@ impl SemanticIndex {
                 }
             })
             .ok();
-        Self {
-            req_tx,
-            res_rx,
-            ready,
-            last_query: String::new(),
-            results: Vec::new(),
-        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -316,7 +326,12 @@ impl SemanticIndex {
             if q.trim().is_empty() {
                 self.results.clear();
             }
-            let _ = self.req_tx.send(q.to_string());
+            if !q.trim().is_empty() {
+                self.start_worker();
+            }
+            if let Some(sender) = &self.req_tx {
+                let _ = sender.send(q.to_string());
+            }
         }
     }
 
@@ -324,6 +339,17 @@ impl SemanticIndex {
     pub fn pump(&mut self) {
         while let Ok(res) = self.res_rx.try_recv() {
             self.results = res;
+        }
+    }
+}
+
+impl Drop for SemanticIndex {
+    fn drop(&mut self) {
+        // Disconnect first so a ready worker exits recv; initialization may be
+        // in third-party native code and must finish before process statics die.
+        self.req_tx.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
         }
     }
 }
@@ -341,4 +367,39 @@ pub fn fuzzy_subseq(q: &str, s: &str) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod semantic_worker_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn empty_search_does_not_initialize_a_model() {
+        let mut index = SemanticIndex::new(vec!["example".into()]);
+        index.set_query("");
+        index.set_query("   ");
+        assert!(index.pending.is_some());
+        assert!(index.worker.is_none());
+        assert!(!index.is_ready());
+    }
+
+    #[test]
+    fn dropping_index_disconnects_and_joins_an_initializing_worker() {
+        let mut index = SemanticIndex::new(vec![]);
+        let (_, receiver, _) = index.pending.take().unwrap();
+        let finished = Arc::new(AtomicBool::new(false));
+        let worker_finished = Arc::clone(&finished);
+        let (release, gate) = channel();
+        index.worker = Some(std::thread::spawn(move || {
+            gate.recv().unwrap();
+            assert!(receiver.recv().is_err());
+            worker_finished.store(true, Ordering::SeqCst);
+        }));
+        let release_worker = std::thread::spawn(move || {
+            release.send(()).unwrap();
+        });
+        drop(index);
+        release_worker.join().unwrap();
+        assert!(finished.load(Ordering::SeqCst));
+    }
 }

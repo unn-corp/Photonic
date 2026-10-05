@@ -61,7 +61,9 @@ use crate::media::ffmpeg_locate::{locate, FfmpegTools};
 use crate::media::keyframe_index::{KeyframeIndex, PtsIndex};
 use crate::media::probe::{content_hash, probe_details, ProbeDetails};
 use crate::media::proxy_policy::{AdaptiveProxyPolicy, PreviewMediaChoice, PreviewPressure};
-use crate::media::stills::{resample_linear_premult, still_target_size, StillCache};
+use crate::media::stills::{
+    resample_linear_premult, resample_linear_premult_u16, still_target_size, StillCache,
+};
 use crate::playback::pcm::{read_pcm_window, TimeWarpPcmSource};
 use crate::playback::prefetch::{
     cut_ahead_targets, lru_eviction_victims, CUT_AHEAD_LEAD_FRAMES, MAX_LIVE_SOURCES,
@@ -131,7 +133,7 @@ pub struct AssetReadiness {
 
 /// Job-level render options (K-F4 / 26 §14) — how *this* run executes, not
 /// the output format ([`ExportPreset`]). Defaults keep prior behaviour.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, serde::Serialize)]
 pub struct RenderJobOptions {
     /// Use proxies when available (fast verification renders).
     pub use_proxies: bool,
@@ -159,6 +161,8 @@ pub struct RenderJobOptions {
     /// Inhibit system sleep while this job runs (K-F polish). Best-effort;
     /// platforms without a known inhibit API no-op.
     pub inhibit_sleep: bool,
+    /// Write an adjacent, hash-verified render manifest after a successful encode.
+    pub write_manifest: bool,
 }
 
 /// An export request (02 §7). Carried by [`EngineCmd::Export`]: the engine
@@ -248,6 +252,9 @@ pub enum EngineCmd {
     SetPreviewTarget(PreviewTarget),
     /// Draft (default) vs Full interactive quality (24 §4).
     SetPreviewQuality(PreviewQuality),
+    /// Select BT.709 video-signal output for a dedicated native delivery
+    /// session. Interactive sessions default to the sRGB display transform.
+    SetNativeDelivery(bool),
     /// K-E2: choose which texture the scopes measure (03 §3.6 / 07 §5) — the
     /// program pre-`CaptionOverlay`, or one clip's post-`Grade` node. Pure view
     /// state, like [`EngineCmd::SetPreviewTarget`]: it changes nothing the
@@ -322,9 +329,16 @@ struct PublishedSnapshot {
     value: RenderSnapshot,
 }
 
-/// What the GUI presents (02 §1): `Rgba16Float`, linear, premultiplied (D-09).
-/// The present path is 03 §5's `present_engine_frame`.
+/// What the GUI presents (02 §1): `Rgba16Float`, premultiplied. The
+/// interpretation is carried by `output_encoding`, not inferred from format.
 pub struct EngineFrame {
+    pub output_encoding: crate::graph::ir::FrameColorEncoding,
+    /// Interpretation of the resolved intermediate scope tap, if present.
+    pub scope_tap_encoding: Option<crate::graph::ir::FrameColorEncoding>,
+    /// Unsupported technical color requirements bound to this frame.
+    pub color_errors: Vec<String>,
+    /// Compile failures bound to this exact rendered frame.
+    pub grading_errors: Vec<photonic_render::grade::GradeDiagnostic>,
     /// Lossy cached playback provenance. Native exports reject these frames.
     pub cached_preview: bool,
     pub inspection_request_id: Option<u64>,
@@ -354,6 +368,24 @@ pub struct EngineFrame {
     /// not over the requested clip). The UI labels from this, never from the
     /// request, so "Scoping: <clip>" cannot lie.
     pub scope_tap_point: ScopeTapPoint,
+    /// Correctors resolved for qualifier inspection on this exact frame.
+    /// Present only for ordered clip grades containing an enabled qualifier.
+    pub clip_grade_inspections: Vec<crate::graph::compile::ClipGradeInspection>,
+    pub native_qualifier_inspections: Vec<crate::graph::compile::NativeQualifierInspection>,
+    pub native_curve_inputs: Vec<(
+        photonic_core::timeline::ClipId,
+        photonic_core::timeline::GradeOpId,
+        crate::graph::ir::IrNodeId,
+    )>,
+    pub native_graph_qualifier_inspections:
+        Vec<(u32, crate::graph::compile::NativeQualifierInspection)>,
+    pub native_graph_curve_inputs: Vec<(
+        photonic_core::timeline::ClipId,
+        u32,
+        photonic_core::timeline::GradeOpId,
+        crate::graph::ir::IrNodeId,
+    )>,
+    pub native_graph_mattes: Vec<(photonic_core::timeline::ClipId, u32, crate::graph::ir::IrNodeId)>,
     /// K-B5: when compare-effects is on, the clean (no clip effects/grade)
     /// evaluation for the same tick. `None` when compare is off or the clean
     /// path failed.
@@ -921,7 +953,11 @@ impl Drop for EngineSession {
 /// unparsable).
 struct LutEntry {
     path: PathBuf,
+    pinned_hash: Option<String>,
+    color: Option<photonic_core::timeline::color::LutColorInterpretation>,
+    actual_hash: Option<String>,
     table: Option<Arc<photonic_render::Lut3d>>,
+    error: Option<String>,
 }
 
 /// Memoised `.cube` LUT cache (K-0.5): every referenced `Lut3d` asset is parsed
@@ -931,7 +967,7 @@ struct LutEntry {
 /// failure caches a negative entry (→ the grade op resolves inert / identity,
 /// never a black frame — 07 §1) and records one diagnostic.
 #[derive(Default)]
-struct LutCache {
+pub(crate) struct LutCache {
     entries: HashMap<AssetId, LutEntry>,
     /// One diagnostic per still-unresolved LUT, surfaced onto the compiled frame.
     failures: Vec<CompileDiagnostic>,
@@ -940,7 +976,7 @@ struct LutCache {
 impl LutCache {
     /// (Re)parse every file-backed `Lut3d` asset in `project` whose path is not
     /// already cached, and rebuild the failure list. Off the per-frame path.
-    fn warm(&mut self, project: &TimelineProject) {
+    pub(crate) fn warm(&mut self, project: &TimelineProject) {
         self.failures.clear();
         for (id, asset) in &project.media.assets {
             if asset.kind != AssetKind::Lut3d {
@@ -949,23 +985,63 @@ impl LutCache {
             let AssetSource::File { path, .. } = &asset.source else {
                 continue;
             };
-            // Parse only when absent or the source path changed (relink) — reads
-            // never happen per frame.
+            // Hash the full source on each snapshot. A stable path does not
+            // imply stable LUT bytes, and the sampled media relink hash can
+            // miss changes in the middle of a `.cube` file. This remains off
+            // the per-frame path.
+            let source = std::fs::read(path).map_err(|error| error.to_string());
+            let actual_hash = source
+                .as_ref()
+                .ok()
+                .map(|bytes| crate::media::full_content_hash_bytes(bytes));
             let stale = self
                 .entries
                 .get(id)
-                .map(|e| &e.path != path)
+                .map(|e| {
+                    &e.path != path
+                        || e.pinned_hash != asset.lut_full_hash
+                        || e.color != asset.lut_color
+                        || e.actual_hash != actual_hash
+                })
                 .unwrap_or(true);
             if stale {
-                let table = std::fs::read_to_string(path)
-                    .ok()
-                    .and_then(|src| photonic_render::parse_cube(&src).ok())
-                    .map(Arc::new);
+                let parsed = source.and_then(|bytes| {
+                    if let Some(color) = &asset.lut_color {
+                        if let Err(legacy_error) = color.validate_for_legacy_grade() {
+                            color
+                                .validate_for_native_grade()
+                                .map_err(|_| legacy_error)?;
+                            if asset.lut_full_hash.is_none() {
+                                return Err(
+                                    "native LUT requires a full-file content hash pin".into()
+                                );
+                            }
+                        }
+                    }
+                    if let Some(expected) = &asset.lut_full_hash {
+                        if actual_hash.as_ref() != Some(expected) {
+                            return Err(format!(
+                                "content hash changed (expected {expected}, found {})",
+                                actual_hash.as_deref().unwrap_or("unavailable")
+                            ));
+                        }
+                    }
+                    let src = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+                    photonic_render::parse_cube(src).map_err(|error| error.to_string())
+                });
+                let (table, error) = match parsed {
+                    Ok(table) => (Some(Arc::new(table)), None),
+                    Err(error) => (None, Some(error)),
+                };
                 self.entries.insert(
                     *id,
                     LutEntry {
                         path: path.clone(),
+                        pinned_hash: asset.lut_full_hash.clone(),
+                        color: asset.lut_color.clone(),
+                        actual_hash,
                         table,
+                        error,
                     },
                 );
             }
@@ -975,11 +1051,17 @@ impl LutCache {
                 .and_then(|e| e.table.as_ref())
                 .is_none()
             {
+                let reason = self
+                    .entries
+                    .get(id)
+                    .and_then(|entry| entry.error.as_deref());
                 self.failures.push(CompileDiagnostic {
+                    grade: None,
                     message: format!(
-                        "LUT asset {id} could not be loaded from {}; the grade op \
+                        "LUT asset {id} could not be loaded from {}: {}; the grade op \
                          renders inert (identity)",
-                        path.display()
+                        path.display(),
+                        reason.unwrap_or("unknown error")
                     ),
                     graph: None,
                     node: None,
@@ -994,7 +1076,26 @@ impl LutCache {
 
 impl LutProvider for LutCache {
     fn lut(&self, asset: AssetId) -> Option<Arc<photonic_render::Lut3d>> {
-        self.entries.get(&asset).and_then(|e| e.table.clone())
+        let entry = self.entries.get(&asset)?;
+        if entry
+            .color
+            .as_ref()
+            .is_some_and(|color| color.validate_for_legacy_grade().is_err())
+        {
+            return None;
+        }
+        entry.table.clone()
+    }
+    fn native_lut(&self, asset: AssetId) -> Option<crate::graph::compile::NativeLutBinding> {
+        let entry = self.entries.get(&asset)?;
+        let space = entry.color.as_ref()?.validate_for_native_grade().ok()?;
+        if entry.pinned_hash.is_none() || entry.pinned_hash != entry.actual_hash {
+            return None;
+        }
+        Some(crate::graph::compile::NativeLutBinding {
+            table: entry.table.clone()?,
+            space,
+        })
     }
 }
 
@@ -1058,6 +1159,7 @@ struct EngineThread {
     adaptive_proxy: AdaptiveProxyPolicy,
     preview_target: PreviewTarget,
     preview_quality: PreviewQuality,
+    native_delivery: bool,
     /// Set when present requested a frame but eval produced none (24 §5).
     buffering: bool,
     last_error: Option<photonic_core::diag::Diagnostic>,
@@ -1160,6 +1262,7 @@ impl EngineThread {
             adaptive_proxy: AdaptiveProxyPolicy::new(),
             preview_target: PreviewTarget::default(),
             preview_quality: PreviewQuality::Draft,
+            native_delivery: false,
             buffering: false,
             last_error: None,
             scrubbing: false,
@@ -1481,6 +1584,10 @@ impl EngineThread {
             }
             EngineCmd::SetPreviewQuality(q) => {
                 self.preview_quality = q;
+                self.controller.request_present();
+            }
+            EngineCmd::SetNativeDelivery(delivery) => {
+                self.native_delivery = delivery;
                 self.controller.request_present();
             }
             EngineCmd::SetScopeTap(point) => {
@@ -2468,7 +2575,13 @@ impl EngineThread {
 
                 let (compiled, canvas, frame_time, preview_asset) = match &self.preview_target {
                     PreviewTarget::Asset { asset, source_time }
-                        if !self.controller.is_playing() =>
+                        if !self.controller.is_playing()
+                            && (seq.color.is_legacy()
+                                || project
+                                    .media
+                                    .assets
+                                    .get(asset)
+                                    .is_some_and(|source| source.native_input_color.is_some())) =>
                     {
                         let (fw, fh) = seq
                             .formats
@@ -2490,18 +2603,34 @@ impl EngineThread {
                         // Thread the pre-warmed LUT cache so `Grade` `Lut3d` ops
                         // resolve to real tables (K-0.5); parse-failure diagnostics
                         // ride along on the compiled frame.
-                        let mut compiled = compile_full(
-                            project.as_ref(),
-                            seq_id,
-                            format_index,
-                            t,
-                            quality,
-                            None,
-                            Some(&self.lut_cache),
-                            false,
-                            Some(&self.deflicker_gains),
-                            Some(&self.stabilization),
-                        );
+                        let mut compiled = if matches!(
+                            seq.color,
+                            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                        ) {
+                            crate::graph::compile::compile_native_live_with_luts(
+                                project.as_ref(),
+                                seq_id,
+                                format_index,
+                                t,
+                                quality,
+                                self.native_delivery,
+                                &self.media.native_source_errors,
+                                &self.lut_cache,
+                            )
+                        } else {
+                            compile_full(
+                                project.as_ref(),
+                                seq_id,
+                                format_index,
+                                t,
+                                quality,
+                                None,
+                                Some(&self.lut_cache),
+                                false,
+                                Some(&self.deflicker_gains),
+                                Some(&self.stabilization),
+                            )
+                        };
                         compiled
                             .diagnostics
                             .extend(self.lut_cache.failures.iter().cloned());
@@ -2543,6 +2672,10 @@ impl EngineThread {
                 };
                 self.media.begin_frame();
                 let cached = if self.controller.is_playing()
+                    && !matches!(
+                        seq.color,
+                        photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                    )
                     && self.preview_quality == PreviewQuality::Full
                     && self.proxy_mode == ProxyMode::ForceOriginal
                     && self.inspection_request_id.is_none()
@@ -2602,7 +2735,28 @@ impl EngineThread {
                 };
                 let evaluation_missed = frame_tex.is_none();
                 if let Some(texture) = frame_tex {
+                    let output_encoding = compiled.graph.output_color_encoding();
+                    let scope_tap_encoding = tap_node
+                        .map(|id| compiled.graph.node_color_encoding(id))
+                        .transpose();
                     self.frame_out.store(Some(Arc::new(EngineFrame {
+                        output_encoding: output_encoding
+                            .unwrap_or(crate::graph::ir::FrameColorEncoding::SceneLinearAcescg),
+                        scope_tap_encoding: scope_tap_encoding.as_ref().ok().copied().flatten(),
+                        color_errors: compiled.diagnostics.iter()
+                            .filter(|d| d.code == Some(crate::graph::compile::CompileCode::ColorPipelineUnavailable))
+                            .map(|d| d.message.clone())
+                            .chain(output_encoding.err().map(str::to_owned))
+                            .chain(scope_tap_encoding.err().map(str::to_owned))
+                            .collect(),
+                        grading_errors: compiled
+                            .diagnostics
+                            .iter()
+                            .filter(|d| {
+                                d.code == Some(crate::graph::compile::CompileCode::GradeUnresolved)
+                            })
+                            .filter_map(|d| d.grade.clone())
+                            .collect(),
                         cached_preview,
                         inspection_request_id: self.inspection_request_id,
                         content_hash: compiled
@@ -2621,6 +2775,12 @@ impl EngineThread {
                         preview_asset,
                         scope_tap: tap_tex,
                         scope_tap_point: tap_point,
+                        clip_grade_inspections: compiled.clip_grade_inspections.clone(),
+                        native_qualifier_inspections: compiled.native_qualifier_inspections.clone(),
+                        native_curve_inputs: compiled.native_curve_inputs.clone(),
+                        native_graph_qualifier_inspections: compiled.native_graph_qualifier_inspections.clone(),
+                        native_graph_curve_inputs: compiled.native_graph_curve_inputs.clone(),
+                        native_graph_mattes: compiled.native_graph_mattes.clone(),
                         compare_clean,
                     })));
                     self.frames_published = self.frames_published.saturating_add(1);
@@ -2834,7 +2994,25 @@ impl EngineThread {
                 .wrapping_mul(0x9E37_79B9)
                 .wrapping_add(match self.scope_tap {
                     ScopeTapPoint::Program => 0,
+                    ScopeTapPoint::GradeGraphMatteOutput { clip, node } => 7 ^ (clip.0.as_u128() as u64) ^ (node as u64).rotate_left(17),
                     ScopeTapPoint::Clip(id) => 1 ^ (id.0.as_u128() as u64),
+                    ScopeTapPoint::ClipPreGrade(id) => 2 ^ (id.0.as_u128() as u64),
+                    ScopeTapPoint::NativeQualifierInput { clip, op } => {
+                        3 ^ (clip.0.as_u128() as u64) ^ (op.0.as_u128() as u64).rotate_left(17)
+                    }
+                    ScopeTapPoint::NativeGraphQualifierInput { clip, node, op } => {
+                        5 ^ (clip.0.as_u128() as u64)
+                            ^ (node as u64).rotate_left(17)
+                            ^ (op.0.as_u128() as u64).rotate_left(31)
+                    }
+                    ScopeTapPoint::NativeGraphCurveInput { clip, node, op } => {
+                        6 ^ (clip.0.as_u128() as u64)
+                            ^ (node as u64).rotate_left(17)
+                            ^ (op.0.as_u128() as u64).rotate_left(31)
+                    }
+                    ScopeTapPoint::NativeCurveInput { clip, op } => {
+                        4 ^ (clip.0.as_u128() as u64) ^ (op.0.as_u128() as u64).rotate_left(17)
+                    }
                 });
             h
         };
@@ -3010,9 +3188,38 @@ struct VideoSourceEntry {
     /// which drops the last `DecodeSource` handle and kills the sidecar.
     worker: DecodeWorker,
     colorimetry: Colorimetry,
+    /// Fresh ffprobe layout used to choose this worker's decode planes.
+    pixel_format: Option<String>,
+    /// File identity at decoder open. A replacement must not keep serving
+    /// buffered frames under the old project's native source interpretation.
+    file_identity: Option<SourceFileIdentity>,
     rate: FrameRate,
     /// Monotonic use-stamp for LRU eviction (bumped on every steer/read).
     last_used: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceFileIdentity {
+    len: u64,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn source_file_identity(path: &std::path::Path) -> Option<SourceFileIdentity> {
+    let metadata = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    Some(SourceFileIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok()?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
 }
 
 /// Resolves `DecodeVideo` ops to working textures over per-asset ffmpeg
@@ -3027,6 +3234,9 @@ struct MediaSources {
     /// `None` value = open failed; don't re-probe every frame (an
     /// `InvalidateRange` clears the entry and allows a retry).
     sources: HashMap<VideoSourceKey, Option<VideoSourceEntry>>,
+    /// Native-managed source mismatches discovered by the decode worker. The
+    /// next compile turns these into a coded, transparent error frame.
+    native_source_errors: HashMap<AssetId, String>,
     /// Sources whose expensive open (ffprobe + keyframe/pts index build, each a
     /// subprocess) is running on a background thread, so the engine present loop
     /// never stalls on a cold source. `drain_pending` promotes the completed
@@ -3183,8 +3393,10 @@ const VECTOR_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SOURCE_BUILDS: usize = 2;
 
 const MAX_RASTER_JOBS: usize = 2;
-/// Maximum combined native RGBA and packed output bytes of one raster job.
-const RASTER_JOB_BYTES: u64 = 128 * 1024 * 1024;
+/// Maximum estimated decoded, converted and packed bytes of one raster job.
+/// 256 MiB admits a full-resolution 4K RGBA16 still (decoded/converted/f16)
+/// while the two-job limit bounds concurrent raster work.
+const RASTER_JOB_BYTES: u64 = 256 * 1024 * 1024;
 const RASTER_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
 #[derive(Clone, Copy, Eq, PartialEq, Hash)]
 enum RasterKey {
@@ -3222,15 +3434,35 @@ fn prepare_raster(
                 .into_dimensions()
                 .ok()?;
             let target = still_target_size(native, requested);
-            let needed = u64::from(native.0) * u64::from(native.1) * 4
-                + u64::from(target.0) * u64::from(target.1) * 8;
+            let native_pixels = u64::from(native.0).saturating_mul(u64::from(native.1));
+            let target_pixels = u64::from(target.0).saturating_mul(u64::from(target.1));
+            let needed = native_pixels
+                .saturating_mul(12)
+                .saturating_add(target_pixels.saturating_mul(8));
             if needed > RASTER_JOB_BYTES {
                 return None;
             }
             let mut limits = image::Limits::default();
             limits.max_alloc = Some(RASTER_JOB_BYTES);
             reader.limits(limits);
-            let rgba = reader.decode().ok()?.into_rgba8();
+            let decoded = reader.decode().ok()?;
+            if matches!(
+                &decoded,
+                image::DynamicImage::ImageLuma16(_)
+                    | image::DynamicImage::ImageLumaA16(_)
+                    | image::DynamicImage::ImageRgb16(_)
+                    | image::DynamicImage::ImageRgba16(_)
+            ) {
+                let needed = native_pixels
+                    .saturating_mul(16)
+                    .saturating_add(target_pixels.saturating_mul(8));
+                if needed > RASTER_JOB_BYTES {
+                    return None;
+                }
+                let rgba = decoded.into_rgba16();
+                return Some(prepare_pixels_u16(&rgba.into_raw(), native, target));
+            }
+            let rgba = decoded.into_rgba8();
             let image =
                 photonic_core::RasterImage::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
                     .ok()?;
@@ -3268,6 +3500,22 @@ fn prepare_pixels(image: &photonic_core::RasterImage, width: u32, height: u32) -
     });
     PreparedRaster {
         native: (image.width, image.height),
+        width,
+        height,
+        texels,
+    }
+}
+
+fn prepare_pixels_u16(pixels: &[u16], native: (u32, u32), requested: (u32, u32)) -> PreparedRaster {
+    let (width, height) = still_target_size(native, requested);
+    let mut texels = Vec::with_capacity(width as usize * height as usize * 8);
+    resample_linear_premult_u16(pixels, native.0, native.1, width, height, |pixel| {
+        for channel in pixel {
+            texels.extend_from_slice(&f32_to_f16_bits(channel).to_le_bytes());
+        }
+    });
+    PreparedRaster {
+        native,
         width,
         height,
         texels,
@@ -3313,12 +3561,10 @@ const VECTOR_CACHE_CAP: usize = 16;
 
 /// Assets whose decoded bytes could differ between two project snapshots.
 ///
-/// Exactly three things change what an asset decodes to: its source (a relink),
-/// its content hash (the bytes behind an unchanged path changed), and its proxy
-/// (attach, detach, or a re-transcode, since the engine decodes the proxy when
-/// one is ready). Everything else on `MediaAsset` — name, bin, rating, tags,
-/// probe — is metadata, and evicting a warm decode source because someone
-/// starred a clip would be a real performance regression.
+/// Source, content hash and proxy changes alter decoded bytes. A changed probed
+/// pixel format also reopens the decoder: native grading compares its fresh
+/// probe with this stored layout, and a repaired import must retry a failed
+/// open. Other asset metadata (name, rating, tags) leaves warm sources intact.
 ///
 /// An asset that is new in `new` is not reported: nothing is cached under an id
 /// that has never been requested. An asset that disappeared is not reported
@@ -3332,7 +3578,17 @@ fn changed_media_identities(old: &TimelineProject, new: &TimelineProject) -> Has
         };
         if old_asset.source != new_asset.source
             || old_asset.content_hash != new_asset.content_hash
+            || old_asset.lut_full_hash != new_asset.lut_full_hash
+            || old_asset.lut_color != new_asset.lut_color
             || old_asset.proxy != new_asset.proxy
+            || old_asset
+                .probe
+                .as_ref()
+                .and_then(|probe| probe.pixel_format.as_deref())
+                != new_asset
+                    .probe
+                    .as_ref()
+                    .and_then(|probe| probe.pixel_format.as_deref())
         {
             changed.insert(*id);
         }
@@ -3346,6 +3602,7 @@ impl MediaSources {
             tools,
             project: None,
             sources: HashMap::new(),
+            native_source_errors: HashMap::new(),
             pending: HashMap::new(),
             source_builds: Arc::new(AtomicU64::new(0)),
             upload_aliases: HashMap::new(),
@@ -3394,6 +3651,27 @@ impl MediaSources {
             self.invalidate_assets(&changed);
         }
         self.project = Some(project);
+        self.native_source_errors.clear();
+        if let Some(project) = self.project.as_ref() {
+            for ((asset, proxy), entry) in &self.sources {
+                if *proxy {
+                    continue;
+                }
+                let Some(entry) = entry else { continue };
+                if let Some(error) = native_source_format_error(
+                    *asset,
+                    project
+                        .media
+                        .assets
+                        .get(asset)
+                        .and_then(|media| media.probe.as_ref())
+                        .and_then(|probe| probe.pixel_format.as_deref()),
+                    entry.pixel_format.as_deref(),
+                ) {
+                    self.native_source_errors.insert(*asset, error);
+                }
+            }
+        }
     }
 
     fn set_playing(&mut self, playing: bool) {
@@ -3544,6 +3822,8 @@ impl MediaSources {
             return;
         }
         self.sources.retain(|(asset, _), _| !assets.contains(asset));
+        self.native_source_errors
+            .retain(|asset, _| !assets.contains(asset));
         self.pending.retain(|(asset, _), _| !assets.contains(asset));
         self.uploads.remove_assets(assets);
         self.upload_aliases
@@ -3799,6 +4079,7 @@ impl MediaSources {
 /// `MediaSources::ensure_source`). GPU-free: the first frame's upload happens
 /// later in `video_texture` with the shared `GpuContext`.
 fn build_source_entry(tools: FfmpegTools, path: std::path::PathBuf) -> Option<VideoSourceEntry> {
+    let file_identity = source_file_identity(&path);
     let details = probe_details(&tools, &path).ok()?;
     let video = details.probe.video.clone()?;
     let keyframes = KeyframeIndex::build(&tools, &path).ok()?;
@@ -3811,7 +4092,7 @@ fn build_source_entry(tools: FfmpegTools, path: std::path::PathBuf) -> Option<Vi
         input: path,
         width: video.width,
         height: video.height,
-        pix_fmt: PixFmt::for_alpha(details.has_alpha),
+        pix_fmt: PixFmt::for_source(details.pixel_format.as_deref(), details.has_alpha),
         pts_kind,
         keyframes,
     };
@@ -3822,39 +4103,54 @@ fn build_source_entry(tools: FfmpegTools, path: std::path::PathBuf) -> Option<Vi
         ring,
         worker,
         colorimetry: colorimetry_for_probe(&details),
+        pixel_format: details.pixel_format,
+        file_identity,
         rate: video.frame_rate,
         last_used: 0,
     })
 }
 
-impl GpuFrameSource for MediaSources {
-    fn cache_namespace(&self) -> u64 {
-        let document = if self.document.is_some() {
-            self.raster_epoch
-                .load(Ordering::Acquire)
-                .wrapping_add(1)
-                .wrapping_mul(0x9e3779b97f4a7c15)
-        } else {
-            0
-        };
-        if self.scrubbing {
-            document ^ self.use_counter.wrapping_add(1).max(1)
-        } else {
-            document
-        }
+fn native_source_format_error(
+    asset: AssetId,
+    stored: Option<&str>,
+    current: Option<&str>,
+) -> Option<String> {
+    match (stored, current) {
+        (Some(stored), Some(current)) if stored.eq_ignore_ascii_case(current) => None,
+        (Some(stored), Some(current)) => Some(format!(
+            "native source {asset} pixel format changed after import: project records {stored}, current file reports {current}; re-probe or relink before grading"
+        )),
+        (_, None) => Some(format!(
+            "native source {asset} has no pixel format in its current file probe"
+        )),
+        (None, Some(_)) => Some(format!(
+            "native source {asset} has no stored pixel format; re-probe before grading"
+        )),
     }
-    fn video_texture(
+}
+
+impl MediaSources {
+    fn video_texture_with_input(
         &mut self,
         gpu: &GpuContext,
         asset: AssetId,
         src_time: Tick,
         proxy: bool,
+        native_input: Option<&photonic_core::timeline::color::NativeInputColorInterpretation>,
     ) -> Option<GpuFrame> {
         self.sources_requested += 1;
         self.drain_pending();
+        let stored_format = native_input.and_then(|_| {
+            self.project
+                .as_ref()
+                .and_then(|project| project.media.assets.get(&asset))
+                .and_then(|media| media.probe.as_ref())
+                .and_then(|probe| probe.pixel_format.clone())
+        });
         let input = self.resolve_video_input(asset, proxy)?;
+        let source_path = native_input.map(|_| input.path.clone());
         let requested_key = (asset, src_time, input.key.1);
-        if !self.scrubbing {
+        if native_input.is_none() && !self.scrubbing {
             if let Some(key) = self.upload_aliases.get(&requested_key) {
                 if let Some(frame) = self.uploads.get(key, self.use_counter) {
                     self.sources_ready += 1;
@@ -3870,8 +4166,40 @@ impl GpuFrameSource for MediaSources {
         // A source still building in the background reads as absent here → the
         // caller composites transparent / holds the last frame for a few presents
         // until `drain_pending` promotes it. No engine-thread stall.
-        let entry = self.sources.get_mut(&source_key)?.as_mut()?;
+        let entry = match self.sources.get_mut(&source_key) {
+            Some(Some(entry)) => entry,
+            Some(None) => {
+                if native_input.is_some() {
+                    self.native_source_errors.insert(
+                        asset,
+                        format!("native source {asset} could not be probed or opened; re-probe or relink before grading"),
+                    );
+                }
+                return None;
+            }
+            None => return None,
+        };
         entry.last_used = stamp;
+        if native_input.is_some() {
+            if entry.file_identity.is_none()
+                || source_path.as_deref().and_then(source_file_identity) != entry.file_identity
+            {
+                self.native_source_errors.insert(
+                    asset,
+                    format!("native source {asset} changed or became unavailable after decoder open; re-probe or relink before grading"),
+                );
+                return None;
+            }
+            if let Some(error) = native_source_format_error(
+                asset,
+                stored_format.as_deref(),
+                entry.pixel_format.as_deref(),
+            ) {
+                self.native_source_errors.insert(asset, error);
+                return None;
+            }
+            self.native_source_errors.remove(&asset);
+        }
         let colorimetry = entry.colorimetry;
 
         // Steer the background decode worker off the engine thread (decode ∥
@@ -3913,6 +4241,34 @@ impl GpuFrameSource for MediaSources {
         };
         saturating_increment(&RING_HITS);
 
+        if let Some(native_input) = native_input {
+            let converter = self
+                .converter
+                .get_or_insert_with(|| YuvConverter::new(gpu.device()));
+            let (width, height) = frame.planes.dims();
+            let bucket = crate::graph::ir::TextureDesc { width, height }.bucket();
+            let converted = crate::color::convert_native_decoded_frame_to_size(
+                gpu.device(),
+                gpu.queue(),
+                converter,
+                &frame,
+                native_input,
+                bucket,
+            );
+            let converted = match converted {
+                Ok(texture) => texture,
+                Err(error) => {
+                    self.native_source_errors.insert(
+                        asset,
+                        format!("native source {asset} conversion failed: {error}"),
+                    );
+                    return None;
+                }
+            };
+            self.sources_ready += 1;
+            return Some(GpuFrame::new(Arc::new(converted), width, height));
+        }
+
         // Upload (cached by decoded pts) and record as the new last-good frame.
         let key = (asset, frame.pts, source_key.1);
         let texture = if let Some(cached) = self.uploads.get(&key, stamp) {
@@ -3946,6 +4302,61 @@ impl GpuFrameSource for MediaSources {
         }
         self.sources_ready += 1;
         Some(texture)
+    }
+}
+
+impl GpuFrameSource for MediaSources {
+    fn cache_namespace(&self) -> u64 {
+        let document = if self.document.is_some() {
+            self.raster_epoch
+                .load(Ordering::Acquire)
+                .wrapping_add(1)
+                .wrapping_mul(0x9e3779b97f4a7c15)
+        } else {
+            0
+        };
+        if self.scrubbing {
+            document ^ self.use_counter.wrapping_add(1).max(1)
+        } else {
+            document
+        }
+    }
+    fn video_texture(
+        &mut self,
+        gpu: &GpuContext,
+        asset: AssetId,
+        src_time: Tick,
+        proxy: bool,
+    ) -> Option<GpuFrame> {
+        self.video_texture_with_input(gpu, asset, src_time, proxy, None)
+    }
+
+    fn native_video_texture(
+        &mut self,
+        gpu: &GpuContext,
+        asset: AssetId,
+        src_time: Tick,
+        input: &photonic_core::timeline::color::NativeInputColorInterpretation,
+    ) -> Option<GpuFrame> {
+        self.video_texture_with_input(gpu, asset, src_time, false, Some(input))
+    }
+
+    fn native_still_texture(
+        &mut self,
+        gpu: &GpuContext,
+        asset: AssetId,
+        w: u32,
+        h: u32,
+    ) -> Option<GpuFrame> {
+        let media = self.project.as_ref()?.media.assets.get(&asset)?;
+        let AssetSource::File { path, .. } = &media.source else {
+            return None;
+        };
+        if let Err(error) = crate::color::validate_native_still_file(path) {
+            self.native_source_errors.insert(asset, error);
+            return None;
+        }
+        self.still_texture(gpu, asset, w, h)
     }
 
     fn still_texture(
@@ -4512,6 +4923,579 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_session_source_interpretation_does_not_reuse_legacy_upload() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+        };
+        use photonic_core::timeline::{AssetKind, MediaAsset};
+        let Some(tools) = crate::media::ffmpeg_locate::locate_for_test() else {
+            return;
+        };
+        let Some(gpu) = GpuContext::request_blocking() else {
+            return;
+        };
+        let path =
+            std::env::temp_dir().join(format!("photonic-native-source-{}.mkv", AssetId::new()));
+        let generated = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=16x16:rate=1:duration=2",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                "-y",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(generated.success());
+        let input709 = NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        };
+        let mut asset = MediaAsset::from_file(AssetKind::Video, path.clone());
+        asset.native_input_color = Some(input709.clone());
+        asset.probe = Some(crate::media::probe::probe_asset(&tools, &path).unwrap());
+        let asset_id = asset.id;
+        let mut project = TimelineProject::new();
+        project.media.assets.insert(asset_id, asset);
+        let mut media = MediaSources::new(Some(tools.clone()));
+        media.set_project(Arc::new(project.clone()));
+        let input2020 = NativeInputColorInterpretation {
+            standard: NativeInputStandard::Bt2020Scene,
+            matrix: InputMatrix::Bt2020NonConstant,
+            ..input709.clone()
+        };
+        let wait_native = |media: &mut MediaSources, input: &NativeInputColorInterpretation| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(frame) = media.native_video_texture(&gpu, asset_id, Tick::ZERO, input) {
+                    break frame;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native source frame did not decode"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let first = wait_native(&mut media, &input709);
+        let mut invalid_input = input709.clone();
+        invalid_input.range = InputSignalRange::FromMetadata;
+        assert!(media
+            .native_video_texture(&gpu, asset_id, Tick::ZERO, &invalid_input)
+            .is_none());
+        assert!(media.native_source_errors[&asset_id].contains("conversion failed"));
+        let second = wait_native(&mut media, &input2020);
+        assert!(!media.native_source_errors.contains_key(&asset_id));
+        let a = crate::graph::eval::read_texture_rgba16f(&gpu, &first.texture, 16, 16);
+        let b = crate::graph::eval::read_texture_rgba16f(&gpu, &second.texture, 16, 16);
+        assert!(a.iter().zip(&b).any(|(left, right)| {
+            (0..3).any(|channel| (left[channel] - right[channel]).abs() > 0.02)
+        }));
+        assert!(
+            media.upload_aliases.is_empty(),
+            "native frames must not alias legacy uploads"
+        );
+        use crate::graph::ir::{
+            ContentHash, FrameColorEncoding, FrameGraph, IrNode, IrNodeId, IrOp, OutPort,
+            WorkingColorDomain,
+        };
+        let graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::NativeDecodeVideo {
+                        asset: asset_id,
+                        src_time: Tick::ZERO,
+                        input: input709.clone(),
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: IrOp::NativeSdrOutput,
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(2),
+                },
+            ],
+            output: Some(IrNodeId(1)),
+        };
+        assert_eq!(
+            graph.output_color_encoding(),
+            Ok(FrameColorEncoding::SrgbDisplay)
+        );
+        let displayed = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate(&graph, (16, 16), &mut media)
+            .expect("native source and output graph should render");
+        let display_pixel = crate::graph::eval::read_texture_rgba16f(&gpu, &displayed, 16, 16)[0];
+        let expected = crate::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_premultiplied(a[0].map(f64::from))
+            .unwrap();
+        for channel in 0..4 {
+            assert!((f64::from(display_pixel[channel]) - expected[channel]).abs() < 0.01);
+        }
+        let peek = crate::graph::compile::compile_asset_peek(
+            &project,
+            asset_id,
+            Tick::ZERO,
+            crate::graph::compile::Quality::FULL,
+            16,
+            16,
+        );
+        assert!(peek.diagnostics.is_empty());
+        assert_eq!(
+            peek.graph.output_color_encoding(),
+            Ok(FrameColorEncoding::SrgbDisplay)
+        );
+        let peek_texture = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate(&peek.graph, (16, 16), &mut media)
+            .expect("compiled native source peek should render");
+        let peek_pixel = crate::graph::eval::read_texture_rgba16f(&gpu, &peek_texture, 16, 16)[0];
+        for channel in 0..4 {
+            assert!((peek_pixel[channel] - display_pixel[channel]).abs() < 0.01);
+        }
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Grade, GradeOp, GradeOpKind, GradeOpParams, Sequence,
+            Track, TrackKind,
+        };
+        let mut seq = Sequence::new("native preview", FrameRate::FPS_30, 16, 16);
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let seq_id = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: asset_id },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        let timeline = crate::graph::compile::compile_native_preview(
+            &project,
+            seq_id,
+            0,
+            Tick::ZERO,
+            crate::graph::compile::Quality::FULL,
+        );
+        assert!(
+            !timeline.diagnostics.iter().any(|diagnostic| diagnostic.severity == crate::graph::compile::DiagSeverity::Error),
+            "{:?}",
+            timeline.diagnostics
+        );
+        let timeline_texture = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate(&timeline.graph, (16, 16), &mut media)
+            .expect("native sequence preview should render");
+        let timeline_pixel =
+            crate::graph::eval::read_texture_rgba16f(&gpu, &timeline_texture, 16, 16)[0];
+        let scene = a[0].map(f64::from);
+        let expected_timeline = crate::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_premultiplied([scene[0] * 2.0, scene[1] * 2.0, scene[2] * 2.0, scene[3]])
+            .unwrap();
+        for channel in 0..4 {
+            assert!((f64::from(timeline_pixel[channel]) - expected_timeline[channel]).abs() < 0.01);
+        }
+        project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0]
+            .transform
+            .base
+            .x = 2.0;
+        let moved = crate::graph::compile::compile_native_preview(
+            &project,
+            seq_id,
+            0,
+            Tick::ZERO,
+            crate::graph::compile::Quality::FULL,
+        );
+        assert!(
+            !moved.diagnostics.iter().any(|diagnostic| diagnostic.severity == crate::graph::compile::DiagSeverity::Error),
+            "{:?}",
+            moved.diagnostics
+        );
+        let moved_texture = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate(&moved.graph, (16, 16), &mut media)
+            .expect("translated native sequence preview should render");
+        let moved_pixels = crate::graph::eval::read_texture_rgba16f(&gpu, &moved_texture, 16, 16);
+        // The existing Transform2D sampler clamps at image edges, so a
+        // uniform source remains uniform after translation.
+        for channel in 0..4 {
+            assert!(
+                (f64::from(moved_pixels[4][channel]) - expected_timeline[channel]).abs() < 0.01
+            );
+        }
+        let replacement = path.with_extension("replacement.mkv");
+        std::fs::copy(&path, &replacement).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(media
+            .native_video_texture(&gpu, asset_id, Tick::ZERO, &input709)
+            .is_none());
+        assert!(media.native_source_errors[&asset_id].contains("changed or became unavailable"));
+        media.invalidate_assets(&HashSet::from([asset_id]));
+        let engine = VideoEngine::new(gpu.clone());
+        let document = Arc::new(Mutex::new(Document::new("native preview", 16.0, 16.0)));
+        let history = Arc::new(Mutex::new(CommandHistory::new(1)));
+        let session = engine.open_session(document, history);
+        session.publish_snapshot(RenderSnapshot {
+            revision: 0,
+            project: Some(Arc::new(project.clone())),
+            document: None,
+        });
+        session.send(EngineCmd::SetActiveSequence(seq_id));
+        session.send(EngineCmd::Seek(Tick::ZERO));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let displayed_frame = loop {
+            if let Some(frame) = session.latest_frame() {
+                if frame.sequence == seq_id
+                    && frame.output_encoding == FrameColorEncoding::SrgbDisplay
+                    && frame.color_errors.is_empty()
+                {
+                    break frame;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not publish the managed display preview"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        session.send(EngineCmd::SetNativeDelivery(true));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = session.latest_frame() {
+                if !Arc::ptr_eq(&frame, &displayed_frame)
+                    && frame.sequence == seq_id
+                    && frame.output_encoding == FrameColorEncoding::Bt709Video
+                    && frame.color_errors.is_empty()
+                {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not publish native delivery output"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut changed_probe_project = project.clone();
+        changed_probe_project
+            .media
+            .assets
+            .get_mut(&asset_id)
+            .unwrap()
+            .probe
+            .as_mut()
+            .unwrap()
+            .pixel_format = Some("yuv444p10le".into());
+        let changed_probe_generation = session.publish_snapshot(RenderSnapshot {
+            revision: 1,
+            project: Some(Arc::new(changed_probe_project)),
+            document: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = session.latest_frame() {
+                if frame.snapshot_generation == changed_probe_generation && frame.sequence == seq_id
+                {
+                    assert!(
+                        frame
+                            .color_errors
+                            .iter()
+                            .any(|error| error.contains("pixel format changed after import")),
+                        "{:?}",
+                        frame.color_errors
+                    );
+                    assert_eq!(
+                        frame.output_encoding,
+                        FrameColorEncoding::LegacyLinearRec709
+                    );
+                    let blank =
+                        crate::graph::eval::read_texture_rgba16f(&gpu, &frame.texture, 16, 16);
+                    assert!(blank.iter().all(|pixel| pixel[3] == 0.0));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not report changed native source format"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let repaired_generation = session.publish_snapshot(RenderSnapshot {
+            revision: 2,
+            project: Some(Arc::new(project.clone())),
+            document: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = session.latest_frame() {
+                if frame.snapshot_generation == repaired_generation
+                    && frame.sequence == seq_id
+                    && frame.output_encoding == FrameColorEncoding::Bt709Video
+                    && frame.color_errors.is_empty()
+                {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "re-probed native source did not recover"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut rejected_project = project.clone();
+        rejected_project
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks[0]
+            .blend = photonic_core::layer::BlendMode::Multiply;
+        let rejected_generation = session.publish_snapshot(RenderSnapshot {
+            revision: 3,
+            project: Some(Arc::new(rejected_project)),
+            document: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = session.latest_frame() {
+                if frame.snapshot_generation == rejected_generation && frame.sequence == seq_id {
+                    assert!(!frame.color_errors.is_empty());
+                    assert_eq!(
+                        frame.output_encoding,
+                        FrameColorEncoding::LegacyLinearRec709
+                    );
+                    let blank =
+                        crate::graph::eval::read_texture_rgba16f(&gpu, &frame.texture, 16, 16);
+                    assert!(blank.iter().all(|pixel| pixel[3] == 0.0));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not publish the rejected managed frame"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        session.send(EngineCmd::SetNativeDelivery(false));
+        let mut offline_project = project.clone();
+        offline_project
+            .media
+            .assets
+            .get_mut(&asset_id)
+            .unwrap()
+            .source = photonic_core::timeline::AssetSource::File {
+            path: std::env::temp_dir()
+                .join(format!("photonic-native-offline-{}", uuid::Uuid::new_v4())),
+            rel_path: None,
+        };
+        let offline_generation = session.publish_snapshot(RenderSnapshot {
+            revision: 4,
+            project: Some(Arc::new(offline_project)),
+            document: None,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = session.latest_frame() {
+                if frame.snapshot_generation == offline_generation && frame.sequence == seq_id {
+                    assert!(frame
+                        .color_errors
+                        .iter()
+                        .any(|error| error.contains("offline")));
+                    assert_eq!(
+                        frame.output_encoding,
+                        FrameColorEncoding::LegacyLinearRec709
+                    );
+                    let blank =
+                        crate::graph::eval::read_texture_rgba16f(&gpu, &frame.texture, 16, 16);
+                    assert!(blank.iter().all(|pixel| pixel[3] == 0.0));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not report offline native preview"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(session);
+        let canvas_peek = crate::graph::compile::compile_asset_peek(
+            &project,
+            asset_id,
+            Tick::ZERO,
+            crate::graph::compile::Quality::FULL,
+            32,
+            18,
+        );
+        let canvas_frame = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate_with_tap_frame(&canvas_peek.graph, (32, 18), &mut media, None)
+            .0
+            .expect("native source peek should fit its monitor canvas");
+        assert_eq!((canvas_frame.width, canvas_frame.height), (32, 18));
+        let mut video_graph = graph.clone();
+        video_graph.nodes[1].op = IrOp::NativeSdrVideoOutput;
+        video_graph.nodes[1].content_hash = ContentHash(3);
+        assert_eq!(
+            video_graph.output_color_encoding(),
+            Ok(FrameColorEncoding::Bt709Video)
+        );
+        let video = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate(&video_graph, (16, 16), &mut media)
+            .expect("native source and video output graph should render");
+        let video_pixel = crate::graph::eval::read_texture_rgba16f(&gpu, &video, 16, 16)[0];
+        let expected_video = crate::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_premultiplied_video(a[0].map(f64::from))
+            .unwrap();
+        for channel in 0..4 {
+            assert!((f64::from(video_pixel[channel]) - expected_video[channel]).abs() < 0.01);
+        }
+        let delivery = crate::graph::compile::compile_native_delivery(
+            &project,
+            seq_id,
+            0,
+            Tick::ZERO,
+            crate::graph::compile::Quality::FULL,
+        );
+        assert!(
+            !delivery.diagnostics.iter().any(|diagnostic| diagnostic.severity == crate::graph::compile::DiagSeverity::Error),
+            "{:?}",
+            delivery.diagnostics
+        );
+        assert_eq!(
+            delivery.graph.output_color_encoding(),
+            Ok(FrameColorEncoding::Bt709Video)
+        );
+        let delivery_texture = crate::graph::eval::Evaluator::new(gpu.clone())
+            .evaluate(&delivery.graph, (16, 16), &mut media)
+            .expect("native delivery graph should render");
+        let delivery_pixel =
+            crate::graph::eval::read_texture_rgba16f(&gpu, &delivery_texture, 16, 16)[4];
+        let scene = a[0].map(f64::from);
+        let expected_delivery = crate::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_premultiplied_video([scene[0] * 2.0, scene[1] * 2.0, scene[2] * 2.0, scene[3]])
+            .unwrap();
+        for channel in 0..4 {
+            assert!((f64::from(delivery_pixel[channel]) - expected_delivery[channel]).abs() < 0.01);
+        }
+        let video_pixels = crate::graph::eval::read_texture_rgba16f(&gpu, &video, 16, 16);
+        let video_flat: Vec<f32> = video_pixels.into_iter().flatten().collect();
+        let planes = crate::export::convert::video_signal_frame_to_yuv422p10(
+            &video_flat,
+            16,
+            16,
+            photonic_render::color::Colorimetry::BT709_LIMITED,
+        );
+        let crate::export::convert::EncodePlanes::Yuv422P10 { y, cb, cr, .. } = planes else {
+            panic!("expected 10-bit video planes");
+        };
+        let reconstructed = crate::color::native::decode_ycbcr_codes(
+            [
+                u16::from_le_bytes([y[0], y[1]]),
+                u16::from_le_bytes([cb[0], cb[1]]),
+                u16::from_le_bytes([cr[0], cr[1]]),
+            ],
+            10,
+            true,
+            crate::color::native::YcbcrMatrix::Bt709,
+        )
+        .unwrap()
+        .map(crate::color::native::decode_bt709_source);
+        let source_straight = [a[0][0], a[0][1], a[0][2]].map(|value| f64::from(value / a[0][3]));
+        let expected_linear = crate::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_straight_linear(source_straight)
+            .unwrap();
+        for channel in 0..3 {
+            assert!((reconstructed[channel] - expected_linear[channel]).abs() < 0.02);
+        }
+        drop(media);
+        let changed_source = path.with_extension("changed.mkv");
+        let generated = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:size=16x16:rate=1:duration=2",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv422p",
+                "-y",
+            ])
+            .arg(&changed_source)
+            .status()
+            .unwrap();
+        assert!(generated.success());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&changed_source, &path).unwrap();
+        let replacement_engine = VideoEngine::new(gpu.clone());
+        let replacement_session = replacement_engine.open_session(
+            Arc::new(Mutex::new(Document::new(
+                "replaced native source",
+                16.0,
+                16.0,
+            ))),
+            Arc::new(Mutex::new(CommandHistory::new(1))),
+        );
+        replacement_session.publish_snapshot(RenderSnapshot {
+            revision: 0,
+            project: Some(Arc::new(project)),
+            document: None,
+        });
+        replacement_session.send(EngineCmd::SetActiveSequence(seq_id));
+        replacement_session.send(EngineCmd::Seek(Tick::ZERO));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = replacement_session.latest_frame() {
+                if frame.sequence == seq_id
+                    && frame.color_errors.iter().any(|error| {
+                        error.contains("project records yuv444p")
+                            && error.contains("current file reports yuv422p")
+                    })
+                {
+                    assert_eq!(
+                        frame.output_encoding,
+                        FrameColorEncoding::LegacyLinearRec709
+                    );
+                    let blank =
+                        crate::graph::eval::read_texture_rgba16f(&gpu, &frame.texture, 16, 16);
+                    assert!(blank.iter().all(|pixel| pixel[3] == 0.0));
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "engine did not report replaced native source layout"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(replacement_session);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn live_feeder_applies_mixer_edits_and_publishes_track_levels_without_device() {
         use photonic_core::timeline::{AssetKind, MediaAsset, MediaProbe};
         let Some(tools) = crate::media::ffmpeg_locate::locate_for_test() else {
@@ -4908,6 +5892,41 @@ mod tests {
         assert_eq!(f32_to_f16_bits(af), 0);
     }
 
+    #[test]
+    fn sixteen_bit_png_still_retains_more_than_eight_bit_levels() {
+        let path =
+            std::env::temp_dir().join(format!("photonic_still_16_{}.png", uuid::Uuid::new_v4()));
+        let image = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_fn(513, 1, |x, _| {
+            if x == 512 {
+                image::Rgba([65535, 0, 0, 32768])
+            } else {
+                image::Rgba([(x * 128) as u16, 0, 0, 65535])
+            }
+        });
+        image.save(&path).unwrap();
+        let prepared = prepare_raster(RasterTask::Still(path.clone(), (513, 1)), &Mutex::new(None))
+            .expect("decode 16-bit PNG without an 8-bit intermediate");
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(prepared.native, (513, 1));
+        assert_eq!((prepared.width, prepared.height), (513, 1));
+        let levels: std::collections::HashSet<u16> = prepared
+            .texels
+            .chunks_exact(8)
+            .take(512)
+            .map(|pixel| u16::from_le_bytes([pixel[0], pixel[1]]))
+            .collect();
+        assert!(levels.len() > 256, "retained only {} levels", levels.len());
+        let partial_alpha = &prepared.texels[512 * 8..513 * 8];
+        assert_eq!(
+            u16::from_le_bytes([partial_alpha[6], partial_alpha[7]]),
+            0x3800
+        );
+        assert_eq!(
+            u16::from_le_bytes([partial_alpha[0], partial_alpha[1]]),
+            0x3800
+        );
+    }
+
     /// A 64×64 four-quadrant PNG on disk, plus a project whose media pool holds
     /// it as an `Image` asset. Quadrants survive any correct area downscale by
     /// an even factor with their colours exactly intact, so the *content* of a
@@ -4992,6 +6011,132 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lut_cache_rejects_changed_bytes_at_the_same_path() {
+        use photonic_core::timeline::{AssetKind, MediaAsset};
+
+        let path = std::env::temp_dir().join(format!("photonic-lut-pin-{}.cube", AssetId::new()));
+        let cube = b"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        std::fs::write(&path, cube).unwrap();
+        let mut asset = MediaAsset::from_file(AssetKind::Lut3d, &path);
+        let id = asset.id;
+        asset.lut_full_hash = Some(crate::media::full_content_hash_bytes(cube));
+        let mut project = TimelineProject::new();
+        project.media.insert(asset);
+        let mut cache = LutCache::default();
+        cache.warm(&project);
+        assert!(cache.lut(id).is_some());
+        assert!(cache.failures.is_empty());
+
+        let changed = b"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n0 1 1\n";
+        assert_eq!(cube.len(), changed.len());
+        std::fs::write(&path, changed).unwrap();
+        cache.warm(&project);
+        assert!(cache.lut(id).is_none());
+        assert!(cache.failures[0].message.contains("content hash changed"));
+
+        project.media.assets.get_mut(&id).unwrap().lut_full_hash =
+            Some(crate::media::full_content_hash_bytes(changed));
+        cache.warm(&project);
+        assert!(cache.lut(id).is_some());
+        assert!(cache.failures.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_lut_cache_requires_matching_declarations_and_full_content_pins() {
+        use photonic_core::timeline::color::{
+            LutColorInterpretation, LutColorSpace, LutPurpose, NativeLutSpace,
+        };
+        use photonic_core::timeline::{AssetKind, MediaAsset};
+        let path =
+            std::env::temp_dir().join(format!("photonic-native-lut-{}.cube", AssetId::new()));
+        let cube = b"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        std::fs::write(&path, cube).unwrap();
+        let mut asset = MediaAsset::from_file(AssetKind::Lut3d, &path);
+        let id = asset.id;
+        asset.lut_full_hash = Some(crate::media::full_content_hash_bytes(cube));
+        let mut project = TimelineProject::new();
+        project.media.insert(asset);
+        let mut cache = LutCache::default();
+        for space in [NativeLutSpace::Acescg, NativeLutSpace::Acescct] {
+            let declaration = LutColorSpace::Native {
+                transform_revision: 1,
+                space,
+            };
+            project.media.assets.get_mut(&id).unwrap().lut_color = Some(LutColorInterpretation {
+                version: 1,
+                purpose: LutPurpose::Creative,
+                input: declaration.clone(),
+                output: declaration,
+            });
+            cache.warm(&project);
+            assert_eq!(cache.native_lut(id).unwrap().space, space);
+            assert!(cache.lut(id).is_none());
+            assert!(cache.failures.is_empty());
+        }
+        project.media.assets.get_mut(&id).unwrap().lut_full_hash = None;
+        cache.warm(&project);
+        assert!(cache.native_lut(id).is_none());
+        assert!(cache.failures[0].message.contains("content hash pin"));
+        project.media.assets.get_mut(&id).unwrap().lut_full_hash =
+            Some(crate::media::full_content_hash_bytes(cube));
+        std::fs::write(&path, [cube.as_slice(), b"# changed bytes\n"].concat()).unwrap();
+        cache.warm(&project);
+        assert!(cache.native_lut(id).is_none());
+        assert!(cache.failures[0].message.contains("content hash changed"));
+        project.media.assets.get_mut(&id).unwrap().lut_full_hash = Some(
+            crate::media::full_content_hash_bytes(&std::fs::read(&path).unwrap()),
+        );
+        project
+            .media
+            .assets
+            .get_mut(&id)
+            .unwrap()
+            .lut_color
+            .as_mut()
+            .unwrap()
+            .output = LutColorSpace::Native {
+            transform_revision: 1,
+            space: NativeLutSpace::Acescg,
+        };
+        cache.warm(&project);
+        assert!(cache.native_lut(id).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn lut_cache_refuses_incompatible_color_interpretation() {
+        use photonic_core::timeline::{
+            color::{LutColorInterpretation, LutPurpose},
+            AssetKind, MediaAsset,
+        };
+        let path = std::env::temp_dir().join(format!("photonic-lut-space-{}.cube", AssetId::new()));
+        let cube = b"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        std::fs::write(&path, cube).unwrap();
+        let mut asset = MediaAsset::from_file(AssetKind::Lut3d, &path);
+        let id = asset.id;
+        asset.lut_color = Some(LutColorInterpretation::legacy_creative());
+        let mut project = TimelineProject::new();
+        project.media.insert(asset);
+        let mut cache = LutCache::default();
+        cache.warm(&project);
+        assert!(cache.lut(id).is_some());
+        project
+            .media
+            .assets
+            .get_mut(&id)
+            .unwrap()
+            .lut_color
+            .as_mut()
+            .unwrap()
+            .purpose = LutPurpose::Technical;
+        cache.warm(&project);
+        assert!(cache.lut(id).is_none());
+        assert!(cache.failures[0].message.contains("technical LUT"));
+        std::fs::remove_file(path).unwrap();
     }
 
     /// The identity diff reports a relink, a byte change and a proxy swap, and

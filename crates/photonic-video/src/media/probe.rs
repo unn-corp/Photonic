@@ -129,6 +129,7 @@ struct FfStream {
     color_transfer: Option<String>,
     color_space: Option<String>,
     color_range: Option<String>,
+    chroma_location: Option<String>,
     /// ffprobe field_order: progressive / tt / bb / tb / bt / …
     field_order: Option<String>,
     // audio
@@ -221,6 +222,7 @@ fn fold(p: FfProbe) -> Result<ProbeDetails, ProbeError> {
                 transfer: non_unknown(&s.color_transfer),
                 matrix: non_unknown(&s.color_space),
                 full_range: s.color_range.as_deref().and_then(parse_color_range),
+                chroma_location: non_unknown(&s.chroma_location),
             },
             keyframe_index_cached: false,
             scan,
@@ -397,9 +399,53 @@ pub fn content_hash(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:016x}", hasher.digest()))
 }
 
+/// Full-file identity for captured reference images. Media relinking uses the
+/// cheaper sampled [`content_hash`]; comparison stills must detect edits even
+/// when only the middle of a large PNG changed.
+pub fn full_content_hash(path: &Path) -> std::io::Result<String> {
+    use xxhash_rust::xxh3::Xxh3;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Xxh3::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:032x}", hasher.digest128()))
+}
+
+/// Hash bytes already loaded for decoding, so the verified image is exactly
+/// the image presented even if its source file changes during the read.
+pub fn full_content_hash_bytes(bytes: &[u8]) -> String {
+    format!("{:032x}", xxhash_rust::xxh3::xxh3_128(bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_reference_hash_detects_middle_only_change() {
+        let path =
+            std::env::temp_dir().join(format!("photonic-full-hash-{}", uuid::Uuid::new_v4()));
+        let mut bytes = vec![0u8; 256 * 1024];
+        std::fs::write(&path, &bytes).unwrap();
+        let sampled = content_hash(&path).unwrap();
+        let full = full_content_hash(&path).unwrap();
+        assert_eq!(full_content_hash_bytes(&bytes), full);
+        bytes[128 * 1024] = 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(content_hash(&path).unwrap(), sampled);
+        assert_ne!(full_content_hash(&path).unwrap(), full);
+        assert_eq!(
+            full_content_hash_bytes(&bytes),
+            full_content_hash(&path).unwrap()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn parses_rational_rates() {

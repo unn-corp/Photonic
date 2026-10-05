@@ -392,7 +392,16 @@ impl Drop for ThumbnailBudget {
 /// memory regardless.
 #[derive(Clone, Default)]
 struct ThumbTextureRegistry {
-    entries: HashMap<usize, (egui::TextureHandle, u64)>,
+    // Keep a weak identity guard: allocator reuse after a decode-cache eviction
+    // must never show a previous asset's texture on a new shot.
+    entries: HashMap<
+        usize,
+        (
+            std::sync::Weak<photonic_video::RgbaThumb>,
+            egui::TextureHandle,
+            u64,
+        ),
+    >,
     clock: u64,
 }
 
@@ -409,9 +418,17 @@ impl ThumbTextureRegistry {
         let key = Arc::as_ptr(handle) as usize;
         self.clock += 1;
         let clock = self.clock;
-        let (tex, used) = self.entries.get_mut(&key)?;
-        *used = clock;
-        Some(tex.id())
+        let entry = self.entries.get_mut(&key)?;
+        if !entry
+            .0
+            .upgrade()
+            .is_some_and(|old| Arc::ptr_eq(&old, handle))
+        {
+            self.entries.remove(&key);
+            return None;
+        }
+        entry.2 = clock;
+        Some(entry.1.id())
     }
 
     /// Store an already-uploaded `tex` for `handle`, evicting the
@@ -428,14 +445,15 @@ impl ThumbTextureRegistry {
             if let Some(victim) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, _, used))| *used)
                 .map(|(k, _)| *k)
             {
                 self.entries.remove(&victim);
             }
         }
         let id = tex.id();
-        self.entries.insert(key, (tex, self.clock));
+        self.entries
+            .insert(key, (Arc::downgrade(handle), tex, self.clock));
         id
     }
 }
@@ -452,6 +470,30 @@ fn with_thumb_registry<R>(
         let reg = d.get_temp_mut_or_insert_with(thumb_registry_id(), ThumbTextureRegistry::default);
         f(reg)
     })
+}
+
+/// Reuse the timeline's bounded texture registry for the Color shot strip.
+pub(crate) fn thumbnail_texture(
+    ctx: &egui::Context,
+    handle: &ThumbHandle,
+    budget: &mut ThumbnailBudget,
+) -> Option<egui::TextureId> {
+    if let Some(id) = with_thumb_registry(ctx, |reg| reg.get(handle)) {
+        return Some(id);
+    }
+    if handle.width == 0
+        || handle.height == 0
+        || handle.rgba.len() != handle.width as usize * handle.height as usize * 4
+        || !budget.take()
+    {
+        return None;
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [handle.width as usize, handle.height as usize],
+        &handle.rgba,
+    );
+    let tex = ctx.load_texture("timeline-clip-thumb", image, egui::TextureOptions::LINEAR);
+    Some(with_thumb_registry(ctx, |reg| reg.insert(handle, tex)))
 }
 
 /// Sample + draw thumbnails across a video clip's body (spec 15 §3). A cache
@@ -482,24 +524,8 @@ fn paint_thumbnails(
         // cold miss uploads the texture OUTSIDE that lock: `ctx.load_texture`
         // re-enters the `Context` lock, so uploading inside `with_thumb_registry`
         // (which holds `ctx.data_mut`) would deadlock the draw thread.
-        let tex_id = if let Some(id) = with_thumb_registry(ctx, |reg| reg.get(&handle)) {
-            id
-        } else {
-            if handle.width == 0 || handle.height == 0 {
-                continue; // malformed — flat fill shows through
-            }
-            if handle.rgba.len() != handle.width as usize * handle.height as usize * 4 {
-                continue; // malformed — never surfaced by decode/disk, but don't trust blindly
-            }
-            if !budget.take() {
-                continue; // over budget this frame — flat fill shows through
-            }
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [handle.width as usize, handle.height as usize],
-                &handle.rgba,
-            );
-            let tex = ctx.load_texture("timeline-clip-thumb", image, egui::TextureOptions::LINEAR);
-            with_thumb_registry(ctx, |reg| reg.insert(&handle, tex))
+        let Some(tex_id) = thumbnail_texture(ctx, &handle, budget) else {
+            continue;
         };
         let slice_rect = egui::Rect::from_min_max(
             egui::pos2(sx0, visible_rect.top()),
@@ -1181,6 +1207,41 @@ mod tests {
         let mut budget = ThumbnailBudget::new(0);
         assert!(!budget.take());
         assert!(budget.exceeded);
+    }
+
+    #[test]
+    fn thumbnail_registry_rejects_stale_pointer_identity() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let old = Arc::new(photonic_video::RgbaThumb {
+                width: 1,
+                height: 1,
+                rgba: vec![255, 0, 0, 255],
+            });
+            let replacement = Arc::new(photonic_video::RgbaThumb {
+                width: 1,
+                height: 1,
+                rgba: vec![0, 255, 0, 255],
+            });
+            let image = egui::ColorImage::from_rgba_unmultiplied([1, 1], &old.rgba);
+            let texture = ctx.load_texture("old-thumb", image, egui::TextureOptions::LINEAR);
+            let mut registry = ThumbTextureRegistry::default();
+            registry.insert(&old, texture);
+            assert!(registry.get(&old).is_some());
+
+            // Simulate allocator address reuse by moving the old entry under
+            // the replacement key. A numeric pointer key alone would return
+            // the red image for the new green thumbnail.
+            let entry = registry
+                .entries
+                .remove(&(Arc::as_ptr(&old) as usize))
+                .unwrap();
+            registry
+                .entries
+                .insert(Arc::as_ptr(&replacement) as usize, entry);
+            assert!(registry.get(&replacement).is_none());
+            assert!(registry.entries.is_empty());
+        });
     }
 
     // ── paint_lane consumes a live cache (spec 15 integration) ───────────────

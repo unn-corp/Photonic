@@ -423,6 +423,28 @@ pub trait GpuFrameSource {
         proxy: bool,
     ) -> Option<GpuFrame>;
 
+    fn native_video_texture(
+        &mut self,
+        _gpu: &GpuContext,
+        _asset: AssetId,
+        _src_time: Tick,
+        _input: &photonic_core::timeline::color::NativeInputColorInterpretation,
+    ) -> Option<GpuFrame> {
+        None
+    }
+
+    /// Qualified native still decoder. The texture is linear Rec.709 and
+    /// premultiplied; the evaluator applies the explicit AP1 gamut conversion.
+    fn native_still_texture(
+        &mut self,
+        _gpu: &GpuContext,
+        _asset: AssetId,
+        _w: u32,
+        _h: u32,
+    ) -> Option<GpuFrame> {
+        None
+    }
+
     /// `w`/`h` are the **logical** size the still is wanted at — the canvas, in
     /// picture pixels, never a pool bucket size. The provider may return a
     /// smaller frame (it must not upscale a small still); the evaluator
@@ -494,6 +516,11 @@ impl GpuFrameSource for NullFrameSource {
 pub struct Evaluator {
     gpu: GpuContext,
     passes: Passes,
+    native_exposure: Option<photonic_render::native_transfer::NativeExposurePass>,
+    grade_mix: Option<photonic_render::grade_graph::GradeGraphMixPass>,
+    native_mask: Option<photonic_render::grade_gpu::NativeMaskMixPass>,
+    native_acescct: Option<photonic_render::native_transfer::NativeAcescctPass>,
+    native_sdr_output: Option<crate::color::native_output::gpu::NativeAces2SdrPass>,
     cache: NodeCache,
     /// Glyphon caption text compositor (06 §5.3) — burns `CaptionOverlay` glyph
     /// runs over the working texture. Owns its glyphon state behind a `Mutex` so
@@ -509,6 +536,7 @@ pub struct Evaluator {
     pinned_tap: Option<crate::graph::ir::ContentHash>,
     source_namespace: u64,
     canvas_scale: glam::Vec2,
+    working_color_domain: crate::graph::ir::WorkingColorDomain,
 }
 
 impl Evaluator {
@@ -527,12 +555,18 @@ impl Evaluator {
         Evaluator {
             gpu,
             passes,
+            native_exposure: None,
+            grade_mix: None,
+            native_mask: None,
+            native_acescct: None,
+            native_sdr_output: None,
             cache,
             caption,
             pinned_output: None,
             pinned_tap: None,
             source_namespace: 0,
             canvas_scale: glam::Vec2::ONE,
+            working_color_domain: Default::default(),
         }
     }
 
@@ -562,6 +596,9 @@ impl Evaluator {
             self.canvas_scale.x.to_bits(),
             self.canvas_scale.y.to_bits(),
         );
+        if self.working_color_domain == crate::graph::ir::WorkingColorDomain::SceneLinearAcescg {
+            hash = evaluation_hash(hash, 0x4143_4553, 0x6367);
+        }
         if self.source_namespace != 0 {
             // Exact evaluation keeps its stable namespace; approximations must
             // never satisfy a later paused/export lookup for the same tick.
@@ -623,6 +660,76 @@ impl Evaluator {
         source: &mut dyn GpuFrameSource,
         tap: Option<crate::graph::ir::IrNodeId>,
     ) -> (Option<GpuFrame>, Option<GpuFrame>) {
+        if graph.validate_working_color_domain().is_err() {
+            return (None, None);
+        }
+        if self.grade_mix.is_none()
+            && graph.nodes.iter().any(|node| {
+                matches!(
+                    node.op,
+                    IrOp::GradeKeyMix { .. }
+                        | IrOp::GradeMatteRefine { .. }
+                        | IrOp::GradeMatteApply
+                        | IrOp::GradeLayerMix { .. }
+                )
+            })
+        {
+            self.grade_mix = Some(photonic_render::grade_graph::GradeGraphMixPass::new(
+                self.gpu.device(),
+            ));
+        }
+        if self.native_mask.is_none()
+            && graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, IrOp::NativeMaskMix { .. }))
+        {
+            self.native_mask = Some(photonic_render::grade_gpu::NativeMaskMixPass::new(
+                self.gpu.device(),
+            ));
+        }
+        if graph.nodes.iter().any(|node| {
+            matches!(
+                node.op,
+                IrOp::NativeExposure { .. }
+                    | IrOp::NativeLinearOffset { .. }
+                    | IrOp::NativePrinterLights { .. }
+                    | IrOp::NativeHighlightRolloff { .. }
+                    | IrOp::NativeSaturationVibrance { .. }
+                    | IrOp::NativeLogContrast { .. }
+                    | IrOp::NativeLogCdl { .. }
+                    | IrOp::NativeLogQualifier { .. }
+                    | IrOp::NativeDecodeStill { .. }
+            )
+        }) && self.native_exposure.is_none()
+        {
+            self.native_exposure = Some(photonic_render::native_transfer::NativeExposurePass::new(
+                self.gpu.device(),
+            ));
+        }
+        if graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeAcescct { .. }))
+            && self.native_acescct.is_none()
+        {
+            self.native_acescct = Some(photonic_render::native_transfer::NativeAcescctPass::new(
+                self.gpu.device(),
+            ));
+        }
+        if graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, IrOp::NativeSdrOutput | IrOp::NativeSdrVideoOutput))
+            && self.native_sdr_output.is_none()
+        {
+            self.native_sdr_output =
+                crate::color::native_output::gpu::NativeAces2SdrPass::new(self.gpu.device()).ok();
+            if self.native_sdr_output.is_none() {
+                return (None, None);
+            }
+        }
+        self.working_color_domain = graph.working_color_domain;
         self.source_namespace = source.cache_namespace();
         let (cw, ch) = (canvas.0.max(1), canvas.1.max(1));
         let canvas_scale = graph.canvas_scale((cw, ch));
@@ -650,9 +757,36 @@ impl Evaluator {
                     }),
                     None => None,
                 },
+                IrOp::NativeDecodeVideo {
+                    asset,
+                    src_time,
+                    input,
+                } => match source.native_video_texture(&self.gpu, *asset, *src_time, input) {
+                    Some(frame) => Some(if native[i] {
+                        frame
+                    } else {
+                        self.normalize_source_cached(node.content_hash, frame, cw, ch)
+                    }),
+                    None => None,
+                },
                 // K-C8: the still is requested at the LOGICAL canvas size
                 // (`cw`/`ch` — already preview-scaled by `preview_canvas`), not
                 // at a pool bucket size. The provider caches on exactly that.
+                IrOp::NativeDecodeStill { asset } => {
+                    match source.native_still_texture(&self.gpu, *asset, cw, ch) {
+                        Some(frame) => {
+                            // Separate cache entry for normalization versus AP1 conversion.
+                            let normalized = self.normalize_source_cached(
+                                crate::graph::ir::ContentHash(node.content_hash.0 ^ 0x91abde7),
+                                frame,
+                                cw,
+                                ch,
+                            );
+                            Some(self.render_cached(node, &[normalized], cw, ch, canvas_scale))
+                        }
+                        None => None,
+                    }
+                }
                 IrOp::DecodeStill { asset } => {
                     match source.still_texture(&self.gpu, *asset, cw, ch) {
                         Some(frame) => {
@@ -794,6 +928,7 @@ impl Evaluator {
                 height,
                 source.width,
                 source.height,
+                false,
             );
             self.cache.mark_rendered(hash);
         }
@@ -1406,6 +1541,22 @@ impl Evaluator {
                     logical_h,
                     src.width,
                     src.height,
+                    false,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::Transform2DTransparent { mat, sampling } => match inputs.first() {
+                Some(src) => self.passes.transform(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *mat,
+                    *sampling,
+                    logical_w,
+                    logical_h,
+                    src.width,
+                    src.height,
+                    true,
                 ),
                 None => self.passes.fill(&self.gpu, target, [0.0; 4]),
             },
@@ -1478,6 +1629,100 @@ impl Evaluator {
             // `eval_cpu`'s `apply_grade_cpu`, then blit the result into the pooled
             // cache target (07 §3, GPU/CPU parity 03 §4.4). An empty stack falls
             // through to the passthrough blit below.
+            IrOp::QualifierMatte {
+                qualifier,
+                mask,
+                native,
+            } => {
+                if let Some(src) = inputs.first() {
+                    match photonic_render::grade_gpu::qualifier_key_gpu(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &src.texture,
+                        qualifier,
+                        mask.as_ref(),
+                        (logical_w, logical_h),
+                        *native,
+                    ) {
+                        Ok(matte) => self.passes.blit(&self.gpu, &matte, target),
+                        Err(_) => self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]),
+                    }
+                } else {
+                    self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]);
+                }
+            }
+            IrOp::GradeMatteConstant { weight } => {
+                self.passes
+                    .fill(&self.gpu, target, [*weight, *weight, *weight, 1.0])
+            }
+            IrOp::GradeMatteRefine { refinement } => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 1
+                    || pass
+                        .refine_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            target,
+                            (logical_w, logical_h),
+                            *refinement,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]);
+                }
+            }
+            IrOp::GradeKeyMix { mode } => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 2
+                    || pass
+                        .key_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            &inputs[1].texture,
+                            target,
+                            *mode,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]);
+                }
+            }
+            IrOp::GradeMatteApply => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 3
+                    || pass
+                        .matte_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            &inputs[1].texture,
+                            &inputs[2].texture,
+                            target,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0; 4]);
+                }
+            }
+            IrOp::GradeLayerMix { opacity } => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 2
+                    || pass
+                        .layer_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            &inputs[1].texture,
+                            target,
+                            *opacity,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0; 4]);
+                }
+            }
             IrOp::Grade { ops } if !ops.is_empty() => match inputs.first() {
                 Some(src) => {
                     // `src.texture` is pool-bucketed (dims rounded up to 64), so
@@ -1495,6 +1740,274 @@ impl Evaluator {
                     self.passes.blit(&self.gpu, &graded, target);
                 }
                 None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeExposure { stops } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *stops,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLinearOffset { rgb } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_offset_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *rgb,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativePrinterLights { points } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_printer_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *points,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeMaskMix { mask } => {
+                if let [corrected, original] = inputs {
+                    if self
+                        .native_mask
+                        .as_ref()
+                        .expect("native mask pipeline initialized")
+                        .apply_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &corrected.texture,
+                            &original.texture,
+                            target,
+                            mask,
+                            (logical_w, logical_h),
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                } else {
+                    self.passes.fill(&self.gpu, target, [0.0; 4]);
+                }
+            }
+            IrOp::NativeLut3d { lut } => match inputs.first() {
+                Some(src) => {
+                    if photonic_render::grade_gpu::apply_native_lut_into(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &src.texture,
+                        target,
+                        lut,
+                    )
+                    .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeDecodeStill { .. } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native input pass initialized")
+                        .apply_still_into(self.gpu.device(), self.gpu.queue(), &src.texture, target)
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLogCurves { curves } => match inputs.first() {
+                Some(src) => {
+                    if photonic_render::grade_gpu::apply_native_curves_into(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &src.texture,
+                        target,
+                        curves,
+                    )
+                    .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLogQualifier { qualifier } => match inputs.first() {
+                Some(src) => {
+                    if photonic_render::grade_gpu::apply_native_qualifier_into(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &src.texture,
+                        target,
+                        qualifier,
+                    )
+                    .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLogCdl { cdl } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_cdl_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *cdl,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLogContrast { pivot, amount } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_contrast_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *pivot,
+                            *amount,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeSaturationVibrance {
+                saturation,
+                vibrance,
+            } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_saturation_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *saturation,
+                            *vibrance,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeHighlightRolloff { knee, strength } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_exposure
+                        .as_ref()
+                        .expect("native primary pass initialized")
+                        .apply_rolloff_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *knee,
+                            *strength,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeAcescct { direction } => match inputs.first() {
+                Some(src) => {
+                    if self
+                        .native_acescct
+                        .as_ref()
+                        .expect("ACEScct pass initialized")
+                        .apply_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &src.texture,
+                            target,
+                            *direction,
+                        )
+                        .is_err()
+                    {
+                        self.passes.fill(&self.gpu, target, [0.0; 4]);
+                    }
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeSdrOutput => match (inputs.first(), &self.native_sdr_output) {
+                (Some(src), Some(pass)) if src.texture.size() == target.size() => {
+                    pass.apply_into(self.gpu.device(), self.gpu.queue(), &src.texture, target);
+                }
+                _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeSdrVideoOutput => match (inputs.first(), &self.native_sdr_output) {
+                (Some(src), Some(pass)) if src.texture.size() == target.size() => {
+                    pass.apply_video_into(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &src.texture,
+                        target,
+                    );
+                }
+                _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
             },
             // Blit passthrough for empty Grade and marker filter/color ops.
             _ => match inputs.first() {
@@ -1687,7 +2200,7 @@ impl Passes {
             entries: &[tex_entry(0), uniform_entry(1)],
         });
         let transform_src = format!(
-            "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\nstruct T {{ c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, info: vec4<f32> }}\n@group(0) @binding(1) var<uniform> u: T;\nfn at(p: vec2<i32>) -> vec4<f32> {{\n  let hi = vec2<i32>(u.info.zw) - vec2<i32>(1);\n  return textureLoad(t, clamp(p, vec2<i32>(0), hi), 0);\n}}\nfn nearest(p: vec2<f32>) -> vec4<f32> {{ return at(vec2<i32>(floor(p))); }}\nfn bilinear(p: vec2<f32>) -> vec4<f32> {{\n  let q = p - vec2<f32>(0.5);\n  let p0f = floor(q);\n  let p0 = vec2<i32>(p0f);\n  let f = q - p0f;\n  let p00 = at(p0);\n  let p10 = at(p0 + vec2<i32>(1, 0));\n  let p01 = at(p0 + vec2<i32>(0, 1));\n  let p11 = at(p0 + vec2<i32>(1, 1));\n  return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);\n}}\n@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n  if (pos.x >= u.info.x || pos.y >= u.info.y) {{ return vec4<f32>(0.0); }}\n  let canvas_src = u.c0.xy * pos.x + u.c1.xy * pos.y + u.c2.xy;\n  let src = canvas_src * u.info.zw / u.info.xy;\n  if (u.c0.w > 0.5) {{ return nearest(src); }}\n  return bilinear(src);\n}}\n"
+            "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\nstruct T {{ c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, info: vec4<f32> }}\n@group(0) @binding(1) var<uniform> u: T;\nfn at(p: vec2<i32>) -> vec4<f32> {{\n  let hi = vec2<i32>(u.info.zw) - vec2<i32>(1);\n  if (u.c1.w > 0.5 && (any(p < vec2<i32>(0)) || any(p > hi))) {{ return vec4<f32>(0.0); }}\n  return textureLoad(t, clamp(p, vec2<i32>(0), hi), 0);\n}}\nfn nearest(p: vec2<f32>) -> vec4<f32> {{ return at(vec2<i32>(floor(p))); }}\nfn bilinear(p: vec2<f32>) -> vec4<f32> {{\n  let q = p - vec2<f32>(0.5);\n  let p0f = floor(q);\n  let p0 = vec2<i32>(p0f);\n  let f = q - p0f;\n  let p00 = at(p0);\n  let p10 = at(p0 + vec2<i32>(1, 0));\n  let p01 = at(p0 + vec2<i32>(0, 1));\n  let p11 = at(p0 + vec2<i32>(1, 1));\n  return mix(mix(p00, p10, f.x), mix(p01, p11, f.x), f.y);\n}}\n@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n  if (pos.x >= u.info.x || pos.y >= u.info.y) {{ return vec4<f32>(0.0); }}\n  let canvas_src = u.c0.xy * pos.x + u.c1.xy * pos.y + u.c2.xy;\n  let src = canvas_src * u.info.zw / u.info.xy;\n  if (u.c0.w > 0.5) {{ return nearest(src); }}\n  return bilinear(src);\n}}\n"
         );
         let transform_pipeline = make_pipeline(device, &transform_bgl, &transform_src, "fs");
 
@@ -2422,6 +2935,7 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         logical_h: u32,
         source_w: u32,
         source_h: u32,
+        transparent_border: bool,
     ) {
         if !crate::graph::ops::transform_matrix_is_valid(mat) {
             self.fill(gpu, target, [0.0; 4]);
@@ -2440,7 +2954,7 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             inverse[3],
             inverse[4],
             inverse[5],
-            0.0,
+            if transparent_border { 1.0 } else { 0.0 },
             inverse[6],
             inverse[7],
             inverse[8],
@@ -4413,7 +4927,9 @@ mod tests {
     use super::*;
     use crate::graph::compile::{compile, Quality};
     use crate::graph::eval_cpu::FrameProvider;
-    use crate::graph::ir::{ContentHash, IrNode, IrNodeId, OutPort, Sampling};
+    use crate::graph::ir::{
+        ContentHash, IrNode, IrNodeId, LinearColor, OutPort, Sampling, WorkingColorDomain,
+    };
     use crate::graph::ops::Image;
     use photonic_core::timeline::{
         CaptionCue, CaptionStyle, CaptionTrack, CaptionWord, Clip, ClipSource, FrameRate,
@@ -4421,6 +4937,65 @@ mod tests {
         TrackKind,
     };
     use photonic_core::Color;
+
+    #[test]
+    fn managed_working_domain_has_distinct_gpu_cache_identity() {
+        let Some(gpu) = GpuContext::request_blocking() else {
+            eprintln!("GPU unavailable; skipping managed cache identity");
+            return;
+        };
+        let mut evaluator = Evaluator::new(gpu);
+        let legacy = evaluator.evaluation_hash(ContentHash(7), 17, 9);
+        evaluator.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        let managed = evaluator.evaluation_hash(ContentHash(7), 17, 9);
+        assert_ne!(legacy, managed);
+    }
+
+    #[test]
+    fn native_primary_pipelines_initialize_only_for_native_graphs() {
+        let Some(gpu) = GpuContext::request_blocking() else {
+            return;
+        };
+        let mut evaluator = Evaluator::new(gpu);
+        assert!(evaluator.native_exposure.is_none());
+        assert!(evaluator.native_acescct.is_none());
+        let legacy = FrameGraph {
+            nodes: vec![IrNode {
+                op: IrOp::SolidColor {
+                    color: LinearColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    },
+                },
+                inputs: vec![],
+                content_hash: ContentHash(1),
+            }],
+            output: Some(IrNodeId(0)),
+            ..Default::default()
+        };
+        assert!(evaluator
+            .evaluate(&legacy, (2, 2), &mut NullFrameSource)
+            .is_some());
+        assert!(evaluator.native_exposure.is_none());
+        assert!(evaluator.native_acescct.is_none());
+        let mut managed = legacy;
+        managed.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        managed.nodes.push(IrNode {
+            op: IrOp::NativePrinterLights {
+                points: [12.0, 0.0, 0.0],
+            },
+            inputs: vec![(IrNodeId(0), OutPort::default())],
+            content_hash: ContentHash(2),
+        });
+        managed.output = Some(IrNodeId(1));
+        assert!(evaluator
+            .evaluate(&managed, (2, 2), &mut NullFrameSource)
+            .is_some());
+        assert!(evaluator.native_exposure.is_some());
+        assert!(evaluator.native_acescct.is_none());
+    }
 
     struct PatternSource {
         frame: GpuFrame,
@@ -4449,6 +5024,24 @@ mod tests {
             _: AssetId,
             _: Tick,
             _: bool,
+        ) -> Option<GpuFrame> {
+            Some(self.frame.clone())
+        }
+        fn native_video_texture(
+            &mut self,
+            _: &GpuContext,
+            _: AssetId,
+            _: Tick,
+            _: &photonic_core::timeline::color::NativeInputColorInterpretation,
+        ) -> Option<GpuFrame> {
+            Some(self.frame.clone())
+        }
+        fn native_still_texture(
+            &mut self,
+            _: &GpuContext,
+            _: AssetId,
+            _: u32,
+            _: u32,
         ) -> Option<GpuFrame> {
             Some(self.frame.clone())
         }
@@ -4500,7 +5093,9 @@ mod tests {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: WORKING_FORMAT,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let mut half = Vec::with_capacity(image.pixels.len() * 4);
@@ -4524,6 +5119,113 @@ mod tests {
             },
         );
         Arc::new(texture)
+    }
+
+    #[test]
+    fn native_still_source_converts_gamut_and_keeps_logical_bounds() {
+        let Some(gpu) = GpuContext::request_blocking() else {
+            return;
+        };
+        let mut image = Image::new(3, 2);
+        image.pixels = vec![
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0; 4],
+            [0.0; 4],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![IrNode {
+                op: IrOp::NativeDecodeStill {
+                    asset: AssetId::new(),
+                },
+                inputs: vec![],
+                content_hash: ContentHash(944),
+            }],
+            output: Some(IrNodeId(0)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        let expected = crate::graph::eval_cpu::evaluate(
+            &graph,
+            (3, 2),
+            &mut PatternCpuSource {
+                image: image.clone(),
+            },
+        );
+        let mut source = PatternSource {
+            frame: GpuFrame::new(upload_pattern(&gpu, &image), 3, 2),
+        };
+        let mut evaluator = Evaluator::new(gpu.clone());
+        for canvas in [(3, 2), (5, 3)] {
+            let output = evaluator.evaluate(&graph, canvas, &mut source).unwrap();
+            let actual = read_texture_rgba16f(&gpu, &output, canvas.0, canvas.1);
+            let reference = crate::graph::eval_cpu::evaluate(
+                &graph,
+                canvas,
+                &mut PatternCpuSource {
+                    image: image.clone(),
+                },
+            );
+            for (pixel, target) in actual.iter().zip(reference.pixels) {
+                for channel in 0..4 {
+                    assert!(
+                        (pixel[channel] - target[channel]).abs() < 0.003,
+                        "{pixel:?} {target:?}"
+                    );
+                }
+            }
+        }
+        assert!((expected.pixels[0][0] - 0.6130974024).abs() < 1e-6);
+        assert!((expected.pixels[0][1] - 0.0701937225).abs() < 1e-6);
+        assert!((expected.pixels[0][2] - 0.0206155929).abs() < 1e-6);
+    }
+
+    #[test]
+    fn native_video_source_uses_typed_provider_and_preserves_pixels() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+        };
+        let Some(gpu) = GpuContext::request_blocking() else {
+            return;
+        };
+        let image = patterned_image(4, 2);
+        let mut source = PatternSource {
+            frame: GpuFrame::new(upload_pattern(&gpu, &image), 4, 2),
+        };
+        let graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![IrNode {
+                op: IrOp::NativeDecodeVideo {
+                    asset: AssetId::new(),
+                    src_time: Tick(0),
+                    input: NativeInputColorInterpretation {
+                        hlg_peak_nits: None,
+                        reference_white_nits: None,
+                        version: 1,
+                        standard: NativeInputStandard::Bt709Scene,
+                        range: InputSignalRange::Limited,
+                        matrix: InputMatrix::Bt709,
+                        chroma_location: None,
+                    },
+                },
+                inputs: vec![],
+                content_hash: ContentHash(55),
+            }],
+            output: Some(IrNodeId(0)),
+        };
+        let actual = Evaluator::new(gpu.clone())
+            .evaluate(&graph, (4, 2), &mut source)
+            .expect("typed native provider should supply graph source");
+        for (got, expected) in read_texture_rgba16f(&gpu, &actual, 4, 2)
+            .iter()
+            .zip(&image.pixels)
+        {
+            for (a, b) in got.iter().zip(expected) {
+                assert!((a - b).abs() < 0.001);
+            }
+        }
     }
 
     fn upload_padded_solid(
@@ -4589,6 +5291,7 @@ mod tests {
                 frame: GpuFrame::new(upload_pattern(&gpu, &pattern), w, h),
             };
             let graph = FrameGraph {
+                working_color_domain: Default::default(),
                 nodes: vec![
                     IrNode {
                         op: IrOp::DecodeStill {
@@ -4637,6 +5340,7 @@ mod tests {
         let source_logical = (960, 540);
         let source_physical = (960, 576);
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::DecodeStill {
@@ -4696,6 +5400,7 @@ mod tests {
             bottom: 0.125,
         };
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::DecodeStill {
@@ -4748,11 +5453,17 @@ mod tests {
             * glam::Mat3::from_angle(0.23)
             * glam::Mat3::from_scale(glam::Vec2::new(1.2, 0.8));
 
-        for (index, sampling) in [Sampling::Bilinear, Sampling::Nearest]
-            .into_iter()
-            .enumerate()
+        for (index, (sampling, transparent)) in [
+            (Sampling::Bilinear, false),
+            (Sampling::Nearest, false),
+            (Sampling::Bilinear, true),
+            (Sampling::Nearest, true),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let graph = FrameGraph {
+                working_color_domain: Default::default(),
                 nodes: vec![
                     IrNode {
                         op: IrOp::DecodeStill {
@@ -4762,7 +5473,11 @@ mod tests {
                         content_hash: ContentHash(100 + index as u128),
                     },
                     IrNode {
-                        op: IrOp::Transform2D { mat, sampling },
+                        op: if transparent {
+                            IrOp::Transform2DTransparent { mat, sampling }
+                        } else {
+                            IrOp::Transform2D { mat, sampling }
+                        },
                         inputs: vec![(IrNodeId(0), OutPort::default())],
                         content_hash: ContentHash(200 + index as u128),
                     },
@@ -4777,14 +5492,21 @@ mod tests {
                 .evaluate(&graph, (image.width, image.height), &mut source)
                 .expect("transform output");
             let actual = read_texture_rgba16f(&gpu, &output, image.width, image.height);
-            let expected = crate::graph::ops::transform2d(&image, mat, sampling);
+            let expected = crate::graph::ops::transform2d_to_canvas_with_border(
+                &image,
+                mat,
+                sampling,
+                image.width,
+                image.height,
+                transparent,
+            );
             for (pixel_index, (gpu_pixel, cpu_pixel)) in
                 actual.iter().zip(&expected.pixels).enumerate()
             {
                 for channel in 0..4 {
                     assert!(
                         (gpu_pixel[channel] - cpu_pixel[channel]).abs() < 2e-3,
-                        "{sampling:?} pixel {pixel_index} channel {channel}: GPU {} vs CPU {}",
+                        "{sampling:?} transparent={transparent} pixel {pixel_index} channel {channel}: GPU {} vs CPU {}",
                         gpu_pixel[channel],
                         cpu_pixel[channel]
                     );
@@ -4810,6 +5532,7 @@ mod tests {
             .enumerate()
         {
             let graph = FrameGraph {
+                working_color_domain: Default::default(),
                 nodes: vec![
                     IrNode {
                         op: IrOp::DecodeStill {
@@ -4870,6 +5593,7 @@ mod tests {
         };
         let image = patterned_image(7, 5);
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::DecodeStill {
@@ -5055,6 +5779,7 @@ mod tests {
         mode: BlendMode,
     ) -> crate::graph::compile::CompiledFrame {
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::SolidColor { color: top },
@@ -5697,6 +6422,7 @@ mod tests {
             mask: None,
         };
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::SolidColor { color },
@@ -5749,6 +6475,7 @@ mod tests {
         outgoing: crate::graph::ir::LinearColor,
     ) -> crate::graph::compile::CompiledFrame {
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::SolidColor { color: incoming },
@@ -5895,6 +6622,7 @@ mod tests {
             namespace: 0,
         };
         let graph = FrameGraph {
+            working_color_domain: Default::default(),
             nodes: vec![
                 IrNode {
                     op: IrOp::DecodeStill {

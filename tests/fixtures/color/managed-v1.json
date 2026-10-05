@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "grading_semantics_version": 1,
+  "ocio": {
+    "runtime_version": "2.5.2",
+    "name": "cg-config-v2.2.0_aces-v1.3_ocio-v2.4",
+    "sha256": "5aefc668796eabb1902b9593340496231758eceaec18ce290e12901042bd4440",
+    "transform_assets": {}
+  },
+  "display": {"display": "sRGB - Display", "view": "ACES 1.0 - SDR Video"},
+  "export": {"kind": "display_view", "display": "Rec.1886 Rec.709 - Display", "view": "ACES 1.0 - SDR Video"},
+  "unknown_input": {"policy": "require_explicit"}
+}
