@@ -7,6 +7,84 @@ Native-managed video-track SDR preview is now available under explicit limits;
 qualified full-resolution ProRes MOV delivery is available. Other managed
 timeline stages and export formats remain gated.
 
+## Current roadmap checkpoint — 2026-10-05
+
+This checkpoint takes precedence over earlier dated status, pending lists and
+qualification counts below. The chronological entries remain evidence for their
+individual increments, not a claim that the full roadmap is finished.
+
+- Branch: `feat/professional-color-foundation`.
+- Implementation checkpoint: `3e59ee6`, committed and pushed to the same branch
+  on `origin`. All non-ignored local changes present at the stop request were
+  included. This documentation refresh is subsequent to that commit.
+- Goal: **paused at the user's request** after committing and pushing. The full
+  end-to-end roadmap remains incomplete; no completion percentage is asserted.
+- Latest recorded full affected library run: core **875**, GUI **476**, MCP
+  **270**, render **199**, video **861** passed, with two existing ignored video
+  tests. These results precede the unfinished matte-output plumbing described
+  below; they do not qualify every byte of the committed checkpoint. No tests
+  were rerun for this documentation refresh.
+
+### Implemented and qualified within explicit boundaries
+
+1. **Trust foundation:** read-only panel viewing, gesture/structural undo,
+   atomic lock-aware edits, dependency diagnostics and export refusal, Legacy
+   SDR preservation, asynchronous scopes and the shared MCP scope-job interface.
+2. **Managed color:** Photonic-owned AP1/ACEScct transforms; qualified sRGB
+   stills and selected high-depth video inputs; explicit PQ-display and HLG-scene
+   source interpretation; scene-linear extended-range/alpha handling; supported
+   asset/clip/group/shared-look/track/master ordering and nested sequences;
+   native creative LUT contracts and pinned dependencies; qualified SDR preview
+   and Full/original ProRes delivery. Unsupported stages still fail visibly.
+3. **Color workspace:** monitor, shot strip, gallery and verified references,
+   versions/copying, scope selection/settings and persistent scope dock sizing,
+   windows/handles, native curve and qualifier picking, input-node selector,
+   matte preview, and MCP save acknowledgement in GUI history state.
+4. **Advanced grading:** qualified native exposure, offset, printer lights,
+   roll-off, saturation/vibrance, contrast, CDL/log wheels, normalized artistic
+   white balance, master/RGB and five secondary curve families, HSL qualifiers;
+   static ellipse/rectangle/gradient windows; typed image/matte graph, key
+   mixers, matte application, median/grow/erode/Gaussian/levels refinement.
+   GUI/MCP exact input inspection covers unambiguous and explicitly addressed
+   native curve/HSL correctors and qualifier-key source nodes.
+5. **Assistance/finishing foundations:** editable bounded Legacy SDR shot-match
+   proposals, initial verified asset archives, render/dependency manifests,
+   actual high-bit SDR ProRes decode/reimport checks, and limited reference-GPU
+   playback/scope measurements. These do not establish complete restoration,
+   HDR mastering, facility readiness or portable reproducibility.
+
+### Remaining work, in roadmap order
+
+| Area | Work still required |
+| --- | --- |
+| Managed pipeline | General effects, composition/project graphs, transitions, titles/vector/logo/caption stages and remaining blend modes; mixed-source/conversion and proxy/cache precision qualification; full stage-order and independent-reference acceptance. |
+| Color workspace/scopes | Complete saved/dockable workspace arrangements; shared version/reference ownership; node-output inspection and group/shared/compound workflows; scene-linear/HDR scales and before/after-output measurements; safe asset/cache cleanup and portable color dependencies. |
+| Primaries/secondaries | Kelvin/temperature white balance, remaining tonal-range controls and linked luminance; direct ordered-qualifier spatial-refinement workflow; editable Bézier/multiple/Boolean windows and animated feather; defined coordinates through retime/transform/stabilization. |
+| Tracking/graph | Deterministic forward/backward cancellable tracking, confidence/manual keys, cut/occlusion/motion/stale-result tests; shared/compound grades; generic image and mixed/refined matte output viewing in GUI/MCP. |
+| Assistance/restoration/performance | Chart balance, scene grouping, stronger editable subject/skin/depth assistance; spatial/temporal noise reduction, detail/sharpening, grain/halation/bloom, gamut compression/legalization; explicit preview/final quality, resource/cache optimization and longer representative benchmarks. |
+| HDR/professional finishing | HDR scopes/mastering, output tone/gamut transforms, actual HDR high-bit export metadata/sample verification; calibrated/native/external monitoring, panels and optional vendor RAW adapters; conform/relink, annotations, complete dependency reports and portable archives; exact shipped-artifact commercial audit. |
+| End-to-end acceptance | Balance → match → tracked isolation → alternate version → export/reimport with save/undo/locks and GUI/MCP parity; independent numerical references, unchanged Legacy goldens, interaction/throughput/memory/cache/soak checks. Clean build artifacts only after complete acceptance. |
+
+**Unfinished work committed at the stop request:** compiler/session metadata and
+`GradeGraphMatteOutput` tap plumbing now retain reachable native clip matte-node
+outputs, and scope labels recognize that tap. MCP output schemas also document
+optional `graph_node_id`. Direct mixed/refined matte-output inspection is **not
+finished or qualified**: the dedicated GUI preview/action, MCP inspection tool,
+shared raw-weight preview/statistics, and behavior/live regression coverage are
+still required. Do not advertise the tap plumbing as a completed user feature.
+The last in-flight check's result is unavailable in the current environment.
+
+**External qualification:** calibrated HDR/external-output hardware, grading
+panels, vendor SDK/RAW access and broader hardware soak evidence remain necessary
+for the corresponding advertised capabilities. Their absence does not justify
+claiming software work complete or silently substituting Legacy SDR behavior.
+
+**Resume point:** inspect the checkpoint and this current status first; finish
+matte-output inspection and qualify the current tree before proceeding through
+the remaining rows. Preserve qualification artifacts and existing implementation.
+The historical handoff is superseded by
+[`handoff-2026-10-05.md`](../../_arcwright-output/handoffs/handoff-2026-10-05.md).
+
 ## 1A — Trustworthy existing grading
 
 Implemented on `feat/professional-color-foundation`:
@@ -595,8 +673,8 @@ thresholds. They remap the combined key before applying its window and alpha,
 so existing grades render unchanged. Color Controls exposes both thresholds;
 shared edits reject non-finite or out-of-range values, and loaded invalid
 values bypass the corrector with an export-blocking diagnostic. CPU and GPU
-soft-edge tests cover the same threshold behavior. Spatial matte denoise, blur,
-and grow/shrink remain pending.
+soft-edge tests cover the same threshold behavior. Spatial matte denoise, blur, and grow/shrink are now qualified through the
+typed graph refinement utility; direct ordered-qualifier controls remain pending.
 Legacy curve documents omit the new fields and preserve their prior output;
 empty tabs use virtual neutral curves. These controls currently use the Legacy
 SDR domain and do not establish managed-color grading semantics. Full core,
@@ -676,7 +754,8 @@ checks the node, clip owner, missing LUT, and visible message together.
 
 Remaining: additional managed log primaries beyond the qualified v1 controls;
 shared nodes and compound grades; editable Bézier windows
-with Boolean masks and matte refinement. Define mask
+with Boolean masks and direct ordered-qualifier refinement controls. Graph
+matte refinement is qualified in the later increment. Define mask
 coordinates across retiming, transforms and stabilization before implementing
 cancellable deterministic tracking with confidence, manual keys and stale-result
 rejection.
@@ -795,7 +874,7 @@ its own hardware qualification before being advertised.
 - GUI/MCP share edit operations, persisted state and rendering. MCP parity ships
   with each area, including inspection, validation, comparisons and job status.
 
-Latest full library verification (2026-10-04): core **873**, render **195**,
+Historical full library verification (2026-10-04; superseded by the current checkpoint): core **873**, render **195**,
 video **853** (two ignored), GUI **460**, and MCP **257** tests passed.
 Scope-job regressions and direct/nested native scope/export/manifest
 parity checks also passed in focused runs. Workspace documentation tests passed. The Legacy SDR golden-frame
