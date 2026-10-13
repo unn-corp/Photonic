@@ -71,7 +71,7 @@ def parse_row(cells: list[str]):
         status = status_s
         if status not in _STATUS_WORDS:
             raise Violation(f"unknown status word {status_s!r}")
-    return int(num_s), strip_ticks(test), strip_ticks(id_s), status, reason
+    return int(num_s), test, strip_ticks(id_s), status, reason
 
 
 def doc_number(path: Path) -> str:
@@ -79,11 +79,35 @@ def doc_number(path: Path) -> str:
     return m.group(1) if m else "??"
 
 
+def prose_lines(text: str) -> list[str]:
+    """Keep source line positions, but exclude fenced Markdown examples.
+
+    A closing fence must use the opening character and at least its length.
+    This prevents example acceptance rows/headings from becoming requirements.
+    Real tables outside fences still receive every ordinary validation check.
+    """
+    lines = []
+    fence = None
+    for line in text.splitlines():
+        match = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence is not None:
+            if (match and match[1][0] == fence[0]
+                    and len(match[1]) >= fence[1] and not match[2].strip()):
+                fence = None
+            lines.append("")
+        elif match and not (match[1][0] == "`" and "`" in match[2]):
+            fence = (match[1][0], len(match[1]))
+            lines.append("")
+        else:
+            lines.append(line)
+    return lines
+
+
 def parse_doc(path: Path):
     """Yield (doc, section, num, test, id, status, reason) for one doc's
     acceptance table."""
     doc = doc_number(path)
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = prose_lines(path.read_text(encoding="utf-8"))
     i, n = 0, len(lines)
     while i < n:
         m = _ACCEPT_HEADING.match(lines[i])
@@ -141,6 +165,11 @@ def collect_covers(src_roots: list[Path]):
         if root.name == "tools" or root.parts[-1:] == ("tools",):
             files += list(root.rglob("*.py"))
         for f in sorted(files):
+            # The checker corpus intentionally contains unknown/duplicate IDs.
+            # They are inputs to tests, not assertions about the real product.
+            # Explicit --src paths inside a case still scan that case normally.
+            if f.relative_to(root).parts[:3] == ("spec-extract", "tests", "cases"):
+                continue
             try:
                 text = f.read_text(encoding="utf-8")
             except OSError:

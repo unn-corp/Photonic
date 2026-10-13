@@ -225,7 +225,8 @@ fn acceptance_index_enforces_covers() {
     // hard failures. Each corpus is a minimal doc(+src) that must pass (0) or
     // fail (nonzero) validation.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/cases/acceptance");
-    let expect: [(&str, bool); 6] = [
+    let expect: [(&str, bool); 7] = [
+        ("fenced-examples", true),
         ("covered-with-test", true),
         ("waived-with-reason", true),
         ("covered-no-test", false),
@@ -253,6 +254,22 @@ fn acceptance_index_enforces_covers() {
             assert_ne!(code, 0, "{name}: expected a hard failure, but it passed");
         }
     }
+}
+
+#[test]
+fn acceptance_index_checks_real_workspace_without_example_pollution() {
+    let out = Command::new("python3")
+        .env("PYTHONUTF8", "1")
+        .arg(gen_acceptance())
+        .arg("--check")
+        .current_dir(repo_root())
+        .output()
+        .expect("run workspace acceptance index");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

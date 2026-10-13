@@ -7,9 +7,10 @@ Native-managed video-track SDR preview is now available under explicit limits;
 qualified full-resolution ProRes MOV delivery is available. Other managed
 timeline stages and export formats remain gated.
 
-## Publication checkpoint — 2026-10-11
+## Publication checkpoint — 2026-10-13
 
-The cloud continuation through checkpoint 137 is being committed to
+The cloud continuation through checkpoint 137 was published as
+`d98ee3585a2a4977f2d8df588e35ae07910d0b41` on
 `feat/professional-color-foundation` at the owner's request. The restored
 source matches the saved checkpoint; the tracked-file patch also passes a
 reverse-application check against its original base `30f221c`.
@@ -23,6 +24,35 @@ workspace reset. The checkpoint archive SHA-256 is
 The complete roadmap and hardware-performance qualification remain unfinished.
 Earlier statements that continuation work is uncommitted/unpushed describe
 historical checkpoints; this publication entry supersedes that delivery status.
+
+## Post-publication acceptance fixes — 2026-10-13
+
+The initial GitHub run `38339955008` passed lint (formatting, Clippy,
+generated MCP docs, spec drift and dependency checks) and PDF preflight,
+but exposed two integration checks missing from the earlier targeted run:
+
+- MCP discovery still expected only the original two keyframe targets. Its
+  assertion now includes local/stage grading and checks that batch discovery
+  preserves the same operator/stage address schema as individual keyframes.
+- The keyboard-focus source scanner combined production focus checks with
+  key events inside inline test fixtures. Those 16 tests now live in explicit
+  test-only modules; production widget tokens are unchanged and the scanner
+  is unchanged. Repeated-arrow coverage establishes focus on a separate frame
+  before key events, matching egui's filter-installation lifecycle.
+
+All 11 MCP discovery contracts, all 16 numeric-control tests and the original
+keyboard-focus integration check pass locally. The full workspace all-feature
+run is still in progress. Its preset test initially used the cloud's read-only
+inherited config directory; the exact test passes with isolated writable XDG
+configuration. This is a setup correction, not a relaxed assertion.
+
+The acceptance-index generator also now ignores fenced Markdown examples and
+its own negative-test corpus during whole-repository scans, while preserving
+inline code in criterion descriptions. All seven isolated pass/fail corpora
+and the real workspace check pass. A full-workspace regression is added so
+example pollution cannot silently return. This index currently covers eight
+explicitly numbered criteria; it is not a complete video/color acceptance list.
+The full professional roadmap remains in progress.
 
 ## Current roadmap checkpoint — 2026-10-09
 

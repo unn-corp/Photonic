@@ -49,12 +49,43 @@ fn discovery_preserves_complete_definitions() {
     let item = &keyframes["actions"][0]["inputSchema"]["properties"]["ops"]["items"];
     assert_eq!(
         item["properties"]["target"]["enum"],
-        json!(["clip_transform", "clip_effect"])
+        json!([
+            "clip_transform",
+            "clip_effect",
+            "grade_op",
+            "grade_stage_op"
+        ])
     );
     assert!(item["required"]
         .as_array()
         .unwrap()
         .contains(&json!("target")));
+    // Discovery must retain the grading address, not just advertise the new
+    // target names. Batch entries have the same address contract as one key.
+    let single = tool_schema("set_keyframe").unwrap();
+    for field in ["target", "op_id", "stage"] {
+        assert_eq!(
+            item["properties"][field], single["inputSchema"]["properties"][field],
+            "batch discovery lost keyframe address field {field}"
+        );
+    }
+    assert_eq!(item["properties"]["op_id"]["format"], "uuid");
+    let stages: Vec<_> = item["properties"]["stage"]["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|stage| stage["properties"]["kind"]["const"].clone())
+        .collect();
+    assert_eq!(
+        stages,
+        vec![
+            json!("clip"),
+            json!("local_look"),
+            json!("shared_look"),
+            json!("group_pre"),
+            json!("group_post")
+        ]
+    );
 }
 
 #[test]
