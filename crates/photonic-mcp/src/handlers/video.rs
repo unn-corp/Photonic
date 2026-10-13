@@ -23797,7 +23797,7 @@ mod tests {
     }
 
     async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
-        Box::pin(check_native_media_in_import_sized(mode, None, None)).await;
+        Box::pin(check_native_media_in_import_sized(mode, None, None, false)).await;
     }
 
     #[tokio::test]
@@ -23811,6 +23811,7 @@ mod tests {
                 NativeMediaFixtureMode::Plain,
                 Some(fit),
                 None,
+                false,
             ))
             .await;
         }
@@ -23827,6 +23828,24 @@ mod tests {
                 NativeMediaFixtureMode::Plain,
                 Some(fit),
                 Some(dimensions),
+                false,
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_mixed_resolution_invert_before_resize_mcp_preview_prores_and_relink() {
+        for fit in [
+            photonic_core::timeline::FitMode::Contain,
+            photonic_core::timeline::FitMode::Cover,
+            photonic_core::timeline::FitMode::Stretch,
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                Some([21, 7]),
+                true,
             ))
             .await;
         }
@@ -23836,6 +23855,7 @@ mod tests {
         mode: NativeMediaFixtureMode,
         resize_fit: Option<photonic_core::timeline::FitMode>,
         intermediate_dimensions: Option<[usize; 2]>,
+        invert_before_resize: bool,
     ) {
         let output_width = if resize_fit.is_some() { 16_usize } else { 32 };
         let output_height = 16_usize;
@@ -24134,6 +24154,22 @@ mod tests {
                 ))
                 .await;
             }
+            if invert_before_resize {
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":GraphOp::Invert}),
+                ))
+                .await;
+                let inverted = data(&added)["node_id"].clone();
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_edge",
+                    json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":inverted}}),
+                ))
+                .await;
+                output_source = inverted;
+            }
             if let Some(fit) = resize_fit {
                 let added = Box::pin(graph_authoring_edit_roundtrip(
                     &state,
@@ -24168,7 +24204,7 @@ mod tests {
             let saved = state.document.lock().await.to_json().unwrap();
             let reload = photonic_core::Document::from_json(&saved).unwrap();
             assert_eq!(serde_json::to_value(reload).unwrap(), before);
-            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+            let raw_source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
                 if still {
                     let p = still_pixels.as_raw()[index * 4..index * 4 + 4]
                         .try_into()
@@ -24203,6 +24239,14 @@ mod tests {
                         }
                     }
                     (average, 1.)
+                }
+            };
+            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                let (rgb, alpha) = raw_source_pixel(frame, index);
+                if invert_before_resize {
+                    (rgb.map(|c| 1.0 - c.clamp(0.0, 1.0)), alpha)
+                } else {
+                    (rgb, alpha)
                 }
             };
             // Independent f64 premultiplied bilinear reference for both

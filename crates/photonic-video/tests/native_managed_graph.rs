@@ -7700,6 +7700,30 @@ fn native_decode_planning_prunes_unused_sources_but_keeps_requested_scope_taps()
 
 #[test]
 fn native_mixed_resolution_resize_preserves_geometry_alpha_scope_and_quality_cache() {
+    check_native_mixed_resolution_resize(None);
+}
+
+#[test]
+fn native_mixed_resolution_pointwise_processing_preserves_source_extent_and_taps() {
+    for op in [
+        IrOp::NativeInvert,
+        IrOp::NativeChromaKey {
+            key: [0.0, 1.0, 0.0],
+            tolerance: 0.3,
+            softness: 0.2,
+            spill: 0.0,
+        },
+        IrOp::NativeLumaKey {
+            threshold: 0.2,
+            softness: 0.1,
+            invert: false,
+        },
+    ] {
+        check_native_mixed_resolution_resize(Some(op));
+    }
+}
+
+fn check_native_mixed_resolution_resize(pointwise: Option<IrOp>) {
     use photonic_core::timeline::color::{
         InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
     };
@@ -7896,7 +7920,7 @@ fn native_mixed_resolution_resize_preserves_geometry_alpha_scope_and_quality_cac
                         native_extent: true,
                     }
                 };
-                let graph = FrameGraph {
+                let mut graph = FrameGraph {
                     working_color_domain: WorkingColorDomain::SceneLinearAcescg,
                     nodes: vec![
                         IrNode {
@@ -7926,6 +7950,28 @@ fn native_mixed_resolution_resize_preserves_geometry_alpha_scope_and_quality_cac
                     ],
                     output: Some(IrNodeId(3)),
                 };
+                let tap_id = if let Some(op) = &pointwise {
+                    for node in &mut graph.nodes[1..] {
+                        for (id, _) in &mut node.inputs {
+                            if id.0 >= 1 {
+                                id.0 += 1;
+                            }
+                        }
+                    }
+                    graph.nodes.insert(
+                        1,
+                        IrNode {
+                            op: op.clone(),
+                            inputs: vec![(IrNodeId(0), OutPort(0))],
+                            content_hash: ContentHash(hash + 5),
+                        },
+                    );
+                    graph.nodes[2].inputs[0].0 = IrNodeId(1);
+                    graph.output.as_mut().unwrap().0 += 1;
+                    IrNodeId(1)
+                } else {
+                    IrNodeId(0)
+                };
                 assert!(graph.validate_working_color_domain().is_ok());
                 for size in [8, 4, 8] {
                     let mut cpu = Cpu(Image {
@@ -7938,7 +7984,7 @@ fn native_mixed_resolution_resize_preserves_geometry_alpha_scope_and_quality_cac
                         &graph,
                         (size, size),
                         &mut source,
-                        Some(IrNodeId(0)),
+                        Some(tap_id),
                     );
                     let out = out.expect("resized picture");
                     let tap = tap.expect("source scope");
@@ -7955,7 +8001,7 @@ fn native_mixed_resolution_resize_preserves_geometry_alpha_scope_and_quality_cac
                         let inside = !matches!(fit, FitMode::Fit)
                             || (i / (size as usize) >= size as usize / 4
                                 && i / (size as usize) < size as usize * 3 / 4);
-                        if (iw, ih) == (8, 8) {
+                        if (iw, ih) == (8, 8) && pointwise.is_none() {
                             assert!(
                                 (p[3] - if inside { 0.5 } else { 0. }).abs() < 0.002,
                                 "explicit fit coverage"
@@ -7963,6 +8009,17 @@ fn native_mixed_resolution_resize_preserves_geometry_alpha_scope_and_quality_cac
                         }
                     }
                     let scope = read_texture_rgba16f(&gpu, &tap.texture, 4, 2);
+                    if pointwise.is_some() {
+                        let reference =
+                            eval_cpu::evaluate_at(&graph, (size, size), &mut cpu, Some(tap_id));
+                        assert_eq!((reference.width, reference.height), (4, 2));
+                        for (actual, expected) in scope.iter().zip(&reference.pixels) {
+                            for c in 0..4 {
+                                assert!((actual[c] - expected[c]).abs() < 0.003);
+                            }
+                        }
+                        continue;
+                    }
                     for (p, raw) in scope.iter().zip(&pixels) {
                         let want = if still {
                             let m = photonic_video::color::native::linear_srgb_to_ap1();
@@ -8036,6 +8093,53 @@ fn native_mixed_resolution_source_budget_counts_instances_and_padding() {
             allowed,
             "count{count} {w}x{h}"
         );
+    }
+}
+
+#[test]
+fn native_source_extent_budget_includes_pointwise_intermediates() {
+    use photonic_core::timeline::AssetId;
+    use photonic_video::graph::ir::FitMode;
+    for (passes, allowed) in [(0, true), (1, true), (2, false)] {
+        let mut nodes = vec![IrNode {
+            op: IrOp::NativeMediaStill {
+                asset: AssetId::new(),
+                w: 4096,
+                h: 2048,
+                native_extent: true,
+            },
+            inputs: vec![],
+            content_hash: ContentHash(1),
+        }];
+        for _ in 0..passes {
+            let input = IrNodeId(nodes.len() as u32 - 1);
+            nodes.push(IrNode {
+                op: IrOp::NativeInvert,
+                inputs: vec![(input, OutPort(0))],
+                content_hash: ContentHash(1),
+            });
+        }
+        let input = IrNodeId(nodes.len() as u32 - 1);
+        nodes.push(IrNode {
+            op: IrOp::Resize {
+                w: 16,
+                h: 16,
+                fit: FitMode::Stretch,
+            },
+            inputs: vec![(input, OutPort(0))],
+            content_hash: ContentHash(2),
+        });
+        let graph = FrameGraph {
+            output: Some(IrNodeId(nodes.len() as u32 - 1)),
+            nodes,
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+        };
+        assert_eq!(graph.validate_working_color_domain().is_ok(), allowed);
+        if passes > 0 {
+            let mut unnormalized = graph.clone();
+            unnormalized.output = Some(input);
+            assert!(unnormalized.validate_working_color_domain().is_err());
+        }
     }
 }
 

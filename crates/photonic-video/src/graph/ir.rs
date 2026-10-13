@@ -1101,67 +1101,72 @@ impl FrameGraph {
         self.color_domains().map(|_| ())
     }
 
+    /// Logical source-pixel dimensions for explicitly native-resolution paths.
+    /// Only qualified pointwise operations may retain these dimensions before
+    /// an explicit Resize normalizes the graph. Count every source/intermediate
+    /// allocation, including duplicate hashes, against the resident texel bound.
+    pub(crate) fn native_processing_extents(
+        &self,
+    ) -> Result<Vec<Option<(u32, u32)>>, &'static str> {
+        let mut extents: Vec<Option<(u32, u32)>> = Vec::with_capacity(self.nodes.len());
+        let mut texels = 0_u64;
+        for node in &self.nodes {
+            let mut incoming = None;
+            for (id, _) in &node.inputs {
+                let extent = extents
+                    .get(id.0 as usize)
+                    .copied()
+                    .ok_or("color-domain input is not topologically available")?;
+                incoming = incoming.or(extent);
+            }
+            let extent = match node.op {
+                IrOp::NativeMediaVideo { w, h, native_extent: true, .. }
+                | IrOp::NativeMediaStill { w, h, native_extent: true, .. } => {
+                    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+                        return Err("native-resolution MediaIn requires bounded source dimensions");
+                    }
+                    Some((w, h))
+                }
+                IrOp::NativeInvert | IrOp::NativeChromaKey { .. } | IrOp::NativeLumaKey { .. }
+                    if incoming.is_some() && node.inputs.len() == 1 => incoming,
+                IrOp::Resize { .. } => None,
+                _ if incoming.is_some() => return Err(
+                    "native-resolution processing requires an explicit Resize before this operation"
+                ),
+                _ => None,
+            };
+            if let Some((w, h)) = extent {
+                let (bw, bh) = TextureDesc {
+                    width: w,
+                    height: h,
+                }
+                .bucket();
+                texels = texels.saturating_add(u64::from(bw) * u64::from(bh));
+                if texels > 16_777_216 {
+                    return Err(
+                        "native mixed-resolution graph exceeds its padded-extent-texel budget",
+                    );
+                }
+            }
+            extents.push(extent);
+        }
+        if self
+            .output
+            .and_then(|id| extents.get(id.0 as usize))
+            .is_some_and(Option::is_some)
+        {
+            return Err("native-resolution processing requires an explicit Resize before output");
+        }
+        Ok(extents)
+    }
+
     fn color_domains(&self) -> Result<Vec<FrameColorEncoding>, &'static str> {
         use FrameColorEncoding as Domain;
         let root = match self.working_color_domain {
             WorkingColorDomain::LegacyLinearRec709 => Domain::LegacyLinearRec709,
             WorkingColorDomain::SceneLinearAcescg => Domain::SceneLinearAcescg,
         };
-        let mut native_extents = std::collections::HashSet::new();
-        let mut source_texels = 0_u64;
-        for (index, node) in self.nodes.iter().enumerate() {
-            if let IrOp::NativeMediaVideo {
-                w,
-                h,
-                native_extent: true,
-                ..
-            }
-            | IrOp::NativeMediaStill {
-                w,
-                h,
-                native_extent: true,
-                ..
-            } = node.op
-            {
-                if w == 0 || h == 0 || w > 8192 || h > 8192 {
-                    return Err("native-resolution MediaIn requires bounded source dimensions");
-                }
-                native_extents.insert(index);
-                {
-                    // Count actual IR instances; forged duplicate hashes must
-                    // not understate source allocations in a supplied graph.
-                    let (bw, bh) = TextureDesc {
-                        width: w,
-                        height: h,
-                    }
-                    .bucket();
-                    source_texels = source_texels.saturating_add(u64::from(bw) * u64::from(bh));
-                    if source_texels > 16_777_216 {
-                        return Err(
-                            "native mixed-resolution graph exceeds its padded-source-texel budget",
-                        );
-                    }
-                }
-            }
-        }
-        if self
-            .output
-            .is_some_and(|id| native_extents.contains(&(id.0 as usize)))
-        {
-            return Err("native-resolution MediaIn requires an explicit Resize before output");
-        }
-        for node in &self.nodes {
-            if node
-                .inputs
-                .iter()
-                .any(|(id, _)| native_extents.contains(&(id.0 as usize)))
-                && !matches!(node.op, IrOp::Resize { .. })
-            {
-                return Err(
-                    "native-resolution MediaIn requires an explicit Resize before processing",
-                );
-            }
-        }
+        self.native_processing_extents()?;
         let mut domains = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let mut inputs = node.inputs.iter().map(|(id, _)| {

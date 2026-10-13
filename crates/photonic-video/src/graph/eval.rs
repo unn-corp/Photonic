@@ -1283,6 +1283,9 @@ impl Evaluator {
         let canvas_scale = graph.canvas_scale((cw, ch));
         self.canvas_scale = canvas_scale;
         let native = graph.native_video_sources();
+        let Ok(native_extents) = graph.native_processing_extents() else {
+            return (None, None);
+        };
         let mut results: Vec<Option<GpuFrame>> = (0..graph.nodes.len()).map(|_| None).collect();
 
         for (i, node) in graph.nodes.iter().enumerate() {
@@ -1501,7 +1504,10 @@ impl Evaluator {
                     Some(self.native_matte_frame(node, &inputs[0], cw, ch))
                 }
                 _ if inputs.len() == node.inputs.len() => {
-                    Some(self.render_cached(node, &inputs, cw, ch, canvas_scale))
+                    let (width, height, scale) = native_extents[i]
+                        .map(|(w, h)| (w, h, glam::Vec2::ONE))
+                        .unwrap_or((cw, ch, canvas_scale));
+                    Some(self.render_cached(node, &inputs, width, height, scale))
                 }
                 _ => None,
             };
@@ -1531,16 +1537,7 @@ impl Evaluator {
             .filter(|id| (id.0 as usize) < graph.nodes.len())
             .and_then(|id| {
                 results[id.0 as usize].clone().map(|frame| {
-                    if matches!(
-                        graph.nodes[id.0 as usize].op,
-                        IrOp::NativeMediaVideo {
-                            native_extent: true,
-                            ..
-                        } | IrOp::NativeMediaStill {
-                            native_extent: true,
-                            ..
-                        }
-                    ) {
+                    if native_extents[id.0 as usize].is_some() {
                         let hash = self.evaluation_hash(
                             graph.nodes[id.0 as usize].content_hash,
                             frame.width,

@@ -6697,8 +6697,15 @@ fn lower_native_graph_with_sources(
                     .get(&(source.0, input_tick, source.1))
                     .ok_or("native graph producer port was not lowered")?;
                 if native_extents.contains(&raw) {
-                    if !matches!(node.op, GraphOp::Resize { .. } | GraphOp::TimeOffset { .. }) {
-                        return Err("native MediaIn with different source dimensions requires an explicit Resize before other processing".into());
+                    if !matches!(
+                        node.op,
+                        GraphOp::Resize { .. }
+                            | GraphOp::TimeOffset { .. }
+                            | GraphOp::Invert
+                            | GraphOp::ChromaKey
+                            | GraphOp::LumaKey
+                    ) {
+                        return Err("native MediaIn with different source dimensions requires an explicit Resize before this processing".into());
                     }
                 }
                 resolved_inputs.insert(
@@ -7232,6 +7239,13 @@ fn lower_native_graph_with_sources(
         } else {
             output
         };
+        if matches!(
+            node.op,
+            GraphOp::Invert | GraphOp::ChromaKey | GraphOp::LumaKey
+        ) && primary.is_some_and(|input| native_extents.contains(&input))
+        {
+            native_extents.insert(output);
+        }
         lowered.insert((id, tick, 0), output);
         if tick == root_tick {
             b.view_index.insert((graph.id, id), output);
@@ -12746,6 +12760,9 @@ mod tests {
             for (op, allowed) in [
                 (GraphOp::TimeOffset { offset: Tick::ZERO }, true),
                 (GraphOp::Switch, true),
+                (GraphOp::Invert, true),
+                (GraphOp::ChromaKey, true),
+                (GraphOp::LumaKey, true),
                 (GraphOp::Blur, false),
             ] {
                 let mut routed = project.clone();
