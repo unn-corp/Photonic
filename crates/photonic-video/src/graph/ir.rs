@@ -1130,9 +1130,14 @@ impl FrameGraph {
                 IrOp::NativeInvert | IrOp::NativeChromaKey { .. } | IrOp::NativeLumaKey { .. }
                 | IrOp::NativeGaussianBlur { .. } | IrOp::NativeUnsharp { .. } | IrOp::NativeGlow { .. }
                 | IrOp::Crop { .. } | IrOp::Transform2DTransparent { .. }
+                | IrOp::NativeChannelExtract { .. }
+                | IrOp::NativeImageToMask | IrOp::NativeMaskToImage
                     if incoming.is_some() && node.inputs.len() == 1 => incoming,
                 IrOp::Merge { .. }
                     if incoming.is_some() && node.inputs.len() == 2
+                        && node.inputs.iter().all(|(id, _)| extents[id.0 as usize] == incoming) => incoming,
+                IrOp::NativeChannelCombine
+                    if incoming.is_some() && node.inputs.len() == 4
                         && node.inputs.iter().all(|(id, _)| extents[id.0 as usize] == incoming) => incoming,
                 IrOp::Resize { .. } => None,
                 _ if incoming.is_some() => return Err(

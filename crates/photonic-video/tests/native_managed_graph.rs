@@ -7782,6 +7782,29 @@ fn native_source_detail_filters_preserve_source_radius_alpha_and_quality_cache()
 }
 
 #[test]
+fn native_source_channels_preserve_geometry_signal_alpha_and_quality_cache() {
+    use photonic_video::graph::ir::Channel;
+    for channel in [Channel::R, Channel::G, Channel::B, Channel::A] {
+        check_native_mixed_resolution_chain(&[
+            IrOp::NativeChannelExtract { channel },
+            IrOp::NativeMaskToImage,
+        ]);
+    }
+    for channels in [
+        [Channel::R, Channel::G, Channel::B, Channel::A],
+        [Channel::B, Channel::G, Channel::R, Channel::A],
+    ] {
+        let mut ops = channels
+            .into_iter()
+            .map(|channel| IrOp::NativeChannelExtract { channel })
+            .collect::<Vec<_>>();
+        ops.push(IrOp::NativeChannelCombine);
+        check_native_mixed_resolution_chain(&ops);
+    }
+    check_native_mixed_resolution_chain(&[IrOp::NativeImageToMask, IrOp::NativeMaskToImage]);
+}
+
+#[test]
 fn native_source_geometry_preserves_source_canvas_alpha_and_quality_cache() {
     use photonic_video::graph::ir::Sampling;
     let crop = IrOp::Crop {
@@ -8092,6 +8115,12 @@ fn check_native_mixed_resolution_chain(processing: &[IrOp]) {
                         op: op.clone(),
                         inputs: if matches!(op, IrOp::Merge { .. }) {
                             vec![(IrNodeId(i as u32), OutPort(0)), (IrNodeId(0), OutPort(0))]
+                        } else if matches!(op, IrOp::NativeChannelExtract { .. }) {
+                            vec![(IrNodeId(0), OutPort(0))]
+                        } else if matches!(op, IrOp::NativeChannelCombine) {
+                            ((i as u32 - 3)..=i as u32)
+                                .map(|j| (IrNodeId(j), OutPort(0)))
+                                .collect()
                         } else {
                             vec![(IrNodeId(i as u32), OutPort(0))]
                         },
@@ -8121,10 +8150,25 @@ fn check_native_mixed_resolution_chain(processing: &[IrOp]) {
                     let actual = read_texture_rgba16f(&gpu, &out.texture, size, size);
                     for (i, (p, want)) in actual.iter().zip(&expected.pixels).enumerate() {
                         for c in 0..4 {
+                            // Scalar RGB extraction exposes unassociated values
+                            // above one. Bound its three subsequent fp16 output
+                            // stores by three relative fp16 ULPs; retain the
+                            // existing absolute alpha and ordinary-image checks.
+                            let channel_signal = processing.iter().any(|op| {
+                                matches!(
+                                    op,
+                                    IrOp::NativeChannelExtract { .. } | IrOp::NativeImageToMask
+                                )
+                            });
+                            let tolerance = if channel_signal && c < 3 {
+                                3.0 * (1.0 / 1024.0) * want[c].abs().max(1.0)
+                            } else {
+                                0.002
+                            };
                             assert!(
-                            (p[c] - want[c]).abs() < 0.002,
-                            "still{still} fit{fit:?} intermediate{iw}x{ih} size{size} pixel{i}: {p:?} vs{want:?}"
-                        );
+                                (p[c] - want[c]).abs() < tolerance,
+                                "still{still} fit{fit:?} intermediate{iw}x{ih} size{size} pixel{i}: {p:?} vs{want:?}, bound {tolerance}"
+                            );
                         }
                         let inside = !matches!(fit, FitMode::Fit)
                             || (i / (size as usize) >= size as usize / 4
@@ -8406,6 +8450,82 @@ fn native_source_detail_budget_counts_all_scratch_textures() {
             allowed,
             "width {width}"
         );
+    }
+}
+
+#[test]
+fn native_source_channels_refuse_mixed_extents_missing_inputs_and_excess_budget() {
+    use photonic_core::timeline::AssetId;
+    use photonic_video::graph::ir::{Channel, FitMode};
+    for (width, height, other_width, other_native, allowed) in [
+        (4, 2, 4, true, true),
+        (4, 2, 5, true, false),
+        (4, 2, 4, false, false),
+        (1600, 2048, 1600, true, true),
+        (1664, 2048, 1664, true, false),
+    ] {
+        let source = |w, native_extent| IrOp::NativeMediaStill {
+            asset: AssetId::new(),
+            w,
+            h: height,
+            native_extent,
+        };
+        let mut graph = FrameGraph {
+            nodes: vec![
+                IrNode {
+                    op: source(width, true),
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: source(other_width, other_native),
+                    inputs: vec![],
+                    content_hash: ContentHash(2),
+                },
+                IrNode {
+                    op: IrOp::NativeChannelExtract {
+                        channel: Channel::R,
+                    },
+                    inputs: vec![(IrNodeId(0), OutPort(0))],
+                    content_hash: ContentHash(3),
+                },
+                IrNode {
+                    op: IrOp::NativeChannelExtract {
+                        channel: Channel::A,
+                    },
+                    inputs: vec![(IrNodeId(1), OutPort(0))],
+                    content_hash: ContentHash(4),
+                },
+                IrNode {
+                    op: IrOp::NativeChannelCombine,
+                    inputs: vec![
+                        (IrNodeId(2), OutPort(0)),
+                        (IrNodeId(2), OutPort(0)),
+                        (IrNodeId(2), OutPort(0)),
+                        (IrNodeId(3), OutPort(0)),
+                    ],
+                    content_hash: ContentHash(5),
+                },
+                IrNode {
+                    op: IrOp::Resize {
+                        w: 16,
+                        h: 16,
+                        fit: FitMode::Stretch,
+                    },
+                    inputs: vec![(IrNodeId(4), OutPort(0))],
+                    content_hash: ContentHash(6),
+                },
+            ],
+            output: Some(IrNodeId(5)),
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+        };
+        assert_eq!(
+            graph.validate_working_color_domain().is_ok(),
+            allowed,
+            "width{width} other{other_width} native{other_native}"
+        );
+        graph.nodes[4].inputs.pop();
+        assert!(graph.validate_working_color_domain().is_err());
     }
 }
 

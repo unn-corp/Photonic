@@ -6678,16 +6678,21 @@ fn lower_native_graph_with_sources(
         let convert = |b: &mut Builder<'_>,
                        source: (GraphNodeId, u16),
                        raw: IrNodeId,
-                       wants_mask: bool| {
+                       wants_mask: bool,
+                       native_extents: &mut HashMap<IrNodeId, (u32, u32)>| {
             let source_mask = matches!(
                 graph.nodes[&source.0].op,
                 GraphOp::MaskShape { .. } | GraphOp::ChannelSplit | GraphOp::MaskFromMatte
             );
-            match (source_mask, wants_mask) {
+            let converted = match (source_mask, wants_mask) {
                 (true, false) => b.push(IrOp::NativeMaskToImage, vec![(raw, OutPort::default())]),
                 (false, true) => b.push(IrOp::NativeImageToMask, vec![(raw, OutPort::default())]),
                 _ => raw,
+            };
+            if let Some(extent) = native_extents.get(&raw).copied() {
+                native_extents.insert(converted, extent);
             }
+            converted
         };
         let mut resolved_inputs = HashMap::new();
         if !matches!(node.op, GraphOp::Switch) {
@@ -6710,13 +6715,21 @@ fn lower_native_graph_with_sources(
                             | GraphOp::Merge { .. }
                             | GraphOp::Crop
                             | GraphOp::Transform2D
+                            | GraphOp::ChannelSplit
+                            | GraphOp::ChannelCombine
                     ) {
                         return Err("native MediaIn with different source dimensions requires an explicit Resize before this processing".into());
                     }
                 }
                 resolved_inputs.insert(
                     edge.to.1 .0,
-                    convert(b, source, raw, matches!(node.op, GraphOp::ChannelCombine)),
+                    convert(
+                        b,
+                        source,
+                        raw,
+                        matches!(node.op, GraphOp::ChannelCombine),
+                        &mut native_extents,
+                    ),
                 );
             }
         }
@@ -6763,6 +6776,12 @@ fn lower_native_graph_with_sources(
                         IrOp::NativeChannelExtract { channel },
                         vec![(primary.unwrap_or(fallback), OutPort::default())],
                     );
+                    if let Some(extent) = primary
+                        .and_then(|input| native_extents.get(&input))
+                        .copied()
+                    {
+                        native_extents.insert(value, extent);
+                    }
                     lowered.insert((id, tick, port), value);
                     if port == 0 && tick == root_tick {
                         b.view_index.insert((graph.id, id), value);
@@ -6796,6 +6815,7 @@ fn lower_native_graph_with_sources(
                         .get(&(source.0, input_tick, source.1))
                         .ok_or("native Switch selected producer was not lowered")?,
                     false,
+                    &mut native_extents,
                 ),
                 None => b.transparent(format),
             },
@@ -7270,14 +7290,14 @@ fn lower_native_graph_with_sources(
                 native_extents.insert(output, extent);
             }
         }
-        if matches!(node.op, GraphOp::Merge { .. }) {
+        if matches!(node.op, GraphOp::Merge { .. } | GraphOp::ChannelCombine) {
             if let Some(extent) = resolved_inputs
                 .values()
                 .find_map(|input| native_extents.get(input))
                 .copied()
             {
-                // Whole-graph validation below still requires both inputs to
-                // retain exactly the same native extent.
+                // Whole-graph validation below requires every input to retain
+                // exactly the same native extent.
                 native_extents.insert(output, extent);
             }
         }
@@ -12910,6 +12930,8 @@ mod tests {
                 (GraphOp::Glow, true),
                 (GraphOp::Crop, true),
                 (GraphOp::Transform2D, true),
+                (GraphOp::ChannelSplit, true),
+                (GraphOp::ChannelCombine, false),
                 (
                     GraphOp::Merge {
                         mode: BlendMode::Normal,
@@ -12977,6 +12999,44 @@ mod tests {
                     }
                 }
             }
+            let mut channel_project = project.clone();
+            let graph = channel_project.graphs.get_mut(&gid).unwrap();
+            let split = GraphNode::new(GraphOp::ChannelSplit);
+            let split_id = split.id;
+            let combine = GraphNode::new(GraphOp::ChannelCombine);
+            let combine_id = combine.id;
+            graph.nodes.insert(split_id, split);
+            graph.nodes.insert(combine_id, combine);
+            graph.edges[0].to = (split_id, InPort(0));
+            for port in 0..4 {
+                graph.edges.push(GraphEdge {
+                    from: (split_id, GOut(port)),
+                    to: (combine_id, InPort(port)),
+                });
+            }
+            graph.edges.push(GraphEdge {
+                from: (combine_id, GOut(0)),
+                to: (resize_id, InPort(0)),
+            });
+            let frame = compile_native_preview(&channel_project, seq, 0, Tick::ZERO, Quality::FULL);
+            assert!(
+                frame.diagnostics.is_empty(),
+                "source channels: {:?}",
+                frame.diagnostics
+            );
+            assert!(frame.graph.validate_working_color_domain().is_ok());
+            channel_project
+                .graphs
+                .get_mut(&gid)
+                .unwrap()
+                .edges
+                .retain(|edge| edge.to != (combine_id, InPort(3)));
+            let missing_alpha =
+                compile_native_preview(&channel_project, seq, 0, Tick::ZERO, Quality::FULL);
+            assert!(
+                !missing_alpha.diagnostics.is_empty(),
+                "source channels require all four native inputs"
+            );
             let mut merged = project.clone();
             let graph = merged.graphs.get_mut(&gid).unwrap();
             let route = GraphNode::new(GraphOp::Merge {

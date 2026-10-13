@@ -23800,6 +23800,7 @@ mod tests {
     enum NativeSourceTailFixture {
         Merge,
         Geometry,
+        Channels(u8),
     }
 
     async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
@@ -23977,6 +23978,28 @@ mod tests {
                 Some(NativeSourceTailFixture::Geometry),
             ))
             .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_source_channels_mcp_preview_prores_and_relink() {
+        for mode in 0..3 {
+            for fit in [
+                photonic_core::timeline::FitMode::Contain,
+                photonic_core::timeline::FitMode::Cover,
+                photonic_core::timeline::FitMode::Stretch,
+            ] {
+                Box::pin(check_native_media_in_import_sized(
+                    NativeMediaFixtureMode::Plain,
+                    Some(fit),
+                    Some([21, 7]),
+                    false,
+                    false,
+                    None,
+                    Some(NativeSourceTailFixture::Channels(mode)),
+                ))
+                .await;
+            }
         }
     }
 
@@ -24373,6 +24396,41 @@ mod tests {
                 Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":detailed}}))).await;
                 output_source = detailed;
             }
+            if let Some(NativeSourceTailFixture::Channels(mode)) = tail {
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":GraphOp::ChannelSplit}),
+                ))
+                .await;
+                let split = data(&added)["node_id"].clone();
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":split}}))).await;
+                if mode == 0 {
+                    let added = Box::pin(graph_authoring_edit_roundtrip(
+                        &state,
+                        "add_graph_node",
+                        json!({"graph_id":graph_id,"op":GraphOp::ChannelCombine}),
+                    ))
+                    .await;
+                    let combined = data(&added)["node_id"].clone();
+                    for (to, from) in [2, 1, 0, 3].into_iter().enumerate() {
+                        Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":split,"port":from},"to":{"node_id":combined,"port":to}}))).await;
+                    }
+                    output_source = combined;
+                } else {
+                    // TimeOffset is a typed image pass-through here; its zero
+                    // offset exposes the scalar-to-image conversion before Resize.
+                    let added = Box::pin(graph_authoring_edit_roundtrip(
+                        &state,
+                        "add_graph_node",
+                        json!({"graph_id":graph_id,"op":GraphOp::TimeOffset {offset:Tick::ZERO}}),
+                    ))
+                    .await;
+                    let image = data(&added)["node_id"].clone();
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":split,"port":if mode==1 {0} else {3}},"to":{"node_id":image}}))).await;
+                    output_source = image;
+                }
+            }
             if source_geometry {
                 let added = Box::pin(graph_authoring_edit_roundtrip(
                     &state,
@@ -24591,6 +24649,14 @@ mod tests {
                 )
             };
             let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                if let Some(NativeSourceTailFixture::Channels(mode)) = tail {
+                    let (rgb, alpha) = composited_pixel(frame, index);
+                    return match mode {
+                        0 => ([rgb[2], rgb[1], rgb[0]], alpha),
+                        1 => ([if alpha > 0.0 { rgb[0] } else { 0.0 }; 3], 1.0),
+                        _ => ([alpha; 3], 1.0),
+                    };
+                }
                 if !source_geometry {
                     return composited_pixel(frame, index);
                 }
@@ -24737,11 +24803,19 @@ mod tests {
                 previews.push(png);
             }
             if !still {
-                assert_ne!(
-                    previews[0].as_raw(),
-                    previews[2].as_raw(),
-                    "source time actually advances"
-                );
+                if matches!(tail, Some(NativeSourceTailFixture::Channels(2))) {
+                    assert_eq!(
+                        previews[0].as_raw(),
+                        previews[2].as_raw(),
+                        "opaque video alpha inspection is time-invariant"
+                    );
+                } else {
+                    assert_ne!(
+                        previews[0].as_raw(),
+                        previews[2].as_raw(),
+                        "source time actually advances"
+                    );
+                }
             }
             let output_path = dir.join("media-in.mov");
             let start=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":output_path,"preset":"ProRes Mezzanine","write_manifest":true})).await;
