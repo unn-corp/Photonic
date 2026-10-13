@@ -7731,6 +7731,57 @@ fn native_source_resolution_gaussian_preserves_sigma_draft_cache_and_taps() {
 }
 
 #[test]
+fn native_source_detail_filters_preserve_source_radius_alpha_and_quality_cache() {
+    for op in [
+        IrOp::NativeUnsharp {
+            amount: 0.0,
+            sigma: 1.25,
+        },
+        IrOp::NativeUnsharp {
+            amount: 0.75,
+            sigma: 1.25,
+        },
+        IrOp::NativeUnsharp {
+            amount: 2.0,
+            sigma: 3.0,
+        },
+        IrOp::NativeGlow {
+            sigma: 1.25,
+            threshold: 0.25,
+            intensity: 0.0,
+            tint: [0.5, 1.0, 0.2],
+        },
+        IrOp::NativeGlow {
+            sigma: 1.25,
+            threshold: 0.25,
+            intensity: 0.75,
+            tint: [0.5, 1.0, 0.2],
+        },
+        IrOp::NativeGlow {
+            sigma: 3.0,
+            threshold: 0.25,
+            intensity: 2.0,
+            tint: [0.5, 1.0, 0.2],
+        },
+    ] {
+        check_native_mixed_resolution_resize(Some(op));
+    }
+    check_native_mixed_resolution_chain(&[
+        IrOp::NativeUnsharp {
+            amount: 0.5,
+            sigma: 1.25,
+        },
+        IrOp::NativeGlow {
+            sigma: 1.25,
+            threshold: 0.25,
+            intensity: 0.5,
+            tint: [0.5, 1.0, 0.2],
+        },
+        IrOp::NativeInvert,
+    ]);
+}
+
+#[test]
 fn native_source_processing_chains_preserve_order_alpha_and_quality_cache() {
     let chain = [
         IrOp::NativeInvert,
@@ -8227,6 +8278,86 @@ fn native_source_gaussian_budget_counts_three_temporaries() {
             working_color_domain: WorkingColorDomain::SceneLinearAcescg,
         };
         assert_eq!(graph.validate_working_color_domain().is_ok(), allowed);
+    }
+}
+
+#[test]
+fn native_source_detail_budget_counts_all_scratch_textures() {
+    use photonic_core::timeline::AssetId;
+    use photonic_video::graph::ir::FitMode;
+    for (op, width, allowed) in [
+        (
+            IrOp::NativeUnsharp {
+                amount: 1.0,
+                sigma: 1.25,
+            },
+            1280,
+            true,
+        ),
+        (
+            IrOp::NativeUnsharp {
+                amount: 1.0,
+                sigma: 1.25,
+            },
+            1408,
+            false,
+        ),
+        (
+            IrOp::NativeGlow {
+                sigma: 1.25,
+                threshold: 0.2,
+                intensity: 1.0,
+                tint: [1.0; 3],
+            },
+            1152,
+            true,
+        ),
+        (
+            IrOp::NativeGlow {
+                sigma: 1.25,
+                threshold: 0.2,
+                intensity: 1.0,
+                tint: [1.0; 3],
+            },
+            1216,
+            false,
+        ),
+    ] {
+        let graph = FrameGraph {
+            nodes: vec![
+                IrNode {
+                    op: IrOp::NativeMediaStill {
+                        asset: AssetId::new(),
+                        w: width,
+                        h: 2048,
+                        native_extent: true,
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op,
+                    inputs: vec![(IrNodeId(0), OutPort(0))],
+                    content_hash: ContentHash(2),
+                },
+                IrNode {
+                    op: IrOp::Resize {
+                        w: 16,
+                        h: 16,
+                        fit: FitMode::Stretch,
+                    },
+                    inputs: vec![(IrNodeId(1), OutPort(0))],
+                    content_hash: ContentHash(3),
+                },
+            ],
+            output: Some(IrNodeId(2)),
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+        };
+        assert_eq!(
+            graph.validate_working_color_domain().is_ok(),
+            allowed,
+            "width {width}"
+        );
     }
 }
 

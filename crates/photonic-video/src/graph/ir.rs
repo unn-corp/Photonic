@@ -1128,7 +1128,7 @@ impl FrameGraph {
                     Some((w, h))
                 }
                 IrOp::NativeInvert | IrOp::NativeChromaKey { .. } | IrOp::NativeLumaKey { .. }
-                | IrOp::NativeGaussianBlur { .. }
+                | IrOp::NativeGaussianBlur { .. } | IrOp::NativeUnsharp { .. } | IrOp::NativeGlow { .. }
                     if incoming.is_some() && node.inputs.len() == 1 => incoming,
                 IrOp::Resize { .. } => None,
                 _ if incoming.is_some() => return Err(
@@ -1142,12 +1142,13 @@ impl FrameGraph {
                     height: h,
                 }
                 .bucket();
-                // Gaussian reserves its output plus three same-sized temporary
-                // textures. Charge all four even for its identity fast path.
-                let allocations = if matches!(node.op, IrOp::NativeGaussianBlur { .. }) {
-                    4
-                } else {
-                    1
+                // Conservatively include all same-sized scratch textures,
+                // even when identity parameters take a cheaper fast path.
+                let allocations = match node.op {
+                    IrOp::NativeGaussianBlur { .. } => 4,
+                    IrOp::NativeUnsharp { .. } => 5,
+                    IrOp::NativeGlow { .. } => 6,
+                    _ => 1,
                 };
                 texels = texels.saturating_add(u64::from(bw) * u64::from(bh) * allocations);
                 if texels > 16_777_216 {

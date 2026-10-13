@@ -23798,7 +23798,7 @@ mod tests {
 
     async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
         Box::pin(check_native_media_in_import_sized(
-            mode, None, None, false, false,
+            mode, None, None, false, false, None,
         ))
         .await;
     }
@@ -23816,6 +23816,7 @@ mod tests {
                 None,
                 false,
                 false,
+                None,
             ))
             .await;
         }
@@ -23834,6 +23835,7 @@ mod tests {
                 Some(dimensions),
                 false,
                 false,
+                None,
             ))
             .await;
         }
@@ -23852,6 +23854,7 @@ mod tests {
                 Some([21, 7]),
                 true,
                 false,
+                None,
             ))
             .await;
         }
@@ -23870,6 +23873,7 @@ mod tests {
                 Some([21, 7]),
                 false,
                 true,
+                None,
             ))
             .await;
         }
@@ -23888,8 +23892,39 @@ mod tests {
                 Some([21, 7]),
                 true,
                 true,
+                None,
             ))
             .await;
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NativeSourceDetailFixture {
+        Unsharp,
+        Glow,
+    }
+
+    #[tokio::test]
+    async fn native_source_detail_before_resize_mcp_preview_prores_and_relink() {
+        for detail in [
+            NativeSourceDetailFixture::Unsharp,
+            NativeSourceDetailFixture::Glow,
+        ] {
+            for fit in [
+                photonic_core::timeline::FitMode::Contain,
+                photonic_core::timeline::FitMode::Cover,
+                photonic_core::timeline::FitMode::Stretch,
+            ] {
+                Box::pin(check_native_media_in_import_sized(
+                    NativeMediaFixtureMode::Plain,
+                    Some(fit),
+                    Some([21, 7]),
+                    false,
+                    false,
+                    Some(detail),
+                ))
+                .await;
+            }
         }
     }
 
@@ -23899,6 +23934,7 @@ mod tests {
         intermediate_dimensions: Option<[usize; 2]>,
         invert_before_resize: bool,
         blur_before_resize: bool,
+        detail_before_resize: Option<NativeSourceDetailFixture>,
     ) {
         let output_width = if resize_fit.is_some() { 16_usize } else { 32 };
         let output_height = 16_usize;
@@ -24231,6 +24267,57 @@ mod tests {
                 )).await;
                 output_source = blurred;
             }
+            if let Some(detail) = detail_before_resize {
+                let op = if detail == NativeSourceDetailFixture::Unsharp {
+                    GraphOp::Sharpen
+                } else {
+                    GraphOp::Glow
+                };
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":op}),
+                ))
+                .await;
+                let detailed = data(&added)["node_id"].clone();
+                let mut params = vec![(
+                    "params.radius",
+                    photonic_core::timeline::PropValue::Float(1.25),
+                )];
+                if detail == NativeSourceDetailFixture::Unsharp {
+                    params.push((
+                        "params.amount",
+                        photonic_core::timeline::PropValue::Float(0.75),
+                    ));
+                } else {
+                    params.extend([
+                        (
+                            "params.threshold",
+                            photonic_core::timeline::PropValue::Float(0.25),
+                        ),
+                        (
+                            "params.intensity",
+                            photonic_core::timeline::PropValue::Float(0.5),
+                        ),
+                        (
+                            "params.tint",
+                            photonic_core::timeline::PropValue::Color(photonic_core::Color::new(
+                                0.5, 0.8, 1.0, 1.0,
+                            )),
+                        ),
+                    ]);
+                }
+                for (path, value) in params {
+                    Box::pin(graph_authoring_edit_roundtrip(
+                        &state,
+                        "set_graph_node_param",
+                        json!({"graph_id":graph_id,"node_id":detailed,"path":path,"value":value}),
+                    ))
+                    .await;
+                }
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":detailed}}))).await;
+                output_source = detailed;
+            }
             if let Some(fit) = resize_fit {
                 let added = Box::pin(graph_authoring_edit_roundtrip(
                     &state,
@@ -24311,7 +24398,7 @@ mod tests {
                 }
             };
             let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
-                if blur_before_resize {
+                if blur_before_resize || detail_before_resize.is_some() {
                     // Independent binary64 2D Gaussian, sigma 1.25, radius
                     // ceil(3*sigma)=4. Clamp samples to the source image edge,
                     // average premultiplied RGBA, then recover straight color.
@@ -24326,7 +24413,13 @@ mod tests {
                         for dx in -4..=4 {
                             let j = (y + dy).clamp(0, 15) as usize * 32
                                 + (x + dx).clamp(0, 31) as usize;
-                            let (rgb, a) = pointwise_pixel(frame, j);
+                            let (rgb, mut a) = pointwise_pixel(frame, j);
+                            if detail_before_resize == Some(NativeSourceDetailFixture::Glow)
+                                && rgb[0] * 0.27222872 + rgb[1] * 0.67408174 + rgb[2] * 0.053689517
+                                    < 0.25
+                            {
+                                a = 0.0;
+                            }
                             let weight =
                                 weights[(dx + 4) as usize] * weights[(dy + 4) as usize] / norm;
                             for c in 0..3 {
@@ -24336,6 +24429,41 @@ mod tests {
                         }
                     }
                     let a = value[3];
+                    let (src, src_alpha) = pointwise_pixel(frame, index);
+                    if detail_before_resize == Some(NativeSourceDetailFixture::Unsharp) {
+                        return (
+                            std::array::from_fn(|c| {
+                                if src_alpha <= 0.0 {
+                                    0.0
+                                } else if a > 1e-8 {
+                                    src[c] + 0.75 * (src[c] - value[c] / a)
+                                } else {
+                                    src[c]
+                                }
+                            }),
+                            src_alpha,
+                        );
+                    }
+                    if detail_before_resize == Some(NativeSourceDetailFixture::Glow) {
+                        let tint =
+                            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                                0.5, 0.8, 1.0,
+                            ]);
+                        let alpha = src_alpha + (a * 0.5).clamp(0.0, 1.0) * (1.0 - src_alpha);
+                        return (
+                            std::array::from_fn(|c| {
+                                let original = src[c] * src_alpha;
+                                let premult =
+                                    original + value[c] * tint[c] * 0.5 * (1.0 - original).max(0.0);
+                                if alpha > 0.0 {
+                                    premult / alpha
+                                } else {
+                                    0.0
+                                }
+                            }),
+                            alpha,
+                        );
+                    }
                     return (
                         std::array::from_fn(|c| if a > 0.0 { value[c] / a } else { 0.0 }),
                         a,
