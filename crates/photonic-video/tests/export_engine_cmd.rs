@@ -411,15 +411,54 @@ fn native_managed_prores_export_decodes_as_ten_bit_bt709() {
         .ops[0]
         .params
         .base = GradeOpParams::Exposure { stops: 1.0 };
+    // Solid-color clips are supported by the native pipeline. Keep this
+    // late-frame atomicity check genuinely invalid rather than relying on a
+    // formerly unsupported source type.
+    let mut later_clip = Clip::new(
+        ClipSource::SolidColor {
+            color: Color::rgb(0.0, 0.0, 1.0),
+        },
+        FrameRate::FPS_30.ticks_per_frame(),
+        FrameRate::FPS_30.ticks_per_frame(),
+    );
+    let mut supported_project = project.clone();
+    supported_project
+        .sequences
+        .get_mut(&seq_id)
+        .unwrap()
+        .video_tracks[0]
+        .clips
+        .push(later_clip.clone());
+    let mut supported_job = job.clone();
+    supported_job.output = directory.join("supported-later-solid.mov");
+    run_export_job(
+        gpu.clone(),
+        Arc::new(supported_project),
+        &supported_job,
+        &tools,
+        &AtomicBool::new(false),
+        |_| {},
+    )
+    .expect("a supported later solid-color frame must export");
+    let supported_decode = std::process::Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&supported_job.output)
+        .args(["-pix_fmt", "yuv422p10le", "-f", "rawvideo", "-"])
+        .output()
+        .unwrap();
+    assert!(supported_decode.status.success());
+    assert_eq!(supported_decode.stdout.len(), 2 * 32 * 32 * 4);
+    assert_eq!(std::fs::read(&output).unwrap(), published);
+
+    let mut later_grade = Grade::new();
+    later_grade.ops.push(GradeOp::new(
+        GradeOpKind::Exposure,
+        GradeOpParams::Exposure { stops: 100.0 },
+    ));
+    later_clip.grade = Some(later_grade);
     project.sequences.get_mut(&seq_id).unwrap().video_tracks[0]
         .clips
-        .push(Clip::new(
-            ClipSource::SolidColor {
-                color: Color::rgb(0.0, 0.0, 1.0),
-            },
-            FrameRate::FPS_30.ticks_per_frame(),
-            FrameRate::FPS_30.ticks_per_frame(),
-        ));
+        .push(later_clip);
     let failure = run_export_job(
         gpu.clone(),
         Arc::new(project.clone()),

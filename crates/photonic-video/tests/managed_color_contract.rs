@@ -162,6 +162,23 @@ fn native_managed_qualified_solid_delivery_preserves_unqualified_export_gates() 
         .unwrap()
         .master_effects
         .push(ClipEffect::new(EffectKind::Deflicker));
+    // Bounded native Deflicker is now qualified. The refusal contract must
+    // instead use a genuinely unknown effect, not an implemented operator.
+    assert!(resolve_export_job(&project, &qualified_preset).is_ok());
+    project
+        .sequences
+        .get_mut(&id)
+        .unwrap()
+        .master_effects
+        .clear();
+    project
+        .sequences
+        .get_mut(&id)
+        .unwrap()
+        .master_effects
+        .push(ClipEffect::new(EffectKind::Unknown(UnknownTag::intern(
+            "test.unqualified_native_effect",
+        ))));
     assert!(resolve_export_job(&project, &qualified_preset)
         .unwrap_err()
         .to_string()

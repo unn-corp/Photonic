@@ -34,6 +34,47 @@ fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Parse independently with a bounded worker pool. Results (including errors)
+/// are consumed in source order, so scheduling cannot change the index or the
+/// first diagnostic. No worker touches the output file.
+fn index_files(root: &Path, files: &[PathBuf], workers: usize) -> Result<Vec<Item>, String> {
+    let workers = workers.max(1).min(files.len().max(1));
+    let mut results = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                scope.spawn(move || {
+                    files
+                        .iter()
+                        .enumerate()
+                        .skip(worker)
+                        .step_by(workers)
+                        .map(|(position, file)| {
+                            let mut items = Vec::new();
+                            let result = index::index_file(root, file, &mut items).map(|()| items);
+                            (position, result)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut results = Vec::with_capacity(files.len());
+        for handle in handles {
+            results.extend(
+                handle
+                    .join()
+                    .map_err(|_| "index worker panicked".to_string())?,
+            );
+        }
+        Ok::<_, String>(results)
+    })?;
+    results.sort_by_key(|(position, _)| *position);
+    let mut items = Vec::new();
+    for (_, result) in results {
+        items.extend(result?);
+    }
+    Ok(items)
+}
+
 fn default_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
 }
@@ -95,10 +136,8 @@ fn run() -> Result<(), String> {
     // guard, but this keeps error reporting deterministic too).
     files.sort();
 
-    let mut items: Vec<Item> = Vec::new();
-    for f in &files {
-        index::index_file(&root, f, &mut items)?;
-    }
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(4));
+    let items = index_files(&root, &files, workers)?;
 
     let idx = Index::new(items);
     let json = serde_json::to_string_pretty(&idx).map_err(|e| format!("serialize error: {e}"))?;
@@ -123,5 +162,35 @@ fn main() -> ExitCode {
             eprintln!("spec-extract: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod parallel_tests {
+    use super::*;
+
+    #[test]
+    fn bounded_workers_preserve_index_bytes_and_first_error() {
+        let root = default_root().canonicalize().unwrap();
+        let mut files = Vec::new();
+        rs_files(&root.join("crates/photonic-core/src/timeline"), &mut files);
+        files.sort();
+        assert!(files.len() > 4);
+        let serial =
+            serde_json::to_string(&Index::new(index_files(&root, &files, 1).unwrap())).unwrap();
+        for workers in [2, 4] {
+            let parallel =
+                serde_json::to_string(&Index::new(index_files(&root, &files, workers).unwrap()))
+                    .unwrap();
+            assert_eq!(parallel, serial);
+        }
+        files.insert(1, root.join("crates/photonic-core/src/first-missing.rs"));
+        files.push(root.join("crates/photonic-core/src/second-missing.rs"));
+        let serial = index_files(&root, &files, 1).err().unwrap();
+        assert!(serial.contains("first-missing.rs"));
+        for workers in [2, 4] {
+            assert_eq!(index_files(&root, &files, workers).err().unwrap(), serial);
+        }
+        assert!(index_files(&root, &[], 0).unwrap().is_empty());
     }
 }

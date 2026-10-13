@@ -54,6 +54,31 @@ example pollution cannot silently return. This index currently covers eight
 explicitly numbered criteria; it is not a complete video/color acceptance list.
 The full professional roadmap remains in progress.
 
+### Full-workspace regression follow-through
+
+The first complete local all-feature run on October 13 finished with 3,733
+passing tests, four failures and 24 ignored tests. This was not a clean pass.
+In addition to the isolated XDG preset configuration issue above, the broader
+run exposed two stale export expectations and a real checker throughput gap:
+
+- The late-frame atomic-export test now uses an out-of-range exposure instead
+  of treating an ordinary solid source as unsupported. It also exports and
+  decodes the supported two-frame sequence separately, and still verifies that
+  invalid delivery preserves the existing output bytes. All three export-engine
+  tests pass after the correction.
+- The managed contract now accepts bounded Deflicker and uses an explicit
+  unknown-effect sentinel for refusal coverage. All six contract tests pass.
+- Structural extraction consumed roughly 13.25 seconds before checking. A
+  bounded pool of at most four independent parsers now consumes results and
+  errors in original source order. Serial/parallel byte equality and first-error
+  ordering are tested; the original ten-second acceptance budget is unchanged.
+  All 14 spec-extract unit/integration tests pass, including that budget.
+
+GitHub run `38343529423` on `6ca80f57` passed lint, PDF preflight and strict
+video/render/export acceptance, but its full workspace job stopped at the stale
+late-frame export fixture. A complete clean rerun and publication of these
+follow-through fixes are pending; no full-roadmap completion is implied.
+
 ## Current roadmap checkpoint — 2026-10-09
 
 This checkpoint takes precedence over earlier dated status, pending lists and
