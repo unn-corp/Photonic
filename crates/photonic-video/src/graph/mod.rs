@@ -13,6 +13,10 @@
 //! - [`rolling_bands`] — rolling-shutter AC banding: per-scanline detect + correct.
 
 pub mod ir;
+pub(crate) mod native_channels;
+pub(crate) mod native_matte;
+pub(crate) mod native_rank;
+pub(crate) mod native_surface;
 
 pub mod analysis;
 pub mod cache;
@@ -39,3 +43,5 @@ pub use compile::{
     compile, CompileCode, CompileDiagnostic, CompiledFrame, DiagSeverity, Quality, ScopeTapPoint,
     ViewNodeOverride,
 };
+
+pub(crate) mod native_deflicker_plan;

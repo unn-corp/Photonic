@@ -212,6 +212,11 @@ use egui::Key;
 
 /// Every shortcut-bearing editor action. Ids are stable and used as keymap keys.
 pub static REGISTRY: &[CommandDef] = &[
+    CommandDef {
+        id: "file.save",
+        label: "Save Document",
+        default: Some(KeyBinding::ctrl(Key::S)),
+    },
     // ── Edit ──────────────────────────────────────────────────────────────
     CommandDef {
         id: "edit.undo",

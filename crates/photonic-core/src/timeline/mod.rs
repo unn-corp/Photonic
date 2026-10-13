@@ -13,6 +13,8 @@
 
 pub mod anim;
 pub mod audio;
+pub mod bezier_animation;
+pub mod bezier_window;
 pub mod captions;
 pub mod clip;
 pub mod color;
@@ -26,11 +28,13 @@ pub mod graph_ops;
 pub mod ids;
 pub mod load;
 pub mod media;
+pub mod native_balance;
 pub mod ops;
 pub mod precision_trim;
 pub mod prop_registry;
 pub mod scale;
 pub mod sequence;
+pub mod shared_look_versions;
 pub mod stabilization;
 pub mod time;
 pub mod title_presets;
@@ -49,7 +53,7 @@ pub use audio::{
 };
 pub use captions::{
     CaptionAnim, CaptionBackground, CaptionCue, CaptionStyle, CaptionTrack, CaptionWord,
-    KaraokeMode, KaraokeStyle,
+    KaraokeMode, KaraokeStyle, TextDirection,
 };
 pub use clip::{
     AnchorSpace, Clip, ClipEffect, ClipSource, ClipTransform, EaseCurve, GradeVersion, LumaWipeMap,
@@ -79,10 +83,11 @@ pub use effect_preset::{
     EffectPreset, EffectPresetError, EffectPresetLibrary, LibraryLoad, LibraryStoreError,
 };
 pub use grade::{
-    parse_cdl_xml, write_cdl_xml, CdlParams, CdlXmlError, ClipLook, Grade, GradeGraph,
-    GradeGraphInputPort, GradeGraphNode, GradeGraphPortType, GradeKeyMixMode, GradeMask,
-    GradeMatteRefinement, GradeOp, GradeOpKind, GradeOpParams, LutInterp, MaskRef, QualifierKey,
-    QualifierKeyMode, SharedLook, WindowShape, MAX_QUALIFIER_KEYS,
+    parse_cdl_xml, validate_tonal_exposure, write_cdl_xml, CdlParams, CdlXmlError, ClipLook, Grade,
+    GradeGraph, GradeGraphInputPort, GradeGraphNode, GradeGraphPortType, GradeInspectionStage,
+    GradeKeyMixMode, GradeMask, GradeMatteRefinement, GradeOp, GradeOpKind, GradeOpParams,
+    GradeQualifierSpatial, LutInterp, MaskRef, QualifierKey, QualifierKeyMode, SharedLook,
+    WindowShape, MAX_QUALIFIER_KEYS,
 };
 pub use graph::{
     FitMode, GraphEdge, GraphNode, GraphNodeParams, GraphOp, InPort, MaskShapeKind, NodeGraph,
@@ -111,3 +116,10 @@ pub use sequence::{
 };
 pub use time::{FrameRate, Tick, Timecode, TICKS_PER_SECOND};
 pub use unknown::UnknownTag;
+
+pub mod reference_gallery;
+
+pub use bezier_animation::{
+    BezierWindowInterpolation, BezierWindowKey, BezierWindowTrack, MAX_BEZIER_KEYS,
+};
+pub use bezier_window::{BezierKnot, BezierWindow, MAX_BEZIER_KNOTS, MAX_BEZIER_SEGMENTS};

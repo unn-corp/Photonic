@@ -157,10 +157,22 @@ pub(crate) fn draw_window_handles(
         return;
     };
     let mut grade = grade.clone();
-    let editable = ops::set_grade_scoped(project, owner, Some(grade.clone())).is_ok();
+    let mut editable = ops::set_grade_scoped(project, owner, Some(grade.clone())).is_ok();
     let Some(op) = grade.ops.iter_mut().find(|op| op.id == op_id) else {
         return;
     };
+    if op.has_mask_animation() {
+        let at = if matches!(owner, VfxOwner::Track(_) | VfxOwner::Master(_)) {
+            playhead
+        } else {
+            playhead - clip.start
+        };
+        let Ok(mask) = op.mask_at(at) else {
+            return;
+        };
+        op.mask = mask;
+        editable = false; // display sampled geometry; edit animated lanes in Keyframes
+    }
     let Some(GradeMask::PowerWindow {
         shape,
         center,
@@ -341,6 +353,13 @@ mod tests {
 
     #[test]
     fn dragging_center_changes_one_undoable_grade() {
+        check_window_handle_editing(false);
+    }
+    #[test]
+    fn animated_window_handles_show_sampled_geometry_without_editing_base() {
+        check_window_handle_editing(true);
+    }
+    fn check_window_handle_editing(animated: bool) {
         let mut doc = Document::new("window", 16.0, 16.0);
         let mut project = TimelineProject::new();
         let mut sequence = Sequence::new("cut", FrameRate::FPS_30, 16, 16);
@@ -360,6 +379,18 @@ mod tests {
             softness: 0.1,
             invert: false,
         });
+        if animated {
+            use photonic_core::timeline::{Interp, Keyframe, PropPath, PropValue};
+            for (at, value) in [(0, 0.5), (100, 0.8)] {
+                op.params
+                    .track_mut(&PropPath::new("mask.center[0]"))
+                    .insert_keyframe(Keyframe::new(
+                        Tick(at),
+                        PropValue::Float(value),
+                        Interp::Linear,
+                    ));
+            }
+        }
         let op_id = op.id;
         grade.ops.push(op);
         clip.grade = Some(grade.clone());
@@ -380,7 +411,7 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
+            let output = ctx.run(input, |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     draw_window_handles(
                         ui,
@@ -389,10 +420,13 @@ mod tests {
                         history,
                         &[clip_id],
                         Some(op_id),
-                        Tick::ZERO,
+                        if animated { Tick(50) } else { Tick::ZERO },
                     );
                 });
             });
+            if animated {
+                assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::epaint::Shape::Circle(circle) if (circle.center.x-360.0).abs()<0.01 && (circle.center.y-300.0).abs()<0.01)),"sampled center handle must match the current window");
+            }
         };
         draw(Vec::new(), 0.0, &mut doc, &mut history);
         history.begin_coalescing();
@@ -434,6 +468,11 @@ mod tests {
         let Some(GradeMask::PowerWindow { center, .. }) = &moved.ops[0].mask else {
             panic!("mask disappeared")
         };
+        if animated {
+            assert_eq!(moved, &grade);
+            assert!(!history.undo(&mut doc));
+            return;
+        }
         assert!(center[0] > 0.5, "window center did not move: {center:?}");
         assert!(history.undo(&mut doc));
         let project = doc.timeline.as_ref().unwrap();

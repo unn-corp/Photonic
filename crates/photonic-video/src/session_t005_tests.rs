@@ -283,7 +283,7 @@ fn t005_playing_and_scrub_misses_never_wait_per_source() {
         );
         let worker = DecodeWorker::spawn(Arc::new(Mutex::new(decode)), FrameRate::FPS_30);
         media.sources.insert(
-            (id, false),
+            (id, false, 0),
             Some(VideoSourceEntry {
                 ring,
                 worker,
@@ -294,6 +294,7 @@ fn t005_playing_and_scrub_misses_never_wait_per_source() {
                 pixel_format: Some("yuv420p".into()),
                 file_identity: None,
                 rate: FrameRate::FPS_30,
+                pts_table: None,
                 last_used: 0,
             }),
         );

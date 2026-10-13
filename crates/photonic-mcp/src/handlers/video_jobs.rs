@@ -252,12 +252,50 @@ impl EngineBridge {
                     Some(p) => !Arc::ptr_eq(p, &frame),
                     None => true,
                 };
-                if fresh && pred(&frame) {
+                if fresh
+                    && (frame.pending_computations == 0 || !frame.color_errors.is_empty())
+                    && pred(&frame)
+                {
                     return Some(frame);
                 }
             }
             if Instant::now() >= deadline {
                 return None;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    /// Like wait_fresh_frame, but fail promptly on an error from this exact
+    /// inspection even when no texture could be allocated or published.
+    pub async fn wait_inspection_frame(
+        &self,
+        prev: Option<Arc<EngineFrame>>,
+        timeout: Duration,
+        request_id: u64,
+        pred: impl Fn(&EngineFrame) -> bool,
+    ) -> Result<Option<Arc<EngineFrame>>, Vec<String>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(frame) = self.session.latest_frame() {
+                let fresh = match &prev {
+                    Some(p) => !Arc::ptr_eq(p, &frame),
+                    None => true,
+                };
+                if fresh
+                    && (frame.pending_computations == 0 || !frame.color_errors.is_empty())
+                    && pred(&frame)
+                {
+                    return Ok(Some(frame));
+                }
+            }
+            let status = self.session.status();
+            if status.computation_error_inspection == Some(request_id)
+                && !status.computation_errors.is_empty()
+            {
+                return Err(status.computation_errors.clone());
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
             }
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -374,6 +412,12 @@ impl JobRegistry {
             },
         );
         Ok((id, cancel))
+    }
+
+    pub fn has_active_kind(&self, kind: &str) -> bool {
+        self.jobs
+            .values()
+            .any(|job| job.kind == kind && !job.status.is_terminal())
     }
 
     /// Update a job's status; stamps `finished` on the terminal transition.

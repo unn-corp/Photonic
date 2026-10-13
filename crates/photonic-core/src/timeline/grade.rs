@@ -36,6 +36,26 @@ pub struct SharedLook {
     pub id: SharedLookId,
     pub name: String,
     pub grade: Grade,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub versions: Vec<SharedLookVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_version: Option<uuid::Uuid>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SharedLookVersion {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub grade: Grade,
+}
+impl SharedLook {
+    pub fn sync_active_version(&mut self) {
+        if let Some(active) = self.active_version {
+            if let Some(version) = self.versions.iter_mut().find(|v| v.id == active) {
+                version.grade = self.grade.clone();
+            }
+        }
+    }
 }
 
 /// A clip's optional look stage. `Local` is the exact snapshot produced by
@@ -45,6 +65,112 @@ pub struct SharedLook {
 pub enum ClipLook {
     Shared(SharedLookId),
     Local(Box<Grade>),
+}
+
+/// Stage address within one selected clip's grading pipeline. Readback uses
+/// this directly; writes must additionally pass the checked edit operations.
+/// Shared stages must match that clip's current link; this is not an arbitrary
+/// project-wide shared-look preview with an invented input picture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GradeInspectionStage {
+    #[default]
+    Clip,
+    LocalLook,
+    GroupPre {
+        id: super::GroupId,
+    },
+    GroupPost {
+        id: super::GroupId,
+    },
+    SharedLook {
+        id: SharedLookId,
+    },
+}
+
+impl<'de> Deserialize<'de> for GradeInspectionStage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Serde unit variants accept ignored payload fields even with an enum's
+        // deny_unknown_fields. Empty struct variants preserve the strict address
+        // contract without changing the public unit-variant API.
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum Address {
+            Clip {},
+            LocalLook {},
+            GroupPre { id: super::GroupId },
+            GroupPost { id: super::GroupId },
+            SharedLook { id: SharedLookId },
+        }
+        Ok(match Address::deserialize(deserializer)? {
+            Address::Clip {} => Self::Clip,
+            Address::LocalLook {} => Self::LocalLook,
+            Address::GroupPre { id } => Self::GroupPre { id },
+            Address::GroupPost { id } => Self::GroupPost { id },
+            Address::SharedLook { id } => Self::SharedLook { id },
+        })
+    }
+}
+
+impl GradeInspectionStage {
+    pub fn resolve_grade<'a>(
+        self,
+        project: &'a super::TimelineProject,
+        clip: &'a super::Clip,
+    ) -> Option<&'a Grade> {
+        match self {
+            Self::Clip => clip.grade.as_ref(),
+            Self::LocalLook => match clip.look.as_ref()? {
+                ClipLook::Local(grade) => Some(grade.as_ref()),
+                _ => None,
+            },
+            Self::GroupPre { id } | Self::GroupPost { id } => {
+                // A shared group has a different input for each member. Resolve
+                // only the selected member's complete, well-formed ancestry.
+                let mut owners = project.sequences.values().filter(|sequence| {
+                    sequence
+                        .tracks()
+                        .any(|track| track.clips.iter().any(|c| c.id == clip.id))
+                });
+                let sequence = owners.next()?;
+                if owners.next().is_some() {
+                    return None;
+                }
+                let mut current = clip.group;
+                let mut visited = std::collections::HashSet::new();
+                let mut contains = false;
+                while let Some(group) = current {
+                    if !visited.insert(group) {
+                        return None;
+                    }
+                    let node = sequence.groups.get(&group)?;
+                    if !matches!(
+                        node.kind,
+                        super::GroupKind::Normal | super::GroupKind::AvLink
+                    ) {
+                        return None;
+                    }
+                    contains |= group == id;
+                    current = node.parent;
+                }
+                if !contains {
+                    return None;
+                }
+                let node = sequence.groups.get(&id)?;
+                if matches!(self, Self::GroupPre { .. }) {
+                    node.pre_grade.as_ref()
+                } else {
+                    node.post_grade.as_ref()
+                }
+            }
+            Self::SharedLook { id } => match clip.look.as_ref()? {
+                ClipLook::Shared(link) if *link == id => {
+                    project.shared_looks.get(&id).map(|look| &look.grade)
+                }
+                _ => None,
+            },
+        }
+    }
 }
 
 impl Grade {
@@ -91,6 +217,37 @@ impl Grade {
         }
     }
 
+    /// Whether a raw matte output belongs to a valid, enabled graph and feeds
+    /// its output. Disconnected alternatives are not rendered inspection taps.
+    pub fn has_matte_output(&self, node: u32) -> bool {
+        !self.bypass
+            && self.graph.as_ref().is_some_and(|graph| {
+                graph.validate(&self.ops).is_ok()
+                    && graph
+                        .nodes
+                        .get(&node)
+                        .is_some_and(|value| value.output_type() == GradeGraphPortType::Matte)
+                    && graph
+                        .reachable_nodes()
+                        .is_ok_and(|reachable| reachable.contains(&node))
+            })
+    }
+
+    /// Reachable native image-node output in the ordinary clip grade.
+    pub fn has_image_output(&self, node: u32) -> bool {
+        !self.bypass
+            && self.graph.as_ref().is_some_and(|graph| {
+                graph.validate(&self.ops).is_ok()
+                    && graph
+                        .nodes
+                        .get(&node)
+                        .is_some_and(|value| value.output_type() == GradeGraphPortType::Image)
+                    && graph
+                        .reachable_nodes()
+                        .is_ok_and(|reachable| reachable.contains(&node))
+            })
+    }
+
     pub fn has_unambiguous_corrector_input(&self, op: GradeOpId) -> bool {
         self.graph.as_ref().is_none_or(|graph| {
             graph.nodes.values().filter(|node| matches!(node, GradeGraphNode::Corrector { op: candidate, .. } if *candidate == op)).count() == 1
@@ -100,7 +257,10 @@ impl Grade {
     pub fn add_graph_utility(&mut self, node: GradeGraphNode) -> Result<u32, &'static str> {
         if !matches!(
             node,
-            GradeGraphNode::QualifierMatte { .. }
+            GradeGraphNode::WindowMatte { .. }
+                | GradeGraphNode::BezierMatte { .. }
+                | GradeGraphNode::AnimatedBezierMatte { .. }
+                | GradeGraphNode::QualifierMatte { .. }
                 | GradeGraphNode::KeyMixer { .. }
                 | GradeGraphNode::MatteApply { .. }
                 | GradeGraphNode::MatteRefine { .. }
@@ -144,6 +304,7 @@ impl Grade {
             .values()
             .filter_map(|node| match node {
                 GradeGraphNode::Corrector { op, .. }
+                | GradeGraphNode::WindowMatte { op, .. }
                 | GradeGraphNode::QualifierMatte { op, .. } => Some(*op),
                 _ => None,
             })
@@ -165,12 +326,54 @@ impl Grade {
 /// stable within the grade; the graph never changes the enclosing scope order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GradeGraph {
+    #[serde(deserialize_with = "deserialize_grade_graph_nodes")]
     pub nodes: BTreeMap<u32, GradeGraphNode>,
     pub output: u32,
     /// Allocation cursor; retained across deletions so stale node IDs are not
     /// accidentally reused. Older graphs default to zero and recover on add.
     #[serde(default)]
     pub next_id: u32,
+}
+
+// JSON object keys arrive as strings. Internally tagged timeline commands
+// buffer nested maps in Serde Content, losing serde_json's integer-key adapter.
+// Accept both representations so a GradeGraph survives embedded undo history.
+fn deserialize_grade_graph_nodes<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<u32, GradeGraphNode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Key {
+        Number(u32),
+        Text(String),
+    }
+    struct Nodes;
+    impl<'de> serde::de::Visitor<'de> for Nodes {
+        type Value = BTreeMap<u32, GradeGraphNode>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a map of numeric grading node IDs")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut nodes = BTreeMap::new();
+            while let Some((key, node)) = map.next_entry::<Key, GradeGraphNode>()? {
+                let id = match key {
+                    Key::Number(id) => id,
+                    Key::Text(text) => text.parse::<u32>().map_err(serde::de::Error::custom)?,
+                };
+                if nodes.insert(id, node).is_some() {
+                    return Err(serde::de::Error::custom("duplicate grading graph node ID"));
+                }
+            }
+            Ok(nodes)
+        }
+    }
+    deserializer.deserialize_map(Nodes)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -192,6 +395,25 @@ pub enum GradeGraphNode {
     QualifierMatte {
         input: u32,
         op: GradeOpId,
+        label: String,
+    },
+    /// Geometry-only window key. RGB parameters and source alpha do not affect it.
+    WindowMatte {
+        input: u32,
+        op: GradeOpId,
+        label: String,
+    },
+    /// Closed cubic geometry key, independent of source color and alpha.
+    BezierMatte {
+        input: u32,
+        window: super::BezierWindow,
+        label: String,
+    },
+    /// Fixed-topology keyframed path. Separate variant prevents old readers
+    /// from silently ignoring animation on an otherwise static window.
+    AnimatedBezierMatte {
+        input: u32,
+        track: super::BezierWindowTrack,
         label: String,
     },
     MatteRefine {
@@ -276,9 +498,12 @@ pub struct GradeGraphInputPort {
 impl GradeGraphNode {
     pub fn output_type(&self) -> GradeGraphPortType {
         match self {
-            Self::QualifierMatte { .. } | Self::KeyMixer { .. } | Self::MatteRefine { .. } => {
-                GradeGraphPortType::Matte
-            }
+            Self::WindowMatte { .. }
+            | Self::BezierMatte { .. }
+            | Self::AnimatedBezierMatte { .. }
+            | Self::QualifierMatte { .. }
+            | Self::KeyMixer { .. }
+            | Self::MatteRefine { .. } => GradeGraphPortType::Matte,
             _ => GradeGraphPortType::Image,
         }
     }
@@ -290,6 +515,9 @@ impl GradeGraphNode {
         match self {
             Self::Input => [None; 3],
             Self::Corrector { input, .. }
+            | Self::WindowMatte { input, .. }
+            | Self::BezierMatte { input, .. }
+            | Self::AnimatedBezierMatte { input, .. }
             | Self::QualifierMatte { input, .. }
             | Self::Output { input } => [port(*input, Image, "image"), None, None],
             Self::LayerMixer { top, bottom, .. } => [
@@ -319,6 +547,9 @@ impl GradeGraphNode {
     pub fn set_input(&mut self, port: &str, source: u32) -> Result<(), &'static str> {
         let slot = match self {
             Self::Corrector { input, .. }
+            | Self::WindowMatte { input, .. }
+            | Self::BezierMatte { input, .. }
+            | Self::AnimatedBezierMatte { input, .. }
             | Self::QualifierMatte { input, .. }
             | Self::Output { input }
                 if port == "image" =>
@@ -436,7 +667,12 @@ impl GradeGraph {
                 GradeGraphNode::LayerMixer { bottom, .. } | GradeGraphNode::KeyMixer { bottom, .. },
             ) => *bottom,
             Some(GradeGraphNode::MatteApply { original, .. }) => *original,
-            Some(GradeGraphNode::QualifierMatte { .. }) => {
+            Some(
+                GradeGraphNode::WindowMatte { .. }
+                | GradeGraphNode::BezierMatte { .. }
+                | GradeGraphNode::AnimatedBezierMatte { .. }
+                | GradeGraphNode::QualifierMatte { .. },
+            ) => {
                 if self.nodes.values().any(|node| {
                     node.input_ports()
                         .into_iter()
@@ -515,6 +751,7 @@ impl GradeGraph {
                 .ok_or("grading graph references a missing node")?;
             match node {
                 GradeGraphNode::Corrector { op, .. }
+                | GradeGraphNode::WindowMatte { op, .. }
                 | GradeGraphNode::QualifierMatte { op, .. } => {
                     let corrector = ops
                         .iter()
@@ -528,6 +765,8 @@ impl GradeGraph {
                     }
                 }
                 GradeGraphNode::MatteRefine { refinement, .. } => refinement.validate()?,
+                GradeGraphNode::BezierMatte { window, .. } => window.validate()?,
+                GradeGraphNode::AnimatedBezierMatte { track, .. } => track.validate()?,
                 GradeGraphNode::LayerMixer { opacity, .. }
                     if !opacity.is_finite() || !(0.0..=1.0).contains(opacity) =>
                 {
@@ -575,6 +814,207 @@ impl Default for Grade {
 #[cfg(test)]
 mod graph_tests {
     use super::*;
+
+    #[test]
+    fn inspection_stage_json_is_explicit_strict_and_round_trips() {
+        let id = SharedLookId::new();
+        for stage in [
+            GradeInspectionStage::Clip,
+            GradeInspectionStage::LocalLook,
+            GradeInspectionStage::GroupPre {
+                id: super::super::GroupId::new(),
+            },
+            GradeInspectionStage::GroupPost {
+                id: super::super::GroupId::new(),
+            },
+            GradeInspectionStage::SharedLook { id },
+        ] {
+            let json = serde_json::to_value(stage).unwrap();
+            assert_eq!(
+                serde_json::from_value::<GradeInspectionStage>(json).unwrap(),
+                stage
+            );
+        }
+        assert_eq!(GradeInspectionStage::default(), GradeInspectionStage::Clip);
+        for json in [
+            serde_json::json!({"kind":"shared_look"}),
+            serde_json::json!({"kind":"shared_look","id":"bad"}),
+            serde_json::json!({"kind":"local_look","id":id}),
+            serde_json::json!({"kind":"clip","extra":true}),
+            serde_json::json!({"kind":"group"}),
+            serde_json::json!({"kind":"group_pre"}),
+            serde_json::json!({"kind":"group_post","id":"bad"}),
+            serde_json::json!({"kind":"group_pre","id":id,"extra":true}),
+        ] {
+            assert!(
+                serde_json::from_value::<GradeInspectionStage>(json.clone()).is_err(),
+                "{json}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_inspection_resolves_only_valid_member_ancestry() {
+        use super::super::{
+            Clip, ClipSource, FrameRate, GroupKind, GroupNode, Sequence, Tick, TimelineProject,
+            Track, TrackKind,
+        };
+        let mut p = TimelineProject::new();
+        let mut sequence = Sequence::new("members", FrameRate::FPS_30, 16, 16);
+        let seq = sequence.id;
+        let mut root = GroupNode::new(GroupKind::Normal);
+        root.pre_grade = Some(Grade::new());
+        root.post_grade = Some(Grade {
+            bypass: true,
+            ..Grade::new()
+        });
+        let root_id = root.id;
+        let mut leaf = GroupNode::new(GroupKind::Normal);
+        let leaf_id = leaf.id;
+        leaf.parent = Some(root_id);
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+        clip.group = Some(leaf_id);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        sequence.groups.insert(root_id, root);
+        sequence.groups.insert(leaf_id, leaf);
+        p.insert_sequence(sequence);
+        let stage = GradeInspectionStage::GroupPre { id: root_id };
+        let member = |p: &TimelineProject| p.sequences[&seq].video_tracks[0].clips[0].clone();
+        assert!(!stage.resolve_grade(&p, &member(&p)).unwrap().bypass);
+        assert!(
+            GradeInspectionStage::GroupPost { id: root_id }
+                .resolve_grade(&p, &member(&p))
+                .unwrap()
+                .bypass
+        );
+        assert!(GradeInspectionStage::GroupPre { id: leaf_id }
+            .resolve_grade(&p, &member(&p))
+            .is_none());
+        let mut detached = p.clone();
+        detached.sequences.get_mut(&seq).unwrap().video_tracks[0].clips[0].group = None;
+        assert!(stage.resolve_grade(&detached, &member(&detached)).is_none());
+        let mut reparented = p.clone();
+        reparented
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .groups
+            .get_mut(&leaf_id)
+            .unwrap()
+            .parent = None;
+        assert!(stage
+            .resolve_grade(&reparented, &member(&reparented))
+            .is_none());
+        let mut cycle = p.clone();
+        cycle
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .groups
+            .get_mut(&root_id)
+            .unwrap()
+            .parent = Some(leaf_id);
+        assert!(stage.resolve_grade(&cycle, &member(&cycle)).is_none());
+        let mut missing = p.clone();
+        missing
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .groups
+            .get_mut(&root_id)
+            .unwrap()
+            .parent = Some(super::super::GroupId::new());
+        assert!(stage.resolve_grade(&missing, &member(&missing)).is_none());
+        let mut duplicate = p.clone();
+        let mut other = Sequence::new("duplicate", FrameRate::FPS_30, 16, 16);
+        other.video_tracks = duplicate.sequences[&seq].video_tracks.clone();
+        duplicate.insert_sequence(other);
+        assert!(stage
+            .resolve_grade(&duplicate, &member(&duplicate))
+            .is_none());
+    }
+
+    #[test]
+    fn graph_node_key_decoder_rejects_invalid_and_duplicate_ids() {
+        for nodes in [
+            r#"{"-1":{"kind":"input"}}"#,
+            r#"{"4294967296":{"kind":"input"}}"#,
+            r#"{"x":{"kind":"input"}}"#,
+            r#"{"0":{"kind":"input"},"00":{"kind":"input"}}"#,
+        ] {
+            let json = format!(r#"{{"nodes":{nodes},"output":0}}"#);
+            assert!(serde_json::from_str::<GradeGraph>(&json).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn window_matte_graph_is_typed_atomic_serializable_and_retains_its_operator() {
+        let mut grade = Grade::new();
+        let op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.0 },
+        );
+        let op_id = op.id;
+        grade.ops.push(op);
+        grade.convert_to_graph();
+        let key = grade
+            .add_graph_utility(GradeGraphNode::WindowMatte {
+                input: 0,
+                op: op_id,
+                label: "Window".into(),
+            })
+            .unwrap();
+        let before = grade.clone();
+        assert_eq!(
+            grade.graph.as_ref().unwrap().nodes[&key].output_type(),
+            GradeGraphPortType::Matte
+        );
+        assert!(grade
+            .add_graph_utility(GradeGraphNode::WindowMatte {
+                input: key,
+                op: op_id,
+                label: String::new()
+            })
+            .is_err());
+        assert_eq!(grade, before);
+        assert!(grade
+            .add_graph_utility(GradeGraphNode::WindowMatte {
+                input: 0,
+                op: GradeOpId::new(),
+                label: String::new()
+            })
+            .is_err());
+        assert_eq!(grade, before);
+        let mixed = grade
+            .add_graph_utility(GradeGraphNode::KeyMixer {
+                top: key,
+                bottom: key,
+                mode: GradeKeyMixMode::Union,
+                label: String::new(),
+            })
+            .unwrap();
+        assert!(grade.remove_graph_node(key).is_err());
+        grade.remove_graph_node(1).unwrap();
+        assert_eq!(
+            grade.ops.len(),
+            1,
+            "removing the RGB corrector must retain the window's operator"
+        );
+        let apply = grade
+            .add_graph_utility(GradeGraphNode::MatteApply {
+                original: 0,
+                corrected: 0,
+                matte: mixed,
+                label: String::new(),
+            })
+            .unwrap();
+        assert!(grade.has_matte_output(key));
+        let round: Grade = serde_json::from_str(&serde_json::to_string(&grade).unwrap()).unwrap();
+        assert_eq!(round, grade);
+        assert!(round.graph.unwrap().nodes.contains_key(&apply));
+    }
 
     #[test]
     fn typed_matte_utilities_round_trip_and_reject_wrong_ports_atomically() {
@@ -965,6 +1405,34 @@ mod graph_tests {
     }
 }
 
+/// Static spatial cleanup of a qualifier's combined key/window, before source
+/// coverage is applied. Lengths are fractions of the shorter logical dimension;
+/// denoise is a 3x3 processing-pixel median. Native Managed only.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct GradeQualifierSpatial {
+    pub denoise: bool,
+    pub grow: f32,
+    pub blur: f32,
+}
+
+impl GradeQualifierSpatial {
+    pub fn refinement(self) -> GradeMatteRefinement {
+        GradeMatteRefinement {
+            denoise: self.denoise,
+            grow: self.grow,
+            blur: self.blur,
+            matte_levels: [0.0; 2],
+        }
+    }
+    pub fn validate(self) -> Result<(), &'static str> {
+        self.refinement().validate()
+    }
+    pub fn is_neutral(self) -> bool {
+        self.refinement().is_neutral()
+    }
+}
+
 /// One corrector in the stack.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GradeOp {
@@ -974,11 +1442,15 @@ pub struct GradeOp {
     pub enabled: bool,
     /// Discriminant, immutable after creation.
     pub kind: GradeOpKind,
-    /// `base + PropertyTrack` keyframes (01 §6 convention).
+    /// `base + PropertyTrack` keyframes (01 §6 convention). Operator scalars
+    /// use `params.`; power-window scalars share these tracks under `mask.`.
     pub params: AnimProps<GradeOpParams>,
     /// Spatial/qualifier mask; `None` = full frame (§4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<GradeMask>,
+    /// Optional static cleanup; absent/neutral retains the original evaluator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier_spatial: Option<GradeQualifierSpatial>,
 }
 
 pub(crate) fn default_true() -> bool {
@@ -986,6 +1458,79 @@ pub(crate) fn default_true() -> bool {
 }
 
 impl GradeOp {
+    /// Scalar animation base, including normalized power-window geometry.
+    /// Window lanes share the corrector's existing tracks with a `mask.` prefix.
+    pub fn scalar_property(&self, path: &str) -> Option<f32> {
+        self.params
+            .base
+            .scalar_property(path)
+            .or_else(|| self.mask.as_ref()?.scalar_property(path))
+    }
+
+    pub fn has_mask_animation(&self) -> bool {
+        self.params.tracks.iter().any(|track| {
+            !track.orphaned
+                && !track.keyframes.is_empty()
+                && self
+                    .mask
+                    .as_ref()
+                    .and_then(|mask| mask.scalar_property(track.property.as_str()))
+                    .is_some()
+        })
+    }
+
+    /// Sample geometry in the same tick domain as this corrector's parameters.
+    /// Missing/non-power masks retain dormant lanes; no mask is created implicitly.
+    pub fn mask_at(&self, tick: super::Tick) -> Result<Option<GradeMask>, &'static str> {
+        let mut mask = self.mask.clone();
+        if !self.has_mask_animation() {
+            return Ok(mask);
+        }
+        let Some(mask_value) = mask.as_mut() else {
+            return Ok(mask);
+        };
+        for track in &self.params.tracks {
+            if track.orphaned || track.keyframes.is_empty() {
+                continue;
+            }
+            let Some(slot) = mask_value.scalar_property_mut(track.property.as_str()) else {
+                continue;
+            };
+            let base = super::PropValue::Float(f64::from(*slot));
+            let super::PropValue::Float(value) = super::anim::eval(track, &base, tick) else {
+                return Err("window animation requires scalar Float values");
+            };
+            if !value.is_finite() || !(value as f32).is_finite() {
+                return Err("window animation produced a nonfinite value");
+            }
+            if super::prop_registry::resolve(self.kind.target_kind(), track.property.as_str())
+                .and_then(|entry| entry.range)
+                .is_some_and(|(low, high)| !(low..=high).contains(&value))
+            {
+                return Err("window animation exceeded its registered scalar range");
+            }
+            *slot = value as f32;
+        }
+        if let GradeMask::PowerWindow {
+            center,
+            size,
+            rotation,
+            softness,
+            ..
+        } = mask_value
+        {
+            if center.iter().chain(size.iter()).any(|v| !v.is_finite())
+                || size.iter().any(|v| *v <= 0.0)
+                || !rotation.is_finite()
+                || !softness.is_finite()
+                || *softness < 0.0
+            {
+                return Err("animated window requires finite geometry, positive sizes and nonnegative feather");
+            }
+        }
+        Ok(mask)
+    }
+
     /// Construct an op with default params for its kind.
     pub fn new(kind: GradeOpKind, params: GradeOpParams) -> Self {
         GradeOp {
@@ -994,6 +1539,7 @@ impl GradeOp {
             kind,
             params: AnimProps::new(params),
             mask: None,
+            qualifier_spatial: None,
         }
     }
 }
@@ -1016,6 +1562,10 @@ pub enum GradeOpKind {
     SaturationVibrance,
     Contrast,
     WhiteBalance,
+    /// Explicit approximate Planckian-white Bradford adaptation in Kelvin.
+    WhiteBalanceCct,
+    /// Linked scene-linear exposure selected by relative-luminance tonal ranges.
+    TonalExposure,
     Cdl,
     Wheels,
     Curves,
@@ -1117,6 +1667,15 @@ pub enum GradeOpParams {
     WhiteBalance {
         temp: f32,
         tint: f32,
+    },
+    TonalExposure {
+        stops: [f32; 3],
+        boundaries: [f32; 2],
+        softness: f32,
+    },
+    WhiteBalanceCct {
+        source_kelvin: f32,
+        target_kelvin: f32,
     },
     Cdl {
         slope: [f32; 3],
@@ -1227,6 +1786,8 @@ impl GradeOpParams {
             GradeOpParams::SaturationVibrance { .. } => GradeOpKind::SaturationVibrance,
             GradeOpParams::Contrast { .. } => GradeOpKind::Contrast,
             GradeOpParams::WhiteBalance { .. } => GradeOpKind::WhiteBalance,
+            GradeOpParams::WhiteBalanceCct { .. } => GradeOpKind::WhiteBalanceCct,
+            GradeOpParams::TonalExposure { .. } => GradeOpKind::TonalExposure,
             GradeOpParams::Cdl { .. } => GradeOpKind::Cdl,
             GradeOpParams::Wheels { .. } => GradeOpKind::Wheels,
             GradeOpParams::Curves { .. } => GradeOpKind::Curves,
@@ -1271,6 +1832,35 @@ pub enum GradeMask {
     },
     /// Stretch/forward-compat (07 §4.2): not required for CAP-015's v1 exit.
     RotoMatte { source: MaskRef, invert: bool },
+}
+
+impl GradeMask {
+    pub fn scalar_property(&self, path: &str) -> Option<f32> {
+        let mut copy = self.clone();
+        copy.scalar_property_mut(path).copied()
+    }
+    pub fn scalar_property_mut(&mut self, path: &str) -> Option<&mut f32> {
+        let Self::PowerWindow {
+            shape,
+            center,
+            size,
+            rotation,
+            softness,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        match path {
+            "mask.center[0]" => Some(&mut center[0]),
+            "mask.center[1]" => Some(&mut center[1]),
+            "mask.size[0]" if *shape != WindowShape::Gradient => Some(&mut size[0]),
+            "mask.size[1]" => Some(&mut size[1]),
+            "mask.rotation" => Some(rotation),
+            "mask.softness" if *shape != WindowShape::Gradient => Some(softness),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1670,5 +2260,261 @@ mod tests {
             parse_cdl_xml("not xml <<"),
             Err(CdlXmlError::Malformed(_))
         ));
+    }
+}
+
+/// Tonal pivots are stops relative to linear Y=0.18, with one shared half-width.
+/// Ordered boundaries guarantee nonnegative partition-of-unity weights.
+pub fn validate_tonal_exposure(
+    stops: [f32; 3],
+    boundaries: [f32; 2],
+    softness: f32,
+) -> Result<(), &'static str> {
+    if !stops
+        .iter()
+        .all(|v| v.is_finite() && (-8.0..=8.0).contains(v))
+        || !boundaries
+            .iter()
+            .all(|v| v.is_finite() && (-12.0..=12.0).contains(v))
+        || boundaries[0] >= boundaries[1]
+        || !softness.is_finite()
+        || !(0.01..=6.0).contains(&softness)
+    {
+        return Err("tonal exposure requires stops in -8..=8, ordered boundaries in -12..=12, and softness in 0.01..=6");
+    }
+    Ok(())
+}
+
+impl GradeOpParams {
+    /// Shared scalar path mapping for rendering and generic grade animation.
+    pub fn scalar_property_mut(&mut self, path: &str) -> Option<&mut f32> {
+        use GradeOpParams::*;
+        match self {
+            Exposure { stops } => (path == "params.stops").then_some(stops),
+            LinearOffset { rgb } => match path {
+                "params.rgb[0]" => Some(&mut rgb[0]),
+                "params.rgb[1]" => Some(&mut rgb[1]),
+                "params.rgb[2]" => Some(&mut rgb[2]),
+                _ => None,
+            },
+            PrinterLights { points } => match path {
+                "params.points[0]" => Some(&mut points[0]),
+                "params.points[1]" => Some(&mut points[1]),
+                "params.points[2]" => Some(&mut points[2]),
+                _ => None,
+            },
+            HighlightRolloff { knee, strength } => match path {
+                "params.knee" => Some(knee),
+                "params.strength" => Some(strength),
+                _ => None,
+            },
+            SaturationVibrance {
+                saturation,
+                vibrance,
+            } => match path {
+                "params.saturation" => Some(saturation),
+                "params.vibrance" => Some(vibrance),
+                _ => None,
+            },
+            Contrast { pivot, amount } => match path {
+                "params.pivot" => Some(pivot),
+                "params.amount" => Some(amount),
+                _ => None,
+            },
+            TonalExposure {
+                stops,
+                boundaries,
+                softness,
+            } => match path {
+                "params.stops[0]" => Some(&mut stops[0]),
+                "params.stops[1]" => Some(&mut stops[1]),
+                "params.stops[2]" => Some(&mut stops[2]),
+                "params.boundaries[0]" => Some(&mut boundaries[0]),
+                "params.boundaries[1]" => Some(&mut boundaries[1]),
+                "params.softness" => Some(softness),
+                _ => None,
+            },
+            WhiteBalanceCct {
+                source_kelvin,
+                target_kelvin,
+            } => match path {
+                "params.source_kelvin" => Some(source_kelvin),
+                "params.target_kelvin" => Some(target_kelvin),
+                _ => None,
+            },
+            WhiteBalance { temp, tint } => match path {
+                "params.temp" => Some(temp),
+                "params.tint" => Some(tint),
+                _ => None,
+            },
+            Cdl {
+                slope,
+                offset,
+                power,
+                sat,
+            } => match path {
+                "params.slope[0]" => Some(&mut slope[0]),
+                "params.slope[1]" => Some(&mut slope[1]),
+                "params.slope[2]" => Some(&mut slope[2]),
+                "params.offset[0]" => Some(&mut offset[0]),
+                "params.offset[1]" => Some(&mut offset[1]),
+                "params.offset[2]" => Some(&mut offset[2]),
+                "params.power[0]" => Some(&mut power[0]),
+                "params.power[1]" => Some(&mut power[1]),
+                "params.power[2]" => Some(&mut power[2]),
+                "params.sat" => Some(sat),
+                _ => None,
+            },
+            Wheels {
+                lift,
+                gamma,
+                gain,
+                sat,
+            } => match path {
+                "params.lift[0]" => Some(&mut lift[0]),
+                "params.lift[1]" => Some(&mut lift[1]),
+                "params.lift[2]" => Some(&mut lift[2]),
+                "params.gamma[0]" => Some(&mut gamma[0]),
+                "params.gamma[1]" => Some(&mut gamma[1]),
+                "params.gamma[2]" => Some(&mut gamma[2]),
+                "params.gain[0]" => Some(&mut gain[0]),
+                "params.gain[1]" => Some(&mut gain[1]),
+                "params.gain[2]" => Some(&mut gain[2]),
+                "params.sat" => Some(sat),
+                _ => None,
+            },
+            HslQualifier {
+                softness,
+                correction,
+                ..
+            } => match path {
+                "params.softness" => Some(softness),
+                "params.correction.sat" => Some(&mut correction.sat),
+                _ => None,
+            },
+            Lut3d { intensity, .. } => (path == "params.intensity").then_some(intensity),
+            Curves { .. } | Unknown(_) => None,
+        }
+    }
+    /// Current authored scalar value. Structural vector/unknown parameters are
+    /// not exposed by the scalar registry. Called by UI, never per pixel.
+    pub fn scalar_property(&self, path: &str) -> Option<f32> {
+        self.clone().scalar_property_mut(path).copied()
+    }
+}
+
+#[cfg(test)]
+mod window_animation_tests {
+    use super::*;
+    use crate::timeline::{Interp, Keyframe, PropPath, PropValue, Tick};
+    fn op() -> GradeOp {
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        op.mask = Some(GradeMask::PowerWindow {
+            shape: WindowShape::Ellipse,
+            center: [0.25, 0.25],
+            size: [0.1, 0.2],
+            rotation: 0.0,
+            softness: 0.2,
+            invert: false,
+        });
+        op
+    }
+    fn lane(op: &mut GradeOp, path: &str, a: f64, b: f64) {
+        let track = op.params.track_mut(&PropPath::new(path));
+        for (at, v) in [(0, a), (100, b)] {
+            track.insert_keyframe(Keyframe::new(Tick(at), PropValue::Float(v), Interp::Linear));
+        }
+    }
+    #[test]
+    fn window_animation_samples_registered_geometry_without_mutating_base() {
+        let mut op = op();
+        for (path, a, b) in [
+            ("mask.center[0]", 0.25, 0.75),
+            ("mask.center[1]", 0.25, 0.5),
+            ("mask.size[0]", 0.1, 0.3),
+            ("mask.size[1]", 0.2, 0.4),
+            ("mask.rotation", 0.0, 1.0),
+            ("mask.softness", 0.2, 0.8),
+        ] {
+            lane(&mut op, path, a, b);
+            assert!(crate::timeline::prop_registry::resolve(op.kind.target_kind(), path).is_some());
+        }
+        let json = serde_json::to_string(&op).unwrap();
+        let loaded: GradeOp = serde_json::from_str(&json).unwrap();
+        assert!(loaded.has_mask_animation());
+        let mask = loaded.mask_at(Tick(50)).unwrap().unwrap();
+        for (path, value) in [
+            ("mask.center[0]", 0.5),
+            ("mask.center[1]", 0.375),
+            ("mask.size[0]", 0.2),
+            ("mask.size[1]", 0.3),
+            ("mask.rotation", 0.5),
+            ("mask.softness", 0.5),
+        ] {
+            assert!((mask.scalar_property(path).unwrap() - value).abs() < 1e-6);
+        }
+        assert_eq!(serde_json::to_string(&op).unwrap(), json);
+        assert_eq!(
+            loaded
+                .mask_at(Tick(-1))
+                .unwrap()
+                .unwrap()
+                .scalar_property("mask.center[0]"),
+            Some(0.25)
+        );
+        assert_eq!(
+            loaded
+                .mask_at(Tick(200))
+                .unwrap()
+                .unwrap()
+                .scalar_property("mask.center[0]"),
+            Some(0.75)
+        );
+    }
+    #[test]
+    fn window_animation_rejects_invalid_samples_and_preserves_dormant_lanes() {
+        for (path, value) in [
+            ("mask.size[0]", 0.0),
+            ("mask.size[1]", -0.2),
+            ("mask.softness", -0.1),
+            ("mask.softness", 1.1),
+            ("mask.center[0]", f64::MAX),
+        ] {
+            let mut op = op();
+            lane(&mut op, path, value, value);
+            assert!(op.mask_at(Tick(50)).is_err(), "{path}");
+        }
+        let mut op = op();
+        lane(&mut op, "mask.softness", 0.0, 1.0);
+        let count = op.params.tracks.len();
+        op.mask = None;
+        assert!(!op.has_mask_animation());
+        assert_eq!(op.mask_at(Tick(50)).unwrap(), None);
+        assert_eq!(op.params.tracks.len(), count);
+        op.mask = Some(GradeMask::PowerWindow {
+            shape: WindowShape::Gradient,
+            center: [0.5; 2],
+            size: [0.2; 2],
+            rotation: 0.0,
+            softness: 0.0,
+            invert: false,
+        });
+        assert!(!op.has_mask_animation());
+        assert_eq!(op.scalar_property("mask.softness"), None);
+        lane(&mut op, "mask.size[1]", 0.2, 0.6);
+        assert!(op.has_mask_animation());
+        assert!(
+            (op.mask_at(Tick(50))
+                .unwrap()
+                .unwrap()
+                .scalar_property("mask.size[1]")
+                .unwrap()
+                - 0.4)
+                .abs()
+                < 1e-6
+        );
     }
 }

@@ -90,6 +90,18 @@ Coercion rules (auto-applied at the port boundary, no node needed):
 
 Port-type mismatches are rejected **at edit time** (the wire simply refuses to connect — no invalid edge is ever representable). This is a stronger, earlier guarantee than 02 §2 step 3's "diagnostics, never black frames" — that clause covers a different failure class (a whole composition failing to satisfy the compiler, e.g. a stale/corrupt file missing its `Output`), not per-port type errors, which can't reach compile at all.
 
+**Managed-domain qualification (2026-10-07):** NativeManaged composition graphs
+apply the same typed boundary rules in their scene-linear AP1 working space:
+ChannelSplit emits unassociated AP1 R/G/B or alpha; Image → Mask uses AP1
+luminance; Mask → Image is opaque AP1 grayscale. Signed/HDR scalar signals
+are separate from bounded grading-key weights and are stored within finite
+FP16 ±65504 limits. ChannelCombine preserves component signals and clamps its
+alpha input to 0..1 before premultiplying. Missing RGB is 0 and missing alpha is
+1. Only connected/reachable Split outputs are evaluated. This qualification
+covers supported fixed-canvas native graph nodes. Same-canvas MediaIn has the
+separate qualification below, as does constant TimeOffset; MaskFromMatte has the bounded qualification below.
+Legacy Rec.709 behavior is unchanged.
+
 ### 3.2 Merge is binary (decision)
 
 Recommended: **binary `Merge` only**, Fusion-style — chain multiple `Merge` nodes for N-layer stacks. Rejected alternative: an N-input `Merge` — it would need a per-input mode/opacity/order list (effectively re-inventing a mini track stack inside a node), complicates the port-type table, and buys nothing a chain of binary merges doesn't already give with a clearer visual graph shape.
@@ -193,7 +205,60 @@ Passed as an extra compile input alongside `(sequence, format, tick)`. When set 
 - **`TimeOffset` cost is real and visible** (§3.4): each additional *distinct* offset value in a composition is a full extra evaluation of everything upstream of that node, every frame it's on-screen. Reusing the same offset value across multiple `TimeOffset` nodes is free (identical content hash, one cached instance).
 - **Resolution context**: a composition evaluates in the active `SequenceFormat`'s pixel dimensions by default (`Output.w/h` = format's `w,h`). `MediaIn`/`VectorIn` sources decode/rasterize at native resolution; nothing auto-fits — a `Resize`/`Crop`/`Transform2D` the user wires is the only way pixels change size. **Region-of-interest** (computing only the on-screen crop through the whole chain instead of full frames everywhere) is explicitly **post-v1** — v1 pays the full-frame cost at every node, consistent with 02 §8's per-frame budget table already assuming this.
 
+**NativeManaged MediaIn qualification (2026-10-07; intermediate Resize extended 2026-10-09):** independent file-backed
+stills and progressive videos use explicit asset-level input interpretation;
+host clip overrides, trim and speed do not affect MediaIn. Clip Local time is
+sequence time minus host start; project Local uses sequence time. Actual decoded
+geometry is checked before preview scaling, including stale probes after relink.
+Matching-canvas media retains the existing path. Differently sized media keeps
+its coded-pixel extent until an explicit Resize (Contain, Cover or Stretch).
+The authored intermediate target is bounded to integer dimensions 1..=8192 and
+16,777,216 pixels; a following internal Stretch normalizes it to the sequence
+canvas before downstream processing. Draft scales both target dimensions, with
+a minimum of one pixel. TimeOffset/selected Switch routing is allowed before Resize, while
+other processing and direct output are refused. The native extent participates
+in cache identity and source scope readback retains its natural dimensions.
+Sources are bounded to 8192 per dimension and 16,777,216 padded source texels across
+mixed-resolution IR instances. General variable-extent chains, pixel-aspect-aware
+conform, broader codecs/proxies and interlaced decoding remain unqualified.
+
+**NativeManaged TimeOffset qualification (2026-10-07):** structural constant
+clock offsets re-evaluate upstream nodes and sources; identical content dedups.
+ClipIn trim and validated constant/held/linear/bounded Bézier speed are applied at the shifted time, while outer
+host processing keeps its timeline clock. Retimed program inputs stop before
+project processing and outer captions. Negative moving-source/program time,
+overflow, malformed maps and unsafe eased-integration ranges fail visibly. Static sources
+can reuse their image. More than four distinct offsets warns; expansion is
+bounded to 8,192 node/time instances. Paused preview, export, typed exact-tick
+editing and undo are qualified; bounded four-clock playback is qualified below; high-resolution and long-soak playback remain open.
+The native inspector and `set_graph_time_offset` MCP tool preserve graph identity,
+wiring and layout, with no-op repeats, stale-draft and locked-graph protection.
+
+**Native independent clocks (2026-10-07):** demanded native asset/time pairs
+receive stable sorted decoder lanes within the existing eight-source budget.
+Equal clocks share a lane; unused sources are pruned while requested scope taps
+remain demanded. Four separated clocks pass real preview/export and repeated
+three-second 32×16 playback checks. This is not broad throughput qualification.
+
 ---
+
+Native ramp qualification additionally covers four analytic speed-map cases with
+half-frame offsets, actual preview/ProRes and native Full pictures. Worker cold
+seeks use covering frames; VFR readiness uses actual adjacent PTS intervals.
+Public at-or-after seek semantics remain unchanged.
+
+**NativeManaged subject masks (2026-10-07):** `NativeMatteExtract` uses a pinned,
+offline U²-Net-p model on a serial background worker, with asynchronous GPU
+readback and explicit bounded AP1-to-sRGB model input. Outputs are raw weights,
+not weights multiplied by source coverage; Mask→Image remains opaque grayscale.
+Inputs must match the canvas and fit four megapixels. At most eight distinct
+results and 16 MiB of masks may be needed simultaneously. Pending previews are
+labeled provisional; exact inspection/export waits or fails, never publishes a
+placeholder. Relink/Undo, stale-job rejection, missing-model no-publish behavior,
+actual preview/ProRes and bounded playback are qualified. This is not real-time
+segmentation or general footage/HDR/high-resolution quality qualification. The
+model must be provisioned beforehand; rendering never downloads it. See
+`../../implementation/native-matte-worker.md` for identity and limits.
 
 ## 8. Undo integration
 
@@ -241,3 +306,11 @@ pub enum GraphCmd {
 | `crates/photonic-gui/src/app/node_editor/` (new) | egui-snarl canvas + viewer-inset split, palette, node-body widgets, drag/box-select, diagnostic badges — central-panel content, reached from a composition-edit entry point. |
 | `panels/mod.rs` `DrawerGroup::NodeEditor` interior | Palette + selected-node full inspector + graph-level info (refines 04 §4.1's delegation). |
 | `session.rs` (`EngineSession`, 02) | + `view_override: Option<ViewNodeOverride>` (session state, never document state). |
+
+**Native source-end behavior (2026-10-07):** a proven unavailable moving-source
+request produces a tick-specific visible error; exact inspection/export refuses
+it and a valid seek recovers without poisoning asset configuration. The final
+picture retains the presenter's existing nominal-interval fallback when no next
+PTS exists. Container/audio duration is not used as video-end proof. Raw decode
+preserves all source pictures with explicit passthrough sync and source time
+base; VFR tests now check actual picture payloads as well as timestamps.

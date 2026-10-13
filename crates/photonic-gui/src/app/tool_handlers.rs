@@ -112,6 +112,12 @@ impl PhotonicApp {
             return doc_modified;
         }
 
+        // Save is a file operation, not an authored document/history mutation.
+        // It shares the palette/menu path and honors the same keymap/text gate.
+        if self.binding_pressed(ctx, "file.save") {
+            self.dispatch_command("file.save", doc, history);
+        }
+
         // ── Selection-anchored shortcuts (z-order, ungroup) ───────────────────
         // These need a single anchor node from `self.selected_id`. They operate
         // on `doc.selection` / the anchored node, so they are safe under any
@@ -2108,5 +2114,127 @@ mod clipboard_shortcut_tests {
         assert_ne!(roots2[0], roots[0], "repeat paste gets fresh ids");
         history.execute(cmd2, &mut doc);
         assert_eq!(doc.nodes_in_draw_order().len(), before * 3);
+    }
+}
+
+#[cfg(test)]
+mod save_shortcut_tests {
+    use super::*;
+    use crate::commands::KeyBinding;
+    fn input(key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: Some(key),
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        }
+    }
+    fn fixture() -> (PhotonicApp, Document, CommandHistory, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("photonic-save-shortcut-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = PhotonicApp::default();
+        let doc = Document::new("Save shortcut content", 37., 29.);
+        let h = CommandHistory::new(20);
+        app.current_file = Some(root.join("saved.photon"));
+        app.ensure_initial_tab(&doc, &h);
+        app.tabs[0].dirty = true;
+        (app, doc, h, root)
+    }
+    #[test]
+    fn save_shortcut_primary_modifiers_persist_without_history_edits() {
+        for modifiers in [
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..Default::default()
+            },
+            egui::Modifiers {
+                mac_cmd: true,
+                command: true,
+                ..Default::default()
+            },
+        ] {
+            let (mut app, mut doc, mut history, root) = fixture();
+            let ctx = egui::Context::default();
+            let before = serde_json::to_value(&doc).unwrap();
+            let rev = history.revision();
+            let _ = ctx.run(input(egui::Key::S, modifiers), |ctx| {
+                assert!(!app.handle_global_shortcuts(ctx, &mut doc, &mut history))
+            });
+            let saved = std::fs::read_to_string(root.join("saved.photon")).unwrap();
+            let loaded = photonic_core::Document::from_json(&saved).unwrap();
+            assert_eq!(serde_json::to_value(loaded).unwrap(), before);
+            assert_eq!(history.revision(), rev);
+            assert_eq!(history.undo_depth(), 0);
+            assert!(!app.tabs[0].dirty);
+            assert!(app.file_status.as_ref().unwrap().starts_with("Saved "));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn save_shortcut_respects_keymap_and_does_not_fire_for_plain_s() {
+        let (mut app, mut doc, mut history, root) = fixture();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(input(egui::Key::S, egui::Modifiers::NONE), |ctx| {
+            app.handle_global_shortcuts(ctx, &mut doc, &mut history);
+        });
+        assert!(!root.join("saved.photon").exists());
+        assert!(app.tabs[0].dirty);
+        app.prefs
+            .keymap
+            .insert("file.save".into(), KeyBinding::ctrl_alt(egui::Key::S));
+        let _ = ctx.run(
+            input(
+                egui::Key::S,
+                egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    ..Default::default()
+                },
+            ),
+            |ctx| {
+                app.handle_global_shortcuts(ctx, &mut doc, &mut history);
+            },
+        );
+        assert!(!root.join("saved.photon").exists());
+        let _ = ctx.run(
+            input(
+                egui::Key::S,
+                egui::Modifiers {
+                    ctrl: true,
+                    command: true,
+                    alt: true,
+                    ..Default::default()
+                },
+            ),
+            |ctx| {
+                app.handle_global_shortcuts(ctx, &mut doc, &mut history);
+            },
+        );
+        assert!(root.join("saved.photon").is_file());
+        assert!(!app.tabs[0].dirty);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn save_shortcut_failed_write_preserves_dirty_document_and_destination() {
+        let (mut app, mut doc, mut history, root) = fixture();
+        let path = root.join("saved.photon");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("keep.txt"), b"existing").unwrap();
+        let before = serde_json::to_value(&doc).unwrap();
+        let rev = history.revision();
+        assert!(!app.dispatch_command("file.save", &mut doc, &mut history));
+        assert!(app.tabs[0].dirty);
+        assert_eq!(app.file_status.as_deref(), Some("Save failed"));
+        assert_eq!(std::fs::read(path.join("keep.txt")).unwrap(), b"existing");
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert_eq!(history.revision(), rev);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -11,7 +11,8 @@
 //! Path convention (matches 01 §6.2's two literal examples `transform.x` and
 //! `params.blur_radius`): the [`ClipTransform`](super::clip::ClipTransform) block
 //! uses a `transform.` prefix; every effect/grade/audio-fx/audio param block
-//! uses a `params.` prefix. Array components use a `[i]` suffix
+//! uses a `params.` prefix. GradeOp window lanes additionally use `mask.`
+//! and resolve through the shared `grade_mask_entries` block. Array components use a `[i]` suffix
 //! (`params.slope[0]`).
 
 use super::anim::PropValueKind;
@@ -144,6 +145,18 @@ const GRADE_CONTRAST: &[PropEntry] = &[
     f("params.pivot", Some((0.0, 1.0))),
     f("params.amount", Some((-1.0, 1.0))),
 ];
+const GRADE_TONAL_EXPOSURE: &[PropEntry] = &[
+    f("params.stops[0]", Some((-8.0, 8.0))),
+    f("params.stops[1]", Some((-8.0, 8.0))),
+    f("params.stops[2]", Some((-8.0, 8.0))),
+    f("params.boundaries[0]", Some((-12.0, 12.0))),
+    f("params.boundaries[1]", Some((-12.0, 12.0))),
+    f("params.softness", Some((0.01, 6.0))),
+];
+const GRADE_WHITEBALANCE_CCT: &[PropEntry] = &[
+    f("params.source_kelvin", Some((1667.0, 25000.0))),
+    f("params.target_kelvin", Some((1667.0, 25000.0))),
+];
 const GRADE_WHITEBALANCE: &[PropEntry] = &[
     f("params.temp", Some((-1.0, 1.0))),
     f("params.tint", Some((-1.0, 1.0))),
@@ -247,6 +260,8 @@ pub fn entries(kind: PropTargetKind) -> &'static [PropEntry] {
             GradeOpKind::SaturationVibrance => GRADE_SATURATION_VIBRANCE,
             GradeOpKind::Contrast => GRADE_CONTRAST,
             GradeOpKind::WhiteBalance => GRADE_WHITEBALANCE,
+            GradeOpKind::WhiteBalanceCct => GRADE_WHITEBALANCE_CCT,
+            GradeOpKind::TonalExposure => GRADE_TONAL_EXPOSURE,
             GradeOpKind::Cdl => GRADE_CDL,
             GradeOpKind::Wheels => GRADE_WHEELS,
             GradeOpKind::Curves => GRADE_CURVES,
@@ -270,6 +285,20 @@ pub fn entries(kind: PropTargetKind) -> &'static [PropEntry] {
     }
 }
 
+/// Shared power-window scalar lanes, stored in the owning GradeOp's tracks.
+/// Shape/invert remain discrete base settings; gradient has no width/feather lane.
+const GRADE_MASK: &[PropEntry] = &[
+    f("mask.center[0]", None),
+    f("mask.center[1]", None),
+    f("mask.size[0]", None),
+    f("mask.size[1]", None),
+    f("mask.rotation", None),
+    f("mask.softness", Some((0.0, 1.0))),
+];
+pub fn grade_mask_entries() -> &'static [PropEntry] {
+    GRADE_MASK
+}
+
 /// Resolve a path against a target kind's registry block.
 ///
 /// `GraphNode` accepts any path (open param surface). For every other kind an
@@ -282,6 +311,13 @@ pub fn resolve(kind: PropTargetKind, path: &str) -> Option<PropEntry> {
             kind: PropValueKind::Float,
             range: None,
         });
+    }
+    if let PropTargetKind::GradeOp(grade_kind) = kind {
+        if !grade_kind.is_unknown() {
+            if let Some(entry) = grade_mask_entries().iter().find(|entry| entry.path == path) {
+                return Some(*entry);
+            }
+        }
     }
     entries(kind)
         .iter()

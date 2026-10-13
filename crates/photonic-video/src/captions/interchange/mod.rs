@@ -45,6 +45,25 @@ pub struct ExportSummary {
     pub notes: Vec<String>,
 }
 
+/// The current subtitle writers do not serialize the explicit paragraph style.
+/// Return one warning across track/cue/word scopes instead of silently losing it.
+pub fn direction_export_notes(track: &photonic_core::timeline::CaptionTrack) -> Vec<String> {
+    let explicit = std::iter::once(&track.style)
+        .chain(track.cues.iter().filter_map(|c| c.style_override.as_ref()))
+        .chain(
+            track
+                .cues
+                .iter()
+                .flat_map(|c| c.words.iter().filter_map(|w| w.style_override.as_ref())),
+        )
+        .any(|s| !s.direction.is_auto());
+    if explicit {
+        vec!["Explicit paragraph direction is not represented in this subtitle export; external players will choose their own text direction.".into()]
+    } else {
+        Vec::new()
+    }
+}
+
 // ── Shared timestamp parsing (SRT `,` / VTT `.` millisecond timestamps) ────
 
 /// Parse `[H]H:MM:SS<sep>mmm` (hours may be 1+ digits; VTT additionally
@@ -107,5 +126,17 @@ mod shared_tests {
     fn ms_timestamp_rejects_garbage() {
         assert!(parse_ms_timestamp("not a timestamp", ',').is_none());
         assert!(parse_ms_timestamp("00:00:00", ',').is_none()); // no fractional part
+    }
+    #[test]
+    fn explicit_caption_direction_loss_is_reported_for_subtitle_interchange() {
+        let mut track = photonic_core::timeline::CaptionTrack::new("Directions");
+        assert!(super::direction_export_notes(&track).is_empty());
+        track.style.direction = photonic_core::timeline::TextDirection::Rtl;
+        assert_eq!(super::direction_export_notes(&track).len(), 1);
+        assert!(super::ass::write_ass(&track)
+            .1
+            .notes
+            .iter()
+            .any(|s| s.contains("paragraph direction")));
     }
 }

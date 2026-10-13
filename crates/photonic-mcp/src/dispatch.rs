@@ -3318,6 +3318,13 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::video::list_reference_stills(state, a).await,
             ))
         }
+        "copy_reference_still" => {
+            let a: CopyReferenceStillArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::copy_reference_still(state, a).await,
+            ))
+        }
         "remove_reference_still" => {
             let a: RemoveReferenceStillArgs =
                 serde_json::from_value(args).map_err(|e| e.to_string())?;
@@ -3370,6 +3377,20 @@ pub(crate) async fn dispatch_tool_inner(
                 handlers::video_export::inspect_render_manifest(state, a).await,
             ))
         }
+        "track_grade_window" => {
+            let a: TrackGradeWindowArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::track_grade_window(state, a).await,
+            ))
+        }
+        "apply_window_track" => {
+            let a: ApplyWindowTrackArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::apply_window_track(state, a).await,
+            ))
+        }
         "measure_scopes" => {
             let a: GetScopesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::readonly(
@@ -3381,6 +3402,27 @@ pub(crate) async fn dispatch_tool_inner(
                 serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::readonly(
                 handlers::video::sample_grade_input(state, a).await,
+            ))
+        }
+        "inspect_grade_matte" => {
+            let a: InspectGradeMatteArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::inspect_grade_matte(state, a).await,
+            ))
+        }
+        "measure_native_output" => {
+            let a: MeasureNativeOutputArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::measure_native_output(state, a).await,
+            ))
+        }
+        "inspect_grade_image" => {
+            let a: InspectGradeImageArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::readonly(
+                handlers::video::inspect_grade_image(state, a).await,
             ))
         }
         "inspect_qualifier" => {
@@ -3427,6 +3469,26 @@ pub(crate) async fn dispatch_tool_inner(
             let a: RemoveGraphEdgeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::video::remove_graph_edge(state, a).await,
+            ))
+        }
+        "set_graph_time_offset" => {
+            let a: SetGraphTimeOffsetArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_graph_time_offset(state, a).await,
+            ))
+        }
+        "set_graph_mask_shape" => {
+            let a: SetGraphMaskShapeArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_graph_mask_shape(state, a).await,
+            ))
+        }
+        "set_graph_text" => {
+            let a: SetGraphTextArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
+            Ok(ToolOutput::mutating(
+                handlers::video::set_graph_text(state, a).await,
             ))
         }
         "set_graph_node_param" => {

@@ -247,22 +247,14 @@ fn dispatch(id: &str, raster: &mut RasterImage, params: &ResolvedParams) -> Opti
             // Up to 5 authored knots (p0..p4). Non-zero contrast overrides p2.y
             // as a midtone pivot (authoring convenience).
             let contrast = f("params.contrast", 0.0).clamp(-1.0, 1.0);
-            let mut pts = vec![
-                (f("params.p0x", 0.0), f("params.p0y", 0.0)),
-                (f("params.p1x", 0.25), f("params.p1y", 0.25)),
-                (f("params.p2x", 0.5), f("params.p2y", 0.5)),
-                (f("params.p3x", 0.75), f("params.p3y", 0.75)),
-                (f("params.p4x", 1.0), f("params.p4y", 1.0)),
-            ];
-            if contrast.abs() > 1e-6 {
-                pts[2].1 = (0.5 + contrast * 0.25).clamp(0.05, 0.95);
-            }
-            // Drop duplicate x's after sort (curves() also sanitizes).
-            pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
-            if pts.len() < 2 {
-                pts = vec![(0.0, 0.0), (1.0, 1.0)];
-            }
+            let knots = std::array::from_fn(|i| {
+                let default = i as f32 * 0.25;
+                [
+                    f(&format!("params.p{i}x"), default),
+                    f(&format!("params.p{i}y"), default),
+                ]
+            });
+            let pts = photonic_core::raster::adjust::catalog_curve_points(knots, contrast);
             curves(raster, &pts, &[], &[], &[], None);
         }
         "color.photo_filter" => {
@@ -382,35 +374,44 @@ fn dispatch_util(id: &str, input: &Image, params: &ResolvedParams) -> Option<Ima
     }
 }
 
+/// Established diagnostic float utility: divide RGB but retain alpha. Downstream
+/// storage remains associated, so this intentionally changes the visible color.
+pub(crate) fn unpremultiply_pixel(p: [f32; 4]) -> [f32; 4] {
+    let a = p[3].clamp(0.0, 1.0);
+    if a > 1e-6 {
+        [p[0] / a, p[1] / a, p[2] / a, a]
+    } else {
+        [0.0; 4]
+    }
+}
 fn util_unpremultiply(input: &Image) -> Image {
     let mut out = Image::new(input.width, input.height);
     for (i, p) in input.pixels.iter().enumerate() {
-        let a = p[3].clamp(0.0, 1.0);
-        if a > 1e-6 {
-            out.pixels[i] = [p[0] / a, p[1] / a, p[2] / a, a];
-        } else {
-            out.pixels[i] = [0.0, 0.0, 0.0, 0.0];
-        }
+        out.pixels[i] = unpremultiply_pixel(*p);
     }
     out
 }
 
+/// Shared float utility semantics. Mode1 is an exact premultiplied passthrough;
+/// other modes produce an opaque inspection image, including empty source pixels.
+pub(crate) fn alpha_view_pixel(p: [f32; 4], mode: i32) -> [f32; 4] {
+    let a = p[3].clamp(0.0, 1.0);
+    match mode {
+        1 => p,
+        2 => {
+            if a > 1e-6 {
+                [p[0] / a, p[1] / a, p[2] / a, 1.0]
+            } else {
+                [0.0, 0.0, 0.0, 1.0]
+            }
+        }
+        _ => [a, a, a, 1.0],
+    }
+}
 fn util_alpha_view(input: &Image, mode: i32) -> Image {
     let mut out = Image::new(input.width, input.height);
     for (i, p) in input.pixels.iter().enumerate() {
-        let a = p[3].clamp(0.0, 1.0);
-        out.pixels[i] = match mode {
-            1 => *p, // premul RGB as-is
-            2 => {
-                // straight RGB (unpremult) with full alpha so it is visible
-                if a > 1e-6 {
-                    [p[0] / a, p[1] / a, p[2] / a, 1.0]
-                } else {
-                    [0.0, 0.0, 0.0, 1.0]
-                }
-            }
-            _ => [a, a, a, 1.0], // alpha as luma
-        };
+        out.pixels[i] = alpha_view_pixel(*p, mode);
     }
     out
 }
@@ -1088,5 +1089,65 @@ mod tests {
             "15px out must still be solid"
         );
         assert!(out.pixel(24 - 18, y)[3] < 0.05, "18px out must be clear");
+    }
+}
+
+#[cfg(test)]
+mod shared_alpha_view_tests {
+    use super::*;
+    #[test]
+    fn native_alpha_view_shared_legacy_float_semantics() {
+        for p in [
+            [0.2f32, 0.3, 0.4, 0.5],
+            [-4.0, 8.0, 2.0, 0.25],
+            [2.0, 3.0, 4.0, 0.0],
+            [0.000001, 0.0, 0.0, 0.000001],
+            [0.0; 4],
+        ] {
+            for mode in [-1, 0, 1, 2, 3] {
+                let a = p[3].clamp(0.0f32, 1.0);
+                let expected = match mode {
+                    1 => p,
+                    2 => {
+                        if a > 1e-6 {
+                            [p[0] / a, p[1] / a, p[2] / a, 1.0]
+                        } else {
+                            [0.0, 0.0, 0.0, 1.0]
+                        }
+                    }
+                    _ => [a, a, a, 1.0],
+                };
+                assert_eq!(alpha_view_pixel(p, mode), expected);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_unpremultiply_tests {
+    use super::*;
+    #[test]
+    fn native_unpremultiply_shared_legacy_float_semantics() {
+        for p in [
+            [0.2f32, 0.3, 0.4, 0.5],
+            [-4.0, 8.0, 2.0, 0.25],
+            [2.0, 3.0, 4.0, 0.0],
+            [0.000001, 0.0, 0.0, 0.000001],
+            [0.0; 4],
+            [0.25, 0.5, 0.75, 1.0],
+            [65504.0, -65504.0, 1.0, 0.0009765625],
+            [1.0, 2.0, 3.0, -0.1],
+        ] {
+            let a = p[3].clamp(0.0f32, 1.0);
+            let expected = if a > 1e-6 {
+                [p[0] / a, p[1] / a, p[2] / a, a]
+            } else {
+                [0.0; 4]
+            };
+            assert_eq!(unpremultiply_pixel(p), expected);
+            let mut image = Image::new(1, 1);
+            image.set(0, 0, p);
+            assert_eq!(util_unpremultiply(&image).pixel(0, 0), expected);
+        }
     }
 }

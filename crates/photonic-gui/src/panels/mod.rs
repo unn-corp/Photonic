@@ -118,6 +118,7 @@ pub enum EyedropperTarget {
     /// engine frame and applies the sampled colour's HSL to the clip's
     /// `HslQualifier` op via `SetGrade`.
     GradeQualifier {
+        stage: photonic_core::timeline::GradeInspectionStage,
         seq: photonic_core::timeline::SequenceId,
         track: photonic_core::timeline::TrackId,
         clip: photonic_core::timeline::ClipId,
@@ -127,6 +128,7 @@ pub enum EyedropperTarget {
     },
     /// Add an anchor to a grade curve from a program-monitor pixel.
     GradeCurve {
+        stage: photonic_core::timeline::GradeInspectionStage,
         seq: photonic_core::timeline::SequenceId,
         track: photonic_core::timeline::TrackId,
         clip: photonic_core::timeline::ClipId,
@@ -146,6 +148,37 @@ pub enum QualifierSampleMode {
 /// An action requested by a panel widget, to be processed by the main draw loop.
 #[derive(Debug)]
 pub enum PanelAction {
+    CancelGradeSampling,
+    ShowWindowTracking {
+        clip: photonic_core::timeline::ClipId,
+        op: photonic_core::timeline::GradeOpId,
+    },
+    ShowProgramMeasurements {
+        sequence: photonic_core::timeline::SequenceId,
+    },
+    ToggleGradeInput {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        stage: photonic_core::timeline::GradeInspectionStage,
+        op: photonic_core::timeline::GradeOpId,
+        node: Option<u32>,
+        qualifier: bool,
+    },
+    ToggleGradeMatte {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        stage: photonic_core::timeline::GradeInspectionStage,
+        node: u32,
+    },
+    ToggleGradeImage {
+        seq: photonic_core::timeline::SequenceId,
+        track: photonic_core::timeline::TrackId,
+        clip: photonic_core::timeline::ClipId,
+        stage: photonic_core::timeline::GradeInspectionStage,
+        node: u32,
+    },
     GradeInputSelectionChanged {
         seq: photonic_core::timeline::SequenceId,
         track: photonic_core::timeline::TrackId,
@@ -162,9 +195,14 @@ pub enum PanelAction {
         graph_node: Option<u32>,
     },
     /// Reorder a node in z-order.
-    ReorderNode { node_id: NodeId, op: ZOrderOp },
+    ReorderNode {
+        node_id: NodeId,
+        op: ZOrderOp,
+    },
     /// Select a single node (e.g. clicked in the Layers tree).
-    SelectNode { node_id: NodeId },
+    SelectNode {
+        node_id: NodeId,
+    },
     /// Run a boolean operation on the two currently selected nodes.
     BooleanOp(BooleanOp),
     /// Restore the document to a named checkpoint.
@@ -175,12 +213,21 @@ pub enum PanelAction {
     #[allow(dead_code)]
     RestoreCheckpoint(Uuid),
     /// Update the fill of a selected node.
-    UpdateNodeFill { node_id: NodeId, fill: Fill },
+    UpdateNodeFill {
+        node_id: NodeId,
+        fill: Fill,
+    },
     /// Update the stroke of a selected node.
-    UpdateNodeStroke { node_id: NodeId, stroke: Stroke },
+    UpdateNodeStroke {
+        node_id: NodeId,
+        stroke: Stroke,
+    },
     /// Apply the same fill to every listed node at once (multi-selection edit).
     /// Recorded as a single undoable batch.
-    UpdateNodesFill { node_ids: Vec<NodeId>, fill: Fill },
+    UpdateNodesFill {
+        node_ids: Vec<NodeId>,
+        fill: Fill,
+    },
     /// Apply the same stroke to every listed node at once (multi-selection edit).
     /// Recorded as a single undoable batch.
     UpdateNodesStroke {
@@ -190,11 +237,17 @@ pub enum PanelAction {
     /// Convert each listed path's stroke into a filled outline shape (Illustrator
     /// "Outline Stroke"). Paths without an enabled, positive-width stroke are
     /// skipped. Recorded as a single undoable batch.
-    OutlineStroke { node_ids: Vec<NodeId> },
+    OutlineStroke {
+        node_ids: Vec<NodeId>,
+    },
     /// Deep-clone a node and insert the copy at a small offset.
-    DuplicateNode { node_id: NodeId },
+    DuplicateNode {
+        node_id: NodeId,
+    },
     /// Remove a specific node by ID.
-    DeleteNode { node_id: NodeId },
+    DeleteNode {
+        node_id: NodeId,
+    },
     /// Remove all currently selected nodes.
     DeleteSelected,
     /// Create a default-sized shape at a canvas position.
@@ -208,7 +261,9 @@ pub enum PanelAction {
     GroupSelected,
     /// Export the given nodes (or the current selection when empty) as SVG and
     /// write the result to the OS clipboard.
-    CopyAsSvg { node_ids: Vec<NodeId> },
+    CopyAsSvg {
+        node_ids: Vec<NodeId>,
+    },
     /// Diff the current document state against a saved checkpoint, populating
     /// the canvas diff-highlight overlay.
     ///
@@ -216,66 +271,120 @@ pub enum PanelAction {
     /// (#173) as redundant with the left-drawer Edit History; the diff handler
     /// is retained for a future menu relocation of checkpoint diff.
     #[allow(dead_code)]
-    DiffWithCheckpoint { checkpoint_id: Uuid },
+    DiffWithCheckpoint {
+        checkpoint_id: Uuid,
+    },
     /// Clear the active diff highlight overlay.
     ClearDiff,
     /// Insert a midpoint anchor on every segment of a path node.
-    AddAnchorPoints { node_id: NodeId },
+    AddAnchorPoints {
+        node_id: NodeId,
+    },
     /// Open the Simplify Path dialog for a path node.
-    OpenSimplifyDialog { node_id: NodeId },
+    OpenSimplifyDialog {
+        node_id: NodeId,
+    },
     /// Open the Merge Vertices by Distance (weld) dialog for a path node.
-    OpenMergeVerticesDialog { node_id: NodeId },
+    OpenMergeVerticesDialog {
+        node_id: NodeId,
+    },
     /// Invert the fill/stroke colors of the given nodes. Empty vec = use selection.
-    InvertColors { node_ids: Vec<NodeId> },
+    InvertColors {
+        node_ids: Vec<NodeId>,
+    },
     /// Convert fill/stroke colors to grayscale. Empty vec = use selection.
-    ConvertToGrayscale { node_ids: Vec<NodeId> },
+    ConvertToGrayscale {
+        node_ids: Vec<NodeId>,
+    },
     /// Open the Find / Replace Text dialog (document-wide, no node target needed).
     OpenFindReplaceTextDialog,
     /// Dissolve a group node, re-inserting its children in place.
-    UngroupNode { node_id: NodeId },
+    UngroupNode {
+        node_id: NodeId,
+    },
     /// Recursively dissolve a group and every nested group into leaf nodes.
-    UngroupAllNode { node_id: NodeId },
+    UngroupAllNode {
+        node_id: NodeId,
+    },
     /// Close every open subpath in a path node (single-node) or merge two path
     /// nodes into one by connecting their nearest endpoints (two-node).
-    JoinPaths { node_ids: Vec<NodeId> },
+    JoinPaths {
+        node_ids: Vec<NodeId>,
+    },
     /// Clip all selected nodes to the frontmost node's boundary (Pathfinder Crop).
     /// Empty vec = use current selection.
-    PathfinderCrop { node_ids: Vec<NodeId> },
+    PathfinderCrop {
+        node_ids: Vec<NodeId>,
+    },
     /// Subtract all back nodes from the frontmost node (Pathfinder Minus Back).
     /// Empty vec = use current selection.
-    PathfinderMinusBack { node_ids: Vec<NodeId> },
+    PathfinderMinusBack {
+        node_ids: Vec<NodeId>,
+    },
     /// Subtract the frontmost node from every back node (Pathfinder Minus Front).
     /// Empty vec = use current selection.
-    PathfinderMinusFront { node_ids: Vec<NodeId> },
+    PathfinderMinusFront {
+        node_ids: Vec<NodeId>,
+    },
     /// Trim hidden areas from every selected node (Pathfinder Trim).
     /// Empty vec = use current selection.
-    PathfinderTrim { node_ids: Vec<NodeId> },
+    PathfinderTrim {
+        node_ids: Vec<NodeId>,
+    },
     /// Convert fills to stroked outlines on selected nodes (Pathfinder Outline).
     /// Empty vec = use current selection.
-    PathfinderOutline { node_ids: Vec<NodeId> },
+    PathfinderOutline {
+        node_ids: Vec<NodeId>,
+    },
     /// Select all document nodes sharing the given attribute with the reference node.
     SelectSame {
         node_id: NodeId,
         attribute: SelectSameAttr,
     },
     /// Reverse the winding direction of a path node.
-    ReversePathDirection { node_id: NodeId },
+    ReversePathDirection {
+        node_id: NodeId,
+    },
     /// Average all anchor points of a path node to their centroid.
-    AverageAnchorPoints { node_id: NodeId },
+    AverageAnchorPoints {
+        node_id: NodeId,
+    },
     /// Update the outer glow of a node.
-    UpdateNodeOuterGlow { node_id: NodeId, glow: GlowEffect },
+    UpdateNodeOuterGlow {
+        node_id: NodeId,
+        glow: GlowEffect,
+    },
     /// Update the inner glow of a node.
-    UpdateNodeInnerGlow { node_id: NodeId, glow: GlowEffect },
+    UpdateNodeInnerGlow {
+        node_id: NodeId,
+        glow: GlowEffect,
+    },
     /// Update the Gaussian glow of a node.
-    UpdateNodeGaussianGlow { node_id: NodeId, glow: GaussianGlow },
+    UpdateNodeGaussianGlow {
+        node_id: NodeId,
+        glow: GaussianGlow,
+    },
     /// Lock or unlock a node (prevents canvas selection when locked).
-    SetLocked { node_id: NodeId, locked: bool },
+    SetLocked {
+        node_id: NodeId,
+        locked: bool,
+    },
     /// Show or hide an individual node (does not affect layer visibility).
-    SetVisible { node_id: NodeId, visible: bool },
+    SetVisible {
+        node_id: NodeId,
+        visible: bool,
+    },
     /// Move a node to an absolute canvas position by setting its translation directly.
-    SetNodePosition { node_id: NodeId, x: f64, y: f64 },
+    SetNodePosition {
+        node_id: NodeId,
+        x: f64,
+        y: f64,
+    },
     /// Set a single object's opacity (0.0–1.0).
-    SetNodeOpacity { node_id: NodeId, opacity: f32 },
+    SetNodeOpacity {
+        node_id: NodeId,
+        opacity: f32,
+    },
     /// Set a single object's blend mode.
     SetNodeBlendMode {
         node_id: NodeId,
@@ -304,37 +413,56 @@ pub enum PanelAction {
     },
     /// Split two overlapping path nodes at their intersection edges into distinct face nodes.
     /// Empty vec = use current selection (resolved in app.rs).
-    PathfinderDivide { node_ids: Vec<NodeId> },
+    PathfinderDivide {
+        node_ids: Vec<NodeId>,
+    },
     /// Trim all selected nodes of hidden areas then merge same-color faces (Pathfinder Merge).
     /// Empty vec = use current selection (resolved in app.rs).
-    PathfinderMerge { node_ids: Vec<NodeId> },
+    PathfinderMerge {
+        node_ids: Vec<NodeId>,
+    },
     /// Use the given path node as a cutting edge to divide all objects beneath it.
     /// The cutter is removed; each intersecting object below is split into inside/outside faces.
-    DivideObjectsBelow { node_id: NodeId },
+    DivideObjectsBelow {
+        node_id: NodeId,
+    },
     /// Activate the eyedropper for the given color slot.
     StartEyedropper(EyedropperTarget),
     /// Remove the background of a raster layer with the local matting model,
     /// storing the result as a non-destructive foreground layer mask.
-    RasterRemoveBackground { node_id: NodeId },
+    RasterRemoveBackground {
+        node_id: NodeId,
+    },
     /// Begin a color-range mask-out session on a raster layer: arms the
     /// eyedropper so the next canvas click samples the color to hide.
-    StartRasterColorRange { node_id: NodeId },
+    StartRasterColorRange {
+        node_id: NodeId,
+    },
     /// Live-update the active color-range session's fuzziness/contiguity and
     /// refresh its preview.
-    SetRasterColorRangeParams { tolerance: f32, contiguous: bool },
+    SetRasterColorRangeParams {
+        tolerance: f32,
+        contiguous: bool,
+    },
     /// Commit the active color-range session as one undoable step.
     ApplyRasterColorRange,
     /// Discard the active color-range session, restoring the layer.
     CancelRasterColorRange,
     /// Remove a raster layer's non-destructive layer mask (undoable).
-    ClearRasterMask { node_id: NodeId },
+    ClearRasterMask {
+        node_id: NodeId,
+    },
     /// Crop a raster layer's pixels (and mask) to the artboard bounds,
     /// discarding everything outside (undoable).
-    CropRasterToArtboard { node_id: NodeId },
+    CropRasterToArtboard {
+        node_id: NodeId,
+    },
     /// Add a new empty layer at the top of the stack and make it active.
     AddLayer,
     /// Move the given nodes (or current selection if empty) into a new layer.
-    CollectInNewLayer { node_ids: Vec<NodeId> },
+    CollectInNewLayer {
+        node_ids: Vec<NodeId>,
+    },
     /// Blend fill colors linearly across 3+ selected path nodes.
     /// Empty vec = use current selection (resolved in app.rs).
     /// `direction`: "horizontal", "vertical", "depth", or "" for selection order.
@@ -351,14 +479,20 @@ pub enum PanelAction {
         delta_a: f32,
     },
     /// Move each node (or current selection if empty) into its own new layer.
-    ReleaseToLayers { node_ids: Vec<NodeId> },
+    ReleaseToLayers {
+        node_ids: Vec<NodeId>,
+    },
     /// Merge the given layers into one (bottommost in stack order is the target).
-    MergeLayers { layer_ids: Vec<LayerId> },
+    MergeLayers {
+        layer_ids: Vec<LayerId>,
+    },
     /// Flatten all layers in the document into a single layer.
     FlattenArtwork,
     /// Reorder the layer stack to `new_order` (bottom→top), e.g. from a
     /// drag-to-reorder in the Layers panel (#169). Applied as one undoable step.
-    ReorderLayers { new_order: Vec<LayerId> },
+    ReorderLayers {
+        new_order: Vec<LayerId>,
+    },
     /// Reparent a node into a container (a group, or a layer) at an index —
     /// Layers-panel drag-and-drop (#210). The handler resolves the old container.
     ReparentNode {
@@ -407,30 +541,53 @@ pub enum PanelAction {
         is_template: bool,
     },
     /// Rename a layer.
-    RenameLayer { layer_id: LayerId, name: String },
+    RenameLayer {
+        layer_id: LayerId,
+        name: String,
+    },
     /// Open a floating color picker for a path node's fill (`stroke = false`) or
     /// stroke (`stroke = true`) solid color. Raised from the radial menu.
-    OpenColorPopup { node_id: NodeId, stroke: bool },
+    OpenColorPopup {
+        node_id: NodeId,
+        stroke: bool,
+    },
     /// Delete a layer and all the nodes it contains (undoable). Refuses to
     /// remove the last remaining layer.
-    DeleteLayer { layer_id: LayerId },
+    DeleteLayer {
+        layer_id: LayerId,
+    },
     /// Show or hide an entire layer.
-    SetLayerVisible { layer_id: LayerId, visible: bool },
+    SetLayerVisible {
+        layer_id: LayerId,
+        visible: bool,
+    },
     /// Lock or unlock an entire layer (prevents selecting its contents).
-    SetLayerLocked { layer_id: LayerId, locked: bool },
+    SetLayerLocked {
+        layer_id: LayerId,
+        locked: bool,
+    },
     /// Set a layer's opacity (0.0–1.0); the layer composites as a unit.
-    SetLayerOpacity { layer_id: LayerId, opacity: f32 },
+    SetLayerOpacity {
+        layer_id: LayerId,
+        opacity: f32,
+    },
     /// Set a layer's blend mode; the layer composites as a unit against those beneath.
     SetLayerBlendMode {
         layer_id: LayerId,
         blend_mode: photonic_core::layer::BlendMode,
     },
     /// Open the Options modal for a whole layer (name, blend, opacity, color, template…).
-    OpenLayerOptions { layer_id: LayerId },
+    OpenLayerOptions {
+        layer_id: LayerId,
+    },
     /// Open the Options modal for a single object, scoped to its type.
-    OpenObjectOptions { node_id: NodeId },
+    OpenObjectOptions {
+        node_id: NodeId,
+    },
     /// Duplicate a layer and all its objects as a new layer above it.
-    DuplicateLayer { layer_id: LayerId },
+    DuplicateLayer {
+        layer_id: LayerId,
+    },
     /// Create a new empty group ("sublayer") nesting container. When a group is
     /// selected it is nested inside that group; otherwise it lands at the top of
     /// the active layer.
@@ -442,7 +599,9 @@ pub enum PanelAction {
     /// Create a non-destructive adjustment layer of the given kind (MCP
     /// adjustment vocabulary, e.g. "brightness_contrast", "invert") at the top
     /// of the active layer, with sensible default parameters.
-    AddAdjustmentLayer { kind: String },
+    AddAdjustmentLayer {
+        kind: String,
+    },
     /// Align or distribute selected nodes.
     /// `operation`: left/center_horizontal/right/top/center_vertical/bottom/distribute_horizontal/distribute_vertical
     /// `key_object_id`: when set, align relative to this node's bounds (key object is not moved)
@@ -451,9 +610,13 @@ pub enum PanelAction {
         key_object_id: Option<NodeId>,
     },
     /// Combine multiple path nodes into one compound path (even-odd fill rule creates holes).
-    MakeCompoundPath { node_ids: Vec<NodeId> },
+    MakeCompoundPath {
+        node_ids: Vec<NodeId>,
+    },
     /// Release a compound path back into individual path nodes, one per subpath.
-    ReleaseCompoundPath { node_id: NodeId },
+    ReleaseCompoundPath {
+        node_id: NodeId,
+    },
     /// Apply a shear (skew) transform to a node around its own centre.
     ShearNode {
         node_ids: Vec<NodeId>,
@@ -461,7 +624,9 @@ pub enum PanelAction {
         shear_y: f64,
     },
     /// Round the position of one or more nodes to integer pixel coordinates.
-    SnapToPixel { node_ids: Vec<NodeId> },
+    SnapToPixel {
+        node_ids: Vec<NodeId>,
+    },
     /// Distribute node copies evenly along a guide path.
     /// `path_node_id` is the guide; `node_ids` are the sources to clone.
     DistributeOnPath {
@@ -476,7 +641,10 @@ pub enum PanelAction {
     },
     /// Live preview: set the solid fill of exactly these nodes to `to` WITHOUT
     /// recording history. Used while dragging the document color-swatch picker.
-    RecolorPreview { ids: Vec<NodeId>, to: [f32; 4] },
+    RecolorPreview {
+        ids: Vec<NodeId>,
+        to: [f32; 4],
+    },
     /// Commit a document color-swatch recolor as one undoable step: the given
     /// nodes change from `from` to `to` (undo restores `from`).
     RecolorCommit {
@@ -485,15 +653,24 @@ pub enum PanelAction {
         to: [f32; 4],
     },
     /// Align selected nodes relative to the document canvas (artboard) bounds.
-    AlignToArtboard { operation: String },
+    AlignToArtboard {
+        operation: String,
+    },
     /// Remove all unlocked guides from the document.
     ClearGuides,
     /// Convert anchor points to smooth joins for the given path nodes.
-    ConvertToSmooth { node_ids: Vec<NodeId> },
+    ConvertToSmooth {
+        node_ids: Vec<NodeId>,
+    },
     /// Convert anchor points to corner joins (cusps) for the given path nodes.
-    ConvertToCorner { node_ids: Vec<NodeId> },
+    ConvertToCorner {
+        node_ids: Vec<NodeId>,
+    },
     /// Select all nodes of a given kind ("path", "text", "group", "same_layer").
-    SelectByKind { kind: String, additive: bool },
+    SelectByKind {
+        kind: String,
+        additive: bool,
+    },
     /// Apply zig-zag distortion to path nodes.
     ZigZagPath {
         node_ids: Vec<NodeId>,
@@ -554,7 +731,10 @@ pub enum PanelAction {
         bend: f64,
     },
     /// Round sharp corners with arc fillets.
-    RoundCorners { node_ids: Vec<NodeId>, radius: f64 },
+    RoundCorners {
+        node_ids: Vec<NodeId>,
+        radius: f64,
+    },
     /// Move a single selected anchor of an edited path to a local position.
     SetAnchorPosition {
         node_id: NodeId,
@@ -591,22 +771,30 @@ pub enum PanelAction {
         letter_spacing: Option<f64>,
     },
     /// Add a drop shadow behind a node.
-    AddDropShadow { node_id: NodeId },
+    AddDropShadow {
+        node_id: NodeId,
+    },
     /// Create a sample radar chart at canvas center (5 axes, 2 series).
     CreateRadarChart,
     /// Create a sample stacked column chart at canvas center.
     CreateStackedBarChart,
     /// Create a parametric shape (Lissajous, Superellipse, Rose, etc.) at canvas center.
-    CreateParametricShape { shape_type: String },
+    CreateParametricShape {
+        shape_type: String,
+    },
     /// Offset (expand or inset) a path node by a fixed distance, creating a copy.
     OffsetPath {
         node_ids: Vec<NodeId>,
         distance: f64,
     },
     /// Generate a Truchet tiling at canvas center.
-    CreateTruchetTiling { style: String },
+    CreateTruchetTiling {
+        style: String,
+    },
     /// Push selected nodes apart until their bounding boxes no longer overlap.
-    DistributeNoOverlap { node_ids: Vec<NodeId> },
+    DistributeNoOverlap {
+        node_ids: Vec<NodeId>,
+    },
     /// Apply sinusoidal noise deformation to path anchor points.
     NoiseDeform {
         node_ids: Vec<NodeId>,
@@ -614,9 +802,15 @@ pub enum PanelAction {
         style: String,
     },
     /// Duplicate and flip selected nodes to create mirrored copies.
-    MirrorCopy { node_ids: Vec<NodeId>, axis: String },
+    MirrorCopy {
+        node_ids: Vec<NodeId>,
+        axis: String,
+    },
     /// Create N evenly-spaced rotational copies around the node's center.
-    RotateCopies { node_id: NodeId, count: usize },
+    RotateCopies {
+        node_id: NodeId,
+        count: usize,
+    },
     /// Copy appearance (fill/stroke/opacity) from source to target nodes.
     CopyAppearance {
         source_id: NodeId,
@@ -626,11 +820,17 @@ pub enum PanelAction {
         copy_opacity: bool,
     },
     /// Remove a named export profile from the document.
-    RemoveExportProfile { name: String },
+    RemoveExportProfile {
+        name: String,
+    },
     /// Pin guides at node edges/centers.
-    PinObjectGuides { node_ids: Vec<NodeId> },
+    PinObjectGuides {
+        node_ids: Vec<NodeId>,
+    },
     /// Reverse the children order in selected group nodes.
-    ReverseNodeOrder { node_ids: Vec<NodeId> },
+    ReverseNodeOrder {
+        node_ids: Vec<NodeId>,
+    },
     /// Copy document template JSON to the OS clipboard.
     CopyDocumentTemplate,
     /// Select all nodes whose fill color matches selected nodes.
@@ -645,22 +845,36 @@ pub enum PanelAction {
         format: String,
     },
     /// Remove the asset export tag from a node.
-    RemoveExportTag { node_id: NodeId },
+    RemoveExportTag {
+        node_id: NodeId,
+    },
     /// Apply a named character style to a text node.
-    ApplyCharacterStyle { node_id: NodeId, style_name: String },
+    ApplyCharacterStyle {
+        node_id: NodeId,
+        style_name: String,
+    },
     /// Delete a named character style from the document.
-    DeleteCharacterStyle { name: String },
+    DeleteCharacterStyle {
+        name: String,
+    },
     /// Apply a named paragraph style to a text node.
-    ApplyParagraphStyle { node_id: NodeId, style_name: String },
+    ApplyParagraphStyle {
+        node_id: NodeId,
+        style_name: String,
+    },
     /// Delete a named paragraph style from the document.
-    DeleteParagraphStyle { name: String },
+    DeleteParagraphStyle {
+        name: String,
+    },
     /// Apply a named color swatch to a node's fill.
     ApplyColorSwatch {
         node_id: NodeId,
         swatch_name: String,
     },
     /// Delete a named color swatch from the document palette.
-    DeleteColorSwatch { name: String },
+    DeleteColorSwatch {
+        name: String,
+    },
     /// Load a predefined swatch library into the document palette.
     LoadSwatchLibrary {
         library: String,
@@ -674,26 +888,47 @@ pub enum PanelAction {
         profile_name: String,
     },
     /// Save a width profile from the selected node's current stroke width.
-    SaveWidthProfile { stroke_width: f64, name: String },
+    SaveWidthProfile {
+        stroke_width: f64,
+        name: String,
+    },
     /// Delete a named width profile.
-    DeleteWidthProfile { name: String },
+    DeleteWidthProfile {
+        name: String,
+    },
     /// Rename an existing width profile (e.g. one shaped with the Width tool).
-    RenameWidthProfile { old_name: String, new_name: String },
+    RenameWidthProfile {
+        old_name: String,
+        new_name: String,
+    },
     /// Save a graphic style from the selected node.
-    SaveGraphicStyle { node_id: NodeId, name: String },
+    SaveGraphicStyle {
+        node_id: NodeId,
+        name: String,
+    },
     /// Apply a named graphic style to the selected node.
-    ApplyGraphicStyle { node_id: NodeId, style_name: String },
+    ApplyGraphicStyle {
+        node_id: NodeId,
+        style_name: String,
+    },
     /// Delete a named graphic style.
-    DeleteGraphicStyle { name: String },
+    DeleteGraphicStyle {
+        name: String,
+    },
     /// Save the gradient fill of a node as a named gradient swatch.
-    SaveGradientSwatch { node_id: NodeId, name: String },
+    SaveGradientSwatch {
+        node_id: NodeId,
+        name: String,
+    },
     /// Apply a named gradient swatch to a node's fill.
     ApplyGradientSwatch {
         node_id: NodeId,
         swatch_name: String,
     },
     /// Delete a named gradient swatch.
-    DeleteGradientSwatch { name: String },
+    DeleteGradientSwatch {
+        name: String,
+    },
     /// Run composition analysis and store findings in app state.
     AnalyzeComposition,
     /// Detect rhythm patterns and store findings in app state.
@@ -705,17 +940,28 @@ pub enum PanelAction {
         params_json: String,
     },
     /// Delete a named document grammar rule.
-    DeleteGrammarRule { name: String },
+    DeleteGrammarRule {
+        name: String,
+    },
     /// Check all grammar rules and store results in app state.
     CheckGrammar,
     /// Measure distances between selected nodes and store results.
-    MeasureDistances { node_ids: Vec<NodeId> },
+    MeasureDistances {
+        node_ids: Vec<NodeId>,
+    },
     /// Play a named action set.
-    PlayAction { name: String },
+    PlayAction {
+        name: String,
+    },
     /// Delete a named action set.
-    DeleteAction { name: String },
+    DeleteAction {
+        name: String,
+    },
     /// Register an event trigger.
-    RegisterEventTrigger { event: String, action_name: String },
+    RegisterEventTrigger {
+        event: String,
+        action_name: String,
+    },
     /// Remove an event trigger.
     RemoveEventTrigger {
         event: String,
@@ -732,7 +978,10 @@ pub enum PanelAction {
         padding: f64,
     },
     /// Revert a node N edits back in history.
-    UndoNode { node_id: NodeId, steps: usize },
+    UndoNode {
+        node_id: NodeId,
+        steps: usize,
+    },
     /// Apply grid layout to a group's children.
     ApplyGridLayout {
         group_id: NodeId,
@@ -749,10 +998,14 @@ pub enum PanelAction {
     /// Refresh the displayed history entries (read-only trigger).
     RefreshHistory,
     /// Jump to a specific undo history index (linear; used by MCP/CLI).
-    JumpToHistory { index: usize },
+    JumpToHistory {
+        index: usize,
+    },
     /// Jump to a specific edit-tree node by id (branch-aware; used by the commit
     /// graph). Navigates across branches via the history tree.
-    JumpToHistoryNode { id: u64 },
+    JumpToHistoryNode {
+        id: u64,
+    },
     /// Scale and position selected (or all) nodes to fill the artboard safe area.
     FitToMargins,
     /// Add a dimension annotation between two nodes.
@@ -762,11 +1015,20 @@ pub enum PanelAction {
         axis: String,
     },
     /// Remove a dimension annotation by ID.
-    RemoveDimension { id: uuid::Uuid },
+    RemoveDimension {
+        id: uuid::Uuid,
+    },
     /// Set document bleed and slug values.
-    SetDocumentBleed { bleed_mm: f64, slug_mm: f64 },
+    SetDocumentBleed {
+        bleed_mm: f64,
+        slug_mm: f64,
+    },
     /// Add an angled construction line.
-    AddConstructionLine { x: f64, y: f64, angle_degrees: f64 },
+    AddConstructionLine {
+        x: f64,
+        y: f64,
+        angle_degrees: f64,
+    },
     /// Set artboard safe-area margins.
     SetArtboardMargins {
         top: f64,
@@ -781,22 +1043,40 @@ pub enum PanelAction {
         overprint: bool,
     },
     /// Apply a spot color to a node.
-    ApplySpotColor { node_id: NodeId, color_name: String },
+    ApplySpotColor {
+        node_id: NodeId,
+        color_name: String,
+    },
     /// Delete a spot color.
-    DeleteSpotColor { name: String },
+    DeleteSpotColor {
+        name: String,
+    },
     /// Name the current history state (label the HEAD commit).
-    BranchCreate { name: String },
+    BranchCreate {
+        name: String,
+    },
     /// Jump to a named state (non-destructive; navigates the edit tree).
-    BranchSwitch { name: String },
+    BranchSwitch {
+        name: String,
+    },
     /// Remove a named state's name (deletes the label, keeps the commit).
-    BranchDelete { name: String },
+    BranchDelete {
+        name: String,
+    },
     /// Set or clear a specific commit's name — `None` clears it. Drives the
     /// commit-graph right-click "Name this state…" / "Remove name".
-    LabelHistoryNode { id: u64, name: Option<String> },
+    LabelHistoryNode {
+        id: u64,
+        name: Option<String>,
+    },
     /// Make a clipping mask from a group node (topmost child becomes clip path).
-    MakeClippingMask { group_id: NodeId },
+    MakeClippingMask {
+        group_id: NodeId,
+    },
     /// Release the clipping mask from a group node.
-    ReleaseClippingMask { group_id: NodeId },
+    ReleaseClippingMask {
+        group_id: NodeId,
+    },
     /// Place a text node along a path spine.
     SetTextPath {
         text_node_id: NodeId,
@@ -804,22 +1084,38 @@ pub enum PanelAction {
         offset: f64,
     },
     /// Remove the path spine from a text node.
-    ClearTextPath { text_node_id: NodeId },
+    ClearTextPath {
+        text_node_id: NodeId,
+    },
     /// Set the layout direction of a text node (horizontal/vertical).
-    SetTextDirection { node_id: NodeId, vertical: bool },
+    SetTextDirection {
+        node_id: NodeId,
+        vertical: bool,
+    },
     /// Set the font style (italic/oblique/normal) on a text node.
-    SetFontStyle { node_id: NodeId, style: String },
+    SetFontStyle {
+        node_id: NodeId,
+        style: String,
+    },
     /// Set the font weight (100–900) on a text node.
-    SetFontWeight { node_id: NodeId, weight: u16 },
+    SetFontWeight {
+        node_id: NodeId,
+        weight: u16,
+    },
     /// Flow a text node inside a closed path area.
     SetTextArea {
         text_node_id: NodeId,
         area_path_id: NodeId,
     },
     /// Remove the area boundary from a text node.
-    ClearTextArea { text_node_id: NodeId },
+    ClearTextArea {
+        text_node_id: NodeId,
+    },
     /// Set text decoration (underline/line-through/overline/none) on a text node.
-    SetTextDecoration { node_id: NodeId, decoration: String },
+    SetTextDecoration {
+        node_id: NodeId,
+        decoration: String,
+    },
     /// Set paragraph spacing and indent on a text node.
     SetParagraphOptions {
         node_id: NodeId,
@@ -828,9 +1124,14 @@ pub enum PanelAction {
         indent: f64,
     },
     /// Set custom tab stop positions on a text node.
-    SetTabStops { node_id: NodeId, stops: Vec<f64> },
+    SetTabStops {
+        node_id: NodeId,
+        stops: Vec<f64>,
+    },
     /// Clear custom tab stops from a text node.
-    ClearTabStops { node_id: NodeId },
+    ClearTabStops {
+        node_id: NodeId,
+    },
     /// Set OpenType features on a text node.
     SetOpenTypeFeatures {
         node_id: NodeId,
@@ -843,38 +1144,67 @@ pub enum PanelAction {
         script_position: photonic_core::node::ScriptPosition,
     },
     /// Link two text nodes as a threaded text chain.
-    LinkTextFrames { from_id: NodeId, to_id: NodeId },
+    LinkTextFrames {
+        from_id: NodeId,
+        to_id: NodeId,
+    },
     /// Remove a text node from its thread chain.
-    UnlinkTextFrames { node_id: NodeId },
+    UnlinkTextFrames {
+        node_id: NodeId,
+    },
     /// Bind a text node to a document variable.
     BindTextVariable {
         node_id: NodeId,
         variable_name: String,
     },
     /// Remove the variable binding from a text node.
-    UnbindTextVariable { node_id: NodeId },
+    UnbindTextVariable {
+        node_id: NodeId,
+    },
     /// Apply all document variable values to bound text nodes.
     ApplyVariables,
     /// Delete a document variable.
-    DeleteVariable { name: String },
+    DeleteVariable {
+        name: String,
+    },
     /// Define a node as a named symbol master.
-    DefineSymbol { node_id: NodeId, name: String },
+    DefineSymbol {
+        node_id: NodeId,
+        name: String,
+    },
     /// Place an instance of a named symbol at a position.
-    PlaceSymbol { symbol_name: String },
+    PlaceSymbol {
+        symbol_name: String,
+    },
     /// Break the symbol link on an instance node.
-    BreakLinkToSymbol { node_id: NodeId },
+    BreakLinkToSymbol {
+        node_id: NodeId,
+    },
     /// Delete a symbol from the registry.
-    DeleteSymbol { name: String },
+    DeleteSymbol {
+        name: String,
+    },
     /// Assign a path node as the blend spine for a group.
-    SetBlendSpine { group_id: NodeId, path_id: NodeId },
+    SetBlendSpine {
+        group_id: NodeId,
+        path_id: NodeId,
+    },
     /// Clear the blend spine assignment from a group.
-    ClearBlendSpine { group_id: NodeId },
+    ClearBlendSpine {
+        group_id: NodeId,
+    },
     /// Reverse the direction of the blend spine path in a group.
-    ReverseBlendSpine { group_id: NodeId },
+    ReverseBlendSpine {
+        group_id: NodeId,
+    },
     /// Expand a blend group into individual discrete objects.
-    ExpandBlend { group_id: NodeId },
+    ExpandBlend {
+        group_id: NodeId,
+    },
     /// Load a built-in symbol library into the document.
-    LoadSymbolLibrary { library_name: String },
+    LoadSymbolLibrary {
+        library_name: String,
+    },
     /// Spray N symbol instances scattered around a center point.
     SpraySymbolInstances {
         symbol_name: String,
@@ -890,15 +1220,27 @@ pub enum PanelAction {
         stroke_hex: Option<String>,
     },
     /// Clear all per-instance color overrides from a symbol instance.
-    ClearSymbolOverrides { node_id: NodeId },
+    ClearSymbolOverrides {
+        node_id: NodeId,
+    },
     /// Save the current prop_search as a named workspace.
-    SaveWorkspace { name: String, search_query: String },
+    SaveWorkspace {
+        name: String,
+        search_query: String,
+    },
     /// Load a workspace by name (returns search_query to apply).
-    LoadWorkspace { name: String },
+    LoadWorkspace {
+        name: String,
+    },
     /// Delete a named workspace.
-    DeleteWorkspace { name: String },
+    DeleteWorkspace {
+        name: String,
+    },
     /// Recenter the canvas viewport on a canvas-space point (Navigator click).
-    CenterViewOn { canvas_x: f64, canvas_y: f64 },
+    CenterViewOn {
+        canvas_x: f64,
+        canvas_y: f64,
+    },
 
     // ── Media pool (video mode, 05 §2) ────────────────────────────────────────
     /// Open the OS multi-file picker and enqueue the chosen files for
@@ -912,7 +1254,9 @@ pub enum PanelAction {
         parent: Option<photonic_core::timeline::BinId>,
     },
     /// Remove a media bin (assets fall back to the root).
-    MediaRemoveBin { bin: photonic_core::timeline::BinId },
+    MediaRemoveBin {
+        bin: photonic_core::timeline::BinId,
+    },
     /// Remove an asset from the pool.
     MediaRemoveAsset {
         asset: photonic_core::timeline::AssetId,
@@ -954,11 +1298,15 @@ pub enum PanelAction {
         technical: bool,
     },
     /// Engine-wide proxy playback mode (05 §4; `EngineCmd::SetProxyMode`).
-    MediaSetProxyMode { mode: photonic_video::ProxyMode },
+    MediaSetProxyMode {
+        mode: photonic_video::ProxyMode,
+    },
     /// Build reusable editing proxies for every file-backed video in the pool.
     MediaGenerateProxies,
     /// Project policy: auto-queue L7 proxy generation after import (G-15C).
-    MediaSetGenerateProxiesOnImport { enabled: bool },
+    MediaSetGenerateProxiesOnImport {
+        enabled: bool,
+    },
     /// Attach a user-supplied proxy file to a video asset (G-15A).
     MediaAttachProxy {
         asset: photonic_core::timeline::AssetId,
@@ -1003,7 +1351,9 @@ pub enum PanelAction {
     /// playhead through [`video::VideoPanelUi`], and the engine seek is driven
     /// off `PhotonicApp::playhead` in `app/monitor.rs`, so a panel cannot seek
     /// directly — it queues this and the main loop assigns the field.
-    SeekPlayhead { at: photonic_core::timeline::Tick },
+    SeekPlayhead {
+        at: photonic_core::timeline::Tick,
+    },
     /// Navigate Color Controls to a clip in the active sequence and seek to
     /// its start. Selection and playhead are session state, not undoable edits.
     SelectGradeClip {

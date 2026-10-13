@@ -15,12 +15,90 @@
 
 use glam::Mat3;
 use photonic_core::layer::BlendMode;
+use photonic_render::caption_decoration::{CaptionDecoration, CaptionPaint};
 use photonic_render::native_transfer::AcescctDirection;
 
 use crate::contract::{
     AssetId, CaptionBatch, EffectKind, MatteModel, ResolvedGradeOp, ResolvedParams,
     ResolvedTextBlock, Tick, VectorRef, VectorStateKey,
 };
+
+/// Scene-linear AP1 blend functions with defined, unclamped extended-channel math.
+/// Normal uses direct premultiplied source-over without an alpha division or
+/// artistic cutoff, retaining valid extended RGB at very small coverage.
+/// Polynomial/min/max/absolute-value functions extend the familiar separable
+/// equations to signed scene values; this is not display-referred CSS matching.
+/// Overlay/HardLight use a 0.5 scene-channel pivot; PinLight uses the same
+/// piecewise min/max extension. These pivots are creative AP1 operations, not
+/// perceptual middle gray. SoftLight extends its cubic low-backdrop branch to
+/// negative AP1 values and uses sqrt only above 0.25; this can amplify negative
+/// channels and is not a perceptual/HDR-safe contrast operation. Like other
+/// extended blends, results remain subject to RGBA16F storage limits.
+/// LinearDodge, LinearBurn, Subtract and LinearLight use dedicated unclamped
+/// arithmetic IR; DarkerColor/LighterColor use AP1 Y to select a whole RGB.
+/// Legacy equations/weights are unchanged. The nine bounded artistic modes use a dedicated
+/// overlap-only unit-range contract; they do not preserve HDR overlap values.
+pub fn native_blend_supported(mode: BlendMode) -> bool {
+    native_arithmetic_blend(mode)
+        || native_bounded_blend(mode)
+        || native_luminance_blend(mode)
+        || matches!(
+            mode,
+            BlendMode::Normal
+                | BlendMode::Overlay
+                | BlendMode::HardLight
+                | BlendMode::PinLight
+                | BlendMode::SoftLight
+                | BlendMode::Multiply
+                | BlendMode::Screen
+                | BlendMode::Darken
+                | BlendMode::Lighten
+                | BlendMode::Difference
+                | BlendMode::Exclusion
+        )
+}
+
+/// Native-only unclamped arithmetic equations. These have their own IR/cache
+/// identity: Legacy uses the original bounded raster equations for these names.
+pub fn native_arithmetic_blend(mode: BlendMode) -> bool {
+    matches!(
+        mode,
+        BlendMode::LinearDodge
+            | BlendMode::LinearBurn
+            | BlendMode::Subtract
+            | BlendMode::LinearLight
+    )
+}
+
+/// Bounded artistic overlap functions on unit-range straight AP1 operands.
+/// Source-over retains original signed/extended color outside the overlap.
+pub fn native_bounded_blend(mode: BlendMode) -> bool {
+    matches!(
+        mode,
+        BlendMode::Hue
+            | BlendMode::Saturation
+            | BlendMode::Color
+            | BlendMode::Luminosity
+            | BlendMode::ColorDodge
+            | BlendMode::ColorBurn
+            | BlendMode::Divide
+            | BlendMode::VividLight
+            | BlendMode::HardMix
+    )
+}
+
+/// Bounded AP1 Hue/Saturation/Color/Luminosity use scene-linear AP1 Y.
+pub fn native_nonseparable_blend(mode: BlendMode) -> bool {
+    matches!(
+        mode,
+        BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity
+    )
+}
+
+/// Whole-color selection by scene-linear AP1 luminance, not Legacy RGB luma.
+pub fn native_luminance_blend(mode: BlendMode) -> bool {
+    matches!(mode, BlendMode::DarkerColor | BlendMode::LighterColor)
+}
 
 /// Index of a node within one compiled [`FrameGraph`] arena. Not stable across
 /// compiles — cross-frame identity is [`ContentHash`], never this index.
@@ -66,6 +144,8 @@ pub enum FrameColorEncoding {
     Acescct,
     /// Unassociated key weight, stored as opaque grayscale.
     MatteWeight,
+    /// Signed scene channel/luminance value in opaque grayscale storage; not a bounded key.
+    ScalarChannel,
     SrgbDisplay,
     Bt709Video,
 }
@@ -165,6 +245,46 @@ pub fn threading_for_op(op: &IrOp) -> Threading {
         | IrOp::StabilizeWarp { .. }
         | IrOp::Effect { .. }
         | IrOp::Grade { .. }
+        | IrOp::NativeMotionBlur { .. }
+        | IrOp::NativeOutline { .. }
+        | IrOp::NativeLinearHsl { .. }
+        | IrOp::NativeLensBlur { .. }
+        | IrOp::NativeSurfaceBlur { .. }
+        | IrOp::NativeRankFilter { .. }
+        | IrOp::NativeDeflicker{..}
+        | IrOp::NativeUnpremultiply
+        | IrOp::NativeAlphaView { .. }
+        | IrOp::NativeTransferLevels { .. }
+        | IrOp::NativeTransferCurves { .. }
+        | IrOp::NativeColorBalance { .. }
+        | IrOp::NativePhotoFilter { .. }
+        | IrOp::NativeTransferMatrix { .. }
+        | IrOp::NativeTransferArtistic { .. }
+        | IrOp::NativeDropShadow { .. }
+        | IrOp::NativePerspective { .. }
+        | IrOp::NativeStylize { .. }
+        | IrOp::NativeDetail { .. }
+        | IrOp::NativeGeometricWarp { .. }
+        | IrOp::NativeBoxBlur { .. }
+        | IrOp::NativeMosaic { .. }
+        | IrOp::NativeGaussianBlur { .. }
+        | IrOp::NativeUnsharp { .. }
+        | IrOp::NativeChannelExtract { .. }
+        | IrOp::NativeImageToMask
+        | IrOp::NativeMaskToImage
+        | IrOp::NativeChannelCombine
+        | IrOp::NativeInvert
+        | IrOp::NativeVignette { .. }
+        | IrOp::NativeGrain { .. }
+        | IrOp::NativeDenoise { .. }
+        | IrOp::NativeMaskShape { .. }
+        | IrOp::NativePolygonMask { .. }
+        | IrOp::NativeGlow { .. }
+        | IrOp::NativeChromaKey { .. }
+        | IrOp::NativeLumaKey { .. }
+        | IrOp::NativeCanvas { .. }
+        | IrOp::NativeDissolve { .. }
+        | IrOp::NativeLumaWipe { .. }
         | IrOp::NativeExposure { .. }
         | IrOp::NativeLinearOffset { .. }
         | IrOp::NativePrinterLights { .. }
@@ -172,10 +292,15 @@ pub fn threading_for_op(op: &IrOp) -> Threading {
         | IrOp::NativeSaturationVibrance { .. }
         | IrOp::NativeLogContrast { .. }
         | IrOp::NativeLogCdl { .. }
+        | IrOp::WindowMatte { .. }
+        | IrOp::BezierMatte { .. }
         | IrOp::QualifierMatte { .. }
         | IrOp::GradeKeyMix { .. }
         | IrOp::GradeMatteRefine { .. }
         | IrOp::GradeMatteApply
+        | IrOp::NativeMatteCdl { .. }
+        | IrOp::NativeRgbMatrix { .. }
+        | IrOp::NativeTonalExposure { .. }
         | IrOp::GradeMatteConstant { .. }
         | IrOp::GradeLayerMix { .. }
         | IrOp::NativeLogQualifier { .. }
@@ -185,6 +310,9 @@ pub fn threading_for_op(op: &IrOp) -> Threading {
         | IrOp::NativeAcescct { .. }
         | IrOp::NativeSdrOutput
         | IrOp::NativeSdrVideoOutput
+        | IrOp::NativeLuminanceMerge { .. }
+        | IrOp::NativeBoundedMerge { .. }
+        | IrOp::NativeArithmeticMerge { .. }
         | IrOp::Merge { .. }
         | IrOp::WipeMix { .. }
         | IrOp::PushMix { .. }
@@ -200,12 +328,18 @@ pub fn threading_for_op(op: &IrOp) -> Threading {
         | IrOp::NativeDecodeVideo { .. }
         | IrOp::DecodeStill { .. }
         | IrOp::NativeDecodeStill { .. }
+        | IrOp::NativeMediaVideo { .. }
+        | IrOp::NativeMediaStill { .. }
         | IrOp::RasterVector { .. }
+        | IrOp::NativeRasterVector { .. }
         | IrOp::TextGen { .. }
-        | IrOp::CaptionOverlay { .. } => Threading::PerInstance,
+        | IrOp::NativeTextGen { .. }
+        | IrOp::NativeDecoratedTextGen { .. }
+        | IrOp::CaptionOverlay { .. }
+        | IrOp::NativeCaptionOutput { .. } => Threading::PerInstance,
 
         // Matte inference is a sequential CPU worker op.
-        IrOp::MatteExtract { .. } => Threading::Serial,
+        IrOp::MatteExtract { .. } | IrOp::NativeMatteExtract => Threading::Serial,
 
         // Temporal / field-order aware — must not run out of order.
         IrOp::Deinterlace { .. } => Threading::Serial,
@@ -303,6 +437,51 @@ impl StabilizeWarp {
     }
 }
 
+/// Exact straight-linear-Rec709 neighborhood rank semantics.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum NativeRankKind {
+    Median = 0,
+    DustScratches = 1,
+}
+
+/// Native artistic effects in signed encoded sRGB; only Posterize/Threshold are bounded.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum NativeTransferArtisticKind {
+    Posterize = 0,
+    Threshold = 1,
+    Desaturate = 2,
+    Invert = 3,
+}
+
+/// Fixed-canvas native AP1 stylization.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum NativeStylizeKind {
+    Emboss = 0,
+    FindEdges = 1,
+    ChromaticAberration = 2,
+}
+
+/// Native straight-color detail combination after coverage-normalized Gaussian blur.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum NativeDetailKind {
+    SmartSharpen = 0,
+    HighPass = 1,
+    Clarity = 2,
+}
+
+/// Supported fixed-canvas native inverse-sampling geometry.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum NativeWarpKind {
+    Pinch = 0,
+    Spherize = 1,
+    Ripple = 2,
+}
+
 /// One frame-graph operation. Each op is one wgpu render/compute pass (or a
 /// CPU worker-thread op where noted), with a CPU `eval_cpu` reference
 /// implementation for export determinism and golden tests (02 §2).
@@ -328,12 +507,36 @@ pub enum IrOp {
     NativeDecodeStill {
         asset: AssetId,
     },
+    /// Independent graph media. Native extent is retained only when an explicit
+    /// canvas-sized Resize consumes a differently sized source.
+    NativeMediaVideo {
+        asset: AssetId,
+        src_time: Tick,
+        input: photonic_core::timeline::color::NativeInputColorInterpretation,
+        w: u32,
+        h: u32,
+        native_extent: bool,
+    },
+    NativeMediaStill {
+        asset: AssetId,
+        w: u32,
+        h: u32,
+        native_extent: bool,
+    },
     /// Decoded still image (cached per asset).
     DecodeStill {
         asset: AssetId,
     },
     /// Rasterized vector content (Tier A CPU-readback or Tier B GPU-direct,
     /// 03 §2.5), cached by `doc_state`.
+    /// Native vector source: explicitly premultiplied linear Rec.709 raster,
+    /// converted once to AP1 by the evaluator. Separate from Legacy uploads.
+    NativeRasterVector {
+        vref: VectorRef,
+        doc_state: VectorStateKey,
+        w: u32,
+        h: u32,
+    },
     RasterVector {
         vref: VectorRef,
         doc_state: VectorStateKey,
@@ -382,6 +585,235 @@ pub enum IrOp {
     Grade {
         ops: Vec<ResolvedGradeOp>,
     },
+    /// Endpoint-complete softened analytic map in premultiplied AP1.
+    NativeLumaWipe {
+        kind: super::luma_wipe::LumaWipeKind,
+        softness: f32,
+        invert: bool,
+        t: f32,
+    },
+    /// Convex interpolation of two premultiplied AP1 images, including alpha.
+    /// Inputs are incoming, outgoing; t=0 is outgoing and t=1 is incoming.
+    NativeDissolve {
+        t: f32,
+    },
+    /// Authored picture dimensions at the native output boundary. Identity on
+    /// pixels; supplies the basis for Draft transforms and spatial effects.
+    NativeCanvas {
+        w: u32,
+        h: u32,
+    },
+    /// Explicit bounded straight-AP1 inversion: (1-clamp(rgb/alpha,0,1))*alpha.
+    NativeInvert,
+    /// Image to unassociated AP1 component or alpha signal.
+    NativeChannelExtract {
+        channel: Channel,
+    },
+    /// Image to AP1 scene luminance, equivalent to XYZ Y, without clipping.
+    NativeImageToMask,
+    /// Scalar signal to opaque AP1 grayscale image at a typed port boundary.
+    NativeMaskToImage,
+    /// Pinned offline subject inference on a bounded asynchronous worker.
+    NativeMatteExtract,
+    /// Four unassociated signals to premultiplied AP1; clamp only alpha.
+    NativeChannelCombine,
+    /// Smooth radial AP1 gain; signed extended RGB and source alpha retained.
+    NativeVignette {
+        amount: f32,
+        feather: f32,
+    },
+    /// Deterministic signed scene-linear noise at authored pixel centers.
+    NativeGrain {
+        amount: f32,
+        monochrome: bool,
+        seed: u32,
+        pixel_scale: [f32; 2],
+    },
+    /// Bounded alpha-aware bilateral smoothing in straight AP1 range coordinates.
+    NativeDenoise {
+        strength: f32,
+        spatial_scale: f32,
+    },
+    /// Bounded display-authored captions applied after the managed output transform.
+    NativeCaptionOutput {
+        cue_batch: CaptionBatch,
+        video: bool,
+        paints: Vec<CaptionPaint>,
+    },
+    NativeDecoratedTextGen {
+        block: ResolvedTextBlock,
+        decoration: CaptionDecoration,
+    },
+    /// Glyphon linear-sRGB title raster explicitly converted into AP1.
+    NativeTextGen {
+        block: ResolvedTextBlock,
+    },
+    /// Zero-input AP1 white shape generator with normalized geometry.
+    NativeMaskShape {
+        rect: bool,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation: f32,
+        feather: f32,
+    },
+    /// Static normalized polygon; even-odd fill and inward local-space feather.
+    NativePolygonMask {
+        vertices: Vec<[f32; 2]>,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation: f32,
+        feather: f32,
+    },
+    /// AP1 bright extraction, native Gaussian convolution and tinted screen-add.
+    NativeGlow {
+        sigma: f32,
+        threshold: f32,
+        intensity: f32,
+        tint: [f32; 3],
+    },
+    /// AP1 RGB-distance chroma key with dominant-channel spill suppression.
+    NativeChromaKey {
+        key: [f32; 3],
+        tolerance: f32,
+        softness: f32,
+        spill: f32,
+    },
+    /// AP1 luminance key; multiplies premultiplied RGBA by a smooth keep factor.
+    NativeLumaKey {
+        threshold: f32,
+        softness: f32,
+        invert: bool,
+    },
+    /// Coverage-preserving straight-color unsharp mask in scene-linear AP1.
+    NativeUnsharp {
+        amount: f32,
+        sigma: f32,
+    },
+    /// Radius-independent coverage outline using authored-pixel jump flooding.
+    NativeOutline {
+        thickness: f32,
+        color: [f32; 3],
+        opacity: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Catalog LinearStraight HSL with a continuous signed/HDR envelope.
+    NativeLinearHsl {
+        vibrance: bool,
+        controls: [f32; 3],
+    },
+    /// Discrete circular aperture average of premultiplied AP1 RGBA.
+    NativeLensBlur {
+        radius: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Exact authored-tap bilateral Surface Blur with an explicit work guard.
+    NativeSurfaceBlur {
+        radius: u32,
+        threshold: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Exact independent straight-linear709 rank with authored pixel footprint.
+    NativeRankFilter {
+        kind: NativeRankKind,
+        radius: u32,
+        threshold: u8,
+        pixel_scale: [f32; 2],
+    },
+    /// Diagnostic numeric RGB/alpha with retained coverage, matching the float utility.
+    /// This does not change the associated working-storage convention.
+    NativeUnpremultiply,
+    /// Analysis-resolved bounded perceptual correction with linear HDR tails.
+    NativeDeflicker {
+        gain: [f32; 3],
+        band: [f32; 3],
+    },
+    /// Diagnostic alpha/associated/straight RGB view in working AP1.
+    NativeAlphaView {
+        mode: u8,
+    },
+    /// Catalog levels with bounded gamma and linear signed/headroom tails.
+    NativeTransferLevels {
+        black_white: [f32; 2],
+        gamma: f32,
+        output: [f32; 2],
+    },
+    /// Catalog five-knot transfer-space Hermite curve with extended endpoints.
+    NativeTransferCurves {
+        knots: [[f32; 2]; 5],
+        contrast: f32,
+    },
+    /// Extended transfer-space tonal shifts with original source coverage.
+    NativeColorBalance {
+        shifts: [[f32; 3]; 3],
+        preserve: bool,
+    },
+    /// Extended signed encoded-sRGB tint with optional encoded-luma preservation.
+    NativePhotoFilter {
+        color: [f32; 3],
+        density: f32,
+        preserve: bool,
+    },
+    /// Extended signed encoded-sRGB matrix with AP1 adaptation and original alpha.
+    NativeTransferMatrix {
+        matrix: [[f32; 3]; 3],
+    },
+    /// AP1 -> encoded sRGB artistic function -> AP1, original coverage.
+    /// Posterize/Threshold are bounded; Desaturate preserves extended range.
+    NativeTransferArtistic {
+        kind: NativeTransferArtisticKind,
+        parameter: f32,
+    },
+    /// Shifted, equal-weight blurred alpha under the original AP1 image.
+    NativeDropShadow {
+        offset: [f32; 2],
+        radius: u32,
+        color: [f32; 3],
+        opacity: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Fixed-canvas projective inverse in normalized pixel-center coordinates.
+    NativePerspective {
+        inverse: [f32; 9],
+    },
+    /// Coverage-preserving AP1 stylization in authored pixel coordinates.
+    NativeStylize {
+        kind: NativeStylizeKind,
+        amount: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Source-coverage-preserving AP1 detail combination; sigma is authored pixels,
+    /// except Clarity derives sigma from authored canvas dimensions.
+    NativeDetail {
+        kind: NativeDetailKind,
+        amount: f32,
+        sigma: f32,
+        threshold: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Fixed-canvas authored-coordinate inverse warp in premultiplied AP1.
+    NativeGeometricWarp {
+        kind: NativeWarpKind,
+        amount: f32,
+        wavelength: f32,
+        pixel_scale: [f32; 2],
+    },
+    /// Equal-weight separable convolution of premultiplied AP1 RGBA.
+    NativeBoxBlur {
+        radius: [u32; 2],
+    },
+    /// Origin-anchored average cells of premultiplied AP1 RGBA.
+    NativeMosaic {
+        block: [u32; 2],
+    },
+    /// Bounded directional line convolution in premultiplied AP1. The displacement
+    /// is in authored pixels; logical edges clamp, padding stays transparent.
+    NativeMotionBlur {
+        delta: [f32; 2],
+    },
+    /// Gaussian convolution of premultiplied scene-linear AP1 RGBA; no clipping or transfer.
+    NativeGaussianBlur {
+        sigma: f32,
+    },
     /// Scene-linear ACEScg exposure, distinct from the legacy grade stack.
     NativeExposure {
         stops: f32,
@@ -416,6 +848,13 @@ pub enum IrOp {
     NativeLogQualifier {
         qualifier: Box<photonic_render::grade::ResolvedHslQualifier>,
     },
+    /// Primitive unassociated geometry key; one image input supplies dimensions.
+    BezierMatte {
+        window: photonic_core::timeline::BezierWindow,
+    },
+    WindowMatte {
+        mask: photonic_render::grade::ResolvedMask,
+    },
     /// Key-only output; input is ACEScct for native grading, Legacy linear otherwise.
     QualifierMatte {
         qualifier: Box<photonic_render::grade::ResolvedHslQualifier>,
@@ -430,6 +869,16 @@ pub enum IrOp {
         refinement: photonic_core::timeline::GradeMatteRefinement,
     },
     GradeMatteApply,
+    /// Scene AP1 image + unassociated key; fused logarithmic CDL application.
+    NativeMatteCdl {
+        cdl: photonic_render::grade::ResolvedCdl,
+    },
+    NativeTonalExposure {
+        tonal: photonic_render::tonal_exposure::ResolvedTonalExposure,
+    },
+    NativeRgbMatrix {
+        rows: [[f32; 3]; 3],
+    },
     GradeMatteConstant {
         weight: f32,
     },
@@ -463,6 +912,25 @@ pub enum IrOp {
     /// Binary over-composite with full 26-blend-mode support via
     /// COMPOSITE_SHADER (03 §2.4). Inputs: a (top), b (bottom).
     Merge {
+        mode: BlendMode,
+        opacity: f32,
+    },
+    /// Native AP1-only arithmetic source-over. Straight RGB equations for
+    /// LinearDodge/Burn/Subtract/LinearLight are B+S, B+S-1, B-S, B+2S-1.
+    /// No unit-range clipping; ordinary source-over alpha and RGBA16F bounds.
+    NativeArithmeticMerge {
+        mode: BlendMode,
+        opacity: f32,
+    },
+    /// Bounded artistic overlap: clamp straight AP1 operands to 0..1 for the
+    /// blend function only; source-over uses original extended RGB and alpha.
+    NativeBoundedMerge {
+        mode: BlendMode,
+        opacity: f32,
+    },
+    /// Select the whole straight RGB with lower/higher AP1 Y, then source-over.
+    /// Exact luminance ties choose backdrop. Signed working values are retained.
+    NativeLuminanceMerge {
         mode: BlendMode,
         opacity: f32,
     },
@@ -567,6 +1035,49 @@ pub struct FrameGraph {
 }
 
 impl FrameGraph {
+    /// Ancestors demanded by presentation and its optional independent scope tap.
+    pub fn demanded_nodes(&self, tap: Option<IrNodeId>) -> Vec<bool> {
+        let mut needed = vec![false; self.nodes.len()];
+        let mut pending: Vec<_> = self.output.into_iter().chain(tap).collect();
+        while let Some(id) = pending.pop() {
+            let index = id.0 as usize;
+            if index >= needed.len() || needed[index] {
+                continue;
+            }
+            needed[index] = true;
+            pending.extend(self.nodes[index].inputs.iter().map(|(id, _)| *id));
+        }
+        needed
+    }
+
+    /// Distinct native decoder clocks. Equal asset/time requests share one lane,
+    /// even when their downstream input interpretations differ.
+    pub fn native_decode_requests(&self, tap: Option<IrNodeId>) -> Vec<(AssetId, Tick)> {
+        let needed = self.demanded_nodes(tap);
+        let mut requests: Vec<_> = self
+            .nodes
+            .iter()
+            .zip(needed)
+            .filter_map(|(node, needed)| {
+                if !needed {
+                    return None;
+                }
+                match node.op {
+                    IrOp::NativeDecodeVideo {
+                        asset, src_time, ..
+                    }
+                    | IrOp::NativeMediaVideo {
+                        asset, src_time, ..
+                    } => Some((asset, src_time)),
+                    _ => None,
+                }
+            })
+            .collect();
+        requests.sort_by_key(|(asset, tick)| (asset.0.as_u128(), tick.0));
+        requests.dedup();
+        requests
+    }
+
     pub fn output_color_encoding(&self) -> Result<FrameColorEncoding, &'static str> {
         let domains = self.color_domains()?;
         self.output
@@ -596,6 +1107,61 @@ impl FrameGraph {
             WorkingColorDomain::LegacyLinearRec709 => Domain::LegacyLinearRec709,
             WorkingColorDomain::SceneLinearAcescg => Domain::SceneLinearAcescg,
         };
+        let mut native_extents = std::collections::HashSet::new();
+        let mut source_texels = 0_u64;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if let IrOp::NativeMediaVideo {
+                w,
+                h,
+                native_extent: true,
+                ..
+            }
+            | IrOp::NativeMediaStill {
+                w,
+                h,
+                native_extent: true,
+                ..
+            } = node.op
+            {
+                if w == 0 || h == 0 || w > 8192 || h > 8192 {
+                    return Err("native-resolution MediaIn requires bounded source dimensions");
+                }
+                native_extents.insert(index);
+                {
+                    // Count actual IR instances; forged duplicate hashes must
+                    // not understate source allocations in a supplied graph.
+                    let (bw, bh) = TextureDesc {
+                        width: w,
+                        height: h,
+                    }
+                    .bucket();
+                    source_texels = source_texels.saturating_add(u64::from(bw) * u64::from(bh));
+                    if source_texels > 16_777_216 {
+                        return Err(
+                            "native mixed-resolution graph exceeds its padded-source-texel budget",
+                        );
+                    }
+                }
+            }
+        }
+        if self
+            .output
+            .is_some_and(|id| native_extents.contains(&(id.0 as usize)))
+        {
+            return Err("native-resolution MediaIn requires an explicit Resize before output");
+        }
+        for node in &self.nodes {
+            if node
+                .inputs
+                .iter()
+                .any(|(id, _)| native_extents.contains(&(id.0 as usize)))
+                && !matches!(node.op, IrOp::Resize { .. })
+            {
+                return Err(
+                    "native-resolution MediaIn requires an explicit Resize before processing",
+                );
+            }
+        }
         let mut domains = Vec::with_capacity(self.nodes.len());
         for node in &self.nodes {
             let mut inputs = node.inputs.iter().map(|(id, _)| {
@@ -606,7 +1172,9 @@ impl FrameGraph {
             });
             let input = inputs.next().transpose()?.unwrap_or(root);
             for (index, other) in inputs.enumerate() {
-                let expected = if matches!(node.op, IrOp::GradeMatteApply) && index == 1 {
+                let expected = if (matches!(node.op, IrOp::GradeMatteApply) && index == 1)
+                    || (matches!(node.op, IrOp::NativeMatteCdl { .. }) && index == 0)
+                {
                     Domain::MatteWeight
                 } else {
                     input
@@ -614,6 +1182,14 @@ impl FrameGraph {
                 if other? != expected {
                     return Err("graph operation mixes different color domains");
                 }
+            }
+            if input == Domain::ScalarChannel
+                && !matches!(
+                    node.op,
+                    IrOp::NativeMaskToImage | IrOp::NativeChannelCombine
+                )
+            {
+                return Err("scalar channel signals require an explicit image conversion");
             }
             if input == Domain::MatteWeight
                 && !matches!(
@@ -623,7 +1199,9 @@ impl FrameGraph {
             {
                 return Err("matte weights cannot enter an image operation");
             }
-            if matches!(input, Domain::SrgbDisplay | Domain::Bt709Video) {
+            if matches!(input, Domain::SrgbDisplay | Domain::Bt709Video)
+                && !matches!(node.op, IrOp::NativeCaptionOutput { .. })
+            {
                 return Err("display-encoded pixels cannot enter another graph operation");
             }
             if input == Domain::Acescct
@@ -639,8 +1217,11 @@ impl FrameGraph {
                         | IrOp::NativeSaturationVibrance { .. }
                         | IrOp::NativeLogContrast { .. }
                         | IrOp::NativeLogCdl { .. }
+                        | IrOp::WindowMatte { .. }
+                        | IrOp::BezierMatte { .. }
                         | IrOp::QualifierMatte { .. }
                         | IrOp::NativeLogQualifier { .. }
+                        | IrOp::GradeMatteApply
                         | IrOp::NativeLogCurves { .. }
                         | IrOp::NativeLut3d { .. }
                         | IrOp::NativeMaskMix { .. }
@@ -651,6 +1232,34 @@ impl FrameGraph {
                 return Err("operation is not qualified in the ACEScct grading domain");
             }
             let output = match node.op {
+                IrOp::BezierMatte { ref window } => {
+                    if node.inputs.len() != 1
+                        || !matches!(
+                            input,
+                            Domain::LegacyLinearRec709
+                                | Domain::SceneLinearAcescg
+                                | Domain::Acescct
+                        )
+                    {
+                        return Err("Bezier matte requires one working image input");
+                    }
+                    window.validate()?;
+                    Domain::MatteWeight
+                }
+                IrOp::WindowMatte { ref mask } => {
+                    if node.inputs.len() != 1
+                        || !matches!(
+                            input,
+                            Domain::LegacyLinearRec709
+                                | Domain::SceneLinearAcescg
+                                | Domain::Acescct
+                        )
+                    {
+                        return Err("window matte requires one working image input");
+                    }
+                    photonic_render::grade_gpu::validate_native_mask(mask)?;
+                    Domain::MatteWeight
+                }
                 IrOp::QualifierMatte {
                     native,
                     ref qualifier,
@@ -704,7 +1313,8 @@ impl FrameGraph {
                         || !matches!(
                             input,
                             Domain::LegacyLinearRec709 | Domain::SceneLinearAcescg
-                        )
+                        ) && !(matches!(node.op, IrOp::GradeMatteApply)
+                            && input == Domain::Acescct)
                     {
                         return Err("grade image mixer requires image inputs and a typed matte when applicable");
                     }
@@ -730,10 +1340,100 @@ impl FrameGraph {
                 IrOp::CaptionOverlay { .. } if input == Domain::SceneLinearAcescg => {
                     return Err("display-authored captions require a managed output stage");
                 }
-                IrOp::Merge { mode, .. }
-                    if input == Domain::SceneLinearAcescg && mode != BlendMode::Normal =>
-                {
-                    return Err("non-Normal blend mode is not qualified in scene-linear ACEScg");
+                IrOp::NativeLuminanceMerge { mode, opacity } => {
+                    if root != Domain::SceneLinearAcescg
+                        || input != Domain::SceneLinearAcescg
+                        || node.inputs.len() != 2
+                        || !native_luminance_blend(mode)
+                        || !opacity.is_finite()
+                        || !(0.0..=1.0).contains(&opacity)
+                    {
+                        return Err("native luminance merge requires two AP1 inputs, a whole-color mode and finite opacity in 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeBoundedMerge { mode, opacity } => {
+                    if root != Domain::SceneLinearAcescg
+                        || input != Domain::SceneLinearAcescg
+                        || node.inputs.len() != 2
+                        || !native_bounded_blend(mode)
+                        || !opacity.is_finite()
+                        || !(0.0..=1.0).contains(&opacity)
+                    {
+                        return Err("native bounded merge requires two AP1 inputs, a bounded artistic mode and finite opacity in 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeArithmeticMerge { mode, opacity } => {
+                    if root != Domain::SceneLinearAcescg
+                        || input != Domain::SceneLinearAcescg
+                        || node.inputs.len() != 2
+                        || !native_arithmetic_blend(mode)
+                        || !opacity.is_finite()
+                        || !(0.0..=1.0).contains(&opacity)
+                    {
+                        return Err("native arithmetic merge requires two AP1 inputs, a qualified arithmetic mode and finite opacity in 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::Merge { mode, opacity } if input == Domain::SceneLinearAcescg => {
+                    if node.inputs.len() != 2
+                        || !opacity.is_finite()
+                        || !(0.0..=1.0).contains(&opacity)
+                    {
+                        return Err("native merge requires two scene-linear AP1 inputs and finite opacity in 0..=1");
+                    }
+                    if !native_blend_supported(mode)
+                        || native_arithmetic_blend(mode)
+                        || native_bounded_blend(mode)
+                        || native_luminance_blend(mode)
+                    {
+                        return Err("blend mode is not qualified in scene-linear ACEScg");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeRasterVector { vref, w, h, .. } => {
+                    if root != Domain::SceneLinearAcescg
+                        || !node.inputs.is_empty()
+                        || vref != VectorRef::WholeDocument
+                        || w == 0
+                        || h == 0
+                        || w > 8192
+                        || h > 8192
+                        || u64::from(w) * u64::from(h) > 16_777_216
+                    {
+                        return Err("native vector requires a bounded whole-document source in a managed graph");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMediaVideo {
+                    ref input, w, h, ..
+                } => {
+                    if root != Domain::SceneLinearAcescg
+                        || !node.inputs.is_empty()
+                        || w == 0
+                        || h == 0
+                        || w > 16384
+                        || h > 16384
+                        || input
+                            .validate_asset_kind(photonic_core::timeline::AssetKind::Video)
+                            .is_err()
+                    {
+                        return Err("native MediaIn video requires explicit input and bounded source dimensions");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMediaStill { w, h, .. } => {
+                    if root != Domain::SceneLinearAcescg
+                        || !node.inputs.is_empty()
+                        || w == 0
+                        || h == 0
+                        || w > 16384
+                        || h > 16384
+                    {
+                        return Err("native MediaIn still requires bounded source dimensions");
+                    }
+                    Domain::SceneLinearAcescg
                 }
                 IrOp::NativeDecodeStill { .. } => {
                     if root != Domain::SceneLinearAcescg || !node.inputs.is_empty() {
@@ -756,6 +1456,712 @@ impl FrameGraph {
                 }
                 IrOp::Grade { .. } if input != Domain::LegacyLinearRec709 => {
                     return Err("legacy grade operation cannot run in scene-linear ACEScg");
+                }
+                IrOp::Transform2DTransparent { mat, .. } if input == Domain::SceneLinearAcescg => {
+                    if node.inputs.len() != 1 || !mat.is_finite() || mat.determinant().abs() < 1e-12
+                    {
+                        return Err("native transform requires one AP1 input and a finite invertible matrix");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::Crop {
+                    left,
+                    top,
+                    right,
+                    bottom,
+                } if input == Domain::SceneLinearAcescg => {
+                    if node.inputs.len() != 1
+                        || [left, top, right, bottom]
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    {
+                        return Err(
+                            "native crop requires one AP1 input and finite margins in 0..=1",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::WipeMix { t, softness, .. } if input == Domain::SceneLinearAcescg => {
+                    if node.inputs.len() != 2
+                        || !t.is_finite()
+                        || !(0.0..=1.0).contains(&t)
+                        || !softness.is_finite()
+                        || !(0.0..=0.5).contains(&softness)
+                    {
+                        return Err(
+                            "native wipe requires two AP1 images, mix 0..=1 and softness 0..=0.5",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::LumaWipeMix { .. } if input == Domain::SceneLinearAcescg => {
+                    return Err("native luma wipe requires its endpoint-complete progress mapping");
+                }
+                IrOp::NativeLumaWipe { t, softness, .. } => {
+                    if input != Domain::SceneLinearAcescg
+                        || node.inputs.len() != 2
+                        || !t.is_finite()
+                        || !(0.0..=1.0).contains(&t)
+                        || !softness.is_finite()
+                        || !(0.0..=0.5).contains(&softness)
+                    {
+                        return Err("native luma wipe requires two AP1 images, mix 0..=1 and softness 0..=0.5");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::PushMix { t, .. } if input == Domain::SceneLinearAcescg => {
+                    if node.inputs.len() != 2 || !t.is_finite() || !(0.0..=1.0).contains(&t) {
+                        return Err("native push requires two AP1 images and finite mix in 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeDissolve { t } => {
+                    if node.inputs.len() != 2
+                        || input != Domain::SceneLinearAcescg
+                        || !t.is_finite()
+                        || !(0.0..=1.0).contains(&t)
+                    {
+                        return Err(
+                            "native dissolve requires two AP1 images and finite mix in 0..=1",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::Resize { w, h, .. } if input == Domain::SceneLinearAcescg => {
+                    if node.inputs.len() != 1
+                        || w == 0
+                        || h == 0
+                        || w > 8192
+                        || h > 8192
+                        || u64::from(w) * u64::from(h) > 16_777_216
+                    {
+                        return Err(
+                            "native resize requires one AP1 image and bounded nonzero dimensions",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeCanvas { w, h } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || w == 0
+                        || h == 0
+                    {
+                        return Err("native canvas requires one AP1 image and nonzero dimensions");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeLumaKey {
+                    threshold,
+                    softness,
+                    ..
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !threshold.is_finite()
+                        || !(0.0..=1.0).contains(&threshold)
+                        || !softness.is_finite()
+                        || !(0.0..=1.0).contains(&softness)
+                    {
+                        return Err("native luma key requires one AP1 image and threshold/softness in 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeChromaKey {
+                    key,
+                    tolerance,
+                    softness,
+                    spill,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || key
+                            .iter()
+                            .any(|v| !v.is_finite() || !(-16.0..=16.0).contains(v))
+                        || [tolerance, softness, spill]
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    {
+                        return Err("native chroma key requires one AP1 image, bounded finite key and controls in 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeGlow {
+                    sigma,
+                    threshold,
+                    intensity,
+                    tint,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !sigma.is_finite()
+                        || !(0.0..=500.0).contains(&sigma)
+                        || !threshold.is_finite()
+                        || !(0.0..=1.0).contains(&threshold)
+                        || !intensity.is_finite()
+                        || !(0.0..=10.0).contains(&intensity)
+                        || tint
+                            .iter()
+                            .any(|v| !v.is_finite() || !(-16.0..=16.0).contains(v))
+                    {
+                        return Err("native glow requires one AP1 image, sigma 0..500, threshold 0..1, intensity 0..10 and finite bounded tint");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMaskShape {
+                    center,
+                    size,
+                    rotation,
+                    feather,
+                    ..
+                } => {
+                    if !node.inputs.is_empty()
+                        || center
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                        || size
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=2.0).contains(v))
+                        || !rotation.is_finite()
+                        || !feather.is_finite()
+                        || !(0.0..=1.0).contains(&feather)
+                    {
+                        return Err(
+                            "native shape requires zero inputs and finite normalized geometry",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativePolygonMask {
+                    ref vertices,
+                    center,
+                    size,
+                    rotation,
+                    feather,
+                } => {
+                    if !node.inputs.is_empty()
+                        || !super::ops::native_polygon_vertices_valid(vertices)
+                        || center
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                        || size
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=2.0).contains(v))
+                        || !rotation.is_finite()
+                        || !feather.is_finite()
+                        || !(0.0..=1.0).contains(&feather)
+                    {
+                        return Err("native polygon requires zero inputs, 3..128 normalized finite vertices and bounded shape geometry");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeCaptionOutput {
+                    ref cue_batch,
+                    video,
+                    ref paints,
+                } => {
+                    if root != Domain::SceneLinearAcescg
+                        || node.inputs.len() != 1
+                        || input
+                            != if video {
+                                Domain::Bt709Video
+                            } else {
+                                Domain::SrgbDisplay
+                            }
+                    {
+                        return Err("native captions require exactly one matching display-encoded managed input");
+                    }
+                    let source = &self.nodes[node.inputs[0].0 .0 as usize];
+                    if !matches!(
+                        (&source.op, video),
+                        (IrOp::NativeSdrOutput, false) | (IrOp::NativeSdrVideoOutput, true)
+                    ) {
+                        return Err("native caption output must immediately follow its matching managed SDR transform");
+                    }
+                    validate_native_caption_batch(cue_batch)?;
+                    if !paints.is_empty() && paints.len() != cue_batch.cues.len() {
+                        return Err("native caption paint count must match active cues");
+                    }
+                    for (paint, cue) in paints.iter().zip(&cue_batch.cues) {
+                        paint.validate(cue.words.len())?;
+                    }
+                    input
+                }
+                IrOp::NativeDecoratedTextGen {
+                    ref block,
+                    ref decoration,
+                } => {
+                    if root != Domain::SceneLinearAcescg || !node.inputs.is_empty() {
+                        return Err("decorated native title requires zero inputs in AP1");
+                    }
+                    validate_native_text_block(block)?;
+                    decoration.validate()?;
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeTextGen { ref block } => {
+                    if root != Domain::SceneLinearAcescg || !node.inputs.is_empty() {
+                        return Err("native title requires zero inputs in an AP1 graph");
+                    }
+                    validate_native_text_block(block)?;
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeDenoise {
+                    strength,
+                    spatial_scale,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !strength.is_finite()
+                        || !(0.0..=1.0).contains(&strength)
+                        || !spatial_scale.is_finite()
+                        || !(1.0 / 65536.0..=4.0).contains(&spatial_scale)
+                    {
+                        return Err("native denoise requires one AP1 image, strength 0..=1 and bounded positive spatial scale");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeGrain {
+                    amount,
+                    seed,
+                    pixel_scale,
+                    ..
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !amount.is_finite()
+                        || !(0.0..=1.0).contains(&amount)
+                        || seed > 1_000_000_000
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(1.0 / 65536.0..=65536.0).contains(v))
+                    {
+                        return Err("native grain requires one AP1 image, amount 0..=1, seed 0..=1000000000 and positive pixel scales");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeVignette { amount, feather } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !amount.is_finite()
+                        || !(-1.0..=1.0).contains(&amount)
+                        || !feather.is_finite()
+                        || !(0.0..=1.0).contains(&feather)
+                    {
+                        return Err("native vignette requires one AP1 image, amount -1..=1 and feather 0..=1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMatteExtract
+                | IrOp::NativeChannelExtract { .. }
+                | IrOp::NativeImageToMask => {
+                    if root != Domain::SceneLinearAcescg
+                        || input != Domain::SceneLinearAcescg
+                        || node.inputs.len() != 1
+                    {
+                        return Err("native channel extraction requires one AP1 image");
+                    }
+                    Domain::ScalarChannel
+                }
+                IrOp::NativeMaskToImage => {
+                    if root != Domain::SceneLinearAcescg
+                        || input != Domain::ScalarChannel
+                        || node.inputs.len() != 1
+                    {
+                        return Err("native mask image requires one scalar signal");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeChannelCombine => {
+                    if root != Domain::SceneLinearAcescg
+                        || input != Domain::ScalarChannel
+                        || node.inputs.len() != 4
+                    {
+                        return Err("native channel combine requires four scalar signals");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeInvert => {
+                    if node.inputs.len() != 1 || input != Domain::SceneLinearAcescg {
+                        return Err("native invert requires one scene-linear AP1 image");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeUnsharp { amount, sigma } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !amount.is_finite()
+                        || !(0.0..=10.0).contains(&amount)
+                        || !sigma.is_finite()
+                        || !(0.0..=100.0).contains(&sigma)
+                    {
+                        return Err("native unsharp requires one AP1 image, amount 0..=10 and sigma 0..=100");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeOutline {
+                    thickness,
+                    color,
+                    opacity,
+                    pixel_scale,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !thickness.is_finite()
+                        || !(0.0..=64.0).contains(&thickness)
+                        || color
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=16.0).contains(v))
+                        || !opacity.is_finite()
+                        || !(0.0..=1.0).contains(&opacity)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native outline requires one AP1 image and finite bounded thickness, color, opacity and pixel scale");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeLinearHsl { vibrance, controls } => {
+                    let bound = if vibrance { 1.0 } else { 180.0 };
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || controls.iter().any(|v| !v.is_finite())
+                        || !(-bound..=bound).contains(&controls[0])
+                        || controls[1..].iter().any(|v| !(-1.0..=1.0).contains(v))
+                        || (vibrance && (controls[1] != 0.0 || controls[2] != 0.0))
+                    {
+                        return Err(
+                            "native linear HSL requires one AP1 image and bounded catalog controls",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeSurfaceBlur {
+                    radius,
+                    threshold,
+                    pixel_scale,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || radius > 64
+                        || !threshold.is_finite()
+                        || !(0.0..=1.0).contains(&threshold)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native Surface Blur requires one AP1 image, radius0..64, threshold0..1 and finite positive pixel scale");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeLensBlur {
+                    radius,
+                    pixel_scale,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !radius.is_finite()
+                        || !(0.0..=500.0).contains(&radius)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native Lens Blur requires one AP1 image, radius0..500 and finite positive pixel scale");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeRankFilter {
+                    kind,
+                    radius,
+                    threshold,
+                    pixel_scale,
+                } => {
+                    let max = if kind == NativeRankKind::Median {
+                        500
+                    } else {
+                        16
+                    };
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || radius > max
+                        || (kind == NativeRankKind::Median && threshold != 0)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native rank filter requires one AP1 image, valid kind-specific radius/threshold and finite positive pixel scale");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeDeflicker { gain, band } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || gain
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.1..=10.0).contains(v))
+                        || band.iter().any(|v| !v.is_finite())
+                        || !(0.0..=512.0).contains(&band[0])
+                        || band[0].fract() != 0.0
+                        || !(0.0..=0.9).contains(&band[1])
+                        || band[2].abs() > 100_000.0
+                    {
+                        return Err("native Deflicker requires one AP1 input and finite bounded resolved gains/bands");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeUnpremultiply => {
+                    if node.inputs.len() != 1 || input != Domain::SceneLinearAcescg {
+                        return Err("native Unpremultiply requires one AP1 image");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeAlphaView { mode } => {
+                    if node.inputs.len() != 1 || input != Domain::SceneLinearAcescg || mode > 2 {
+                        return Err("native Alpha View requires one AP1 image and mode0..2");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeTransferLevels {
+                    black_white,
+                    gamma,
+                    output,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !gamma.is_finite()
+                        || !(0.01..=9.99).contains(&gamma)
+                        || black_white
+                            .iter()
+                            .chain(output.iter())
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    {
+                        return Err("native Levels requires one AP1 image, finite unit ranges and gamma .01..9.99");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeTransferCurves { knots, contrast } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !contrast.is_finite()
+                        || !(-1.0..=1.0).contains(&contrast)
+                        || knots
+                            .iter()
+                            .flatten()
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    {
+                        return Err("native catalog Curves requires one AP1 input, five finite unit knots and contrast -1..1");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeColorBalance { shifts, .. } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || shifts
+                            .iter()
+                            .flatten()
+                            .any(|v| !v.is_finite() || !(-1.0..=1.0).contains(v))
+                    {
+                        return Err(
+                            "native Color Balance requires one AP1 image and finite shifts -1..1",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativePhotoFilter { color, density, .. } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !density.is_finite()
+                        || !(0.0..=1.0).contains(&density)
+                        || color
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    {
+                        return Err("native Photo Filter requires one AP1 image and finite unit color/density");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeTransferMatrix { matrix } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || matrix
+                            .iter()
+                            .flatten()
+                            .any(|v| !v.is_finite() || !(-2.0..=2.0).contains(v))
+                    {
+                        return Err("native transfer matrix requires one AP1 image and finite coefficients -2..2");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeTransferArtistic { kind, parameter } => {
+                    let valid = match kind {
+                        NativeTransferArtisticKind::Posterize => {
+                            (2.0..=255.0).contains(&parameter) && parameter.fract() == 0.0
+                        }
+                        NativeTransferArtisticKind::Threshold => (0.0..=1.0).contains(&parameter),
+                        NativeTransferArtisticKind::Desaturate
+                        | NativeTransferArtisticKind::Invert => parameter == 0.0,
+                    };
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !parameter.is_finite()
+                        || !valid
+                    {
+                        return Err("native transfer-space artistic filter requires one AP1 image and a bounded kind-specific parameter");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeDropShadow {
+                    offset,
+                    radius,
+                    color,
+                    opacity,
+                    pixel_scale,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || offset
+                            .iter()
+                            .any(|v| !v.is_finite() || !(-200.0..=200.0).contains(v))
+                        || radius > 64
+                        || color
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.0..=16.0).contains(v))
+                        || !opacity.is_finite()
+                        || !(0.0..=1.0).contains(&opacity)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native drop shadow requires one AP1 image and finite bounded offset, radius, color, opacity and pixel scale");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativePerspective { inverse } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !super::ops::native_perspective_matrix_valid(&inverse)
+                    {
+                        return Err("native perspective requires one AP1 image and a finite nonsingular bounded inverse");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeStylize {
+                    kind,
+                    amount,
+                    pixel_scale,
+                } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !amount.is_finite()
+                        || !(-64.0..=64.0).contains(&amount)
+                        || (kind != NativeStylizeKind::ChromaticAberration && amount != 0.0)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native stylize requires one AP1 image and finite bounded kind-specific parameters");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeDetail {
+                    kind,
+                    amount,
+                    sigma,
+                    threshold,
+                    pixel_scale,
+                } => {
+                    let valid = match kind {
+                        NativeDetailKind::SmartSharpen => {
+                            (0.0..=10.0).contains(&amount)
+                                && (0.0..=100.0).contains(&sigma)
+                                && (0.0..=1.0).contains(&threshold)
+                        }
+                        NativeDetailKind::HighPass => {
+                            amount == 1.0 && (0.0..=500.0).contains(&sigma) && threshold == 0.0
+                        }
+                        NativeDetailKind::Clarity => {
+                            (-1.0..=1.0).contains(&amount) && sigma == 0.0 && threshold == 0.0
+                        }
+                    };
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !valid
+                        || !amount.is_finite()
+                        || !sigma.is_finite()
+                        || !threshold.is_finite()
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native detail requires one AP1 image and finite bounded kind-specific parameters");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeGeometricWarp {
+                    kind,
+                    amount,
+                    wavelength,
+                    pixel_scale,
+                } => {
+                    let max = if kind == NativeWarpKind::Ripple {
+                        64.0
+                    } else {
+                        1.0
+                    };
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !amount.is_finite()
+                        || !(-max..=max).contains(&amount)
+                        || !wavelength.is_finite()
+                        || !(1.0..=512.0).contains(&wavelength)
+                        || (kind != NativeWarpKind::Ripple && wavelength != 1.0)
+                        || pixel_scale
+                            .iter()
+                            .any(|v| !v.is_finite() || !(0.000001..=1_000_000.0).contains(v))
+                    {
+                        return Err("native geometric warp requires one AP1 image and finite bounded kind-specific parameters");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeBoxBlur { radius } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || radius.iter().any(|v| *v > 500)
+                    {
+                        return Err(
+                            "native box blur requires one AP1 image and radii in 0..=500 pixels",
+                        );
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMosaic { block } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || block.iter().any(|v| !(1..=256).contains(v))
+                    {
+                        return Err("native mosaic requires one AP1 image and cell dimensions in 1..=256 pixels");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMotionBlur { delta } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || delta.iter().any(|v| !v.is_finite())
+                        || f64::from(delta[0]).hypot(f64::from(delta[1])) > 500.0001
+                    {
+                        return Err("native directional motion blur requires one AP1 image and a finite displacement of at most 500 pixels");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeGaussianBlur { sigma } => {
+                    if node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                        || !sigma.is_finite()
+                        || !(0.0..=500.0).contains(&sigma)
+                    {
+                        return Err("native Gaussian blur requires one scene-linear AP1 image and finite sigma in 0..=500 pixels");
+                    }
+                    Domain::SceneLinearAcescg
                 }
                 IrOp::NativeExposure { stops } => {
                     if !stops.is_finite() || !(-32.0..=32.0).contains(&stops) {
@@ -837,6 +2243,30 @@ impl FrameGraph {
                     }
                     Domain::Acescct
                 }
+                IrOp::NativeTonalExposure { tonal } => {
+                    tonal.validate()?;
+                    if !tonal.native_ap1
+                        || node.inputs.len() != 1
+                        || input != Domain::SceneLinearAcescg
+                    {
+                        return Err("native tonal exposure requires one scene AP1 input");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeRgbMatrix { rows } => {
+                    photonic_render::white_balance::validate_matrix(&rows)?;
+                    if node.inputs.len() != 1 || input != Domain::SceneLinearAcescg {
+                        return Err("native linear color matrix requires one scene AP1 input");
+                    }
+                    Domain::SceneLinearAcescg
+                }
+                IrOp::NativeMatteCdl { cdl } => {
+                    photonic_render::native_transfer::validate_native_cdl(&cdl)?;
+                    if node.inputs.len() != 2 || input != Domain::SceneLinearAcescg {
+                        return Err("native matte CDL requires a scene image and typed matte");
+                    }
+                    Domain::SceneLinearAcescg
+                }
                 IrOp::NativeLogCdl { cdl } => {
                     photonic_render::native_transfer::validate_native_cdl(&cdl)?;
                     if input != Domain::Acescct {
@@ -898,6 +2328,9 @@ impl FrameGraph {
         }
         if let Some(output) = self.output {
             match domains.get(output.0 as usize) {
+                Some(Domain::ScalarChannel) => {
+                    return Err("scalar channels require an image conversion before display");
+                }
                 Some(Domain::Acescct | Domain::MatteWeight) => {
                     return Err("ACEScct grading coordinates cannot be a displayed output");
                 }
@@ -946,9 +2379,26 @@ impl FrameGraph {
 
     /// Convert authored output pixels to the processing canvas used by Draft.
     pub(crate) fn canvas_scale(&self, canvas: (u32, u32)) -> glam::Vec2 {
-        match self.output.and_then(|id| self.nodes.get(id.0 as usize)) {
+        let mut terminal = self.output.and_then(|id| self.nodes.get(id.0 as usize));
+        if let Some(node) = terminal {
+            if matches!(node.op, IrOp::NativeCaptionOutput { .. }) {
+                terminal = node
+                    .inputs
+                    .first()
+                    .and_then(|(id, _)| self.nodes.get(id.0 as usize));
+            }
+        }
+        let boundary = match terminal {
+            Some(node) if matches!(node.op, IrOp::NativeSdrOutput | IrOp::NativeSdrVideoOutput) => {
+                node.inputs
+                    .first()
+                    .and_then(|(id, _)| self.nodes.get(id.0 as usize))
+            }
+            _ => terminal,
+        };
+        match boundary {
             Some(IrNode {
-                op: IrOp::Output { w, h },
+                op: IrOp::Output { w, h } | IrOp::NativeCanvas { w, h },
                 ..
             }) if *w > 0 && *h > 0 => {
                 glam::Vec2::new(canvas.0 as f32 / *w as f32, canvas.1 as f32 / *h as f32)
@@ -958,11 +2408,261 @@ impl FrameGraph {
     }
 }
 
+pub(crate) fn validate_native_caption_batch(batch: &CaptionBatch) -> Result<(), &'static str> {
+    if batch.cues.len() > 16
+        || batch
+            .cues
+            .iter()
+            .flat_map(|c| &c.words)
+            .map(|w| w.text.len())
+            .sum::<usize>()
+            > 4096
+        || batch.cues.iter().map(|c| c.words.len()).sum::<usize>() > 128
+    {
+        return Err("native captions exceed the bounded cue, word or text budget");
+    }
+    for cue in &batch.cues {
+        // SlideUp may start up to 5% below an authored bottom-edge anchor.
+        if !cue.anchor[1].is_finite() || !(0.0..=1.05).contains(&cue.anchor[1]) {
+            return Err("native caption vertical anchor exceeds the bounded slide animation");
+        }
+        let mut checked = cue.clone();
+        checked.anchor[1] = checked.anchor[1].min(1.0);
+        validate_native_text_block(&ResolvedTextBlock { cue: Some(checked) })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_native_text_block(block: &ResolvedTextBlock) -> Result<(), &'static str> {
+    let Some(cue) = &block.cue else {
+        return Ok(());
+    };
+    if cue.words.len() > 128
+        || cue.words.iter().map(|w| w.text.len()).sum::<usize>() > 4096
+        || !cue.font_size.is_finite()
+        || !(1.0..=512.0).contains(&cue.font_size)
+        || !cue.line_height_mul.is_finite()
+        || !(0.5..=4.0).contains(&cue.line_height_mul)
+        || !cue.max_width.is_finite()
+        || !(0.001..=1.0).contains(&cue.max_width)
+        || cue
+            .anchor
+            .iter()
+            .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        || cue.words.iter().any(|w| {
+            w.font_family.is_empty()
+                || w.font_family.len() > 128
+                || !(1..=1000).contains(&w.font_weight)
+        })
+    {
+        return Err("native title has unsupported text length, font or layout bounds");
+    }
+    Ok(())
+}
+
 impl IrOp {
+    /// Native resize dimensions are authored pixels, like spatial coordinates.
+    /// Legacy explicit raster sizes retain their existing behavior.
+    pub(crate) fn at_evaluation_scale(
+        &self,
+        scale: glam::Vec2,
+        domain: WorkingColorDomain,
+    ) -> std::borrow::Cow<'_, Self> {
+        if domain == WorkingColorDomain::SceneLinearAcescg {
+            if let Self::Resize { w, h, fit } = self {
+                return std::borrow::Cow::Owned(Self::Resize {
+                    w: ((*w as f32 * scale.x).round() as u32).max(1),
+                    h: ((*h as f32 * scale.y).round() as u32).max(1),
+                    fit: *fit,
+                });
+            }
+        }
+        self.at_canvas_scale(scale)
+    }
+
     /// Affine coordinates are authored in output pixels, including the pivot.
     /// Conjugation preserves scale/rotation while adapting translation to Draft.
     pub(crate) fn at_canvas_scale(&self, scale: glam::Vec2) -> std::borrow::Cow<'_, Self> {
         match self {
+            Self::NativeCaptionOutput {
+                cue_batch,
+                video,
+                paints,
+            } if scale != glam::Vec2::ONE => {
+                let mut cue_batch = cue_batch.clone();
+                for cue in &mut cue_batch.cues {
+                    cue.font_size *= scale.y;
+                }
+                std::borrow::Cow::Owned(Self::NativeCaptionOutput {
+                    cue_batch,
+                    video: *video,
+                    paints: paints.iter().map(|p| p.scaled(scale.y)).collect(),
+                })
+            }
+            Self::NativeDecoratedTextGen { block, decoration } if scale != glam::Vec2::ONE => {
+                let mut block = block.clone();
+                if let Some(cue) = &mut block.cue {
+                    cue.font_size *= scale.y;
+                }
+                std::borrow::Cow::Owned(Self::NativeDecoratedTextGen {
+                    block,
+                    decoration: decoration.scaled(scale.y),
+                })
+            }
+            Self::NativeTextGen { block } if scale != glam::Vec2::ONE => {
+                let mut block = block.clone();
+                if let Some(cue) = &mut block.cue {
+                    cue.font_size *= scale.y;
+                }
+                std::borrow::Cow::Owned(Self::NativeTextGen { block })
+            }
+            Self::NativeDenoise {
+                strength,
+                spatial_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeDenoise {
+                strength: *strength,
+                spatial_scale: (*spatial_scale * scale.min_element()).clamp(1.0 / 65536.0, 4.0),
+            }),
+            Self::NativeGrain {
+                amount,
+                monochrome,
+                seed,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeGrain {
+                amount: *amount,
+                monochrome: *monochrome,
+                seed: *seed,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeGlow {
+                sigma,
+                threshold,
+                intensity,
+                tint,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeGlow {
+                sigma: *sigma * scale.min_element(),
+                threshold: *threshold,
+                intensity: *intensity,
+                tint: *tint,
+            }),
+            Self::NativeUnsharp { amount, sigma } if scale != glam::Vec2::ONE => {
+                std::borrow::Cow::Owned(Self::NativeUnsharp {
+                    amount: *amount,
+                    sigma: *sigma * scale.min_element(),
+                })
+            }
+            Self::NativeOutline {
+                thickness,
+                color,
+                opacity,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeOutline {
+                thickness: *thickness,
+                color: *color,
+                opacity: *opacity,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeSurfaceBlur {
+                radius,
+                threshold,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeSurfaceBlur {
+                radius: *radius,
+                threshold: *threshold,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeLensBlur {
+                radius,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeLensBlur {
+                radius: *radius,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeRankFilter {
+                kind,
+                radius,
+                threshold,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeRankFilter {
+                kind: *kind,
+                radius: *radius,
+                threshold: *threshold,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeDropShadow {
+                offset,
+                radius,
+                color,
+                opacity,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeDropShadow {
+                offset: *offset,
+                radius: *radius,
+                color: *color,
+                opacity: *opacity,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeStylize {
+                kind,
+                amount,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeStylize {
+                kind: *kind,
+                amount: *amount,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeDetail {
+                kind,
+                amount,
+                sigma,
+                threshold,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeDetail {
+                kind: *kind,
+                amount: *amount,
+                sigma: *sigma,
+                threshold: *threshold,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeGeometricWarp {
+                kind,
+                amount,
+                wavelength,
+                pixel_scale,
+            } if scale != glam::Vec2::ONE => std::borrow::Cow::Owned(Self::NativeGeometricWarp {
+                kind: *kind,
+                amount: *amount,
+                wavelength: *wavelength,
+                pixel_scale: [pixel_scale[0] * scale.x, pixel_scale[1] * scale.y],
+            }),
+            Self::NativeBoxBlur { radius } if scale != glam::Vec2::ONE => {
+                std::borrow::Cow::Owned(Self::NativeBoxBlur {
+                    radius: [
+                        (radius[0] as f32 * scale.x).round().max(0.0) as u32,
+                        (radius[1] as f32 * scale.y).round().max(0.0) as u32,
+                    ],
+                })
+            }
+            Self::NativeMosaic { block } if scale != glam::Vec2::ONE => {
+                std::borrow::Cow::Owned(Self::NativeMosaic {
+                    block: [
+                        (block[0] as f32 * scale.x).round().max(1.0) as u32,
+                        (block[1] as f32 * scale.y).round().max(1.0) as u32,
+                    ],
+                })
+            }
+            Self::NativeMotionBlur { delta } if scale != glam::Vec2::ONE => {
+                std::borrow::Cow::Owned(Self::NativeMotionBlur {
+                    delta: [delta[0] * scale.x, delta[1] * scale.y],
+                })
+            }
+            Self::NativeGaussianBlur { sigma } if scale != glam::Vec2::ONE => {
+                // Draft keeps picture aspect ratio; use the smaller scale for
+                // its one-pixel rounding difference and isotropic authored sigma.
+                std::borrow::Cow::Owned(Self::NativeGaussianBlur {
+                    sigma: *sigma * scale.min_element(),
+                })
+            }
             Self::Transform2D { mat, sampling } if scale != glam::Vec2::ONE => {
                 let basis = Mat3::from_scale(scale);
                 std::borrow::Cow::Owned(Self::Transform2D {
@@ -1065,7 +2765,267 @@ mod tests {
     }
 
     #[test]
-    fn managed_graph_qualifies_only_normal_blend() {
+    fn native_nonseparable_rejects_wrong_domains_modes_arity_and_opacity() {
+        let source = |hash| IrNode {
+            op: IrOp::SolidColor {
+                color: LinearColor {
+                    r: 0.5,
+                    g: 0.25,
+                    b: 0.0,
+                    a: 0.5,
+                },
+            },
+            inputs: vec![],
+            content_hash: ContentHash(hash),
+        };
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                source(1),
+                source(2),
+                IrNode {
+                    op: IrOp::NativeBoundedMerge {
+                        mode: BlendMode::Hue,
+                        opacity: 0.5,
+                    },
+                    inputs: vec![
+                        (IrNodeId(0), OutPort::default()),
+                        (IrNodeId(1), OutPort::default()),
+                    ],
+                    content_hash: ContentHash(3),
+                },
+            ],
+            output: Some(IrNodeId(2)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for (mode, opacity) in [
+            (BlendMode::Normal, 0.5),
+            (BlendMode::Hue, f32::NAN),
+            (BlendMode::Hue, -0.1),
+            (BlendMode::Hue, 1.1),
+        ] {
+            graph.nodes[2].op = IrOp::NativeBoundedMerge { mode, opacity };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[2].op = IrOp::NativeBoundedMerge {
+            mode: BlendMode::Luminosity,
+            opacity: 1.0,
+        };
+        graph.nodes[2].inputs.pop();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[2]
+            .inputs
+            .push((IrNodeId(1), OutPort::default()));
+        graph.nodes[2].op = IrOp::Merge {
+            mode: BlendMode::Luminosity,
+            opacity: 1.0,
+        };
+        assert!(
+            graph.validate_working_color_domain().is_err(),
+            "Legacy bounded merge must not silently implement Native arithmetic"
+        );
+    }
+
+    #[test]
+    fn native_bounded_rejects_wrong_domains_modes_arity_and_opacity() {
+        let source = |hash| IrNode {
+            op: IrOp::SolidColor {
+                color: LinearColor {
+                    r: 0.5,
+                    g: 0.25,
+                    b: 0.0,
+                    a: 0.5,
+                },
+            },
+            inputs: vec![],
+            content_hash: ContentHash(hash),
+        };
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                source(1),
+                source(2),
+                IrNode {
+                    op: IrOp::NativeBoundedMerge {
+                        mode: BlendMode::ColorDodge,
+                        opacity: 0.5,
+                    },
+                    inputs: vec![
+                        (IrNodeId(0), OutPort::default()),
+                        (IrNodeId(1), OutPort::default()),
+                    ],
+                    content_hash: ContentHash(3),
+                },
+            ],
+            output: Some(IrNodeId(2)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for (mode, opacity) in [
+            (BlendMode::Normal, 0.5),
+            (BlendMode::ColorDodge, f32::NAN),
+            (BlendMode::ColorDodge, -0.1),
+            (BlendMode::ColorDodge, 1.1),
+        ] {
+            graph.nodes[2].op = IrOp::NativeBoundedMerge { mode, opacity };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[2].op = IrOp::NativeBoundedMerge {
+            mode: BlendMode::Divide,
+            opacity: 1.0,
+        };
+        graph.nodes[2].inputs.pop();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[2]
+            .inputs
+            .push((IrNodeId(1), OutPort::default()));
+        graph.nodes[2].op = IrOp::Merge {
+            mode: BlendMode::Divide,
+            opacity: 1.0,
+        };
+        assert!(
+            graph.validate_working_color_domain().is_err(),
+            "Legacy bounded merge must not silently implement Native arithmetic"
+        );
+    }
+
+    #[test]
+    fn native_arithmetic_rejects_wrong_domains_modes_arity_and_opacity() {
+        let source = |hash| IrNode {
+            op: IrOp::SolidColor {
+                color: LinearColor {
+                    r: 0.5,
+                    g: 0.25,
+                    b: 0.0,
+                    a: 0.5,
+                },
+            },
+            inputs: vec![],
+            content_hash: ContentHash(hash),
+        };
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                source(1),
+                source(2),
+                IrNode {
+                    op: IrOp::NativeArithmeticMerge {
+                        mode: BlendMode::LinearDodge,
+                        opacity: 0.5,
+                    },
+                    inputs: vec![
+                        (IrNodeId(0), OutPort::default()),
+                        (IrNodeId(1), OutPort::default()),
+                    ],
+                    content_hash: ContentHash(3),
+                },
+            ],
+            output: Some(IrNodeId(2)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for (mode, opacity) in [
+            (BlendMode::Normal, 0.5),
+            (BlendMode::LinearDodge, f32::NAN),
+            (BlendMode::LinearDodge, -0.1),
+            (BlendMode::LinearDodge, 1.1),
+        ] {
+            graph.nodes[2].op = IrOp::NativeArithmeticMerge { mode, opacity };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[2].op = IrOp::NativeArithmeticMerge {
+            mode: BlendMode::Subtract,
+            opacity: 1.0,
+        };
+        graph.nodes[2].inputs.pop();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[2]
+            .inputs
+            .push((IrNodeId(1), OutPort::default()));
+        graph.nodes[2].op = IrOp::Merge {
+            mode: BlendMode::Subtract,
+            opacity: 1.0,
+        };
+        assert!(
+            graph.validate_working_color_domain().is_err(),
+            "Legacy bounded merge must not silently implement Native arithmetic"
+        );
+    }
+
+    #[test]
+    fn native_luminance_rejects_wrong_domains_modes_arity_and_opacity() {
+        let source = |hash| IrNode {
+            op: IrOp::SolidColor {
+                color: LinearColor {
+                    r: 0.5,
+                    g: 0.25,
+                    b: 0.0,
+                    a: 0.5,
+                },
+            },
+            inputs: vec![],
+            content_hash: ContentHash(hash),
+        };
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                source(1),
+                source(2),
+                IrNode {
+                    op: IrOp::NativeLuminanceMerge {
+                        mode: BlendMode::DarkerColor,
+                        opacity: 0.5,
+                    },
+                    inputs: vec![
+                        (IrNodeId(0), OutPort::default()),
+                        (IrNodeId(1), OutPort::default()),
+                    ],
+                    content_hash: ContentHash(3),
+                },
+            ],
+            output: Some(IrNodeId(2)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for (mode, opacity) in [
+            (BlendMode::Normal, 0.5),
+            (BlendMode::DarkerColor, f32::NAN),
+            (BlendMode::DarkerColor, -0.1),
+            (BlendMode::DarkerColor, 1.1),
+        ] {
+            graph.nodes[2].op = IrOp::NativeLuminanceMerge { mode, opacity };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[2].op = IrOp::NativeLuminanceMerge {
+            mode: BlendMode::LighterColor,
+            opacity: 1.0,
+        };
+        graph.nodes[2].inputs.pop();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[2]
+            .inputs
+            .push((IrNodeId(1), OutPort::default()));
+        graph.nodes[2].op = IrOp::Merge {
+            mode: BlendMode::LighterColor,
+            opacity: 1.0,
+        };
+        assert!(
+            graph.validate_working_color_domain().is_err(),
+            "Legacy luma merge must not silently implement Native AP1 whole-color selection"
+        );
+    }
+
+    #[test]
+    fn managed_graph_qualifies_only_extended_safe_blends() {
         let source = |hash| IrNode {
             op: IrOp::SolidColor {
                 color: LinearColor {
@@ -1094,13 +3054,306 @@ mod tests {
             ],
             output: Some(IrNodeId(2)),
         };
-        assert!(graph(BlendMode::Normal)
-            .validate_working_color_domain()
-            .is_ok());
-        assert_eq!(
-            graph(BlendMode::Multiply).validate_working_color_domain(),
-            Err("non-Normal blend mode is not qualified in scene-linear ACEScg")
-        );
+        for mode in [
+            BlendMode::Normal,
+            BlendMode::Multiply,
+            BlendMode::Screen,
+            BlendMode::Darken,
+            BlendMode::Lighten,
+            BlendMode::Difference,
+            BlendMode::Exclusion,
+            BlendMode::Overlay,
+            BlendMode::HardLight,
+            BlendMode::PinLight,
+            BlendMode::SoftLight,
+        ] {
+            assert!(graph(mode).validate_working_color_domain().is_ok());
+        }
+        for mode in [
+            BlendMode::Hue,
+            BlendMode::ColorDodge,
+            BlendMode::LinearDodge,
+        ] {
+            assert!(graph(mode).validate_working_color_domain().is_err());
+        }
+        let mut invalid = graph(BlendMode::Normal);
+        for opacity in [f32::NAN, -0.1, 1.1] {
+            invalid.nodes[2].op = IrOp::Merge {
+                mode: BlendMode::Normal,
+                opacity,
+            };
+            assert!(invalid.validate_working_color_domain().is_err());
+        }
+    }
+
+    #[test]
+    fn native_denoise_rejects_invalid_domain_arity_and_controls() {
+        let op = |strength, spatial_scale| IrOp::NativeDenoise {
+            strength,
+            spatial_scale,
+        };
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::SolidColor {
+                        color: LinearColor {
+                            r: -0.25,
+                            g: 2.0,
+                            b: 0.0,
+                            a: 0.5,
+                        },
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: op(0.5, 1.0),
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(2),
+                },
+            ],
+            output: Some(IrNodeId(1)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for invalid in [
+            op(f32::NAN, 1.0),
+            op(-0.01, 1.0),
+            op(1.01, 1.0),
+            op(0.5, 0.0),
+            op(0.5, 4.1),
+            op(0.5, f32::INFINITY),
+        ] {
+            graph.nodes[1].op = invalid;
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[1].op = op(0.5, 1.0);
+        graph.nodes[1].inputs.clear();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1].inputs = vec![(IrNodeId(0), OutPort::default()); 2];
+        assert!(graph.validate_working_color_domain().is_err());
+    }
+
+    #[test]
+    fn native_grain_rejects_invalid_domain_arity_and_controls() {
+        let op = |amount, seed, pixel_scale| IrOp::NativeGrain {
+            amount,
+            monochrome: true,
+            seed,
+            pixel_scale,
+        };
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::SolidColor {
+                        color: LinearColor {
+                            r: -0.25,
+                            g: 2.0,
+                            b: 0.0,
+                            a: 0.5,
+                        },
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: op(0.1, 1, [1.0; 2]),
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(2),
+                },
+            ],
+            output: Some(IrNodeId(1)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for invalid in [
+            op(f32::NAN, 1, [1.0; 2]),
+            op(-0.01, 1, [1.0; 2]),
+            op(1.01, 1, [1.0; 2]),
+            op(0.1, 1_000_000_001, [1.0; 2]),
+            op(0.1, 1, [0.0, 1.0]),
+            op(0.1, 1, [f32::INFINITY, 1.0]),
+            op(0.1, 1, [1e-30, 1.0]),
+        ] {
+            graph.nodes[1].op = invalid;
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[1].op = op(0.1, 1, [1.0; 2]);
+        graph.nodes[1].inputs.clear();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1].inputs = vec![(IrNodeId(0), OutPort::default()); 2];
+        assert!(graph.validate_working_color_domain().is_err());
+    }
+
+    #[test]
+    fn native_vignette_rejects_invalid_domain_arity_and_controls() {
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::SolidColor {
+                        color: LinearColor {
+                            r: -0.25,
+                            g: 2.0,
+                            b: 0.0,
+                            a: 0.5,
+                        },
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: IrOp::NativeVignette {
+                        amount: -0.5,
+                        feather: 0.5,
+                    },
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(2),
+                },
+            ],
+            output: Some(IrNodeId(1)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for (amount, feather) in [
+            (f32::NAN, 0.5),
+            (-1.01, 0.5),
+            (1.01, 0.5),
+            (0.0, f32::INFINITY),
+            (0.0, -0.01),
+            (0.0, 1.01),
+        ] {
+            graph.nodes[1].op = IrOp::NativeVignette { amount, feather };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[1].op = IrOp::NativeVignette {
+            amount: 0.0,
+            feather: 0.0,
+        };
+        graph.nodes[1].inputs.clear();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1].inputs = vec![(IrNodeId(0), OutPort::default()); 2];
+        assert!(graph.validate_working_color_domain().is_err());
+    }
+
+    #[test]
+    fn native_resize_rejects_invalid_allocations_and_domains() {
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::SolidColor {
+                        color: LinearColor {
+                            r: -0.25,
+                            g: 2.0,
+                            b: 0.0,
+                            a: 0.5,
+                        },
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: IrOp::Resize {
+                        w: 16,
+                        h: 8,
+                        fit: FitMode::Fit,
+                    },
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(2),
+                },
+            ],
+            output: Some(IrNodeId(1)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        for (w, h) in [
+            (0, 8),
+            (8, 0),
+            (8193, 1),
+            (8192, 8192),
+            (u32::MAX, u32::MAX),
+        ] {
+            graph.nodes[1].op = IrOp::Resize {
+                w,
+                h,
+                fit: FitMode::Fit,
+            };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[1].op = IrOp::Resize {
+            w: 16,
+            h: 8,
+            fit: FitMode::Fit,
+        };
+        graph.nodes[1].inputs.clear();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1].inputs = vec![(IrNodeId(0), OutPort::default()); 2];
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1].inputs.truncate(1);
+        graph.nodes[0].op = IrOp::GradeMatteConstant { weight: 0.5 };
+        assert!(graph.validate_working_color_domain().is_err());
+    }
+
+    #[test]
+    fn native_gaussian_rejects_wrong_domains_arity_and_nonfinite_radius() {
+        let mut graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::SolidColor {
+                        color: LinearColor {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        },
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: IrOp::NativeGaussianBlur { sigma: 2.0 },
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(2),
+                },
+            ],
+            output: Some(IrNodeId(1)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        graph.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        for sigma in [f32::NAN, f32::INFINITY, -1.0, 500.01] {
+            graph.nodes[1].op = IrOp::NativeGaussianBlur { sigma };
+            assert!(graph.validate_working_color_domain().is_err());
+        }
+        graph.nodes[1].op = IrOp::NativeGaussianBlur { sigma: 2.0 };
+        graph.nodes[1].inputs.clear();
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1].inputs = vec![(IrNodeId(0), OutPort::default()); 2];
+        assert!(graph.validate_working_color_domain().is_err());
+        graph.nodes[1] = IrNode {
+            op: IrOp::NativeAcescct {
+                direction: AcescctDirection::Encode,
+            },
+            inputs: vec![(IrNodeId(0), OutPort::default())],
+            content_hash: ContentHash(3),
+        };
+        graph.nodes.push(IrNode {
+            op: IrOp::NativeGaussianBlur { sigma: 2.0 },
+            inputs: vec![(IrNodeId(1), OutPort::default())],
+            content_hash: ContentHash(4),
+        });
+        graph.output = Some(IrNodeId(2));
+        assert!(graph.validate_working_color_domain().is_err());
     }
 
     #[test]

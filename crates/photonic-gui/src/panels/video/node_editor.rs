@@ -463,7 +463,10 @@ fn op_params(op: &GraphOp) -> Vec<ParamDesc> {
         GraphOp::MaskShape { .. } => {
             from_registry(PropTargetKind::Effect(EffectKind::MaskShapeGen))
         }
-        GraphOp::Transform2D => from_registry(PropTargetKind::ClipTransform),
+        GraphOp::Transform2D => from_registry(PropTargetKind::ClipTransform)
+            .into_iter()
+            .filter(|param| param.path != "transform.opacity")
+            .collect(),
         GraphOp::Merge { .. } => vec![f("params.opacity", "Opacity", 0.0, 1.0)],
         GraphOp::SolidColor => vec![ParamDesc {
             path: "params.color",
@@ -526,6 +529,7 @@ fn pretty_path(path: &str) -> &'static str {
         "params.size_x" => "Size X",
         "params.size_y" => "Size Y",
         "params.rotation" => "Rotation",
+        "transform.rotation" => "Rotation (rad)",
         "params.feather" => "Feather",
         "transform.x" => "Position X",
         "transform.y" => "Position Y",
@@ -538,7 +542,75 @@ fn pretty_path(path: &str) -> &'static str {
     }
 }
 
-/// Neutral default for a param when the node has no stored value yet.
+/// Display the compiler's implicit value without materializing parameters just
+/// because the user opened a node. Stored values (including zero) always win.
+fn node_param_value(doc: &Document, node: &GraphNode, d: &ParamDesc) -> PropValue {
+    if let Some(value) = node.params.base.0.get(d.path) {
+        return *value;
+    }
+    let effect = match node.op {
+        GraphOp::Blur => Some(EffectKind::Blur),
+        GraphOp::Sharpen => Some(EffectKind::Sharpen),
+        GraphOp::Glow => Some(EffectKind::Glow),
+        GraphOp::ChromaKey => Some(EffectKind::ChromaKey),
+        GraphOp::LumaKey => Some(EffectKind::LumaKey),
+        GraphOp::MaskShape { .. } => Some(EffectKind::MaskShapeGen),
+        _ => None,
+    };
+    if let Some(kind) = effect {
+        if let Some(value) = photonic_core::timeline::effect_manifest::manifest(kind.effect_id())
+            .and_then(|manifest| manifest.params.iter().find(|param| param.path == d.path))
+        {
+            return value.default;
+        }
+    }
+
+    match (&node.op, d.path) {
+        (GraphOp::Merge { .. }, "params.opacity") => return PropValue::Float(1.0),
+        (GraphOp::SolidColor, "params.color") => {
+            return PropValue::Color(photonic_core::Color::BLACK)
+        }
+        (GraphOp::Transform2D, path) => {
+            let defaults = photonic_core::timeline::ClipTransform::default();
+            let value = match path {
+                "transform.x" => defaults.x,
+                "transform.y" => defaults.y,
+                "transform.scale_x" => defaults.scale_x,
+                "transform.scale_y" => defaults.scale_y,
+                "transform.rotation" => defaults.rotation,
+                "transform.anchor_x" => defaults.anchor_x,
+                "transform.anchor_y" => defaults.anchor_y,
+                _ => return default_value(d),
+            };
+            return PropValue::Float(value);
+        }
+        (GraphOp::Resize { .. }, path @ ("params.width" | "params.height")) => {
+            if let Some(format) = doc
+                .timeline
+                .as_ref()
+                .and_then(|project| {
+                    project
+                        .active_sequence
+                        .and_then(|id| project.sequences.get(&id))
+                })
+                .and_then(|seq| {
+                    seq.formats
+                        .get(seq.active_format.min(seq.formats.len().saturating_sub(1)))
+                })
+            {
+                return PropValue::Float(if path == "params.width" {
+                    format.width
+                } else {
+                    format.height
+                } as f64);
+            }
+        }
+        _ => {}
+    }
+    default_value(d)
+}
+
+/// Generic fallback for controls whose compiler default is neutral.
 fn default_value(d: &ParamDesc) -> PropValue {
     match d.kind {
         PropValueKind::Float => {
@@ -710,6 +782,7 @@ enum Interaction {
     Wire {
         from: GraphNodeId,
         out_port: u16,
+        original: Option<GraphEdge>,
     },
 }
 
@@ -718,6 +791,21 @@ enum Interaction {
 #[derive(Clone)]
 enum PaletteIntent {
     AddNode(NodeKind),
+    SetTimeOffset {
+        node: GraphNodeId,
+        old: Tick,
+        new: Tick,
+    },
+    SetMaskShape {
+        node: GraphNodeId,
+        old: MaskShapeKind,
+        new: MaskShapeKind,
+    },
+    SetText {
+        node: GraphNodeId,
+        old: TextGen,
+        new: TextGen,
+    },
     SetParam {
         node: GraphNodeId,
         path: String,
@@ -802,6 +890,51 @@ fn commit_batch(history: &mut CommandHistory, doc: &mut Document, cmds: Vec<Time
 
 /// Build a `SetNodeParam` command that sets one path on a node's param bag,
 /// cloning the current bag from the live document.
+fn set_time_offset_cmd(
+    doc: &Document,
+    gid: GraphId,
+    node: GraphNodeId,
+    old: Tick,
+    new: Tick,
+) -> Option<TimelineCmd> {
+    let p = doc.timeline.as_ref()?;
+    let n = p.graphs.get(&gid)?.nodes.get(&node)?;
+    if !matches!(n.op, GraphOp::TimeOffset{offset} if offset==old) {
+        return None;
+    }
+    graph_ops::set_time_offset(p, gid, node, new).ok().flatten()
+}
+
+fn set_mask_shape_cmd(
+    doc: &Document,
+    gid: GraphId,
+    node: GraphNodeId,
+    old: &MaskShapeKind,
+    new: MaskShapeKind,
+) -> Option<TimelineCmd> {
+    let p = doc.timeline.as_ref()?;
+    let n = p.graphs.get(&gid)?.nodes.get(&node)?;
+    if !matches!(&n.op,GraphOp::MaskShape{shape} if shape==old) {
+        return None;
+    }
+    graph_ops::set_mask_shape(p, gid, node, new).ok().flatten()
+}
+
+fn set_text_cmd(
+    doc: &Document,
+    gid: GraphId,
+    node: GraphNodeId,
+    old: &TextGen,
+    new: TextGen,
+) -> Option<TimelineCmd> {
+    let p = doc.timeline.as_ref()?;
+    let n = p.graphs.get(&gid)?.nodes.get(&node)?;
+    if !matches!(&n.op,GraphOp::Text{text} if text==old) {
+        return None;
+    }
+    graph_ops::set_text(p, gid, node, new).ok().flatten()
+}
+
 fn set_param_cmd(
     doc: &Document,
     gid: GraphId,
@@ -836,15 +969,67 @@ fn connect_cmds(
         from: (from, OutPort(out_port)),
         to: (to, InPort(in_port)),
     };
-    let add = graph_ops::add_edge(p, gid, edge.from, edge.to).map_err(|_| ())?;
-    let mut cmds = Vec::new();
-    if let Some(g) = p.graphs.get(&gid) {
-        for existing in g.edges.iter().filter(|e| e.to == (to, InPort(in_port))) {
-            cmds.push(graph_ops::remove_edge(gid, *existing));
-        }
+    Ok(graph_ops::connect_edge(p, gid, edge.from, edge.to)
+        .map_err(|_| ())?
+        .into_iter()
+        .collect())
+}
+
+fn input_wire(
+    graph: &photonic_core::timeline::NodeGraph,
+    node: GraphNodeId,
+    port: u16,
+) -> Option<Interaction> {
+    graph
+        .edges
+        .iter()
+        .find(|edge| edge.to == (node, InPort(port)))
+        .copied()
+        .map(|edge| Interaction::Wire {
+            from: edge.from.0,
+            out_port: edge.from.1 .0,
+            original: Some(edge),
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wire_drop_cmds(
+    doc: &Document,
+    gid: GraphId,
+    from: GraphNodeId,
+    out_port: u16,
+    original: Option<GraphEdge>,
+    target: Option<(GraphNodeId, u16)>,
+    blank: bool,
+) -> Result<Vec<TimelineCmd>, ops::EditError> {
+    let project = doc.timeline.as_ref().ok_or(ops::EditError::NoProject)?;
+    if let Some((node, port)) = target {
+        Ok(graph_ops::rewire_edge(
+            project,
+            gid,
+            original,
+            (from, OutPort(out_port)),
+            (node, InPort(port)),
+        )?
+        .into_iter()
+        .collect())
+    } else if blank {
+        original
+            .map(|edge| graph_ops::remove_edge(project, gid, edge))
+            .transpose()
+            .map(|command| command.into_iter().collect())
+    } else {
+        Ok(Vec::new())
     }
-    cmds.push(add);
-    Ok(cmds)
+}
+
+fn graph_connection_error(error: &ops::EditError) -> String {
+    match error {
+        ops::EditError::TrackLocked => "Track locked: graph is read-only".into(),
+        ops::EditError::WouldCreateCycle => "Can't connect: this would create a cycle".into(),
+        ops::EditError::InvalidGraphConnection(reason) => reason.clone(),
+        _ => "Connection no longer available".into(),
+    }
 }
 
 /// Locate the sequence + track that own a clip (for opening its composition).
@@ -930,6 +1115,7 @@ pub(crate) fn draw_node_canvas(
         return;
     };
     let is_project_graph = doc.timeline.as_ref().and_then(|p| p.project_graph) == Some(gid);
+    begin_graph_canvas_pass(ui, graph_interaction_scope(doc, gid));
 
     let full = rect;
     let mut pending: Vec<TimelineCmd> = Vec::new();
@@ -1022,19 +1208,12 @@ pub(crate) fn draw_node_canvas(
     // early — the frame must still paint (08 §6.1). This replaces the old
     // unconditional top-of-fn `key_pressed(Escape)`, which fired app-wide and
     // abandoned an in-flight wire instead of cancelling it.
-    if resp.has_focus() && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
-    {
-        let wire_in_flight = matches!(
-            ui.data(|d| d.get_temp::<Interaction>(interaction_id())),
-            Some(Interaction::Wire { .. })
-        );
-        match esc_level(wire_in_flight, vid.selected_graph_node.is_some()) {
-            // Cancel only the wire — no orphaned edge, no history entry (R-7).
-            EscLevel::CancelWire => ui.data_mut(|d| d.remove::<Interaction>(interaction_id())),
-            EscLevel::ClearSelection => *vid.selected_graph_node = None,
-            EscLevel::CloseCanvas => *vid.node_canvas_active = false,
-        }
-    }
+    handle_canvas_escape(
+        ui,
+        resp.has_focus(),
+        &mut *vid.selected_graph_node,
+        &mut *vid.node_canvas_active,
+    );
     let origin = canvas_rect.min;
 
     handle_canvas_input(
@@ -1091,7 +1270,7 @@ pub(crate) fn draw_node_canvas(
     }
 
     // In-progress wire preview.
-    if let Some(Interaction::Wire { from, out_port }) = &drag_state {
+    if let Some(Interaction::Wire { from, out_port, .. }) = &drag_state {
         if let (Some(node), Some(ptr)) =
             (graph.nodes.get(from), ui.input(|i| i.pointer.hover_pos()))
         {
@@ -1162,6 +1341,43 @@ pub(crate) fn draw_node_canvas(
     }
 }
 
+fn handle_canvas_escape(
+    ui: &Ui,
+    focused: bool,
+    selected: &mut Option<GraphNodeId>,
+    active: &mut bool,
+) {
+    if focused && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        let wire = matches!(
+            ui.data(|data| data.get_temp::<Interaction>(interaction_id())),
+            Some(Interaction::Wire { .. })
+        );
+        match esc_level(wire, selected.is_some()) {
+            EscLevel::CancelWire => {
+                ui.data_mut(|data| data.remove::<Interaction>(interaction_id()))
+            }
+            EscLevel::ClearSelection => *selected = None,
+            EscLevel::CloseCanvas => *active = false,
+        }
+    }
+}
+
+fn graph_interaction_scope(doc: &Document, gid: GraphId) -> Id {
+    Id::new(("node_canvas_scope", doc.id, gid))
+}
+
+fn begin_graph_canvas_pass(ui: &Ui, scope: Id) {
+    let pass = ui.ctx().cumulative_pass_nr();
+    let previous = ui.data(|data| data.get_temp::<(Id, u64)>(Id::new("node_canvas_visible_pass")));
+    if previous.is_none_or(|(previous_graph, previous_pass)| {
+        previous_graph != scope || previous_pass.saturating_add(1) < pass
+    }) {
+        ui.data_mut(|data| data.remove::<Interaction>(interaction_id()));
+    }
+    ui.data_mut(|data| data.insert_temp(Id::new("node_canvas_visible_pass"), (scope, pass)));
+}
+
 /// Effective draw position for a node, applying an in-progress drag offset.
 fn node_draw_pos(
     graph: &photonic_core::timeline::NodeGraph,
@@ -1198,6 +1414,15 @@ fn handle_canvas_input(
     vid: &mut VideoPanelUi,
 ) {
     let origin = canvas_rect.min;
+    let editable = graph_is_editable(doc, gid);
+    if !editable
+        && !matches!(
+            ui.data(|d| d.get_temp::<Interaction>(interaction_id())),
+            Some(Interaction::Pan)
+        )
+    {
+        ui.data_mut(|d| d.remove::<Interaction>(interaction_id()));
+    }
 
     // Zoom on scroll, anchored at the cursor.
     if resp.hovered() {
@@ -1214,30 +1439,23 @@ fn handle_canvas_input(
 
     // Classify a starting drag.
     if resp.drag_started() {
-        if let Some(press) = resp.interact_pointer_pos() {
+        if let Some(press) = ui
+            .input(|input| input.pointer.press_origin())
+            .or_else(|| resp.interact_pointer_pos())
+        {
             let interaction =
                 if let Some(port) = hit_port(graph, origin, view.pan, view.zoom, press) {
-                    if port.is_input {
-                        // Grab a connected input → detach its edge, then draw a fresh
-                        // wire from the freed upstream output.
-                        if let Some(edge) = graph
-                            .edges
-                            .iter()
-                            .find(|e| e.to == (port.node, InPort(port.idx)))
-                            .copied()
-                        {
-                            pending.push(graph_ops::remove_edge(gid, edge));
-                            Some(Interaction::Wire {
-                                from: edge.from.0,
-                                out_port: edge.from.1 .0,
-                            })
-                        } else {
-                            None
-                        }
+                    if !editable {
+                        None
+                    } else if port.is_input {
+                        // Keep the original edge until a drop is committed, so Escape
+                        // and interrupted drags cannot orphan a connection.
+                        input_wire(graph, port.node, port.idx)
                     } else {
                         Some(Interaction::Wire {
                             from: port.node,
                             out_port: port.idx,
+                            original: None,
                         })
                     }
                 } else if let Some(node) = hit_node(graph, origin, view.pan, view.zoom, press) {
@@ -1247,7 +1465,7 @@ fn handle_canvas_input(
                         .get(&node)
                         .copied()
                         .unwrap_or(NodePos { x: 0.0, y: 0.0 });
-                    Some(Interaction::DragNode {
+                    editable.then_some(Interaction::DragNode {
                         node,
                         start,
                         accum: Vec2::ZERO,
@@ -1301,15 +1519,22 @@ fn handle_canvas_input(
                     }
                 }
             }
-            Some(Interaction::Wire { from, out_port }) => {
+            Some(Interaction::Wire {
+                from,
+                out_port,
+                original,
+            }) => {
                 if let Some(drop) = resp.interact_pointer_pos() {
-                    if let Some(port) = hit_port(graph, origin, view.pan, view.zoom, drop) {
-                        if port.is_input && port.node != from {
-                            match connect_cmds(doc, gid, from, out_port, port.node, port.idx) {
-                                Ok(cmds) => batches.push(cmds),
-                                Err(()) => set_flash(ui, "Can't connect — would create a cycle"),
-                            }
-                        }
+                    let port = hit_port(graph, origin, view.pan, view.zoom, drop);
+                    let target = port
+                        .filter(|port| port.is_input)
+                        .map(|port| (port.node, port.idx));
+                    let blank = canvas_rect.contains(drop)
+                        && port.is_none()
+                        && hit_node(graph, origin, view.pan, view.zoom, drop).is_none();
+                    match wire_drop_cmds(doc, gid, from, out_port, original, target, blank) {
+                        Ok(cmds) => batches.push(cmds),
+                        Err(error) => set_flash(ui, graph_connection_error(&error)),
                     }
                 }
             }
@@ -1329,11 +1554,11 @@ fn handle_canvas_input(
                         .find(|e| e.to == (port.node, InPort(port.idx)))
                         .copied()
                     {
-                        pending.push(graph_ops::remove_edge(gid, edge));
+                        pending.extend(remove_edge_cmd(doc, gid, edge));
                     }
                 }
-            } else if hit_node(graph, origin, view.pan, view.zoom, pos).is_none() {
-                *vid.selected_graph_node = None;
+            } else {
+                *vid.selected_graph_node = hit_node(graph, origin, view.pan, view.zoom, pos);
             }
         }
     }
@@ -1356,7 +1581,8 @@ fn handle_canvas_input(
             ui.separator();
             add_node_menu(ui, is_pg, |kind| {
                 let node = GraphNode::new(kind.make_op());
-                pending.push(graph_ops::add_node(
+                pending.extend(add_node_cmd(
+                    doc,
                     gid,
                     node,
                     NodePos {
@@ -1414,7 +1640,7 @@ fn node_context_menu(
         ui.close_menu();
     }
     ui.separator();
-    ui.add_enabled_ui(!is_output, |ui| {
+    ui.add_enabled_ui(!is_output && graph_is_editable(doc, gid), |ui| {
         if ui.button("Delete node").clicked() {
             if let Some(p) = doc.timeline.as_ref() {
                 if let Ok(cmd) = graph_ops::remove_node(p, gid, node) {
@@ -1807,29 +2033,29 @@ fn draw_inline_param(
     gid: GraphId,
     pending: &mut Vec<TimelineCmd>,
 ) {
-    let cur = node
-        .params
-        .base
-        .0
-        .get(desc.path)
-        .cloned()
-        .unwrap_or_else(|| default_value(desc));
+    let cur = node_param_value(doc, node, desc);
     let prefix = format!("{}: ", desc.label);
+    if !graph_is_editable(doc, gid) {
+        let text = match cur {
+            PropValue::Float(value) => format!("{prefix}{value:.2}"),
+            PropValue::Enum(value) => format!("{prefix}{value}"),
+            _ => prefix,
+        };
+        ui.put(rect, egui::Label::new(egui::RichText::new(text).weak()))
+            .on_hover_text("Track locked: graph is read-only");
+        return;
+    }
     match desc.kind {
         PropValueKind::Float => {
-            let mut v = match cur {
+            let v = match cur {
                 PropValue::Float(f) => f,
                 _ => 0.0,
             };
-            let (lo, hi) = desc.range.unwrap_or((0.0, 1.0));
-            let resp = ui.put(
-                rect,
-                egui::DragValue::new(&mut v)
-                    .range(lo..=hi)
-                    .speed((hi - lo) / 300.0)
-                    .prefix(prefix),
-            );
-            if commit_worthy(&resp) {
+            let key = node_number_draft_id(ui, doc, node.id, desc.path);
+            let (_, edited) = node_number_control(ui, key, v, |ui, value| {
+                ui.put(rect, node_drag_value(value, desc).prefix(prefix))
+            });
+            if let Some(v) = edited {
                 if let Some(cmd) = set_param_cmd(doc, gid, node.id, desc.path, PropValue::Float(v))
                 {
                     pending.push(cmd);
@@ -1837,19 +2063,15 @@ fn draw_inline_param(
             }
         }
         PropValueKind::Enum => {
-            let mut n = match cur {
+            let n = match cur {
                 PropValue::Enum(e) => e as f64,
                 _ => 0.0,
             };
-            let (lo, hi) = desc.range.unwrap_or((0.0, 8.0));
-            let resp = ui.put(
-                rect,
-                egui::DragValue::new(&mut n)
-                    .range(lo..=hi)
-                    .speed(0.25)
-                    .prefix(prefix),
-            );
-            if commit_worthy(&resp) {
+            let key = node_number_draft_id(ui, doc, node.id, desc.path);
+            let (_, edited) = node_number_control(ui, key, n, |ui, value| {
+                ui.put(rect, node_drag_value(value, desc).prefix(prefix))
+            });
+            if let Some(n) = edited {
                 let value = PropValue::Enum(n.round().max(0.0) as u32);
                 if let Some(cmd) = set_param_cmd(doc, gid, node.id, desc.path, value) {
                     pending.push(cmd);
@@ -1862,6 +2084,7 @@ fn draw_inline_param(
 
 /// Commit-on-release: one undo step per drag gesture, immediate on typed/discrete
 /// changes.
+#[cfg(test)]
 fn commit_worthy(resp: &Response) -> bool {
     resp.drag_stopped() || (resp.changed() && !resp.dragged())
 }
@@ -2118,6 +2341,25 @@ fn clip_name_for_graph(doc: &Document, gid: GraphId) -> Option<String> {
     None
 }
 
+fn graph_is_editable(doc: &Document, gid: GraphId) -> bool {
+    doc.timeline
+        .as_ref()
+        .is_some_and(|project| graph_ops::ensure_editable(project, gid).is_ok())
+}
+
+fn add_node_cmd(
+    doc: &Document,
+    gid: GraphId,
+    node: GraphNode,
+    pos: NodePos,
+) -> Option<TimelineCmd> {
+    graph_ops::add_node(doc.timeline.as_ref()?, gid, node, pos).ok()
+}
+
+fn remove_edge_cmd(doc: &Document, gid: GraphId, edge: GraphEdge) -> Option<TimelineCmd> {
+    graph_ops::remove_edge(doc.timeline.as_ref()?, gid, edge).ok()
+}
+
 fn clip_composition_id(doc: &Document, clip: photonic_core::timeline::ClipId) -> Option<GraphId> {
     let p = doc.timeline.as_ref()?;
     p.sequences.values().find_map(|s| {
@@ -2153,7 +2395,20 @@ fn apply_palette_intent(
                 y: center.y + (n % 4.0) * 18.0,
             };
             let node = GraphNode::new(kind.make_op());
-            pending.push(graph_ops::add_node(gid, node, pos));
+            pending.extend(add_node_cmd(doc, gid, node, pos));
+        }
+        PaletteIntent::SetTimeOffset { node, old, new } => {
+            if !pending.iter().any(|cmd|matches!(cmd,TimelineCmd::GraphEdit(photonic_core::timeline::GraphCmd::SetTimeOffset{node:n,..}) if *n==node)) {
+                pending.extend(set_time_offset_cmd(doc,gid,node,old,new));
+            }
+        }
+        PaletteIntent::SetMaskShape{node,old,new}=>{
+            if !pending.iter().any(|cmd|matches!(cmd,TimelineCmd::GraphEdit(photonic_core::timeline::GraphCmd::SetMaskShape{node:n,..}) if *n==node)) {pending.extend(set_mask_shape_cmd(doc,gid,node,&old,new));}
+        }
+        PaletteIntent::SetText {node,old,new} => {
+            if !pending.iter().any(|cmd|matches!(cmd,TimelineCmd::GraphEdit(photonic_core::timeline::GraphCmd::SetText{node:n,..}) if *n==node)) {
+                pending.extend(set_text_cmd(doc,gid,node,&old,new));
+            }
         }
         PaletteIntent::SetParam { node, path, value } => {
             if let Some(cmd) = set_param_cmd(doc, gid, node, &path, value) {
@@ -2237,73 +2492,391 @@ pub(crate) fn draw_node_editor_palette(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     );
     ui.separator();
 
-    // ── Add-node search palette (08 §6.2) ────────────────────────────────────
-    egui::CollapsingHeader::new("Add node")
-        .default_open(true)
-        .show(ui, |ui| {
-            let mut q: String = ui
-                .data(|d| d.get_temp::<String>(palette_search_id()))
-                .unwrap_or_default();
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut q)
-                    .hint_text("Search nodes…")
-                    .desired_width(f32::INFINITY),
-            );
-            if resp.changed() {
-                ui.data_mut(|d| d.insert_temp(palette_search_id(), q.clone()));
-            }
-            let ql = q.to_lowercase();
-            egui::ScrollArea::vertical()
-                .id_salt("node_palette_list")
-                .max_height(220.0)
-                .show(ui, |ui| {
-                    for fam in Family::ORDER {
-                        let kinds: Vec<NodeKind> = NodeKind::ALL
-                            .iter()
-                            .copied()
-                            .filter(|k| {
-                                k.family() == fam
-                                    && k.allowed(is_project_graph)
-                                    && k.matches_query(&ql)
-                            })
-                            .collect();
-                        if kinds.is_empty() {
-                            continue;
-                        }
-                        ui.label(
-                            egui::RichText::new(fam.title().to_uppercase())
-                                .small()
-                                .weak(),
-                        );
-                        for k in kinds {
-                            if ui
-                                .add(
-                                    egui::Button::new(k.label())
-                                        .min_size(Vec2::new(ui.available_width(), 0.0)),
-                                )
-                                .clicked()
-                            {
-                                push_palette_intent(ui, PaletteIntent::AddNode(k));
-                                *ctx.video.node_canvas_active = true;
+    let editable = graph_is_editable(ctx.doc, gid);
+    if !editable {
+        ui.label("Read-only: a clip using this graph is on a locked track.");
+    }
+    ui.add_enabled_ui(editable, |ui| {
+        // ── Add-node search palette (08 §6.2) ────────────────────────────────────
+        egui::CollapsingHeader::new("Add node")
+            .default_open(true)
+            .show(ui, |ui| {
+                let mut q: String = ui
+                    .data(|d| d.get_temp::<String>(palette_search_id()))
+                    .unwrap_or_default();
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut q)
+                        .hint_text("Search nodes…")
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.changed() {
+                    ui.data_mut(|d| d.insert_temp(palette_search_id(), q.clone()));
+                }
+                let ql = q.to_lowercase();
+                egui::ScrollArea::vertical()
+                    .id_salt("node_palette_list")
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        for fam in Family::ORDER {
+                            let kinds: Vec<NodeKind> = NodeKind::ALL
+                                .iter()
+                                .copied()
+                                .filter(|k| {
+                                    k.family() == fam
+                                        && k.allowed(is_project_graph)
+                                        && k.matches_query(&ql)
+                                })
+                                .collect();
+                            if kinds.is_empty() {
+                                continue;
                             }
+                            ui.label(
+                                egui::RichText::new(fam.title().to_uppercase())
+                                    .small()
+                                    .weak(),
+                            );
+                            for k in kinds {
+                                if ui
+                                    .add(
+                                        egui::Button::new(k.label())
+                                            .min_size(Vec2::new(ui.available_width(), 0.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    push_palette_intent(ui, PaletteIntent::AddNode(k));
+                                    *ctx.video.node_canvas_active = true;
+                                }
+                            }
+                            ui.add_space(2.0);
                         }
-                        ui.add_space(2.0);
-                    }
-                });
-        });
+                    });
+            });
 
-    ui.separator();
+        ui.separator();
 
-    // ── Selected-node inspector (08 §6.4) ────────────────────────────────────
-    let sel = *ctx.video.selected_graph_node;
-    match sel.and_then(|id| graph.nodes.get(&id)) {
-        None => {
-            ui.label(egui::RichText::new("Select a node to edit its parameters.").weak());
+        // ── Selected-node inspector (08 §6.4) ────────────────────────────────────
+        let sel = *ctx.video.selected_graph_node;
+        match sel.and_then(|id| graph.nodes.get(&id)) {
+            None => {
+                ui.label(egui::RichText::new("Select a node to edit its parameters.").weak());
+            }
+            Some(node) => {
+                draw_inspector(ui, ctx, gid, &graph, node);
+            }
         }
-        Some(node) => {
-            draw_inspector(ui, ctx, gid, &graph, node);
+    });
+}
+
+#[derive(Clone)]
+struct GraphTimeDraft {
+    base: Tick,
+    text: String,
+}
+
+fn graph_time_draft(stored: Option<GraphTimeDraft>, offset: Tick) -> GraphTimeDraft {
+    stored
+        .filter(|draft| draft.base == offset)
+        .unwrap_or_else(|| GraphTimeDraft {
+            base: offset,
+            text: offset.0.to_string(),
+        })
+}
+
+fn draw_graph_time_editor(
+    ui: &mut Ui,
+    ctx: &mut PropPanelCtx,
+    gid: GraphId,
+    node: GraphNodeId,
+    offset: Tick,
+) {
+    let key = graph_interaction_scope(ctx.doc, gid).with(("time_offset_draft", node));
+    let mut draft = graph_time_draft(ui.data(|d| d.get_temp(key)), offset);
+    ui.label("Offset (integer ticks)");
+    ui.add(egui::TextEdit::singleline(&mut draft.text).desired_width(ui.available_width()));
+    ui.label(
+        egui::RichText::new("705,600,000 ticks = 1 second. Positive reads earlier frames.")
+            .small()
+            .weak(),
+    );
+    let parsed = draft.text.trim().parse::<i64>().map(Tick);
+    if let Ok(value) = parsed {
+        ui.label(format!("{:.6} seconds", value.as_seconds_f64()));
+    } else {
+        ui.colored_label(
+            ui.visuals().error_fg_color,
+            "Enter a signed 64-bit integer.",
+        );
+    }
+    let editable = ctx
+        .doc
+        .timeline
+        .as_ref()
+        .is_some_and(|p| graph_ops::ensure_editable(p, gid).is_ok());
+    if !editable {
+        ui.label("Track locked: graph is read-only");
+    }
+    let changed = parsed.as_ref().is_ok_and(|value| *value != offset);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(editable && changed, egui::Button::new("Apply offset"))
+            .clicked()
+        {
+            if let Ok(new) = parsed {
+                push_palette_intent(
+                    ui,
+                    PaletteIntent::SetTimeOffset {
+                        node,
+                        old: offset,
+                        new,
+                    },
+                );
+                *ctx.video.node_canvas_active = true;
+            }
+        }
+        if ui
+            .add_enabled(
+                draft.text != offset.0.to_string(),
+                egui::Button::new("Revert draft"),
+            )
+            .clicked()
+        {
+            draft.text = offset.0.to_string();
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(key, draft));
+}
+
+#[derive(Clone)]
+struct GraphShapeDraft {
+    base: MaskShapeKind,
+    edited: MaskShapeKind,
+}
+
+fn draw_graph_shape_fields(ui: &mut Ui, shape: &mut MaskShapeKind) {
+    let old_kind = match shape {
+        MaskShapeKind::Ellipse => 0,
+        MaskShapeKind::Rect => 1,
+        MaskShapeKind::Polygon { .. } => 2,
+    };
+    let mut kind = old_kind;
+    egui::ComboBox::from_id_salt("shape_kind")
+        .selected_text(["Ellipse", "Rectangle", "Polygon"][kind])
+        .show_ui(ui, |ui| {
+            for (index, name) in ["Ellipse", "Rectangle", "Polygon"].iter().enumerate() {
+                ui.selectable_value(&mut kind, index, *name);
+            }
+        });
+    if kind != old_kind {
+        *shape = match kind {
+            0 => MaskShapeKind::Ellipse,
+            1 => MaskShapeKind::Rect,
+            _ => MaskShapeKind::Polygon {
+                vertices: vec![[0., 0.], [1., 0.], [0.5, 1.]],
+            },
+        };
+    }
+    if let MaskShapeKind::Polygon { vertices } = shape {
+        ui.label("Static normalized vertices · even-odd fill");
+        ui.label("Feather softens inward; size is the local half-extent.");
+        let mut remove = None;
+        egui::ScrollArea::vertical()
+            .id_salt("polygon_vertices")
+            .max_height(160.0)
+            .show(ui, |ui| {
+                let can_remove = vertices.len() > 3;
+                for (index, vertex) in vertices.iter_mut().take(128).enumerate() {
+                    ui.push_id(index, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{}", index + 1));
+                            for v in vertex {
+                                ui.add(
+                                    egui::DragValue::new(v)
+                                        .range(0.0..=1.0)
+                                        .clamp_existing_to_range(false)
+                                        .speed(0.01),
+                                );
+                            }
+                            if ui.add_enabled(can_remove, egui::Button::new("−")).clicked() {
+                                remove = Some(index);
+                            }
+                        });
+                    });
+                }
+            });
+        if let Some(index) = remove {
+            vertices.remove(index);
+        }
+        if ui
+            .add_enabled(vertices.len() < 128, egui::Button::new("Add vertex"))
+            .clicked()
+        {
+            vertices.push([0.5, 0.5]);
         }
     }
+}
+
+fn draw_graph_shape_editor(
+    ui: &mut Ui,
+    ctx: &mut PropPanelCtx,
+    gid: GraphId,
+    node: GraphNodeId,
+    shape: &MaskShapeKind,
+) {
+    let key = graph_interaction_scope(ctx.doc, gid).with(("shape_draft", node));
+    let mut draft = ui
+        .data(|d| d.get_temp::<GraphShapeDraft>(key))
+        .filter(|d| d.base == *shape)
+        .unwrap_or_else(|| GraphShapeDraft {
+            base: shape.clone(),
+            edited: shape.clone(),
+        });
+    draw_graph_shape_fields(ui, &mut draft.edited);
+    let error = draft.edited.validate_native().err();
+    if let Some(error) = error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+    let editable = ctx
+        .doc
+        .timeline
+        .as_ref()
+        .is_some_and(|p| graph_ops::ensure_editable(p, gid).is_ok());
+    if !editable {
+        ui.label("Track locked: graph is read-only");
+    }
+    let changed = draft.edited != *shape;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                editable && changed && error.is_none(),
+                egui::Button::new("Apply shape"),
+            )
+            .clicked()
+        {
+            push_palette_intent(
+                ui,
+                PaletteIntent::SetMaskShape {
+                    node,
+                    old: shape.clone(),
+                    new: draft.edited.clone(),
+                },
+            );
+            *ctx.video.node_canvas_active = true;
+        }
+        if ui
+            .add_enabled(changed, egui::Button::new("Revert draft"))
+            .clicked()
+        {
+            draft.edited = shape.clone();
+        }
+    });
+    ui.label(
+        egui::RichText::new("Polygon rendering: Native Managed only.")
+            .small()
+            .weak(),
+    );
+    ui.data_mut(|d| d.insert_temp(key, draft));
+}
+
+#[derive(Clone)]
+struct GraphTextDraft {
+    base: TextGen,
+    edited: TextGen,
+}
+
+fn draw_graph_text_fields(ui: &mut Ui, text: &mut TextGen) {
+    ui.add(egui::TextEdit::multiline(&mut text.text).desired_rows(3));
+    ui.horizontal(|ui| {
+        ui.label("Font");
+        ui.text_edit_singleline(&mut text.font_family);
+    });
+    ui.horizontal(|ui| {
+        ui.label("Size");
+        ui.add(
+            egui::DragValue::new(&mut text.font_size)
+                .range(1.0..=512.0)
+                .clamp_existing_to_range(false)
+                .speed(0.5),
+        );
+    });
+    let c = &mut text.fill;
+    let mut rgba = [c.r, c.g, c.b, c.a];
+    if ui.color_edit_button_rgba_unmultiplied(&mut rgba).changed() {
+        *c = photonic_core::Color::new(rgba[0], rgba[1], rgba[2], rgba[3]);
+    }
+    ui.horizontal(|ui| {
+        ui.label("Position");
+        for v in &mut text.position {
+            ui.add(
+                egui::DragValue::new(v)
+                    .range(0.0..=1.0)
+                    .clamp_existing_to_range(false)
+                    .speed(0.01),
+            );
+        }
+    });
+}
+
+fn draw_graph_text_editor(
+    ui: &mut Ui,
+    ctx: &mut PropPanelCtx,
+    gid: GraphId,
+    node: GraphNodeId,
+    text: &TextGen,
+) {
+    let key = graph_interaction_scope(ctx.doc, gid).with(("text_draft", node));
+    let mut draft = ui
+        .data(|d| d.get_temp::<GraphTextDraft>(key))
+        .filter(|d| d.base == *text)
+        .unwrap_or_else(|| GraphTextDraft {
+            base: text.clone(),
+            edited: text.clone(),
+        });
+    ui.label("Static text · managed scene graphic");
+    ui.label(
+        egui::RichText::new("Native Managed rendering; Legacy text nodes remain unqualified.")
+            .small()
+            .weak(),
+    );
+    draw_graph_text_fields(ui, &mut draft.edited);
+    let error = draft.edited.validate_native().err();
+    if let Some(error) = error {
+        ui.colored_label(ui.visuals().error_fg_color, error);
+    }
+    let editable = ctx
+        .doc
+        .timeline
+        .as_ref()
+        .is_some_and(|p| graph_ops::ensure_editable(p, gid).is_ok());
+    if !editable {
+        ui.label("Track locked: graph is read-only");
+    }
+    let changed = draft.edited != *text;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(
+                editable && changed && error.is_none(),
+                egui::Button::new("Apply text"),
+            )
+            .clicked()
+        {
+            push_palette_intent(
+                ui,
+                PaletteIntent::SetText {
+                    node,
+                    old: text.clone(),
+                    new: draft.edited.clone(),
+                },
+            );
+            *ctx.video.node_canvas_active = true;
+        }
+        if ui
+            .add_enabled(changed, egui::Button::new("Revert draft"))
+            .clicked()
+        {
+            draft.edited = text.clone();
+        }
+    });
+    ui.data_mut(|d| d.insert_temp(key, draft));
 }
 
 fn draw_inspector(
@@ -2322,8 +2895,16 @@ fn draw_inspector(
         );
     }
 
+    if let GraphOp::MaskShape { shape } = &node.op {
+        draw_graph_shape_editor(ui, ctx, gid, node.id, shape);
+    }
+    if let GraphOp::TimeOffset { offset } = node.op {
+        draw_graph_time_editor(ui, ctx, gid, node.id, offset);
+    }
     let params = op_params(&node.op);
-    if params.is_empty() {
+    if let GraphOp::Text { text } = &node.op {
+        draw_graph_text_editor(ui, ctx, gid, node.id, text);
+    } else if params.is_empty() {
         ui.label(
             egui::RichText::new(structural_note(&node.op))
                 .weak()
@@ -2376,6 +2957,121 @@ fn draw_inspector(
     }
 }
 
+fn node_number_draft_id(ui: &Ui, doc: &Document, node: GraphNodeId, path: &str) -> Id {
+    ui.id().with(("node_number_draft", doc.id, node, path))
+}
+
+#[derive(Clone, Copy)]
+struct NodeNumberDraft {
+    original: f64,
+    value: f64,
+    pass: u64,
+    widget: Id,
+}
+
+/// Keep an in-progress drag outside the document and commit it once on release.
+/// Escape, a hidden control, a lock change or a concurrent value edit cancels it.
+fn node_number_control(
+    ui: &mut Ui,
+    key: Id,
+    original: f64,
+    draw: impl FnOnce(&mut Ui, &mut f64) -> Response,
+) -> (Response, Option<f64>) {
+    let pass = ui.ctx().cumulative_pass_nr();
+    let previous = ui.data(|data| data.get_temp::<NodeNumberDraft>(key));
+    let (escape, down, released) = ui.input(|input| {
+        (
+            input.key_pressed(egui::Key::Escape),
+            input.pointer.primary_down(),
+            input.pointer.button_released(egui::PointerButton::Primary),
+        )
+    });
+    let cancelled = escape
+        || !ui.is_enabled()
+        || previous.is_some_and(|draft| {
+            draft.original.to_bits() != original.to_bits()
+                || draft.pass.saturating_add(1) < pass
+                || (!down && !released)
+        });
+    if cancelled {
+        if previous.is_some_and(|draft| ui.ctx().dragged_id() == Some(draft.widget)) {
+            ui.ctx().stop_dragging();
+        }
+        ui.data_mut(|data| data.remove::<NodeNumberDraft>(key));
+    }
+    let mut value = if cancelled {
+        original
+    } else {
+        previous.map_or(original, |draft| draft.value)
+    };
+    let response = draw(ui, &mut value);
+    if cancelled {
+        return (response, None);
+    }
+    if (response.dragged() || (response.changed() && down)) && !released {
+        let widget = ui.ctx().dragged_id().unwrap_or(response.id);
+        ui.data_mut(|data| {
+            data.insert_temp(
+                key,
+                NodeNumberDraft {
+                    original,
+                    value,
+                    pass,
+                    widget,
+                },
+            )
+        });
+        return (response, None);
+    }
+    let stopped = (released && previous.is_some())
+        || response.drag_stopped()
+        || previous.is_some_and(|draft| ui.ctx().drag_stopped_id() == Some(draft.widget));
+    let changed = response.changed() || stopped;
+    if changed {
+        ui.data_mut(|data| data.remove::<NodeNumberDraft>(key));
+        let result = (value.to_bits() != original.to_bits()).then_some(value);
+        return (response, result);
+    }
+    (response, None)
+}
+
+fn node_drag_value<'a>(value: &'a mut f64, desc: &ParamDesc) -> egui::DragValue<'a> {
+    let speed = if desc.kind == PropValueKind::Enum {
+        0.25
+    } else if desc.path == "transform.rotation" {
+        0.01
+    } else {
+        desc.range.map_or(1.0, |(lo, hi)| (hi - lo) / 300.0)
+    };
+    let mut widget = egui::DragValue::new(value)
+        .speed(speed)
+        .clamp_existing_to_range(false)
+        .update_while_editing(false);
+    if let Some((lo, hi)) = desc.range {
+        widget = widget.range(lo..=hi);
+    }
+    widget
+}
+
+fn draw_float_param(ui: &mut Ui, value: &mut f64, desc: &ParamDesc) -> Response {
+    match desc.range {
+        Some((lo, hi)) => {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().slider_width = (ui.available_width() - 64.0).clamp(24.0, 120.0);
+                let slider = ui.add(
+                    egui::Slider::new(value, lo..=hi)
+                        .show_value(false)
+                        .clamping(egui::SliderClamping::Edits),
+                );
+                let number = ui.add(node_drag_value(value, desc));
+                slider.union(number)
+            })
+            .inner
+        }
+        None => ui.add(node_drag_value(value, desc)),
+    }
+}
+
 fn draw_inspector_param(
     ui: &mut Ui,
     ctx: &mut PropPanelCtx,
@@ -2383,25 +3079,20 @@ fn draw_inspector_param(
     node: &GraphNode,
     desc: &ParamDesc,
 ) {
-    let cur = node
-        .params
-        .base
-        .0
-        .get(desc.path)
-        .cloned()
-        .unwrap_or_else(|| default_value(desc));
+    let cur = node_param_value(ctx.doc, node, desc);
     ui.horizontal(|ui| {
         ui.label(desc.label);
         let _ = gid;
         match desc.kind {
             PropValueKind::Float => {
-                let mut v = match cur {
+                let v = match cur {
                     PropValue::Float(f) => f,
                     _ => 0.0,
                 };
-                let (lo, hi) = desc.range.unwrap_or((0.0, 1.0));
-                let resp = ui.add(egui::Slider::new(&mut v, lo..=hi));
-                if commit_worthy(&resp) {
+                let key = node_number_draft_id(ui, ctx.doc, node.id, desc.path);
+                let (_, edited) =
+                    node_number_control(ui, key, v, |ui, value| draw_float_param(ui, value, desc));
+                if let Some(v) = edited {
                     push_palette_intent(
                         ui,
                         PaletteIntent::SetParam {
@@ -2450,13 +3141,15 @@ fn draw_inspector_param(
                 }
             }
             PropValueKind::Enum => {
-                let mut n = match cur {
+                let n = match cur {
                     PropValue::Enum(e) => e as f64,
                     _ => 0.0,
                 };
-                let (lo, hi) = desc.range.unwrap_or((0.0, 8.0));
-                let resp = ui.add(egui::DragValue::new(&mut n).range(lo..=hi).speed(0.25));
-                if commit_worthy(&resp) {
+                let key = node_number_draft_id(ui, ctx.doc, node.id, desc.path);
+                let (_, edited) = node_number_control(ui, key, n, |ui, value| {
+                    ui.add(node_drag_value(value, desc))
+                });
+                if let Some(n) = edited {
                     push_palette_intent(
                         ui,
                         PaletteIntent::SetParam {
@@ -2506,6 +3199,525 @@ mod tests {
     }
 
     #[test]
+    fn graph_text_inspector_view_preserves_unqualified_stored_values() {
+        let ctx = egui::Context::default();
+        let mut text = TextGen {
+            text: "Read only".into(),
+            font_size: 900.0,
+            position: [-0.2, 1.2],
+            fill: photonic_core::Color::new(-0.1, 2.0, 0.5, 0.5),
+            ..Default::default()
+        };
+        let before = text.clone();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| draw_graph_text_fields(ui, &mut text));
+            });
+            assert_eq!(text, before);
+        }
+    }
+
+    #[test]
+    fn graph_text_inspector_commit_is_discrete_and_stale_safe() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, TimelineProject, Track, TrackKind,
+        };
+        let (mut g, node) = photonic_core::timeline::NodeGraph::new_clip_composition("Text");
+        let gid = g.id;
+        let original = TextGen {
+            text: "Original".into(),
+            ..Default::default()
+        };
+        g.nodes.get_mut(&node).unwrap().op = GraphOp::Text {
+            text: original.clone(),
+        };
+        let mut p = TimelineProject::new();
+        let mut seq = Sequence::new("Text", FrameRate::FPS_30, 128, 64);
+        let sid = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::BLACK,
+            },
+            Tick(0),
+            Tick(100),
+        );
+        clip.composition = Some(gid);
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        p.insert_sequence(seq);
+        p.graphs.insert(gid, g);
+        let mut doc = Document::new("Text", 128.0, 64.0);
+        doc.timeline = Some(p);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::default();
+        let next = TextGen {
+            text: "Edited".into(),
+            ..original.clone()
+        };
+        assert!(set_text_cmd(&doc, gid, node, &original, original.clone()).is_none());
+        let cmd = set_text_cmd(&doc, gid, node, &original, next.clone()).unwrap();
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        assert_eq!(history.revision(), 1);
+        assert!(
+            set_text_cmd(&doc, gid, node, &original, next.clone()).is_none(),
+            "stale draft refused"
+        );
+        assert!(
+            set_text_cmd(&doc, gid, node, &next, next.clone()).is_none(),
+            "repeat is no-op"
+        );
+        history.undo(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        assert!(set_text_cmd(&doc, gid, node, &original, next).is_none());
+    }
+
+    #[test]
+    fn graph_shape_fields_do_not_clamp_imported_vertices() {
+        let ctx = egui::Context::default();
+        let mut shape = MaskShapeKind::Polygon {
+            vertices: vec![[-0.1, 0.0], [1.1, 0.0], [0.5, 1.2]],
+        };
+        let before = shape.clone();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| draw_graph_shape_fields(ui, &mut shape));
+            });
+            assert_eq!(shape, before);
+        }
+    }
+
+    #[test]
+    fn graph_shape_inspector_commit_is_discrete_and_stale_safe() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, TimelineProject, Track, TrackKind,
+        };
+        let (mut g, node) = photonic_core::timeline::NodeGraph::new_clip_composition("Text");
+        let gid = g.id;
+        let original = MaskShapeKind::Ellipse;
+        g.nodes.get_mut(&node).unwrap().op = GraphOp::MaskShape {
+            shape: original.clone(),
+        };
+        let mut p = TimelineProject::new();
+        let mut seq = Sequence::new("Text", FrameRate::FPS_30, 128, 64);
+        let sid = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::BLACK,
+            },
+            Tick(0),
+            Tick(100),
+        );
+        clip.composition = Some(gid);
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        p.insert_sequence(seq);
+        p.graphs.insert(gid, g);
+        let mut doc = Document::new("Text", 128.0, 64.0);
+        doc.timeline = Some(p);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::default();
+        let next = MaskShapeKind::Polygon {
+            vertices: vec![[0., 0.], [1., 0.], [0.5, 1.]],
+        };
+        assert!(set_mask_shape_cmd(&doc, gid, node, &original, original.clone()).is_none());
+        let cmd = set_mask_shape_cmd(&doc, gid, node, &original, next.clone()).unwrap();
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        assert_eq!(history.revision(), 1);
+        assert!(
+            set_mask_shape_cmd(&doc, gid, node, &original, next.clone()).is_none(),
+            "stale draft refused"
+        );
+        assert!(
+            set_mask_shape_cmd(&doc, gid, node, &next, next.clone()).is_none(),
+            "repeat is no-op"
+        );
+        history.undo(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        assert!(set_mask_shape_cmd(&doc, gid, node, &original, next).is_none());
+    }
+
+    #[test]
+    fn graph_time_offset_inspector_commit_is_discrete_and_stale_safe() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, TimelineProject, Track, TrackKind,
+        };
+        let (mut g, node) = photonic_core::timeline::NodeGraph::new_clip_composition("Text");
+        let gid = g.id;
+        let original = Tick(0);
+        g.nodes.get_mut(&node).unwrap().op = GraphOp::TimeOffset { offset: original };
+        let mut p = TimelineProject::new();
+        let mut seq = Sequence::new("Text", FrameRate::FPS_30, 128, 64);
+        let sid = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::BLACK,
+            },
+            Tick(0),
+            Tick(100),
+        );
+        clip.composition = Some(gid);
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        p.insert_sequence(seq);
+        p.graphs.insert(gid, g);
+        let mut doc = Document::new("Text", 128.0, 64.0);
+        doc.timeline = Some(p);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::default();
+        let next = Tick(-70_560_000);
+        assert!(set_time_offset_cmd(&doc, gid, node, original, original).is_none());
+        let cmd = set_time_offset_cmd(&doc, gid, node, original, next).unwrap();
+        let serialized = serde_json::to_value(&cmd).unwrap();
+        let cmd: TimelineCmd = serde_json::from_value(serialized).unwrap();
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        assert_eq!(history.revision(), 1);
+        assert!(
+            set_time_offset_cmd(&doc, gid, node, original, next).is_none(),
+            "stale draft refused"
+        );
+        assert!(
+            set_time_offset_cmd(&doc, gid, node, next, next).is_none(),
+            "repeat is no-op"
+        );
+        history.undo(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        assert!(set_time_offset_cmd(&doc, gid, node, original, next).is_none());
+    }
+
+    #[test]
+    fn graph_time_offset_drafts_preserve_exact_ticks_and_reset_on_undo() {
+        let original = Tick(i64::MAX);
+        let mut draft = graph_time_draft(None, original);
+        assert_eq!(draft.text.parse::<i64>().unwrap(), i64::MAX);
+        draft.text = "unfinished -".into();
+        assert_eq!(
+            graph_time_draft(Some(draft.clone()), original).text,
+            "unfinished -"
+        );
+        let reset = graph_time_draft(Some(draft), Tick(0));
+        assert_eq!(reset.text, "0");
+        assert_eq!(reset.base, Tick(0));
+    }
+
+    #[test]
+    fn locked_graph_helpers_refuse_palette_canvas_and_inspector_edits() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, Tick, TimelineProject, Track, TrackKind,
+        };
+        let (graph, source) =
+            photonic_core::timeline::NodeGraph::new_clip_composition("Locked composition");
+        let gid = graph.id;
+        let edge = graph.edges[0];
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Sequence", FrameRate::FPS_30, 1920, 1080);
+        let seq = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "Locked");
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::RED,
+            },
+            Tick(0),
+            Tick(100),
+        );
+        clip.composition = Some(gid);
+        track.clips.push(clip);
+        track.locked = true;
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        project.graphs.insert(gid, graph);
+        let mut doc = Document::new("Graph lock", 32.0, 32.0);
+        doc.timeline = Some(project);
+        let history = CommandHistory::default();
+        let before = serde_json::to_value(&doc).unwrap();
+        assert!(add_node_cmd(
+            &doc,
+            gid,
+            GraphNode::new(GraphOp::Blur),
+            NodePos { x: 0.0, y: 0.0 }
+        )
+        .is_none());
+        assert!(remove_edge_cmd(&doc, gid, edge).is_none());
+        assert!(set_param_cmd(&doc, gid, source, "params.radius", PropValue::Float(4.0)).is_none());
+        assert!(connect_cmds(&doc, gid, edge.from.0, 0, edge.to.0, 0).is_err());
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert_eq!(history.revision(), 0);
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .video_tracks[0]
+            .locked = false;
+        assert!(add_node_cmd(
+            &doc,
+            gid,
+            GraphNode::new(GraphOp::Blur),
+            NodePos { x: 0.0, y: 0.0 }
+        )
+        .is_some());
+        assert!(remove_edge_cmd(&doc, gid, edge).is_some());
+        assert!(set_param_cmd(&doc, gid, source, "params.radius", PropValue::Float(4.0)).is_some());
+        assert!(connect_cmds(&doc, gid, edge.from.0, 0, edge.to.0, 0).is_ok());
+    }
+
+    fn wire_fixture() -> (Document, GraphId, GraphNodeId, GraphNodeId) {
+        let (mut graph, source) =
+            photonic_core::timeline::NodeGraph::new_clip_composition("Deferred wire");
+        let blur = GraphNode::new(GraphOp::Blur);
+        let blur_id = blur.id;
+        graph.nodes.insert(blur_id, blur);
+        graph.edges = vec![
+            GraphEdge {
+                from: (source, OutPort::PRIMARY),
+                to: (blur_id, InPort::PRIMARY),
+            },
+            GraphEdge {
+                from: (blur_id, OutPort::PRIMARY),
+                to: (graph.output, InPort::PRIMARY),
+            },
+        ];
+        let gid = graph.id;
+        let mut project = photonic_core::timeline::TimelineProject::new();
+        project.graphs.insert(gid, graph);
+        let mut document = Document::new("Deferred wire", 32.0, 32.0);
+        document.timeline = Some(project);
+        (document, gid, source, blur_id)
+    }
+
+    #[test]
+    fn input_wire_is_deferred_and_valid_drop_is_one_undoable_command() {
+        let (mut doc, gid, source, blur) = wire_fixture();
+        let graph = &doc.timeline.as_ref().unwrap().graphs[&gid];
+        let output = graph.output;
+        let original = graph.edges[0];
+        let before = serde_json::to_value(&doc).unwrap();
+        assert!(
+            matches!(input_wire(graph,blur,0),Some(Interaction::Wire {original:Some(edge),..}) if edge==original)
+        );
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            before,
+            "starting a wire must not detach it"
+        );
+        assert!(
+            wire_drop_cmds(&doc, gid, source, 0, Some(original), None, false)
+                .unwrap()
+                .is_empty(),
+            "cancel/outside drop leaves the origin connected"
+        );
+        assert!(wire_drop_cmds(&doc, gid, source, 0, None, None, true)
+            .unwrap()
+            .is_empty());
+        assert!(wire_drop_cmds(
+            &doc,
+            gid,
+            source,
+            0,
+            Some(original),
+            Some((source, 0)),
+            false
+        )
+        .is_err());
+        let commands = wire_drop_cmds(
+            &doc,
+            gid,
+            source,
+            0,
+            Some(original),
+            Some((output, 0)),
+            false,
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 1);
+        let mut history = CommandHistory::default();
+        commit_batch(&mut history, &mut doc, commands);
+        assert_eq!(history.revision(), 1);
+        let after = serde_json::to_value(&doc).unwrap();
+        assert_ne!(after, before);
+        assert_eq!(
+            doc.timeline.as_ref().unwrap().graphs[&gid].edges,
+            vec![GraphEdge {
+                from: (source, OutPort::PRIMARY),
+                to: (output, InPort::PRIMARY)
+            }]
+        );
+        assert!(history.undo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert!(history.redo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), after);
+        assert!(history.undo(&mut doc));
+        let disconnect = wire_drop_cmds(&doc, gid, source, 0, Some(original), None, true).unwrap();
+        assert_eq!(disconnect.len(), 1);
+        commit_batch(&mut history, &mut doc, disconnect);
+        assert!(!doc.timeline.as_ref().unwrap().graphs[&gid]
+            .edges
+            .contains(&original));
+        assert!(history.undo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+    }
+
+    #[test]
+    fn hidden_or_changed_graph_cancels_transient_wire_without_mutation() {
+        let (doc, gid, _, blur) = wire_fixture();
+        let graph = &doc.timeline.as_ref().unwrap().graphs[&gid];
+        let before = serde_json::to_value(&doc).unwrap();
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                begin_graph_canvas_pass(ui, graph_interaction_scope(&doc, gid));
+                ui.data_mut(|data| {
+                    data.insert_temp(interaction_id(), input_wire(graph, blur, 0).unwrap())
+                });
+            });
+        });
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                begin_graph_canvas_pass(ui, graph_interaction_scope(&doc, gid));
+                assert!(ui
+                    .data(|data| data.get_temp::<Interaction>(interaction_id()))
+                    .is_some());
+            });
+        });
+        let _ = ctx.run(Default::default(), |_| {});
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                begin_graph_canvas_pass(ui, graph_interaction_scope(&doc, gid));
+                assert!(ui
+                    .data(|data| data.get_temp::<Interaction>(interaction_id()))
+                    .is_none());
+                ui.data_mut(|data| {
+                    data.insert_temp(interaction_id(), input_wire(graph, blur, 0).unwrap())
+                });
+            });
+        });
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                begin_graph_canvas_pass(ui, graph_interaction_scope(&doc, GraphId::new()));
+                assert!(ui
+                    .data(|data| data.get_temp::<Interaction>(interaction_id()))
+                    .is_none());
+            });
+        });
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+    }
+
+    #[test]
+    fn interaction_drafts_are_scoped_to_document_identity() {
+        let first = Document::new("First", 32.0, 32.0);
+        let second = Document::new("Second", 32.0, 32.0);
+        let graph = GraphId::new();
+        let node = GraphNodeId::new();
+        assert_ne!(
+            graph_interaction_scope(&first, graph),
+            graph_interaction_scope(&second, graph)
+        );
+        let ctx = egui::Context::default();
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_ne!(
+                    node_number_draft_id(ui, &first, node, "params.opacity"),
+                    node_number_draft_id(ui, &second, node, "params.opacity")
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn escape_cancels_the_deferred_input_wire_before_selection_or_canvas() {
+        let (doc, gid, _, blur) = wire_fixture();
+        let graph = &doc.timeline.as_ref().unwrap().graphs[&gid];
+        let before = serde_json::to_value(&doc).unwrap();
+        let ctx = egui::Context::default();
+        let mut selected = Some(blur);
+        let mut active = true;
+        let key = || egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key()],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.data_mut(|data| {
+                        data.insert_temp(interaction_id(), input_wire(graph, blur, 0).unwrap())
+                    });
+                    handle_canvas_escape(ui, false, &mut selected, &mut active);
+                    assert!(ui
+                        .data(|data| data.get_temp::<Interaction>(interaction_id()))
+                        .is_some());
+                    handle_canvas_escape(ui, true, &mut selected, &mut active);
+                    assert!(ui
+                        .data(|data| data.get_temp::<Interaction>(interaction_id()))
+                        .is_none());
+                });
+            },
+        );
+        assert_eq!(selected, Some(blur));
+        assert!(active);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key()],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    handle_canvas_escape(ui, true, &mut selected, &mut active)
+                });
+            },
+        );
+        assert!(selected.is_none());
+        assert!(active);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![key()],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    handle_canvas_escape(ui, true, &mut selected, &mut active)
+                });
+            },
+        );
+        assert!(!active);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+    }
+
+    #[test]
     fn esc_ladder_unwinds_in_order_without_history_entries() {
         // One Esc press = one rung, in priority order: wire → selection → close.
         assert_eq!(esc_level(true, true), EscLevel::CancelWire);
@@ -2550,6 +3762,20 @@ mod tests {
         let pan = Vec2::new(5.0, 7.0);
         let g = Pos2::new(3.0, 4.0);
         assert!(approx(g2s(g, origin, pan, 1.0), Pos2::new(18.0, 21.0)));
+    }
+
+    #[test]
+    fn displayed_port_counts_match_shared_graph_edit_validation() {
+        for kind in NodeKind::ALL {
+            let op = kind.make_op();
+            let (inputs, outputs) = op_ports(&op);
+            assert_eq!(
+                (inputs.len() as u16, outputs.len() as u16),
+                op.port_counts(),
+                "{op:?}"
+            );
+        }
+        assert_eq!(GraphOp::Output.port_counts(), (1, 0));
     }
 
     #[test]
@@ -2668,6 +3894,401 @@ mod tests {
         });
         assert_eq!(merge.len(), 1);
         assert_eq!(merge[0].path, "params.opacity");
+    }
+
+    fn number_frame(
+        context: &egui::Context,
+        desc: &ParamDesc,
+        events: Vec<egui::Event>,
+        stored: &mut f64,
+    ) -> (Rect, bool) {
+        let mut rect = Rect::NOTHING;
+        let mut edit = None;
+        let original = *stored;
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let (response, value) = node_number_control(
+                        ui,
+                        Id::new("test_node_number"),
+                        original,
+                        |ui, current| draw_float_param(ui, current, desc),
+                    );
+                    rect = response.rect;
+                    edit = value;
+                });
+            },
+        );
+        if let Some(value) = edit {
+            *stored = value;
+        }
+        (rect, edit.is_some())
+    }
+
+    fn pointer_event(pos: Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn number_drag_commits_once_and_keeps_intermediate_values_out_of_document() {
+        for (op, path, initial) in [
+            (GraphOp::Transform2D, "transform.x", -240.0),
+            (
+                GraphOp::Merge {
+                    mode: BlendMode::Normal,
+                },
+                "params.opacity",
+                0.5,
+            ),
+        ] {
+            let desc = op_params(&op).into_iter().find(|d| d.path == path).unwrap();
+            let ctx = egui::Context::default();
+            let mut stored = initial;
+            let (rect, _) = number_frame(&ctx, &desc, vec![], &mut stored);
+            let start = if desc.range.is_some() {
+                Pos2::new(rect.left() + 30.0, rect.center().y)
+            } else {
+                rect.center()
+            };
+            let finish = start + Vec2::new(25.0, 0.0);
+            let (_, edited) = number_frame(
+                &ctx,
+                &desc,
+                vec![egui::Event::PointerMoved(start), pointer_event(start, true)],
+                &mut stored,
+            );
+            assert!(!edited);
+            let (_, edited) = number_frame(
+                &ctx,
+                &desc,
+                vec![egui::Event::PointerMoved(finish)],
+                &mut stored,
+            );
+            assert!(!edited);
+            assert_eq!(stored, initial);
+            let (_, edited) =
+                number_frame(&ctx, &desc, vec![pointer_event(finish, false)], &mut stored);
+            assert!(edited, "{path}: drag must commit on release");
+            assert_ne!(stored, initial);
+            let committed = stored;
+            assert!(!number_frame(&ctx, &desc, vec![], &mut stored).1);
+            assert_eq!(stored, committed);
+        }
+    }
+
+    #[test]
+    fn number_drag_escape_or_concurrent_value_change_cancels_the_pending_edit() {
+        for escape in [true, false] {
+            let desc = op_params(&GraphOp::Transform2D)
+                .into_iter()
+                .find(|d| d.path == "transform.x")
+                .unwrap();
+            let ctx = egui::Context::default();
+            let mut stored = -240.0;
+            let (rect, _) = number_frame(&ctx, &desc, vec![], &mut stored);
+            let start = rect.center();
+            let end = start + Vec2::new(30.0, 0.0);
+            number_frame(
+                &ctx,
+                &desc,
+                vec![egui::Event::PointerMoved(start), pointer_event(start, true)],
+                &mut stored,
+            );
+            number_frame(
+                &ctx,
+                &desc,
+                vec![egui::Event::PointerMoved(end)],
+                &mut stored,
+            );
+            let events = if escape {
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Default::default(),
+                }]
+            } else {
+                stored = 777.0;
+                vec![]
+            };
+            assert!(!number_frame(&ctx, &desc, events, &mut stored).1);
+            assert!(!number_frame(&ctx, &desc, vec![pointer_event(end, false)], &mut stored).1);
+            assert_eq!(stored, if escape { -240.0 } else { 777.0 });
+        }
+    }
+
+    #[test]
+    fn node_number_text_entry_commits_once_or_cancels_with_escape() {
+        for (op, path, initial, text, expected) in [
+            (GraphOp::Transform2D, "transform.x", -240.0, "-120", -120.0),
+            (
+                GraphOp::Merge {
+                    mode: BlendMode::Normal,
+                },
+                "params.opacity",
+                0.5,
+                "0.75",
+                0.75,
+            ),
+        ] {
+            for cancel in [false, true] {
+                let desc = op_params(&op).into_iter().find(|d| d.path == path).unwrap();
+                let ctx = egui::Context::default();
+                let mut stored = initial;
+                let (rect, _) = number_frame(&ctx, &desc, vec![], &mut stored);
+                let click = if desc.range.is_some() {
+                    Pos2::new(rect.right() - 10.0, rect.center().y)
+                } else {
+                    rect.center()
+                };
+                number_frame(
+                    &ctx,
+                    &desc,
+                    vec![egui::Event::PointerMoved(click), pointer_event(click, true)],
+                    &mut stored,
+                );
+                number_frame(&ctx, &desc, vec![pointer_event(click, false)], &mut stored);
+                assert!(
+                    !number_frame(
+                        &ctx,
+                        &desc,
+                        vec![egui::Event::Text(text.to_string())],
+                        &mut stored
+                    )
+                    .1
+                );
+                assert_eq!(stored, initial, "typing stays local until confirmation");
+                let key = if cancel {
+                    egui::Key::Escape
+                } else {
+                    egui::Key::Enter
+                };
+                let (_, edited) = number_frame(
+                    &ctx,
+                    &desc,
+                    vec![egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed: true,
+                        repeat: false,
+                        modifiers: Default::default(),
+                    }],
+                    &mut stored,
+                );
+                assert_eq!(edited, !cancel, "{path}, cancel={cancel}");
+                assert_eq!(stored, if cancel { initial } else { expected });
+                assert!(!number_frame(&ctx, &desc, vec![], &mut stored).1);
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_number_control_discards_an_interrupted_drag() {
+        let desc = op_params(&GraphOp::Transform2D)
+            .into_iter()
+            .find(|d| d.path == "transform.x")
+            .unwrap();
+        let ctx = egui::Context::default();
+        let mut stored = -240.0;
+        let (rect, _) = number_frame(&ctx, &desc, vec![], &mut stored);
+        let start = rect.center();
+        let end = start + Vec2::new(30.0, 0.0);
+        number_frame(
+            &ctx,
+            &desc,
+            vec![egui::Event::PointerMoved(start), pointer_event(start, true)],
+            &mut stored,
+        );
+        number_frame(
+            &ctx,
+            &desc,
+            vec![egui::Event::PointerMoved(end)],
+            &mut stored,
+        );
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        assert!(!number_frame(&ctx, &desc, vec![pointer_event(end, false)], &mut stored).1);
+        assert_eq!(stored, -240.0);
+    }
+
+    #[test]
+    fn merely_drawing_node_numbers_does_not_clamp_or_emit_edits() {
+        for (op, path, initial) in [
+            (GraphOp::Transform2D, "transform.x", -240.0),
+            (GraphOp::Transform2D, "transform.y", 500.0),
+            (
+                GraphOp::Transform2D,
+                "transform.rotation",
+                std::f64::consts::PI,
+            ),
+            (
+                GraphOp::Merge {
+                    mode: BlendMode::Normal,
+                },
+                "params.opacity",
+                1.25,
+            ),
+            (
+                GraphOp::Merge {
+                    mode: BlendMode::Normal,
+                },
+                "params.opacity",
+                -0.25,
+            ),
+        ] {
+            let desc = op_params(&op).into_iter().find(|d| d.path == path).unwrap();
+            let context = egui::Context::default();
+            let mut value = initial;
+            let mut changed = false;
+            let _ = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response = draw_float_param(ui, &mut value, &desc);
+                    changed = commit_worthy(&response);
+                });
+            });
+            assert_eq!(value, initial, "viewing {path} changed the stored value");
+            assert!(!changed, "viewing {path} emitted an edit");
+        }
+    }
+
+    #[test]
+    fn node_drag_widgets_preserve_loaded_values_until_an_edit() {
+        assert_eq!(pretty_path("transform.rotation"), "Rotation (rad)");
+        for (op, path, initial) in [
+            (GraphOp::Switch, "params.selected", 7.0),
+            (
+                GraphOp::Merge {
+                    mode: BlendMode::Normal,
+                },
+                "params.opacity",
+                1.25,
+            ),
+            (GraphOp::Transform2D, "transform.x", -240.0),
+        ] {
+            let desc = op_params(&op).into_iter().find(|d| d.path == path).unwrap();
+            let context = egui::Context::default();
+            let mut value = initial;
+            let mut changed = false;
+            let _ = context.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    changed = commit_worthy(&ui.add(node_drag_value(&mut value, &desc)));
+                });
+            });
+            assert_eq!(value, initial);
+            assert!(!changed);
+        }
+    }
+
+    #[test]
+    fn unstored_node_controls_match_engine_defaults_without_edits() {
+        use photonic_core::timeline::{EffectParams, FrameRate, Sequence, TimelineProject};
+        let mut doc = Document::new("Defaults", 32.0, 32.0);
+        let mut project = TimelineProject::new();
+        let sequence = Sequence::new("Vertical", FrameRate::FPS_30, 1080, 1920);
+        let id = sequence.id;
+        project.insert_sequence(sequence);
+        project.active_sequence = Some(id);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        for (op, path, expected) in [
+            (
+                GraphOp::Merge {
+                    mode: BlendMode::Normal,
+                },
+                "params.opacity",
+                PropValue::Float(1.0),
+            ),
+            (
+                GraphOp::SolidColor,
+                "params.color",
+                PropValue::Color(photonic_core::Color::BLACK),
+            ),
+            (
+                GraphOp::Transform2D,
+                "transform.scale_x",
+                PropValue::Float(1.0),
+            ),
+            (
+                GraphOp::Transform2D,
+                "transform.scale_y",
+                PropValue::Float(1.0),
+            ),
+            (
+                GraphOp::Resize {
+                    fit: FitMode::Contain,
+                },
+                "params.width",
+                PropValue::Float(1080.0),
+            ),
+            (
+                GraphOp::Resize {
+                    fit: FitMode::Contain,
+                },
+                "params.height",
+                PropValue::Float(1920.0),
+            ),
+            (GraphOp::Crop, "params.left", PropValue::Float(0.0)),
+            (GraphOp::Switch, "params.selected", PropValue::Enum(0)),
+        ] {
+            let node = GraphNode::new(op);
+            let param = op_params(&node.op)
+                .into_iter()
+                .find(|d| d.path == path)
+                .unwrap();
+            assert_eq!(node_param_value(&doc, &node, &param), expected, "{path}");
+            assert!(node.params.base.0.entries.is_empty());
+        }
+        assert!(!op_params(&GraphOp::Transform2D).iter().any(|d| d.path == "transform.opacity"), "Transform graph nodes currently lower only their affine, so do not advertise inert opacity");
+        for (op, kind) in [
+            (GraphOp::Blur, EffectKind::Blur),
+            (GraphOp::Sharpen, EffectKind::Sharpen),
+            (GraphOp::Glow, EffectKind::Glow),
+            (GraphOp::ChromaKey, EffectKind::ChromaKey),
+            (GraphOp::LumaKey, EffectKind::LumaKey),
+            (
+                GraphOp::MaskShape {
+                    shape: MaskShapeKind::Ellipse,
+                },
+                EffectKind::MaskShapeGen,
+            ),
+        ] {
+            let node = GraphNode::new(op);
+            let expected = EffectParams::seed(PropTargetKind::Effect(kind));
+            for param in op_params(&node.op) {
+                assert_eq!(
+                    Some(node_param_value(&doc, &node, &param)),
+                    expected.get(param.path).copied(),
+                    "{:?}/{}",
+                    node.op,
+                    param.path
+                );
+            }
+            assert!(node.params.base.0.entries.is_empty());
+        }
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+    }
+
+    #[test]
+    fn stored_node_zero_values_are_not_replaced_by_implicit_defaults() {
+        let doc = Document::new("Stored defaults", 32.0, 32.0);
+        let mut node = GraphNode::new(GraphOp::Merge {
+            mode: BlendMode::Normal,
+        });
+        let param = op_params(&node.op)[0];
+        node.params.base.0.set(param.path, PropValue::Float(0.0));
+        let before = node.clone();
+        assert_eq!(node_param_value(&doc, &node, &param), PropValue::Float(0.0));
+        assert_eq!(node, before);
     }
 
     #[test]

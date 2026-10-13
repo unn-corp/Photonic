@@ -33,6 +33,8 @@ const KIND_LINEAR_OFFSET: u32 = 5;
 const KIND_HIGHLIGHT_ROLLOFF: u32 = 6;
 const KIND_SATURATION_VIBRANCE: u32 = 7;
 const KIND_PRINTER_LIGHTS: u32 = 8;
+const KIND_LINEAR_MATRIX: u32 = 9;
+const KIND_TONAL_EXPOSURE: u32 = 10;
 
 // ── shared WGSL prelude (vertex quad + enc/dec + luma709 + hsl + mask) ──────
 
@@ -322,6 +324,18 @@ fn fs_grade(in: VOut) -> @location(0) vec4<f32> {
         let colorfulness = clamp((peak - trough) / reference, 0.0, 1.0);
         let factor = max(u.p0.x, 0.0) * max(1.0 + clamp(u.p0.y, -1.0, 1.0) * (1.0 - colorfulness), 0.0);
         corrected = vec3<f32>(luma) + (c - vec3<f32>(luma)) * factor;
+    } else if (kind == 10u) {
+        let y=dot(c,u.p2.xyz);
+        var weights=vec3<f32>(1.0,0.0,0.0);
+        if (y > 0.0) {
+            let relative=log2(y/0.18);
+            let low=smoothstep(u.p1.x-u.p1.z,u.p1.x+u.p1.z,relative);
+            let high=smoothstep(u.p1.y-u.p1.z,u.p1.y+u.p1.z,relative);
+            weights=vec3<f32>(1.0-low,low-high,high);
+        }
+        corrected=c*exp2(dot(weights,u.p0.xyz));
+    } else if (kind == 9u) {
+        corrected=vec3<f32>(dot(u.p0.xyz,c),dot(u.p1.xyz,c),dot(u.p2.xyz,c));
     } else if (kind == 8u) {
         corrected = c * exp2(u.p0.xyz / 12.0);
     }
@@ -931,6 +945,37 @@ pub fn native_qualifier_matte_gpu(
     Ok(output)
 }
 
+/// Same exact input inspection with static spatial cleanup. Refine the
+/// unassociated combined key/window first, then apply source coverage once.
+#[allow(clippy::too_many_arguments)]
+pub fn native_qualifier_matte_with_spatial_gpu(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene_input: &wgpu::Texture,
+    qualifier: &crate::grade::ResolvedHslQualifier,
+    mask: Option<&ResolvedMask>,
+    logical: (u32, u32),
+    spatial: Option<photonic_core::timeline::GradeQualifierSpatial>,
+) -> Result<wgpu::Texture, &'static str> {
+    let Some(spatial) = spatial.filter(|s| !s.is_neutral()) else {
+        return native_qualifier_matte_gpu(device, queue, scene_input, qualifier, mask, logical);
+    };
+    spatial.validate()?;
+    let encoded = crate::native_transfer::NativeAcescctPass::new(device).apply(
+        device,
+        queue,
+        scene_input,
+        crate::native_transfer::AcescctDirection::Encode,
+    );
+    let key = qualifier_key_gpu(device, queue, &encoded, qualifier, mask, logical, true)?;
+    let refined = new_working(device, scene_input.width(), scene_input.height());
+    let pass = crate::grade_graph::GradeGraphMixPass::new(device);
+    pass.refine_into(device, queue, &key, &refined, logical, spatial.refinement())?;
+    let output = new_working(device, scene_input.width(), scene_input.height());
+    pass.coverage_into(device, queue, &refined, scene_input, &output)?;
+    Ok(output)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_native_qualifier_mode(
     device: &wgpu::Device,
@@ -1248,6 +1293,23 @@ fn math_uniform(
             u.kind_flags[0] = KIND_CONTRAST;
             u.p0[0] = *pivot;
             u.p0[1] = *amount;
+        }
+        ResolvedGradePayload::TonalExposure(tonal) => {
+            u.kind_flags[0] = KIND_TONAL_EXPOSURE;
+            u.p0[..3].copy_from_slice(&tonal.stops);
+            u.p1 = [
+                tonal.boundaries[0],
+                tonal.boundaries[1],
+                tonal.softness,
+                0.0,
+            ];
+            u.p2[..3].copy_from_slice(&tonal.luma_weights());
+        }
+        ResolvedGradePayload::LinearMatrix { rows } => {
+            u.kind_flags[0] = KIND_LINEAR_MATRIX;
+            u.p0[..3].copy_from_slice(&rows[0]);
+            u.p1[..3].copy_from_slice(&rows[1]);
+            u.p2[..3].copy_from_slice(&rows[2]);
         }
         ResolvedGradePayload::WhiteBalance { temp, tint } => {
             u.kind_flags[0] = KIND_WHITE_BALANCE;
@@ -1730,6 +1792,133 @@ mod tests {
     /// `cpu_gpu_parity`'s sweep cannot catch this: its grade rows use
     /// `mask: None`, and its 8x8 canvas buckets to a *square* 64x64 where the
     /// two axes scale identically and a centred window stays centred.
+    #[test]
+    fn qualifier_spatial_inspection_refines_unassociated_key_before_coverage() {
+        let Some((device, queue)) = try_device() else {
+            return;
+        };
+        use photonic_core::timeline::GradeQualifierSpatial;
+        let input = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("spatial_key_source"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let (width, height) = (50u32, 50u32);
+        let mut bytes = Vec::new();
+        let mut key = Vec::new();
+        let mut coverage = Vec::new();
+        for y in 0..64 {
+            for x in 0..64 {
+                let selected = (15..35).contains(&x) && (15..35).contains(&y) || (x == 5 && y == 5);
+                let alpha = [0.0, 0.25, 0.5, 1.0][((x + y) % 4) as usize];
+                // ACEScct(0.18) lies well inside 0.35..0.5; 0.001 is outside.
+                let value = if selected { 0.18 } else { 0.001 };
+                for c in [value * alpha, value * alpha, value * alpha, alpha] {
+                    bytes.extend_from_slice(&f32_to_f16_bits(c).to_le_bytes());
+                }
+                if x < width && y < height {
+                    key.push([if selected && alpha > 0.0 { 1.0 } else { 0.0 }; 4]);
+                    coverage.push(alpha);
+                }
+            }
+        }
+        queue.write_texture(
+            input.as_image_copy(),
+            &bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 8),
+                rows_per_image: Some(64),
+            },
+            input.size(),
+        );
+        let qualifier = ResolvedHslQualifier {
+            lum: [0.35, 0.5],
+            ..Default::default()
+        };
+        for spatial in [
+            GradeQualifierSpatial {
+                denoise: true,
+                ..Default::default()
+            },
+            GradeQualifierSpatial {
+                grow: 0.02,
+                ..Default::default()
+            },
+            GradeQualifierSpatial {
+                grow: -0.02,
+                ..Default::default()
+            },
+            GradeQualifierSpatial {
+                blur: 0.02,
+                ..Default::default()
+            },
+            GradeQualifierSpatial {
+                denoise: true,
+                grow: 0.02,
+                blur: 0.015,
+            },
+        ] {
+            let mut expected = key.clone();
+            crate::grade_graph::refine_matte_cpu(
+                &mut expected,
+                width,
+                height,
+                spatial.refinement(),
+            )
+            .unwrap();
+            let output = native_qualifier_matte_with_spatial_gpu(
+                &device,
+                &queue,
+                &input,
+                &qualifier,
+                None,
+                (width, height),
+                Some(spatial),
+            )
+            .unwrap();
+            let actual = readback_rgba16_2d(&device, &queue, &output, width, height);
+            for (i, pixel) in actual.chunks_exact(4).enumerate() {
+                let want = expected[i][0] * coverage[i];
+                assert!(
+                    (pixel[0] - want).abs() < 0.002,
+                    "{spatial:?} pixel {i}: {} != {want}",
+                    pixel[0]
+                );
+                assert_eq!(pixel[3], 1.0);
+                if coverage[i] == 0.0 {
+                    assert_eq!(pixel[0], 0.0);
+                }
+            }
+        }
+        let old =
+            native_qualifier_matte_gpu(&device, &queue, &input, &qualifier, None, (width, height))
+                .unwrap();
+        let neutral = native_qualifier_matte_with_spatial_gpu(
+            &device,
+            &queue,
+            &input,
+            &qualifier,
+            None,
+            (width, height),
+            Some(Default::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            readback_rgba16_2d(&device, &queue, &old, width, height),
+            readback_rgba16_2d(&device, &queue, &neutral, width, height)
+        );
+    }
+
     #[test]
     fn matte_refinement_gpu_known_values_and_logical_picture_edges() {
         let Some((device, queue)) = try_device() else {
@@ -2710,6 +2899,7 @@ struct Mask { flags: vec4<u32>, center: vec4<f32>, params: vec4<f32> }
 fn fs_native_mask(in: VOut) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(in.clip_pos.xy);
     let w = window_weight(in.uv.x, in.uv.y, mask.center, mask.params, mask.flags.x, mask.flags.y);
+    if mask.flags.z != 0u { return vec4<f32>(w, w, w, 1.0); }
     return mix(textureLoad(original, pixel, 0), textureLoad(corrected, pixel, 0), w);
 }
 "#
@@ -2761,6 +2951,36 @@ fn fs_native_mask(in: VOut) -> @location(0) vec4<f32> {
         mask: &ResolvedMask,
         logical: (u32, u32),
     ) -> Result<(), &'static str> {
+        self.apply_mode(
+            device, queue, corrected, original, output, mask, logical, false,
+        )
+    }
+
+    /// Produce an unassociated opaque key, independent of image RGB and alpha.
+    pub fn matte_into(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::Texture,
+        output: &wgpu::Texture,
+        mask: &ResolvedMask,
+        logical: (u32, u32),
+    ) -> Result<(), &'static str> {
+        self.apply_mode(device, queue, source, source, output, mask, logical, true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn apply_mode(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        corrected: &wgpu::Texture,
+        original: &wgpu::Texture,
+        output: &wgpu::Texture,
+        mask: &ResolvedMask,
+        logical: (u32, u32),
+        matte_only: bool,
+    ) -> Result<(), &'static str> {
         validate_native_mask(mask)?;
         if corrected.size() != original.size()
             || output.size() != original.size()
@@ -2776,7 +2996,7 @@ fn fs_native_mask(in: VOut) -> @location(0) vec4<f32> {
             ],
         );
         let uniform = NativeMaskUniform {
-            flags: [flags[1], flags[2], 0, 0],
+            flags: [flags[1], flags[2], u32::from(matte_only), 0],
             center,
             params,
         };

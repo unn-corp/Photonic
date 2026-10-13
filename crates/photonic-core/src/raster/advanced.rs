@@ -14,7 +14,8 @@
 //! Every neighborhood filter follows the house rule: take an immutable snapshot
 //! (`clone`), compute a *full* result image from that snapshot, then hand it to
 //! [`blend_result`] so an optional selection [`Mask`] is honored exactly like
-//! editing inside a Photoshop selection. Alpha is always preserved; the math is
+//! editing inside a Photoshop selection. Most filters preserve center alpha;
+//! Lens Blur averages premultiplied color and coverage over its aperture. The math is
 //! `f32` internally and clamped back to `0..=255`. Border addressing uses
 //! clamp-to-edge ([`RasterImage::sample_clamped`] / `sample_bilinear`).
 

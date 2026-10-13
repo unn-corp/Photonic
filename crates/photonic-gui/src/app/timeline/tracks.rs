@@ -312,6 +312,13 @@ fn header_menu(
         ui.data_mut(|d| d.insert_temp(rename_id(), (row.id, name)));
         ui.close_menu();
     }
+    if row.kind != TrackKind::Audio && ui.button("Compositing…").clicked() {
+        if let Some(draft) = begin_composite_draft(doc, seq_id, row.id) {
+            ui.ctx()
+                .data_mut(|d| d.insert_temp(composite_draft_id(), draft));
+        }
+        ui.close_menu();
+    }
     // Map visual up/down to a Vec index. Video is displayed reversed (top row =
     // last Vec index = topmost layer), so "up" moves toward the end of the Vec;
     // audio is displayed in natural order, so "up" moves toward index 0.
@@ -522,5 +529,485 @@ mod row_order_tests {
         assert_eq!(rows[2].index_in_kind, 0);
         // Audio follows, in natural order.
         assert_eq!(rows[3].id, seq.audio_tracks[0].id);
+    }
+}
+
+#[derive(Clone)]
+struct TrackCompositeDraft {
+    document: egui::Id,
+    sequence: SequenceId,
+    track: TrackId,
+    original_blend: photonic_core::layer::BlendMode,
+    original_opacity: f32,
+    blend: photonic_core::layer::BlendMode,
+    opacity: f32,
+    error: Option<String>,
+}
+
+fn composite_draft_id() -> egui::Id {
+    egui::Id::new("timeline_track_composite_draft")
+}
+
+fn begin_composite_draft(
+    doc: &Document,
+    seq: SequenceId,
+    track: TrackId,
+) -> Option<TrackCompositeDraft> {
+    let t = doc.timeline.as_ref()?.sequences.get(&seq)?.track(track)?;
+    if t.kind == TrackKind::Audio {
+        return None;
+    }
+    Some(TrackCompositeDraft {
+        document: egui::Id::new(doc.id),
+        sequence: seq,
+        track,
+        original_blend: t.blend,
+        original_opacity: t.opacity,
+        blend: t.blend,
+        opacity: t.opacity,
+        error: None,
+    })
+}
+
+fn apply_composite_draft(
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    draft: &TrackCompositeDraft,
+) -> Result<bool, String> {
+    if draft.document != egui::Id::new(doc.id) {
+        return Err("Document changed; reopen compositing.".into());
+    }
+    let p = doc.timeline.as_ref().ok_or("Timeline is unavailable")?;
+    if p.active_sequence != Some(draft.sequence) {
+        return Err("Sequence changed; reopen compositing.".into());
+    }
+    let t = p
+        .sequences
+        .get(&draft.sequence)
+        .and_then(|s| s.track(draft.track))
+        .ok_or("Track is unavailable")?;
+    if t.blend != draft.original_blend || t.opacity.to_bits() != draft.original_opacity.to_bits() {
+        return Err("Track compositing changed; close and reopen this editor.".into());
+    }
+    let mut settings = TrackSettings::of(t);
+    settings.blend = Some(draft.blend);
+    settings.opacity = Some(draft.opacity);
+    let cmd =
+        ops::set_track_prop(p, draft.sequence, draft.track, settings).map_err(|e| e.to_string())?;
+    if t.blend == draft.blend && t.opacity == draft.opacity {
+        return Ok(false);
+    }
+    history.execute_discrete(Command::Timeline(cmd), doc);
+    Ok(true)
+}
+
+/// A small explicit Apply/Cancel editor keeps numeric dragging/typing in a
+/// draft. Merely opening it or dismissing it cannot alter the timeline.
+pub(super) fn draw_composite_dialog(
+    ctx: &egui::Context,
+    doc: &mut Document,
+    history: &mut CommandHistory,
+) {
+    use photonic_core::layer::BlendMode::*;
+    let key = composite_draft_id();
+    let Some(mut draft) = ctx.data(|d| d.get_temp::<TrackCompositeDraft>(key)) else {
+        return;
+    };
+    let current = doc.timeline.as_ref().and_then(|p| {
+        if p.active_sequence != Some(draft.sequence) {
+            return None;
+        }
+        p.sequences
+            .get(&draft.sequence)
+            .and_then(|s| s.track(draft.track).map(|t| (s, t)))
+    });
+    if draft.document != egui::Id::new(doc.id) || current.is_none() {
+        ctx.data_mut(|d| d.remove::<TrackCompositeDraft>(key));
+        return;
+    }
+    let (sequence, track) = current.unwrap();
+    let locked = track.locked;
+    let native = matches!(
+        sequence.color,
+        photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+    );
+    let name = track.name.clone();
+    let mut open = true;
+    let mut apply = false;
+    let mut cancel = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+    egui::Window::new("Track compositing")
+        .id(key.with((doc.id, draft.track)))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(name);
+            if locked {
+                ui.label("Track is locked. Unlock it before changing compositing.");
+            }
+            ui.add_enabled_ui(!locked, |ui| {
+                egui::ComboBox::from_label("Blend mode")
+                    .selected_text(draft.blend.to_css())
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            Normal,
+                            Multiply,
+                            Screen,
+                            Overlay,
+                            Darken,
+                            Lighten,
+                            ColorDodge,
+                            ColorBurn,
+                            HardLight,
+                            SoftLight,
+                            Difference,
+                            Exclusion,
+                            Hue,
+                            Saturation,
+                            Color,
+                            Luminosity,
+                            LinearDodge,
+                            LinearBurn,
+                            Subtract,
+                            Divide,
+                            VividLight,
+                            LinearLight,
+                            PinLight,
+                            HardMix,
+                            DarkerColor,
+                            LighterColor,
+                        ] {
+                            let available =
+                                !native || photonic_video::graph::ir::native_blend_supported(mode);
+                            if ui
+                                .add_enabled(
+                                    available,
+                                    egui::SelectableLabel::new(draft.blend == mode, mode.to_css()),
+                                )
+                                .clicked()
+                            {
+                                draft.blend = mode;
+                            }
+                        }
+                    });
+                ui.horizontal(|ui| {
+                    ui.label("Opacity (0–1)");
+                    ui.add(
+                        egui::DragValue::new(&mut draft.opacity)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .clamp_existing_to_range(false)
+                            .update_while_editing(false)
+                            .max_decimals(3),
+                    );
+                });
+            });
+            if native && photonic_video::graph::ir::native_bounded_blend(draft.blend) {
+                ui.label("Bounded artistic blend: the overlap uses AP1 channels clipped to 0–1. Unblended color retains its extended range.");
+            }
+            if native && photonic_video::graph::ir::native_nonseparable_blend(draft.blend) {
+                ui.label("Creative linear AP1 color coordinates, using AP1 luminance. Results differ from display-encoded HSL blends.");
+            }
+            let supported =
+                !native || photonic_video::graph::ir::native_blend_supported(draft.blend);
+            if !supported {
+                ui.label("This blend mode is not qualified for Native Managed rendering.");
+            }
+            if native && photonic_video::graph::ir::native_arithmetic_blend(draft.blend) {
+                ui.label("Native AP1 arithmetic preserves negative values and highlights.");
+                ui.label("Legacy uses bounded equations for these blend modes.");
+            }
+            if native && photonic_video::graph::ir::native_luminance_blend(draft.blend) {
+                ui.label("Selects whole RGB by AP1 luminance; signed values are retained.");
+            }
+            if let Some(error) = &draft.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            ui.horizontal(|ui| {
+                apply = ui
+                    .add_enabled(
+                        !locked
+                            && supported
+                            && draft.opacity.is_finite()
+                            && (0.0..=1.0).contains(&draft.opacity),
+                        egui::Button::new("Apply"),
+                    )
+                    .clicked();
+                cancel |= ui.button("Cancel").clicked();
+            });
+        });
+    if apply && open && !cancel {
+        match apply_composite_draft(doc, history, &draft) {
+            Ok(_) => open = false,
+            Err(error) => draft.error = Some(error),
+        }
+    }
+    if !open || cancel {
+        ctx.data_mut(|d| d.remove::<TrackCompositeDraft>(key));
+    } else {
+        ctx.data_mut(|d| d.insert_temp(key, draft));
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+    use photonic_core::layer::BlendMode;
+    use photonic_core::timeline::{FrameRate, TimelineProject, Track};
+
+    fn fixture() -> (Document, SequenceId, TrackId) {
+        let mut doc = Document::new("Track composite", 64.0, 32.0);
+        let mut p = TimelineProject::new();
+        let mut seq = Sequence::new("s", FrameRate::FPS_30, 64, 32);
+        let t = Track::new(TrackKind::Video, "V1");
+        let (sid, tid) = (seq.id, t.id);
+        seq.video_tracks.push(t);
+        p.insert_sequence(seq);
+        p.active_sequence = Some(sid);
+        doc.timeline = Some(p);
+        (doc, sid, tid)
+    }
+
+    #[test]
+    fn track_composite_apply_is_atomic_undoable_and_noop_safe() {
+        let (mut doc, sid, tid) = fixture();
+        let mut history = CommandHistory::new(100);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+        assert_eq!(
+            apply_composite_draft(&mut doc, &mut history, &draft).unwrap(),
+            false
+        );
+        assert_eq!(history.undo_depth(), 0);
+        draft.blend = BlendMode::SoftLight;
+        draft.opacity = 0.375;
+        assert!(apply_composite_draft(&mut doc, &mut history, &draft).unwrap());
+        assert_eq!(history.undo_depth(), 1);
+        let saved = doc.to_json().unwrap();
+        let loaded: Document = serde_json::from_str(&saved).unwrap();
+        let track = loaded.timeline.as_ref().unwrap().sequences[&sid]
+            .track(tid)
+            .unwrap();
+        assert_eq!((track.blend, track.opacity), (BlendMode::SoftLight, 0.375));
+        assert!(history.undo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert!(!history.undo(&mut doc));
+    }
+
+    #[test]
+    fn native_nonseparable_track_drafts_roundtrip_and_undo() {
+        for mode in [
+            BlendMode::Hue,
+            BlendMode::Saturation,
+            BlendMode::Color,
+            BlendMode::Luminosity,
+        ] {
+            let (mut doc, sid, tid) = fixture();
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap()
+                .color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+            assert!(photonic_video::graph::ir::native_blend_supported(mode));
+            let before = serde_json::to_value(&doc).unwrap();
+            let mut history = CommandHistory::new(100);
+            let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+            draft.blend = mode;
+            draft.opacity = 0.375;
+            assert!(apply_composite_draft(&mut doc, &mut history, &draft).unwrap());
+            assert_eq!(history.undo_depth(), 1);
+            let loaded: Document = serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            let track = loaded.timeline.as_ref().unwrap().sequences[&sid]
+                .track(tid)
+                .unwrap();
+            assert_eq!((track.blend, track.opacity), (mode, 0.375));
+            assert!(history.undo(&mut doc));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_bounded_track_drafts_roundtrip_and_undo() {
+        for mode in [
+            BlendMode::ColorDodge,
+            BlendMode::ColorBurn,
+            BlendMode::Divide,
+            BlendMode::VividLight,
+            BlendMode::HardMix,
+        ] {
+            let (mut doc, sid, tid) = fixture();
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap()
+                .color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+            assert!(photonic_video::graph::ir::native_blend_supported(mode));
+            let before = serde_json::to_value(&doc).unwrap();
+            let mut history = CommandHistory::new(100);
+            let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+            draft.blend = mode;
+            draft.opacity = 0.375;
+            assert!(apply_composite_draft(&mut doc, &mut history, &draft).unwrap());
+            assert_eq!(history.undo_depth(), 1);
+            let loaded: Document = serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            let track = loaded.timeline.as_ref().unwrap().sequences[&sid]
+                .track(tid)
+                .unwrap();
+            assert_eq!((track.blend, track.opacity), (mode, 0.375));
+            assert!(history.undo(&mut doc));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_arithmetic_track_drafts_roundtrip_and_undo() {
+        for mode in [
+            BlendMode::LinearDodge,
+            BlendMode::LinearBurn,
+            BlendMode::Subtract,
+            BlendMode::LinearLight,
+        ] {
+            let (mut doc, sid, tid) = fixture();
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap()
+                .color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+            assert!(photonic_video::graph::ir::native_blend_supported(mode));
+            let before = serde_json::to_value(&doc).unwrap();
+            let mut history = CommandHistory::new(100);
+            let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+            draft.blend = mode;
+            draft.opacity = 0.375;
+            assert!(apply_composite_draft(&mut doc, &mut history, &draft).unwrap());
+            assert_eq!(history.undo_depth(), 1);
+            let loaded: Document = serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            let track = loaded.timeline.as_ref().unwrap().sequences[&sid]
+                .track(tid)
+                .unwrap();
+            assert_eq!((track.blend, track.opacity), (mode, 0.375));
+            assert!(history.undo(&mut doc));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn native_luminance_track_drafts_roundtrip_and_undo() {
+        for mode in [BlendMode::DarkerColor, BlendMode::LighterColor] {
+            let (mut doc, sid, tid) = fixture();
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap()
+                .color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+            assert!(photonic_video::graph::ir::native_blend_supported(mode));
+            let before = serde_json::to_value(&doc).unwrap();
+            let mut history = CommandHistory::new(100);
+            let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+            draft.blend = mode;
+            draft.opacity = 0.375;
+            assert!(apply_composite_draft(&mut doc, &mut history, &draft).unwrap());
+            assert_eq!(history.undo_depth(), 1);
+            let loaded: Document = serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+            let track = loaded.timeline.as_ref().unwrap().sequences[&sid]
+                .track(tid)
+                .unwrap();
+            assert_eq!((track.blend, track.opacity), (mode, 0.375));
+            assert!(history.undo(&mut doc));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn track_composite_draft_rejects_stale_locked_or_other_document() {
+        let (mut doc, sid, tid) = fixture();
+        let mut history = CommandHistory::new(100);
+        let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+        draft.opacity = 0.25;
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .video_tracks[0]
+            .opacity = 0.75;
+        let before = serde_json::to_value(&doc).unwrap();
+        assert!(apply_composite_draft(&mut doc, &mut history, &draft).is_err());
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+        draft.opacity = 0.25;
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        assert!(apply_composite_draft(&mut doc, &mut history, &draft).is_err());
+        let (mut other, _, _) = fixture();
+        assert!(apply_composite_draft(&mut other, &mut history, &draft).is_err());
+        assert_eq!(history.undo_depth(), 0);
+    }
+
+    #[test]
+    fn track_composite_view_and_escape_preserve_document_and_history() {
+        let (mut doc, sid, tid) = fixture();
+        let mut history = CommandHistory::new(100);
+        let ctx = egui::Context::default();
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .video_tracks[0]
+            .opacity = 1.5;
+        let mut draft = begin_composite_draft(&doc, sid, tid).unwrap();
+        draft.blend = BlendMode::SoftLight;
+        ctx.data_mut(|d| d.insert_temp(composite_draft_id(), draft));
+        let before = serde_json::to_value(&doc).unwrap();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            draw_composite_dialog(ctx, &mut doc, &mut history)
+        });
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<TrackCompositeDraft>(composite_draft_id()))
+                .unwrap()
+                .opacity,
+            1.5
+        );
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(input, |ctx| {
+            draw_composite_dialog(ctx, &mut doc, &mut history)
+        });
+        assert!(ctx
+            .data(|d| d.get_temp::<TrackCompositeDraft>(composite_draft_id()))
+            .is_none());
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert_eq!(history.undo_depth(), 0);
     }
 }

@@ -95,6 +95,17 @@ impl Fixture {
 /// restores the timeline; and applying it again reproduces the post-apply state
 /// (`apply → inverse → apply == apply`).
 fn assert_undo_roundtrip(doc: &Document, cmd: &TimelineCmd) {
+    let encoded = serde_json::to_string(cmd).expect("timeline command serializes");
+    let decoded: TimelineCmd =
+        serde_json::from_str(&encoded).expect("timeline command deserializes");
+    assert_eq!(&decoded, cmd, "timeline command JSON must round-trip");
+    let wrapped = Command::Timeline(cmd.clone());
+    let encoded = serde_json::to_string(&wrapped).unwrap();
+    let decoded: Command = serde_json::from_str(&encoded).unwrap();
+    assert_eq!(
+        serde_json::to_value(decoded).unwrap(),
+        serde_json::to_value(wrapped).unwrap()
+    );
     let before = doc.timeline.clone();
 
     let mut d1 = doc.clone();
@@ -1134,10 +1145,12 @@ fn undo_roundtrip_all_graph_cmds() {
 
     // AddNode / MoveNode / SetNodeParam / RemoveEdge against the seeded graph.
     let add_node = graph_ops::add_node(
+        d.timeline.as_ref().unwrap(),
         gid,
         GraphNode::new(GraphOp::Blur),
         NodePos { x: 10.0, y: 10.0 },
-    );
+    )
+    .unwrap();
     assert_undo_roundtrip(&d, &add_node);
 
     let move_node = graph_ops::move_node(
@@ -1160,14 +1173,23 @@ fn undo_roundtrip_all_graph_cmds() {
     .unwrap();
     assert_undo_roundtrip(&d, &set_param);
 
-    let remove_edge = graph_ops::remove_edge(gid, seed_edge);
+    let remove_edge = graph_ops::remove_edge(d.timeline.as_ref().unwrap(), gid, seed_edge).unwrap();
     assert_undo_roundtrip(&d, &remove_edge);
 
     // AddEdge / RemoveNode / (Set|Remove)Keyframe need a second node present.
     let mut d2 = d.clone();
     let blur = GraphNode::new(GraphOp::Blur);
     let blur_id = blur.id;
-    Command::Timeline(graph_ops::add_node(gid, blur, NodePos { x: 10.0, y: 10.0 })).apply(&mut d2);
+    Command::Timeline(
+        graph_ops::add_node(
+            d2.timeline.as_ref().unwrap(),
+            gid,
+            blur,
+            NodePos { x: 10.0, y: 10.0 },
+        )
+        .unwrap(),
+    )
+    .apply(&mut d2);
 
     let add_edge = graph_ops::add_edge(
         d2.timeline.as_ref().unwrap(),
@@ -1723,6 +1745,10 @@ fn graph_cmd_guard(cmd: &commands::GraphCmd) {
         RemoveNode { .. } => {}
         AddEdge { .. } => {}
         RemoveEdge { .. } => {}
+        SetEdges { .. } => {} // atomic_graph_connections_preserve_order_and_noop
+        SetText { .. } => {}  // graph_text_edit_roundtrips_and_preserves_wiring
+        SetMaskShape { .. } => {} // graph_polygon_shape_edit_preserves_animation_edges_layout_and_undo
+        SetTimeOffset { .. } => {} // graph_time_offset_edit_preserves_state_and_exact_undo
         SetNodeParam { .. } => {}
         SetKeyframe { .. } => {}
         RemoveKeyframe { .. } => {}
@@ -2043,4 +2069,487 @@ proptest! {
             }
         }
     }
+}
+
+#[test]
+fn graph_edits_respect_every_locked_composition_owner() {
+    let mut f = fixture();
+    let (graph, source) = NodeGraph::new_clip_composition("Shared graph");
+    let gid = graph.id;
+    let edge = graph.edges[0];
+    let project = f.doc.timeline.as_mut().unwrap();
+    project.graphs.insert(gid, graph);
+    project.sequences.get_mut(&f.seq).unwrap().video_tracks[0].clips[0].composition = Some(gid);
+    assert!(graph_ops::ensure_editable(project, gid).is_ok());
+    let node = GraphNode::new(GraphOp::Blur);
+    let pos = NodePos { x: 0.0, y: 0.0 };
+    assert!(graph_ops::add_node(project, gid, node.clone(), pos).is_ok());
+    // An unlocked first owner must not mask a locked owner in another sequence.
+    let mut other = Sequence::new("Locked owner", FrameRate::FPS_30, 1920, 1080);
+    let mut track = Track::new(TrackKind::Video, "Locked");
+    let mut clip = Clip::new(
+        ClipSource::SolidColor {
+            color: photonic_core::Color::RED,
+        },
+        Tick(0),
+        Tick(1000),
+    );
+    clip.composition = Some(gid);
+    track.clips.push(clip);
+    track.locked = true;
+    other.video_tracks.push(track);
+    let other_id = other.id;
+    project.insert_sequence(other);
+    for result in [
+        graph_ops::add_node(project, gid, node, pos),
+        graph_ops::remove_node(project, gid, source),
+        graph_ops::add_edge(project, gid, edge.from, edge.to),
+        graph_ops::remove_edge(project, gid, edge),
+        graph_ops::set_node_param(project, gid, source, GraphNodeParams::default()),
+        graph_ops::move_node(project, gid, source, pos),
+    ] {
+        assert_eq!(result, Err(ops::EditError::TrackLocked));
+    }
+    let independent = NodeGraph::new_project_graph("Independent project graph");
+    let independent_id = independent.id;
+    project.graphs.insert(independent_id, independent);
+    assert!(graph_ops::ensure_editable(project, independent_id).is_ok());
+    let missing = GraphId::new();
+    assert_eq!(
+        graph_ops::ensure_editable(project, missing),
+        Err(ops::EditError::NoGraph(missing))
+    );
+    project.sequences.get_mut(&other_id).unwrap().video_tracks[0].locked = false;
+    assert!(graph_ops::ensure_editable(project, gid).is_ok());
+    assert!(graph_ops::remove_edge(project, gid, edge).is_ok());
+}
+
+fn ordered_composition_fixture() -> (Document, GraphId) {
+    let mut f = fixture();
+    let (mut graph, source) = NodeGraph::new_clip_composition("Ordered edges");
+    let first = GraphNode::new(GraphOp::Blur);
+    let a = first.id;
+    let second = GraphNode::new(GraphOp::Blur);
+    let b = second.id;
+    graph.nodes.insert(a, first);
+    graph.nodes.insert(b, second);
+    graph.edges = vec![
+        GraphEdge {
+            from: (source, OutPort::PRIMARY),
+            to: (a, InPort::PRIMARY),
+        },
+        GraphEdge {
+            from: (source, OutPort::PRIMARY),
+            to: (b, InPort::PRIMARY),
+        },
+        GraphEdge {
+            from: (a, OutPort::PRIMARY),
+            to: (graph.output, InPort::PRIMARY),
+        },
+    ];
+    let gid = graph.id;
+    let project = f.doc.timeline.as_mut().unwrap();
+    project.graphs.insert(gid, graph);
+    project.sequences.get_mut(&f.seq).unwrap().video_tracks[0].clips[0].composition = Some(gid);
+    (f.doc, gid)
+}
+
+#[test]
+fn atomic_graph_connections_preserve_order_and_noop() {
+    let (mut doc, gid) = ordered_composition_fixture();
+    let p = doc.timeline.as_ref().unwrap();
+    let graph = &p.graphs[&gid];
+    let original = graph.edges[0];
+    let alternate = graph.edges[1].to.0;
+    assert!(graph_ops::connect_edge(p, gid, original.from, original.to)
+        .unwrap()
+        .is_none());
+    assert!(graph_ops::add_edge(p, gid, original.from, original.to).is_err());
+    assert!(graph_ops::add_edge(p, gid, (original.from.0, OutPort(8)), original.to).is_err());
+    let removed = graph_ops::remove_edge(p, gid, original).unwrap();
+    assert_undo_roundtrip(&doc, &removed);
+    let changed = graph_ops::connect_edge(p, gid, (alternate, OutPort::PRIMARY), original.to)
+        .unwrap()
+        .unwrap();
+    assert_undo_roundtrip(&doc, &changed);
+    let serialized = serde_json::to_string(&changed).unwrap();
+    let restored: TimelineCmd = serde_json::from_str(&serialized).unwrap();
+    assert_eq!(restored, changed);
+    Command::Timeline(changed).apply(&mut doc);
+    let graph = &doc.timeline.as_ref().unwrap().graphs[&gid];
+    assert_eq!(graph.edges.len(), 3);
+    assert_eq!(graph.edges[0].from.0, alternate);
+    assert_eq!(
+        graph.edges.iter().filter(|e| e.to == original.to).count(),
+        1
+    );
+}
+
+#[test]
+fn removing_graph_node_restores_edge_order_and_absent_layout() {
+    let (doc, gid) = ordered_composition_fixture();
+    let p = doc.timeline.as_ref().unwrap();
+    let graph = &p.graphs[&gid];
+    let node = graph.edges[0].to.0;
+    assert!(!graph.ui.contains_key(&node));
+    let removed = graph_ops::remove_node(p, gid, node).unwrap();
+    assert_undo_roundtrip(&doc, &removed);
+}
+
+#[test]
+fn historical_graph_add_node_position_deserializes_without_restore_metadata() {
+    let (doc, gid) = ordered_composition_fixture();
+    let node = GraphNode::new(GraphOp::Invert);
+    let raw =
+        serde_json::json!({"cmd":"add_node","graph":gid,"node":node,"pos":{"x":12.0,"y":34.0}});
+    let command: commands::GraphCmd = serde_json::from_value(raw).unwrap();
+    assert!(
+        matches!(&command,commands::GraphCmd::AddNode {pos:Some(NodePos{x,y}),restore_edges:None,..} if *x==12.0 && *y==34.0)
+    );
+    assert_undo_roundtrip(&doc, &TimelineCmd::GraphEdit(command));
+}
+
+#[test]
+fn rewiring_defers_detachment_and_rejects_stale_origins() {
+    let (mut doc, gid) = ordered_composition_fixture();
+    let p = doc.timeline.as_ref().unwrap();
+    let g = &p.graphs[&gid];
+    let original = g.edges[0];
+    let output = (g.output, InPort::PRIMARY);
+    assert!(
+        graph_ops::rewire_edge(p, gid, Some(original), original.from, original.to)
+            .unwrap()
+            .is_none()
+    );
+    let command = graph_ops::rewire_edge(p, gid, Some(original), original.from, output)
+        .unwrap()
+        .unwrap();
+    assert_undo_roundtrip(&doc, &command);
+    let stale = GraphEdge {
+        to: (GraphNodeId::new(), InPort::PRIMARY),
+        ..original
+    };
+    assert!(graph_ops::rewire_edge(p, gid, Some(stale), original.from, output).is_err());
+    assert!(graph_ops::rewire_edge(
+        p,
+        gid,
+        Some(original),
+        (g.edges[1].to.0, OutPort::PRIMARY),
+        output
+    )
+    .is_err());
+    Command::Timeline(command).apply(&mut doc);
+    let g = &doc.timeline.as_ref().unwrap().graphs[&gid];
+    assert!(!g.edges.contains(&original));
+    assert_eq!(g.edges.len(), 2);
+    let p = doc.timeline.as_mut().unwrap();
+    p.sequences.values_mut().next().unwrap().video_tracks[0].locked = true;
+    assert!(matches!(
+        graph_ops::rewire_edge(p, gid, None, original.from, output),
+        Err(ops::EditError::TrackLocked)
+    ));
+}
+
+#[test]
+fn track_compositing_roundtrip_and_legacy_commands_preserve_state() {
+    use photonic_core::layer::BlendMode;
+    let mut f = fixture();
+    let p = f.doc.timeline.as_ref().unwrap();
+    let mut settings = TrackSettings::of(p.sequences[&f.seq].track(f.vtrack).unwrap());
+    settings.blend = Some(BlendMode::SoftLight);
+    settings.opacity = Some(0.375);
+    let cmd = ops::set_track_prop(p, f.seq, f.vtrack, settings).unwrap();
+    let before = f.doc.clone();
+    let cmd: TimelineCmd = serde_json::from_str(&serde_json::to_string(&cmd).unwrap()).unwrap();
+    cmd.apply(&mut f.doc);
+    let t = f.doc.timeline.as_ref().unwrap().sequences[&f.seq]
+        .track(f.vtrack)
+        .unwrap();
+    assert_eq!((t.blend, t.opacity), (BlendMode::SoftLight, 0.375));
+    let mut old_json = serde_json::to_value(TrackSettings::of(t)).unwrap();
+    old_json.as_object_mut().unwrap().remove("blend");
+    old_json.as_object_mut().unwrap().remove("opacity");
+    let old_settings: TrackSettings = serde_json::from_value(old_json).unwrap();
+    let mut copy = t.clone();
+    old_settings.apply_to(&mut copy);
+    assert_eq!((copy.blend, copy.opacity), (BlendMode::SoftLight, 0.375));
+    cmd.inverse(&f.doc).unwrap().apply(&mut f.doc);
+    assert_eq!(
+        serde_json::to_value(&f.doc).unwrap(),
+        serde_json::to_value(before).unwrap()
+    );
+}
+
+#[test]
+fn track_compositing_rejects_invalid_locked_and_audio_edits_atomically() {
+    use photonic_core::layer::BlendMode;
+    let mut f = fixture();
+    for value in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+        let p = f.doc.timeline.as_ref().unwrap();
+        let mut settings = TrackSettings::of(p.sequences[&f.seq].track(f.vtrack).unwrap());
+        settings.opacity = Some(value);
+        assert!(ops::set_track_prop(p, f.seq, f.vtrack, settings).is_err());
+    }
+    let p = f.doc.timeline.as_mut().unwrap();
+    p.sequences.get_mut(&f.seq).unwrap().video_tracks[0].locked = true;
+    let mut settings = TrackSettings::of(p.sequences[&f.seq].track(f.vtrack).unwrap());
+    settings.locked = false; // cannot combine unlocking with a protected edit
+    settings.blend = Some(BlendMode::Screen);
+    assert!(matches!(
+        ops::set_track_prop(p, f.seq, f.vtrack, settings),
+        Err(ops::EditError::TrackLocked)
+    ));
+    let mut settings = TrackSettings::of(p.sequences[&f.seq].track(f.atrack).unwrap());
+    settings.opacity = Some(0.5);
+    assert!(ops::set_track_prop(p, f.seq, f.atrack, settings).is_err());
+}
+
+#[test]
+fn graph_text_edit_roundtrips_and_preserves_wiring() {
+    let mut f = fixture();
+    let (mut graph, node) = NodeGraph::new_clip_composition("Text graph");
+    let gid = graph.id;
+    let original = TextGen {
+        text: "Before".into(),
+        ..Default::default()
+    };
+    graph.nodes.get_mut(&node).unwrap().op = GraphOp::Text {
+        text: original.clone(),
+    };
+    graph
+        .nodes
+        .get_mut(&node)
+        .unwrap()
+        .params
+        .base
+        .0
+        .set("legacy.unknown", PropValue::Float(7.0));
+    let params = graph.nodes[&node].params.clone();
+    let edges = graph.edges.clone();
+    let layout = graph.ui.clone();
+    let project = f.doc.timeline.as_mut().unwrap();
+    project.graphs.insert(gid, graph);
+    project.sequences.get_mut(&f.seq).unwrap().video_tracks[0].clips[0].composition = Some(gid);
+    let next = TextGen {
+        text: "After\n世界".into(),
+        font_size: 64.0,
+        ..original.clone()
+    };
+    let cmd = graph_ops::set_text(f.project(), gid, node, next.clone())
+        .unwrap()
+        .unwrap();
+    assert_undo_roundtrip(&f.doc, &cmd);
+    Command::Timeline(cmd).apply(&mut f.doc);
+    let g = &f.project().graphs[&gid];
+    assert_eq!(g.edges, edges);
+    assert_eq!(g.ui, layout);
+    assert_eq!(g.nodes[&node].params, params);
+    assert_eq!(g.nodes[&node].op, GraphOp::Text { text: next.clone() });
+    assert!(graph_ops::set_text(f.project(), gid, node, next.clone())
+        .unwrap()
+        .is_none());
+    for case in 0..5 {
+        let mut invalid = next.clone();
+        match case {
+            0 => invalid.font_size = f32::NAN,
+            1 => invalid.fill.r = 1.1,
+            2 => invalid.position[0] = -0.1,
+            3 => invalid.text = "X".repeat(4097),
+            _ => invalid.font_family = String::new(),
+        };
+        assert!(graph_ops::set_text(f.project(), gid, node, invalid).is_err());
+    }
+    f.doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap()
+        .video_tracks[0]
+        .locked = true;
+    assert_eq!(
+        graph_ops::set_text(f.project(), gid, node, original).unwrap_err(),
+        ops::EditError::TrackLocked
+    );
+}
+
+#[test]
+fn graph_move_restores_missing_layout_entry() {
+    let mut f = fixture();
+    let (g, node) = NodeGraph::new_clip_composition("Missing layout");
+    let gid = g.id;
+    f.doc.timeline.as_mut().unwrap().graphs.insert(gid, g);
+    f.doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .graphs
+        .get_mut(&gid)
+        .unwrap()
+        .ui
+        .remove(&node);
+    let cmd = graph_ops::move_node(f.project(), gid, node, NodePos { x: 90.0, y: 120.0 }).unwrap();
+    assert_undo_roundtrip(&f.doc, &cmd);
+}
+
+#[test]
+fn graph_move_old_position_records_remain_readable_and_invalid_moves_fail() {
+    let mut f = fixture();
+    let (g, node) = NodeGraph::new_clip_composition("Position compatibility");
+    let gid = g.id;
+    f.doc.timeline.as_mut().unwrap().graphs.insert(gid, g);
+    let encoded = serde_json::json!({"cmd":"move_node","graph":gid,"node":node,"old":{"x":10.0,"y":20.0},"new":{"x":30.0,"y":40.0}});
+    let command: commands::GraphCmd = serde_json::from_value(encoded.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&command).unwrap(), encoded);
+    assert!(graph_ops::move_node(
+        f.project(),
+        gid,
+        GraphNodeId::new(),
+        NodePos { x: 0.0, y: 0.0 }
+    )
+    .is_err());
+    assert!(graph_ops::move_node(
+        f.project(),
+        gid,
+        node,
+        NodePos {
+            x: f32::NAN,
+            y: 0.0
+        }
+    )
+    .is_err());
+    let first = graph_ops::move_node(f.project(), gid, node, NodePos { x: 50.0, y: 60.0 }).unwrap();
+    assert_undo_roundtrip(&f.doc, &first);
+}
+
+#[test]
+fn graph_polygon_shape_edit_preserves_animation_edges_layout_and_undo() {
+    let mut f = fixture();
+    let (mut graph, node) = NodeGraph::new_clip_composition("Polygon");
+    let gid = graph.id;
+    graph.nodes.get_mut(&node).unwrap().op = GraphOp::MaskShape {
+        shape: MaskShapeKind::Ellipse,
+    };
+    graph
+        .nodes
+        .get_mut(&node)
+        .unwrap()
+        .params
+        .track_mut(&PropPath::new("params.center_x"))
+        .insert_keyframe(Keyframe::new(
+            Tick(10),
+            PropValue::Float(0.4),
+            Interp::Linear,
+        ));
+    let params = graph.nodes[&node].params.clone();
+    let edges = graph.edges.clone();
+    let ui = graph.ui.clone();
+    let project = f.doc.timeline.as_mut().unwrap();
+    project.graphs.insert(gid, graph);
+    project.sequences.get_mut(&f.seq).unwrap().video_tracks[0].clips[0].composition = Some(gid);
+    let shape = MaskShapeKind::Polygon {
+        vertices: vec![[0., 0.], [1., 0.], [0.5, 1.]],
+    };
+    let cmd = graph_ops::set_mask_shape(f.project(), gid, node, shape.clone())
+        .unwrap()
+        .unwrap();
+    assert_undo_roundtrip(&f.doc, &cmd);
+    let encoded = serde_json::to_string(&cmd).unwrap();
+    let decoded: TimelineCmd = serde_json::from_str(&encoded).unwrap();
+    Command::Timeline(decoded).apply(&mut f.doc);
+    let g = &f.project().graphs[&gid];
+    assert_eq!(g.edges, edges);
+    assert_eq!(g.ui, ui);
+    assert_eq!(g.nodes[&node].params, params);
+    assert_eq!(
+        g.nodes[&node].op,
+        GraphOp::MaskShape {
+            shape: shape.clone()
+        }
+    );
+    assert!(graph_ops::set_mask_shape(f.project(), gid, node, shape)
+        .unwrap()
+        .is_none());
+    for vertices in [
+        vec![],
+        vec![[0., 0.]; 129],
+        vec![[f32::NAN, 0.]; 3],
+        vec![[-0.1, 0.]; 3],
+    ] {
+        assert!(graph_ops::set_mask_shape(
+            f.project(),
+            gid,
+            node,
+            MaskShapeKind::Polygon { vertices }
+        )
+        .is_err());
+    }
+    let output = f.project().graphs[&gid].output;
+    assert!(graph_ops::set_mask_shape(f.project(), gid, output, MaskShapeKind::Rect).is_err());
+    f.doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap()
+        .video_tracks[0]
+        .locked = true;
+    assert_eq!(
+        graph_ops::set_mask_shape(f.project(), gid, node, MaskShapeKind::Rect).unwrap_err(),
+        ops::EditError::TrackLocked
+    );
+}
+
+#[test]
+fn graph_time_offset_edit_preserves_state_and_exact_undo() {
+    let mut f = fixture();
+    let (mut graph, node) = NodeGraph::new_clip_composition("Time offset");
+    let gid = graph.id;
+    graph.nodes.get_mut(&node).unwrap().op = GraphOp::TimeOffset {
+        offset: Tick(i64::MIN),
+    };
+    let edges = graph.edges.clone();
+    let ui = graph.ui.clone();
+    let params = graph.nodes[&node].params.clone();
+    let p = f.doc.timeline.as_mut().unwrap();
+    p.graphs.insert(gid, graph);
+    p.sequences.get_mut(&f.seq).unwrap().video_tracks[0].clips[0].composition = Some(gid);
+    let cmd = graph_ops::set_time_offset(f.project(), gid, node, Tick(i64::MAX))
+        .unwrap()
+        .unwrap();
+    assert_undo_roundtrip(&f.doc, &cmd);
+    let serialized = serde_json::to_string(&cmd).unwrap();
+    let cmd: TimelineCmd = serde_json::from_str(&serialized).unwrap();
+    Command::Timeline(cmd).apply(&mut f.doc);
+    let g = &f.project().graphs[&gid];
+    assert_eq!(
+        g.nodes[&node].op,
+        GraphOp::TimeOffset {
+            offset: Tick(i64::MAX)
+        }
+    );
+    assert_eq!(g.nodes[&node].params, params);
+    assert_eq!(g.edges, edges);
+    assert_eq!(g.ui, ui);
+    assert!(
+        graph_ops::set_time_offset(f.project(), gid, node, Tick(i64::MAX))
+            .unwrap()
+            .is_none()
+    );
+    assert!(graph_ops::set_time_offset(f.project(), gid, g.output, Tick(0)).is_err());
+    f.doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap()
+        .video_tracks[0]
+        .locked = true;
+    assert_eq!(
+        graph_ops::set_time_offset(f.project(), gid, node, Tick(0)).unwrap_err(),
+        ops::EditError::TrackLocked
+    );
 }

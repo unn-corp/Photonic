@@ -200,8 +200,9 @@ fn sat(c: [f32; 3]) -> f32 {
     c[0].max(c[1]).max(c[2]) - c[0].min(c[1]).min(c[2])
 }
 
-/// Set the saturation of `c` to `s` per the W3C SetSat algorithm.
-fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
+/// Set the saturation of finite unit-range `c` to unit-range `s` per W3C SetSat.
+/// This pure RGB-chroma step is shared by Legacy and Native AP1 compositing.
+pub fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
     // indices of min, mid, max
     let mut idx = [0usize, 1, 2];
     idx.sort_by(|&a, &b| c[a].partial_cmp(&c[b]).unwrap());

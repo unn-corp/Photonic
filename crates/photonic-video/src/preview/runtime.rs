@@ -496,7 +496,14 @@ fn dependency_hash(
                     }
                 }
             }
-            IrOp::RasterVector { .. } => {
+            IrOp::RasterVector { .. } | IrOp::NativeRasterVector { .. } => {
+                if matches!(node.op, IrOp::NativeRasterVector { .. }) {
+                    let document = snapshot.document.as_deref().ok_or_else(|| {
+                        PreviewError::Invalid("managed vector document snapshot missing".into())
+                    })?;
+                    photonic_render::native_vector::validate_document(document)
+                        .map_err(|s| PreviewError::Invalid(s.into()))?;
+                }
                 if vector_hash.is_none() {
                     let document = snapshot.document.as_ref().ok_or_else(|| {
                         PreviewError::Invalid("preview vector document missing".into())

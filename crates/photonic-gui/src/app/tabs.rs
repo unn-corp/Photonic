@@ -190,6 +190,22 @@ impl PhotonicApp {
         }
     }
 
+    /// Timeline and floating keyframe widgets commit directly through history.
+    /// Carry those edits into tab dirtiness/autosave/quit protection even when
+    /// they did not travel through a PanelAction or the right-hand drawer.
+    pub(crate) fn record_timeline_history_edits(
+        &mut self,
+        doc: &Document,
+        history: &CommandHistory,
+        before: u64,
+    ) -> bool {
+        let changed = history.revision() != before;
+        if changed {
+            self.sync_active_tab_meta(doc, true);
+        }
+        changed
+    }
+
     /// Record that the active document was just written to disk: clear its dirty
     /// flag, mark the current history node as the on-disk state (drives the "Last
     /// Save" marker in the branch viewer), and drop any recovery file. Call after
@@ -326,6 +342,58 @@ impl PhotonicApp {
 #[cfg(test)]
 mod external_save_tests {
     use super::*;
+
+    #[test]
+    fn floating_grade_keyframe_history_marks_dirty_until_saved() {
+        use photonic_core::timeline::{
+            ops, AnimTarget, Clip, ClipSource, FrameRate, Grade, GradeOp, GradeOpKind,
+            GradeOpParams, Interp, Keyframe, PropPath, PropValue, Sequence, Tick, TimelineProject,
+            Track, TrackKind,
+        };
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("Keyframes", 100.0, 100.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("S", FrameRate::FPS_30, 16, 16);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick::from_seconds(1));
+        let op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.0 },
+        );
+        let target = AnimTarget::GradeOp {
+            clip: clip.id,
+            op: op.id,
+        };
+        let mut grade = Grade::new();
+        grade.ops.push(op);
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::default();
+        app.ensure_initial_tab(&doc, &history);
+        app.mark_active_tab_saved(&history);
+        let before = history.revision();
+        assert!(!app.record_timeline_history_edits(&doc, &history, before));
+        assert!(!app.has_unsaved_changes());
+        let cmd = ops::set_keyframe_checked(
+            doc.timeline.as_ref().unwrap(),
+            target,
+            PropPath::new("params.stops"),
+            Keyframe::new(Tick(0), PropValue::Float(1.0), Interp::Linear),
+        )
+        .unwrap();
+        history.execute_discrete(photonic_core::history::Command::Timeline(cmd), &mut doc);
+        assert!(app.record_timeline_history_edits(&doc, &history, before));
+        assert!(app.has_unsaved_changes());
+        app.mark_active_tab_saved(&history);
+        assert!(!app.has_unsaved_changes());
+        let before = history.revision();
+        assert!(history.undo(&mut doc));
+        assert!(app.record_timeline_history_edits(&doc, &history, before));
+        assert!(app.has_unsaved_changes());
+    }
 
     #[test]
     fn external_save_clears_only_the_exact_saved_history_node() {

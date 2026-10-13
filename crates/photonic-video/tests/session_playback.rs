@@ -864,19 +864,34 @@ fn cut_ahead_crosses_hard_cut_without_transparent_frame() {
         .expect("clip A frame before the cut");
 
     session.send(EngineCmd::Play);
-    let mut samples: Vec<(Tick, f32)> = Vec::new();
+    // Retain immutable presented frames without synchronously draining the GPU
+    // during the narrow real-time cut window. Per-frame map/readback here used
+    // to stall this observer and miss both-side coverage under parallel tests.
+    let mut frames: Vec<Arc<EngineFrame>> = Vec::new();
     let end = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < end {
         if let Some(f) = session.latest_frame() {
-            if samples.last().map(|(t, _)| *t) != Some(f.time) {
-                let px = read_texture_rgba16f(&gpu, &f.texture, w, h);
-                samples.push((f.time, mean_alpha(&px)));
+            if frames.last().map(|frame| frame.time) != Some(f.time) {
+                assert!(
+                    frames.len() < 128,
+                    "bounded presented-frame capture exceeded"
+                );
+                frames.push(f);
             }
         }
         std::thread::sleep(Duration::from_millis(3));
     }
     session.send(EngineCmd::Pause);
     session.shutdown();
+    // Read only after playback stops; the same +/-3-frame and opacity
+    // assertions below remain mandatory, with no widened observation window.
+    let samples: Vec<_> = frames
+        .iter()
+        .map(|frame| {
+            let pixels = read_texture_rgba16f(&gpu, &frame.texture, w, h);
+            (frame.time, mean_alpha(&pixels))
+        })
+        .collect();
 
     let lo = Tick(cut.0 - 3 * tpf);
     let hi = Tick(cut.0 + 3 * tpf);

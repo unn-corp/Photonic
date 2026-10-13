@@ -63,6 +63,8 @@ pub struct DecodeSource {
     /// True while CUDA is still usable for this source. A failed CUDA decode
     /// permanently falls back to software for the lifetime of the source.
     cuda_enabled: bool,
+    known_end_pts: Option<Tick>,
+    process_last_pts: Option<Tick>,
     software_decoder: Option<&'static str>,
     cancellation: DecodeCancellation,
 }
@@ -77,6 +79,8 @@ impl DecodeSource {
             sidecar: None,
             reader: None,
             cuda_enabled,
+            known_end_pts: None,
+            process_last_pts: None,
             software_decoder: None,
             cancellation: DecodeCancellation::default(),
         }
@@ -110,7 +114,7 @@ impl DecodeSource {
     /// Source frame ordinal of the keyframe at `kf_tick`, for the pts model.
     fn start_frame(&self, kf_tick: Tick) -> i64 {
         match &self.params.pts_kind {
-            PtsKind::Cfr(rate) => rate.frame_at(kf_tick),
+            PtsKind::Cfr(rate) => cfr_keyframe_ordinal(*rate, kf_tick),
             PtsKind::Vfr(table) => table.ordinal_before(kf_tick),
         }
     }
@@ -137,6 +141,7 @@ impl DecodeSource {
         // Drop the old process/reader first (kill-on-drop) before respawning.
         self.reader = None;
         self.sidecar = None;
+        self.process_last_pts = None;
 
         let cfg = SidecarConfig {
             input: self.params.input.clone(),
@@ -159,6 +164,21 @@ impl DecodeSource {
         self.sidecar = Some(sidecar);
         self.reader = Some(reader);
         Ok(())
+    }
+
+    /// Playback requests the frame whose interval contains a possibly fractional
+    /// source tick. Keep `seek`'s public at-or-after contract for other callers.
+    pub fn seek_covering(&mut self, target: Tick) -> Result<Arc<DecodedFrame>, DecodeError> {
+        if target < Tick::ZERO {
+            return Err(DecodeError::EmptyDecode);
+        }
+        let boundary = match &self.params.pts_kind {
+            PtsKind::Cfr(rate) => rate.snap(target),
+            PtsKind::Vfr(table) => table
+                .pts_at(table.ordinal_before(target))
+                .ok_or(DecodeError::EmptyDecode)?,
+        };
+        self.seek(boundary)
     }
 
     /// Seek so the frame at or after `target` is decoded and ringed.
@@ -255,20 +275,35 @@ impl DecodeSource {
             // through its reusable discard buffer rather than allocating one
             // decoded payload per frame on a long-GOP seek.
             match reader.next_pts() {
-                Some(pts) if pts < target => {
-                    if reader.discard_next_frame()?.is_none() {
+                Some(pts) if pts < target => match reader.discard_next_frame()? {
+                    Some(pts) => self.process_last_pts = Some(pts),
+                    None => {
+                        if !use_cuda {
+                            self.known_end_pts = self.process_last_pts;
+                        }
                         return Err(DecodeError::EmptyDecode);
                     }
-                }
+                },
                 Some(_) => match reader.next_frame()? {
                     Some(frame) => {
                         let pts = frame.pts;
+                        self.process_last_pts = Some(pts);
                         self.ring.push(frame);
                         return self.ring.get(pts).ok_or(DecodeError::EmptyDecode);
                     }
-                    None => return Err(DecodeError::EmptyDecode),
+                    None => {
+                        if !use_cuda {
+                            self.known_end_pts = self.process_last_pts;
+                        }
+                        return Err(DecodeError::EmptyDecode);
+                    }
                 },
-                None => return Err(DecodeError::EmptyDecode),
+                None => {
+                    if !use_cuda {
+                        self.known_end_pts = self.process_last_pts;
+                    }
+                    return Err(DecodeError::EmptyDecode);
+                }
             }
         }
     }
@@ -359,6 +394,7 @@ impl DecodeSource {
         match reader.next_frame()? {
             Some(frame) => {
                 let pts = frame.pts;
+                self.process_last_pts = Some(pts);
                 self.ring.push(frame);
                 self.ring.get(pts).ok_or(DecodeError::EmptyDecode)
             }
@@ -398,17 +434,88 @@ impl DecodeSource {
             }
             match reader.next_frame()? {
                 Some(frame) => {
+                    self.process_last_pts = Some(frame.pts);
                     self.ring.push(frame);
                     count += 1;
                 }
-                None => break, // clean EOF
+                None => {
+                    self.known_end_pts = self.process_last_pts;
+                    break;
+                } // clean EOF
             }
         }
         Ok(count)
     }
 
+    /// A confirmed stream end, not merely a full ring or a stalled read.
+    pub fn ended_before(&self, target: Tick, rate: FrameRate) -> bool {
+        self.known_end_pts.is_some_and(|last| {
+            // The last decoded picture gets its nominal interval, matching the
+            // presenter's last-frame policy. Container audio duration is irrelevant.
+            target.0 as i128 - last.0 as i128 >= rate.ticks_per_frame().0.max(1) as i128
+        })
+    }
+
     /// Whether a decode process is currently live.
     pub fn is_active(&self) -> bool {
         self.sidecar.is_some()
+    }
+}
+
+/// A keyframe timestamp identifies a frame boundary, not an arbitrary playhead.
+/// Containers commonly quantize CFR timestamps (Matroska often to milliseconds).
+/// Flooring 33 ms at 30 fps labels decoded frame 1 as frame 0 and a cold seek
+/// returns the following picture. Recover the nearest CFR boundary instead.
+/// VFR continues using its actual per-frame PTS table.
+fn cfr_keyframe_ordinal(rate: FrameRate, tick: Tick) -> i64 {
+    let duration = rate.ticks_per_frame().0.max(1) as i128;
+    ((tick.0 as i128 + duration / 2).div_euclid(duration)).clamp(i64::MIN as i128, i64::MAX as i128)
+        as i64
+}
+
+#[cfg(test)]
+mod cfr_seek_tests {
+    use super::*;
+    #[test]
+    fn native_time_offset_cfr_keyframe_ordinals_survive_container_quantization() {
+        use photonic_core::timeline::TICKS_PER_SECOND;
+        let millisecond = TICKS_PER_SECOND / 1000;
+        for rate in [
+            FrameRate::FPS_24,
+            FrameRate::FPS_25,
+            FrameRate::FPS_30,
+            FrameRate::new(50, 1),
+            FrameRate::FPS_60,
+            FrameRate::FPS_23_976,
+            FrameRate::FPS_29_97,
+            FrameRate::FPS_59_94,
+            FrameRate::new(120, 1),
+        ] {
+            for ordinal in [0, 1, 2, 3, 10, 29, 30, 59, 60, 1001, 10000] {
+                let tick = rate.frame_start(ordinal);
+                for quantized in [
+                    tick,
+                    Tick(tick.0 / millisecond * millisecond),
+                    Tick((tick.0 + millisecond / 2) / millisecond * millisecond),
+                ] {
+                    assert_eq!(
+                        cfr_keyframe_ordinal(rate, quantized),
+                        ordinal,
+                        "{rate:?} {quantized:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            cfr_keyframe_ordinal(FrameRate::FPS_30, Tick(millisecond * 33)),
+            1
+        );
+        assert_eq!(
+            FrameRate::FPS_30.frame_at(Tick(millisecond * 33)),
+            0,
+            "ordinary playhead covering-frame semantics must stay unchanged"
+        );
+        assert!(cfr_keyframe_ordinal(FrameRate::FPS_30, Tick(i64::MAX)) > 0);
+        assert!(cfr_keyframe_ordinal(FrameRate::FPS_30, Tick(i64::MIN)) < 0);
     }
 }

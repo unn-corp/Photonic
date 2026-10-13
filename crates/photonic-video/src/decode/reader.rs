@@ -10,7 +10,10 @@
 //! The pipe carries no PTS, so we reconstruct it. For a **constant-frame-rate**
 //! source this is exact arithmetic at zero extra cost: the first output frame is
 //! the seek keyframe (input `-ss` lands exactly on it), so
-//! `pts(i) = (start_frame + i) × ticks_per_frame`. This keeps the cold-seek
+//! `pts(i) = (start_frame + i) × ticks_per_frame`. The scheduler recovers
+//! `start_frame` by the nearest CFR boundary because container keyframe timestamps
+//! may be quantized below the exact boundary; arbitrary playhead lookup still
+//! uses covering-frame floor semantics. This keeps the cold-seek
 //! budget (02 §8) — no second probe pass.
 //!
 //! For a **variable-frame-rate** source that arithmetic is wrong (the per-frame

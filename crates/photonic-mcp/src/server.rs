@@ -350,6 +350,10 @@ async fn handle_mcp(
 /// Returns `Ok(response)` for JSON-RPC success/error payloads that should use
 /// HTTP 200, or `Err((status, response))` when the protocol demands a non-200
 /// status (invalid params / header mismatch / etc.).
+#[allow(
+    clippy::result_large_err,
+    reason = "Both outcomes carry the same JSON-RPC response; retain the shared public transport API without allocating only on protocol errors"
+)]
 pub async fn process_rpc_request(
     state: AppState,
     req: JsonRpcRequest,

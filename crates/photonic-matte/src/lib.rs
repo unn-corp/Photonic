@@ -12,12 +12,15 @@
 //! layer mask (see `RasterNode::set_foreground_matte`), so the operation is
 //! fully reversible.
 
+pub mod worker;
+
 use anyhow::{anyhow, Context, Result};
 use ndarray::Array4;
 use ort::session::{builder::GraphOptimizationLevel, Session};
 use ort::value::Tensor;
 use photonic_core::raster::{image::RasterImage, mask::Mask};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// U²-Net-p ONNX model, hosted on the `rembg` GitHub release. Overridable via the
@@ -119,11 +122,67 @@ fn build_session() -> Result<Session> {
     let path = ensure_model()?;
     let session = Session::builder()
         .context("creating ort session builder")?
+        .with_intra_threads(1)
+        .context("bounding matting inference threads")?
+        .with_inter_threads(1)
+        .context("bounding matting graph threads")?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .context("setting optimization level")?
         .commit_from_file(&path)
         .with_context(|| format!("loading ONNX model {}", path.display()))?;
     Ok(session)
+}
+
+/// SHA-256 of the pinned upstream U²-Net-p release. Its upstream MD5 also
+/// matches rembg's published 8e83ca70e441ab06c318d82300c84806. Native timeline
+/// evaluation must never download or silently substitute a different model.
+pub const PINNED_MODEL_SHA256: &str =
+    "309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8";
+const MAX_PINNED_MODEL_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Owned, serial inference session for a background worker. Loading and inference
+/// belong on that worker, never the GUI/engine thread. This API is offline-only.
+pub struct CachedMatteModel {
+    session: Session,
+}
+impl CachedMatteModel {
+    pub fn load_cached() -> Result<Self> {
+        let path = std::env::var("PHOTONIC_RMBG_MODEL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| model_cache_dir().join("u2netp.onnx"));
+        Self::load_pinned(&path)
+    }
+    pub fn load_pinned(path: &Path) -> Result<Self> {
+        use std::io::Read;
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("cached matting model missing: {}", path.display()))?;
+        let mut bytes = Vec::new();
+        file.take(MAX_PINNED_MODEL_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .context("reading cached matting model")?;
+        verify_pinned_model(&bytes)?;
+        // Load verified bytes, not the path, to avoid a replace-between-check/load race.
+        let session = Session::builder()?
+            .with_intra_threads(1)?
+            .with_inter_threads(1)?
+            .with_optimization_level(GraphOptimizationLevel::Level3)?
+            .commit_from_memory(&bytes)
+            .context("loading pinned matting model")?;
+        Ok(Self { session })
+    }
+    pub fn matte(&self, img: &RasterImage) -> Result<Mask> {
+        infer(&self.session, img)
+    }
+}
+fn verify_pinned_model(bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 > MAX_PINNED_MODEL_BYTES
+        || format!("{:x}", Sha256::digest(bytes)) != PINNED_MODEL_SHA256
+    {
+        return Err(anyhow!(
+            "cached matting model does not match pinned U2NetP SHA-256"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether the background-removal model is already downloaded (so the UI can hint
@@ -142,29 +201,27 @@ pub fn model_is_cached() -> bool {
 ///
 /// Slow (model load on first call, then inference); run off the UI thread.
 pub fn remove_background(img: &RasterImage) -> Result<Mask> {
-    if img.width == 0 || img.height == 0 {
-        return Err(anyhow!("cannot matte a zero-size image"));
-    }
+    validate_image(img)?;
     let session = session()?;
+    infer(session, img)
+}
 
-    // ── Preprocess: resize to 320×320, normalize to CHW f32 ──────────────────
-    let small = resize_rgba(img, INPUT_SIZE, INPUT_SIZE);
-    // U²-Net divides by the max pixel value (not a fixed 255) before normalizing.
-    let max = small.iter().copied().max().unwrap_or(255).max(1) as f32;
-    let mut input = Array4::<f32>::zeros((1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize));
-    for y in 0..INPUT_SIZE as usize {
-        for x in 0..INPUT_SIZE as usize {
-            let i = (y * INPUT_SIZE as usize + x) * 4;
-            for c in 0..3 {
-                let v = small[i + c] as f32 / max;
-                input[[0, c, y, x]] = (v - MEAN[c]) / STD[c];
-            }
-        }
-    }
+fn infer(session: &Session, img: &RasterImage) -> Result<Mask> {
+    let input = preprocess(img)?;
 
     // ── Run inference ────────────────────────────────────────────────────────
-    let input_name = session.inputs[0].name.clone();
-    let output_name = session.outputs[0].name.clone();
+    let input_name = session
+        .inputs
+        .first()
+        .ok_or_else(|| anyhow!("matting model has no input"))?
+        .name
+        .clone();
+    let output_name = session
+        .outputs
+        .first()
+        .ok_or_else(|| anyhow!("matting model has no output"))?
+        .name
+        .clone();
     let tensor = Tensor::from_array(input).context("building input tensor")?;
     let outputs = session
         .run(ort::inputs![input_name.as_str() => tensor]?)
@@ -176,37 +233,77 @@ pub fn remove_background(img: &RasterImage) -> Result<Mask> {
     // (row-major) order.
     let data: Vec<f32> = output.iter().copied().collect();
 
-    // Output is a 320×320 saliency map. Normalize (pred-min)/(max-min) → 0..1.
-    let n = (INPUT_SIZE * INPUT_SIZE) as usize;
-    if data.len() < n {
+    if output.shape() != [1, 1, INPUT_SIZE as usize, INPUT_SIZE as usize] {
         return Err(anyhow!(
-            "matting output smaller than expected ({} < {})",
-            data.len(),
-            n
+            "unexpected matting output shape: {:?}",
+            output.shape()
         ));
     }
-    let mut lo = f32::INFINITY;
-    let mut hi = f32::NEG_INFINITY;
-    for &v in &data[..n] {
-        if v.is_finite() {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-    }
-    let range = (hi - lo).max(1e-6);
-
-    // Build a 320×320 gray matte, then resize it up to the source dimensions.
-    let mut matte_small = vec![0u8; n];
-    for (dst, &v) in matte_small.iter_mut().zip(&data[..n]) {
-        let t = ((v - lo) / range).clamp(0.0, 1.0);
-        *dst = (t * 255.0).round() as u8;
-    }
+    let matte_small = normalize_prediction(&data)?;
     let matte = resize_gray(&matte_small, INPUT_SIZE, INPUT_SIZE, img.width, img.height);
     Ok(Mask {
         width: img.width,
         height: img.height,
         data: matte,
     })
+}
+
+/// Validate before loading a model or allocating its input. RasterImage fields
+/// are public, so callers can bypass its checked constructors.
+fn validate_image(img: &RasterImage) -> Result<()> {
+    use photonic_core::raster::image::{MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS};
+    let pixels = (img.width as usize)
+        .checked_mul(img.height as usize)
+        .ok_or_else(|| anyhow!("matting image size overflow"))?;
+    if img.width == 0
+        || img.height == 0
+        || img.width > MAX_RASTER_DIMENSION
+        || img.height > MAX_RASTER_DIMENSION
+        || pixels > MAX_RASTER_PIXELS
+        || pixels.checked_mul(4) != Some(img.pixels.len())
+    {
+        return Err(anyhow!("matting requires a bounded, complete RGBA image"));
+    }
+    Ok(())
+}
+
+fn preprocess(img: &RasterImage) -> Result<Array4<f32>> {
+    validate_image(img)?;
+    let small = resize_rgba(img, INPUT_SIZE, INPUT_SIZE);
+    // The model consumes RGB. Alpha must not change the ImageNet divisor.
+    let max = small
+        .chunks_exact(4)
+        .flat_map(|p| p[..3].iter().copied())
+        .max()
+        .unwrap_or(0)
+        .max(1) as f32;
+    let mut input = Array4::<f32>::zeros((1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize));
+    for y in 0..INPUT_SIZE as usize {
+        for x in 0..INPUT_SIZE as usize {
+            let i = (y * INPUT_SIZE as usize + x) * 4;
+            for c in 0..3 {
+                input[[0, c, y, x]] = (small[i + c] as f32 / max - MEAN[c]) / STD[c];
+            }
+        }
+    }
+    Ok(input)
+}
+
+fn normalize_prediction(data: &[f32]) -> Result<Vec<u8>> {
+    let n = (INPUT_SIZE * INPUT_SIZE) as usize;
+    if data.len() != n || data.iter().any(|v| !v.is_finite()) {
+        return Err(anyhow!(
+            "matting output must have exactly {n} finite samples"
+        ));
+    }
+    let lo = data.iter().copied().fold(f32::INFINITY, f32::min) as f64;
+    let hi = data.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    // Evaluate in f64 so finite extreme predictions cannot overflow the range.
+    let range = (hi - lo).max(1e-6);
+    Ok(data
+        .iter()
+        .map(|&v| (((v as f64 - lo) / range).clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect())
 }
 
 /// High-quality (Lanczos3) resize of an RGBA image to `w×h`, returning raw RGBA
@@ -234,6 +331,102 @@ fn resize_gray(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_images_fail_before_model_access() {
+        for (w, h, len) in [
+            (0, 1, 0),
+            (1, 0, 0),
+            (2, 2, 15),
+            (1, 1, 5),
+            (u32::MAX, u32::MAX, 0),
+            (16385, 1, 0),
+        ] {
+            let img = RasterImage {
+                width: w,
+                height: h,
+                pixels: vec![0; len],
+            };
+            assert!(remove_background(&img)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded"));
+        }
+    }
+
+    #[test]
+    fn model_preprocessing_uses_rgb_not_alpha_for_normalization() {
+        let a = RasterImage::filled(320, 320, [10, 20, 40, 255]);
+        let b = RasterImage::filled(320, 320, [10, 20, 40, 64]);
+        let x = preprocess(&a).unwrap();
+        let y = preprocess(&b).unwrap();
+        assert_eq!(x, y);
+        for c in 0..3 {
+            let expected =
+                ([0.25f64, 0.5, 1.0][c] - [0.485, 0.456, 0.406][c]) / [0.229, 0.224, 0.225][c];
+            assert!((x[[0, c, 0, 0]] as f64 - expected).abs() < 0.000001);
+        }
+        assert!(preprocess(&RasterImage::filled(1, 1, [0, 0, 0, 0]))
+            .unwrap()
+            .iter()
+            .all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn prediction_shape_nonfinite_and_extremes_are_checked() {
+        let n = (INPUT_SIZE * INPUT_SIZE) as usize;
+        assert!(normalize_prediction(&vec![0.0; n - 1]).is_err());
+        assert!(normalize_prediction(&vec![0.0; n + 1]).is_err());
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut a = vec![0.0; n];
+            a[7] = bad;
+            assert!(normalize_prediction(&a).is_err());
+        }
+        assert!(normalize_prediction(&vec![0.75; n])
+            .unwrap()
+            .iter()
+            .all(|v| *v == 0));
+        let mut a = vec![0.0; n];
+        a[0] = -f32::MAX;
+        a[1] = f32::MAX;
+        let out = normalize_prediction(&a).unwrap();
+        assert_eq!(&out[..3], &[0, 255, 128]);
+        let mut a = vec![0.0; n];
+        a[0] = -2.0;
+        a[1] = 2.0;
+        a[2] = 1.0;
+        let out = normalize_prediction(&a).unwrap();
+        assert_eq!(&out[..4], &[0, 255, 191, 128]);
+    }
+
+    #[test]
+    fn pinned_model_rejects_unverified_or_oversized_bytes() {
+        assert!(verify_pinned_model(&[]).is_err());
+        assert!(verify_pinned_model(&[1, 2, 3]).is_err());
+        assert!(verify_pinned_model(&vec![0; MAX_PINNED_MODEL_BYTES as usize + 1]).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires the explicitly provisioned pinned local model"]
+    fn pinned_cached_subject_and_repeat_are_stable() {
+        let model = CachedMatteModel::load_cached().expect("pinned offline model");
+        let mut img = RasterImage::filled(96, 96, [12, 12, 20, 255]);
+        for y in 30..66 {
+            for x in 30..66 {
+                img.set_pixel(x, y, [230, 220, 60, 255]);
+            }
+        }
+        let a = model.matte(&img).unwrap();
+        let b = model.matte(&img).unwrap();
+        assert_eq!(a.data, b.data);
+        assert_eq!((a.width, a.height), (96, 96));
+        assert!(a.get(48, 48) as u32 > a.get(3, 3) as u32 + 40);
+        eprintln!(
+            "pinned matte center={} corner={} repeated_exact=true",
+            a.get(48, 48),
+            a.get(3, 3)
+        );
+    }
 
     /// End-to-end: downloads the model on first run, then mattes a synthetic
     /// image (bright square on a dark field). Network + ~4.7 MB download, so it

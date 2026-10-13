@@ -154,6 +154,10 @@ fn blend_channel(mode: u32, cb: f32, cs: f32) -> f32 {
             if (cs <= 0.5) { return min(cb, 2.0 * cs); }
             return max(cb, 2.0 * cs - 1.0);
         }
+        case 26u: { return cb + cs; }            // Native LinearDodge
+        case 27u: { return cb + cs - 1.0; }      // Native LinearBurn
+        case 28u: { return cb - cs; }            // Native Subtract
+        case 29u: { return cb + 2.0 * cs - 1.0; }// Native LinearLight
         case 23u: {
             if (vivid_light1(cb, cs) < 0.5) { return 0.0; }
             return 1.0;
@@ -183,10 +187,52 @@ fn set_sat(c: vec3<f32>, sval: f32) -> vec3<f32> {
     if (rng <= 0.0) { return vec3<f32>(0.0); }
     return (c - vec3<f32>(cmin)) * (sval / rng);
 }
+fn native_lum(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.27222872, 0.67408174, 0.053689517));
+}
+fn native_set_lum(c: vec3<f32>, desired: f32) -> vec3<f32> {
+    var out = c + vec3<f32>(desired-native_lum(c));
+    let l = clamp(native_lum(out),0.0,1.0);
+    let low = min(min(out.r,out.g),out.b);
+    let high = max(max(out.r,out.g),out.b);
+    if (low < 0.0) { out = vec3<f32>(l)+(out-vec3<f32>(l))*(l/(l-low)); }
+    if (high > 1.0) { out = vec3<f32>(l)+(out-vec3<f32>(l))*((1.0-l)/(high-l)); }
+    return clamp(out,vec3<f32>(0.0),vec3<f32>(1.0));
+}
+// Evaluate alpha-weighted SoftLight without its potentially overflowing
+// straight-color quartic. Finite half inputs and alpha >1e-6 bound these
+// factored intermediates below f32 maximum, even for signed extended RGB.
+fn native_soft_overlap(sp: f32, bp: f32, sa: f32, ba: f32, opacity: f32) -> f32 {
+    if (ba <= 1e-6) { return 0.0; }
+    var cs = 0.0;
+    if (sa > 1e-6) { cs = sp / sa; }
+    let cb = bp / ba;
+    if (cs <= 0.5) {
+        return opacity * (sa*bp - (sa-2.0*sp)*bp*(1.0-cb));
+    }
+    if (cb <= 0.25) {
+        return opacity * (sa*bp + (2.0*sp-sa)*bp*((16.0*cb-12.0)*cb+3.0));
+    }
+    return opacity * (sa*bp + (2.0*sp-sa)*(ba*sqrt(cb)-bp));
+}
 @fragment
 fn fs(i: VOut) -> @location(0) vec4<f32> {
     let top = textureSample(t_top, s, i.uv);
     let bot = textureSample(t_bot, s, i.uv);
+    if (m.mode == 41u) {
+        if (m.opacity == 0.0) { return bot; }
+        let a = top.a*m.opacity;
+        var source = vec3<f32>(0.0);
+        if (top.a > 1e-6) { source = top.rgb; }
+        let overlap = vec3<f32>(
+            native_soft_overlap(source.r,bot.r,top.a,bot.a,m.opacity),
+            native_soft_overlap(source.g,bot.g,top.a,bot.a,m.opacity),
+            native_soft_overlap(source.b,bot.b,top.a,bot.a,m.opacity));
+        let rgb = m.opacity*(1.0-bot.a)*source + overlap + (1.0-a)*bot.rgb;
+        return vec4<f32>(clamp(rgb,vec3<f32>(-65504.0),vec3<f32>(65504.0)), a+bot.a*(1.0-a));
+    }
+    // Reserved internal operation: true premultiplied cross-dissolve, not over.
+    if (m.mode == 4294967295u) { return mix(bot, top, m.opacity); }
     // Normal: exact fast-path expression, byte-for-byte the pre-K-0.3a shader so
     // the golden corpus does not shift.
     if (m.mode == 0u) {
@@ -207,6 +253,35 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     else if (mode == 15u) { blended = set_lum(cb, lum(cs)); }
     else if (mode == 24u) { if (lum(cb) <= lum(cs)) { blended = cb; } else { blended = cs; } }
     else if (mode == 25u) { if (lum(cb) >= lum(cs)) { blended = cb; } else { blended = cs; } }
+    else if (mode == 30u || mode == 31u) {
+        let y = vec3<f32>(0.27222872, 0.67408174, 0.053689517);
+        let by = dot(cb,y); let sy = dot(cs,y);
+        if ((mode == 30u && by <= sy) || (mode == 31u && by >= sy)) { blended = cb; } else { blended = cs; }
+    }
+    else if (mode >= 32u && mode <= 40u) {
+        var bounded_mode = 6u;
+        switch (mode) {
+            case 33u: { bounded_mode = 7u; }
+            case 34u: { bounded_mode = 19u; }
+            case 35u: { bounded_mode = 20u; }
+            case 36u: { bounded_mode = 23u; }
+            default: {}
+        }
+        let b = clamp(cb, vec3<f32>(0.0), vec3<f32>(1.0));
+        let t = clamp(cs, vec3<f32>(0.0), vec3<f32>(1.0));
+        if (mode == 37u) { blended = native_set_lum(set_sat(t,sat(b)),native_lum(b)); }
+        else if (mode == 38u) { blended = native_set_lum(set_sat(b,sat(t)),native_lum(b)); }
+        else if (mode == 39u) { blended = native_set_lum(t,native_lum(b)); }
+        else if (mode == 40u) { blended = native_set_lum(b,native_lum(t)); }
+        else if (mode == 36u) {
+            let on = b >= vec3<f32>(1.0) - t;
+            let special_zero = (b == vec3<f32>(0.0)) & (t == vec3<f32>(1.0));
+            blended = select(vec3<f32>(0.0), vec3<f32>(1.0), on & !special_zero);
+        } else {
+            blended = vec3<f32>(blend_channel(bounded_mode, b.r, t.r),
+                blend_channel(bounded_mode, b.g, t.g), blend_channel(bounded_mode, b.b, t.b));
+        }
+    }
     else {
         blended = vec3<f32>(
             blend_channel(mode, cb.r, cs.r),
@@ -217,6 +292,9 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     let cs_prime = (1.0 - a_b) * cs + a_b * blended;
     let out_rgb = a_s * cs_prime + (1.0 - a_s) * bot.rgb;
     let out_a = a_s + a_b * (1.0 - a_s);
+    if (mode >= 26u && mode <= 40u) {
+        return vec4<f32>(clamp(out_rgb, vec3<f32>(-65504.0), vec3<f32>(65504.0)), out_a);
+    }
     return vec4<f32>(out_rgb, out_a);
 }
 "#;
@@ -287,10 +365,14 @@ fn luma_map(kind: i32, uv: vec2<f32>, invert: bool) -> f32 {
   } else {
     let dx = u - 0.5;
     let dy = v - 0.5;
-    let a = atan2(dy, dx);
-    var tt = (-a + 3.14159265359) / (2.0 * 3.14159265359);
-    if (tt >= 1.0) { tt = 0.0; }
-    t = tt;
+    // Match the CPU's explicit center convention on odd-sized canvases.
+    if (dx == 0.0 && dy == 0.0) { t = 0.5; }
+    else {
+      let a = atan2(dy, dx);
+      var tt = (-a + 3.14159265359) / (2.0 * 3.14159265359);
+      if (tt >= 1.0) { tt = 0.0; }
+      t = tt;
+    }
   }
   t = clamp(t, 0.0, 1.0);
   if (invert) { return 1.0 - t; }
@@ -408,6 +490,16 @@ impl GpuContext {
 /// renderer; tests that use only `SolidColor`/`Merge` never trigger it. A `None`
 /// return means "not available yet" — dependent results remain incomplete.
 pub trait GpuFrameSource {
+    /// Stable source invalidation generation; excludes transient scrub sampling.
+    fn invalidation_epoch(&self) -> u64 {
+        0
+    }
+    /// Prepare independent clocks before any decode worker is steered. Providers
+    /// may enforce their bounded source capacity; static/test sources need no work.
+    fn prepare_native_video_sources(&mut self, _requests: &[(AssetId, Tick)]) -> bool {
+        true
+    }
+
     /// Source context absent from the graph, including vector document updates
     /// and approximate samples. Change it whenever identical source ops can
     /// resolve to different pixels. Zero retains the default exact namespace.
@@ -431,6 +523,28 @@ pub trait GpuFrameSource {
         _input: &photonic_core::timeline::color::NativeInputColorInterpretation,
     ) -> Option<GpuFrame> {
         None
+    }
+
+    /// A definitive failure for this source-time request only. A pending
+    /// decode returns None; callers must not turn it into a persistent asset error.
+    fn native_video_failure(&self, _asset: AssetId, _src_time: Tick) -> Option<String> {
+        None
+    }
+
+    /// Report a rejected native source contract through the session's normal
+    /// input-error channel. Test/providers without a session may ignore it.
+    fn report_native_source_error(&mut self, _asset: AssetId, _error: String) {}
+
+    /// Independent still sources may not silently resize to hide a metadata
+    /// mismatch. Production providers verify the original decoded dimensions.
+    fn native_media_still_texture(
+        &mut self,
+        gpu: &GpuContext,
+        asset: AssetId,
+        w: u32,
+        h: u32,
+    ) -> Option<GpuFrame> {
+        self.native_still_texture(gpu, asset, w, h)
     }
 
     /// Qualified native still decoder. The texture is linear Rec.709 and
@@ -459,6 +573,18 @@ pub trait GpuFrameSource {
         w: u32,
         h: u32,
     ) -> Option<GpuFrame>;
+
+    /// Native source must be premultiplied linear Rec.709, with no second alpha multiplication.
+    fn native_vector_texture(
+        &mut self,
+        _gpu: &GpuContext,
+        _vref: VectorRef,
+        _key: VectorStateKey,
+        _w: u32,
+        _h: u32,
+    ) -> Option<GpuFrame> {
+        None
+    }
 
     fn vector_texture(
         &mut self,
@@ -519,6 +645,8 @@ pub struct Evaluator {
     native_exposure: Option<photonic_render::native_transfer::NativeExposurePass>,
     grade_mix: Option<photonic_render::grade_graph::GradeGraphMixPass>,
     native_mask: Option<photonic_render::grade_gpu::NativeMaskMixPass>,
+    native_decoration: Option<photonic_render::caption_decoration::CaptionDecorationPass>,
+    native_caption: Option<photonic_render::native_caption::NativeCaptionTransferPass>,
     native_acescct: Option<photonic_render::native_transfer::NativeAcescctPass>,
     native_sdr_output: Option<crate::color::native_output::gpu::NativeAces2SdrPass>,
     cache: NodeCache,
@@ -537,6 +665,14 @@ pub struct Evaluator {
     source_namespace: u64,
     canvas_scale: glam::Vec2,
     working_color_domain: crate::graph::ir::WorkingColorDomain,
+    frame_failed: bool,
+    matte_worker: Option<Result<photonic_matte::worker::MatteWorker, String>>,
+    matte_generation: u64,
+    matte_source_epoch: u64,
+    source_invalidation_epoch: u64,
+    pending_computations: usize,
+    subject_matte_used: bool,
+    computation_errors: Vec<String>,
 }
 
 impl Evaluator {
@@ -559,6 +695,8 @@ impl Evaluator {
             grade_mix: None,
             native_mask: None,
             native_acescct: None,
+            native_caption: None,
+            native_decoration: None,
             native_sdr_output: None,
             cache,
             caption,
@@ -567,7 +705,206 @@ impl Evaluator {
             source_namespace: 0,
             canvas_scale: glam::Vec2::ONE,
             working_color_domain: Default::default(),
+            frame_failed: false,
+            matte_worker: None,
+            matte_generation: 0,
+            matte_source_epoch: 0,
+            source_invalidation_epoch: 0,
+            pending_computations: 0,
+            subject_matte_used: false,
+            computation_errors: Vec::new(),
         }
+    }
+
+    fn composite_managed_cues(
+        &self,
+        target: &wgpu::Texture,
+        cues: &[crate::contract::CaptionCueRun],
+        paints: &[photonic_render::caption_decoration::CaptionPaint],
+        w: u32,
+        h: u32,
+    ) -> Result<(), String> {
+        if paints.is_empty() {
+            return self.caption.composite_checked(
+                self.gpu.device(),
+                self.gpu.queue(),
+                target,
+                cues,
+                w,
+                h,
+            );
+        }
+        if paints.len() != cues.len() {
+            return Err("caption paint/cue mismatch".into());
+        }
+        if paints.iter().all(|p| p.opacity == 0.0) {
+            return Ok(());
+        }
+        let decoration = self
+            .native_decoration
+            .as_ref()
+            .ok_or("caption decoration pipeline unavailable")?;
+        let group = paints
+            .iter()
+            .any(|p| p.opacity > 0.0 && p.opacity < 1.0)
+            .then(|| {
+                self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+                    label: Some("managed-caption-group"),
+                    size: target.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: WORKING_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+            });
+        // Reuse one coverage mask across cues; do not allocate a full-frame mask per word/cue.
+        let mask = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("managed-text-geometry-mask"),
+            size: target.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.passes.fill(&self.gpu, &mask, [0.0; 4]);
+        for (cue, paint) in cues.iter().zip(paints) {
+            if paint.opacity == 0.0 {
+                continue;
+            }
+            let draw_target = if paint.opacity < 1.0 {
+                let group = group.as_ref().expect("caption group allocated");
+                self.passes.fill(&self.gpu, group, [0.0; 4]);
+                group
+            } else {
+                target
+            };
+            if let Some(bounds) = self.caption.layout_bounds_checked(cue, w, h)? {
+                if paint
+                    .decoration
+                    .stroke
+                    .is_some_and(|(c, width)| c[3] > 0 && width > 0.0)
+                {
+                    self.passes.fill(&self.gpu, &mask, [0.0; 4]);
+                    let mut geometry = cue.clone();
+                    for (index, word) in geometry.words.iter_mut().enumerate() {
+                        word.color = [
+                            255,
+                            255,
+                            255,
+                            paint.word_opacity.get(index).copied().unwrap_or(255),
+                        ];
+                    }
+                    self.caption.composite_checked(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &mask,
+                        std::slice::from_ref(&geometry),
+                        w,
+                        h,
+                    )?;
+                }
+                decoration
+                    .composite(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &mask,
+                        draw_target,
+                        (w, h),
+                        bounds,
+                        &paint.decoration,
+                    )
+                    .map_err(str::to_string)?;
+            }
+            if !paint.underlines.is_empty() {
+                for span in self.caption.word_bounds_checked(cue, w, h)? {
+                    if let Some(underline) = paint.underlines.iter().find(|u| u.word == span.word) {
+                        if underline.width <= 0.0 || underline.color[3] == 0 {
+                            continue;
+                        }
+                        let [left, top, right, bottom] = span.bounds;
+                        let bounds = [left, (bottom - underline.width).max(top), right, bottom];
+                        decoration
+                            .composite(
+                                self.gpu.device(),
+                                self.gpu.queue(),
+                                &mask,
+                                draw_target,
+                                (w, h),
+                                bounds,
+                                &photonic_render::caption_decoration::CaptionDecoration {
+                                    stroke: None,
+                                    background: Some((underline.color, 0.0, 0.0)),
+                                },
+                            )
+                            .map_err(str::to_string)?;
+                    }
+                }
+            }
+            let mut glyphs = cue.clone();
+            for sweep in &paint.sweeps {
+                glyphs.words[sweep.word].color[3] = 0;
+            }
+            self.caption.composite_checked(
+                self.gpu.device(),
+                self.gpu.queue(),
+                draw_target,
+                std::slice::from_ref(&glyphs),
+                w,
+                h,
+            )?;
+            if !paint.sweeps.is_empty() {
+                let spans = self.caption.word_bounds_checked(cue, w, h)?;
+                for sweep in &paint.sweeps {
+                    self.passes.fill(&self.gpu, &mask, [0.0; 4]);
+                    let mut geometry = cue.clone();
+                    for (index, word) in geometry.words.iter_mut().enumerate() {
+                        word.color = [255, 255, 255, if index == sweep.word { 255 } else { 0 }];
+                    }
+                    self.caption.composite_checked(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &mask,
+                        std::slice::from_ref(&geometry),
+                        w,
+                        h,
+                    )?;
+                    let bounds: Vec<_> = spans
+                        .iter()
+                        .filter(|span| span.word == sweep.word)
+                        .map(|span| span.bounds)
+                        .collect();
+                    decoration
+                        .composite_sweep(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &mask,
+                            draw_target,
+                            (w, h),
+                            &bounds,
+                            sweep,
+                        )
+                        .map_err(str::to_string)?;
+                }
+            }
+            if paint.opacity < 1.0 {
+                decoration
+                    .composite_group(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        draw_target,
+                        target,
+                        (w, h),
+                        paint.opacity,
+                    )
+                    .map_err(str::to_string)?;
+            }
+        }
+        Ok(())
     }
 
     pub fn gpu(&self) -> &GpuContext {
@@ -582,7 +919,7 @@ impl Evaluator {
         self.cache.set_budget_bytes(bytes);
     }
 
-    fn evaluation_hash(
+    fn source_evaluation_hash(
         &self,
         hash: crate::graph::ir::ContentHash,
         w: u32,
@@ -605,13 +942,166 @@ impl Evaluator {
             hash.0 ^= (self.source_namespace as u128) << 64;
             hash.0 ^= 0x7363_7275_625f_6170_7072_6f78_696d_6174_u128;
         }
+        if self.matte_source_epoch != 0 {
+            hash = evaluation_hash(
+                hash,
+                self.matte_source_epoch as u32,
+                (self.matte_source_epoch >> 32) as u32,
+            );
+        }
         hash
+    }
+
+    fn evaluation_hash(
+        &self,
+        hash: crate::graph::ir::ContentHash,
+        w: u32,
+        h: u32,
+    ) -> crate::graph::ir::ContentHash {
+        let hash = self.source_evaluation_hash(hash, w, h);
+        if self.matte_generation == 0 {
+            hash
+        } else {
+            evaluation_hash(
+                hash,
+                self.matte_generation as u32,
+                (self.matte_generation >> 32) as u32,
+            )
+        }
+    }
+    pub fn pending_computations(&self) -> usize {
+        self.pending_computations
+    }
+    pub fn subject_matte_used(&self) -> bool {
+        self.subject_matte_used
+    }
+    pub fn computation_errors(&self) -> &[String] {
+        &self.computation_errors
+    }
+
+    fn native_matte_frame(
+        &mut self,
+        node: &crate::graph::ir::IrNode,
+        input: &GpuFrame,
+        cw: u32,
+        ch: u32,
+    ) -> GpuFrame {
+        use photonic_matte::worker::{MatteStatus, MatteWorker};
+        let key = self.source_evaluation_hash(node.content_hash, cw, ch).0;
+        let status = if (input.width, input.height) != (cw, ch)
+            || u64::from(cw) * u64::from(ch) > photonic_matte::worker::MAX_INPUT_PIXELS as u64
+        {
+            MatteStatus::Failed(Arc::from(
+                "native matte requires matching canvas geometry within four megapixels",
+            ))
+        } else {
+            let worker = self
+                .matte_worker
+                .get_or_insert_with(|| MatteWorker::new().map_err(|e| e.to_string()));
+            match worker {
+                Err(error) => MatteStatus::Failed(Arc::from(error.as_str())),
+                Ok(worker) => {
+                    let status = if let Some(status) = worker.status(key) {
+                        status
+                    } else {
+                        let gpu = self.gpu.clone();
+                        let texture = input.texture.clone();
+                        worker.request_prepared(key, move || {
+                            super::native_matte::read_model_input(&gpu, &texture, cw, ch)
+                                .map(Arc::new)
+                        })
+                    };
+                    self.matte_generation = worker.generation();
+                    status
+                }
+            }
+        };
+        let hash = self.evaluation_hash(node.content_hash, cw, ch);
+        let (target, valid) = self.cache.lookup_or_alloc(
+            hash,
+            TextureDesc {
+                width: cw,
+                height: ch,
+            },
+        );
+        match status {
+            MatteStatus::Ready(mask) => {
+                self.subject_matte_used = true;
+                if !valid {
+                    let texture = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+                        label: Some("native-matte-weight-upload"),
+                        size: wgpu::Extent3d {
+                            width: cw,
+                            height: ch,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::R8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    self.gpu.queue().write_texture(
+                        texture.as_image_copy(),
+                        &mask.data,
+                        wgpu::ImageDataLayout {
+                            offset: 0,
+                            bytes_per_row: Some(cw),
+                            rows_per_image: Some(ch),
+                        },
+                        texture.size(),
+                    );
+                    self.passes.native_channels.apply(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        [&texture; 4],
+                        &target,
+                        (cw, ch),
+                        5,
+                    );
+                    self.cache.mark_rendered(hash);
+                }
+            }
+            MatteStatus::Pending | MatteStatus::Busy => {
+                self.pending_computations += 1;
+                if !valid {
+                    self.passes.fill(&self.gpu, &target, [1.0; 4]);
+                    self.cache.mark_rendered(hash);
+                }
+            }
+            MatteStatus::Failed(error) => {
+                self.computation_errors
+                    .push(format!("Native subject matte: {error}"));
+                if !valid {
+                    self.passes.fill(&self.gpu, &target, [1.0; 4]);
+                    self.cache.mark_rendered(hash);
+                }
+            }
+        }
+        GpuFrame::new(target, cw, ch)
     }
 
     /// Evict cached results whose content hash matches `pred` (asset relink /
     /// proxy swap — `InvalidateRange`, 02 §5). Call between frames.
     pub fn invalidate_matching(&mut self, pred: impl Fn(crate::graph::ir::ContentHash) -> bool) {
         self.cache.invalidate_matching(pred);
+        self.invalidate_matte_cache();
+    }
+
+    fn invalidate_matte_cache(&mut self) {
+        if let Some(worker) = &mut self.matte_worker {
+            self.matte_source_epoch = self.matte_source_epoch.wrapping_add(1);
+            match worker {
+                Ok(worker) => {
+                    worker.invalidate();
+                    self.matte_generation = worker.generation();
+                }
+                Err(_) => {
+                    self.matte_worker = None;
+                }
+            }
+        }
     }
 
     /// Evaluate `graph` at canvas size `canvas`, returning the pinned output
@@ -660,6 +1150,30 @@ impl Evaluator {
         source: &mut dyn GpuFrameSource,
         tap: Option<crate::graph::ir::IrNodeId>,
     ) -> (Option<GpuFrame>, Option<GpuFrame>) {
+        self.frame_failed = false;
+        self.pending_computations = 0;
+        self.subject_matte_used = false;
+        self.computation_errors.clear();
+        let source_epoch = source.invalidation_epoch();
+        if source_epoch != self.source_invalidation_epoch {
+            self.invalidate_matte_cache();
+            self.source_invalidation_epoch = source_epoch;
+        }
+        if let Some(Ok(worker)) = &mut self.matte_worker {
+            self.matte_generation = worker.poll();
+        }
+        if let Err(error) = super::native_matte::validate_capacity(graph, canvas, tap) {
+            self.computation_errors.push(error.into());
+            return (None, None);
+        }
+        if let Err(error) = super::native_rank::validate_capacity(graph, canvas, tap) {
+            self.computation_errors.push(error.into());
+            return (None, None);
+        }
+        if let Err(error) = super::native_surface::validate_capacity(graph, canvas, tap) {
+            self.computation_errors.push(error.into());
+            return (None, None);
+        }
         if graph.validate_working_color_domain().is_err() {
             return (None, None);
         }
@@ -670,6 +1184,11 @@ impl Evaluator {
                     IrOp::GradeKeyMix { .. }
                         | IrOp::GradeMatteRefine { .. }
                         | IrOp::GradeMatteApply
+                        | IrOp::NativeMatteCdl { .. }
+                        | IrOp::NativeRgbMatrix { .. }
+                        | IrOp::NativeTextGen { .. }
+                        | IrOp::NativeDecoratedTextGen { .. }
+                        | IrOp::NativeTonalExposure { .. }
                         | IrOp::GradeLayerMix { .. }
                 )
             })
@@ -679,10 +1198,12 @@ impl Evaluator {
             ));
         }
         if self.native_mask.is_none()
-            && graph
-                .nodes
-                .iter()
-                .any(|node| matches!(node.op, IrOp::NativeMaskMix { .. }))
+            && graph.nodes.iter().any(|node| {
+                matches!(
+                    node.op,
+                    IrOp::NativeMaskMix { .. } | IrOp::WindowMatte { .. }
+                )
+            })
         {
             self.native_mask = Some(photonic_render::grade_gpu::NativeMaskMixPass::new(
                 self.gpu.device(),
@@ -700,6 +1221,8 @@ impl Evaluator {
                     | IrOp::NativeLogCdl { .. }
                     | IrOp::NativeLogQualifier { .. }
                     | IrOp::NativeDecodeStill { .. }
+                    | IrOp::NativeMediaStill { .. }
+                    | IrOp::NativeRasterVector { .. }
             )
         }) && self.native_exposure.is_none()
         {
@@ -729,6 +1252,31 @@ impl Evaluator {
                 return (None, None);
             }
         }
+        if graph
+            .nodes
+            .iter()
+            .any(|n| matches!(n.op, IrOp::NativeCaptionOutput { .. }))
+            && self.native_caption.is_none()
+        {
+            self.native_caption = Some(
+                photonic_render::native_caption::NativeCaptionTransferPass::new(self.gpu.device()),
+            );
+        }
+        if self.native_decoration.is_none()
+            && graph.nodes.iter().any(|n| match &n.op {
+                IrOp::NativeDecoratedTextGen { .. } => true,
+                IrOp::NativeCaptionOutput { paints, .. } => !paints.is_empty(),
+                _ => false,
+            })
+        {
+            self.native_decoration = Some(
+                photonic_render::caption_decoration::CaptionDecorationPass::new(self.gpu.device()),
+            );
+        }
+        let needed = graph.demanded_nodes(tap);
+        if !source.prepare_native_video_sources(&graph.native_decode_requests(tap)) {
+            return (None, None);
+        }
         self.working_color_domain = graph.working_color_domain;
         self.source_namespace = source.cache_namespace();
         let (cw, ch) = (canvas.0.max(1), canvas.1.max(1));
@@ -738,6 +1286,9 @@ impl Evaluator {
         let mut results: Vec<Option<GpuFrame>> = (0..graph.nodes.len()).map(|_| None).collect();
 
         for (i, node) in graph.nodes.iter().enumerate() {
+            if !needed[i] {
+                continue;
+            }
             let inputs: Vec<GpuFrame> = node
                 .inputs
                 .iter()
@@ -745,6 +1296,7 @@ impl Evaluator {
                 .collect();
 
             let out = match &node.op {
+                IrOp::NativeCanvas { .. } => inputs.first().cloned(),
                 IrOp::DecodeVideo {
                     asset,
                     src_time,
@@ -767,11 +1319,124 @@ impl Evaluator {
                     } else {
                         self.normalize_source_cached(node.content_hash, frame, cw, ch)
                     }),
-                    None => None,
+                    None => {
+                        if let Some(error) = source.native_video_failure(*asset, *src_time) {
+                            self.computation_errors.push(format!(
+                                "Native video source {asset} at tick {}: {error}",
+                                src_time.0
+                            ));
+                            self.pending_computations = 0;
+                            self.subject_matte_used = false;
+                            let hash =
+                                crate::graph::ir::ContentHash(0x6e61746976655f6465636f64655f6572);
+                            let (target, valid) = self.cache.lookup_or_alloc(
+                                hash,
+                                TextureDesc {
+                                    width: cw,
+                                    height: ch,
+                                },
+                            );
+                            if !valid {
+                                self.passes.fill(&self.gpu, &target, [0.0; 4]);
+                                self.cache.mark_rendered(hash);
+                            }
+                            let frame = GpuFrame::new(target, cw, ch);
+                            return (Some(frame.clone()), tap.map(|_| frame));
+                        }
+                        None
+                    }
                 },
                 // K-C8: the still is requested at the LOGICAL canvas size
                 // (`cw`/`ch` — already preview-scaled by `preview_canvas`), not
                 // at a pool bucket size. The provider caches on exactly that.
+                IrOp::NativeMediaVideo {
+                    asset,
+                    src_time,
+                    input,
+                    w,
+                    h,
+                    native_extent,
+                } => match source.native_video_texture(&self.gpu, *asset, *src_time, input) {
+                    Some(frame) if (frame.width, frame.height) == (*w, *h) => {
+                        Some(if *native_extent {
+                            frame
+                        } else {
+                            self.normalize_source_cached(node.content_hash, frame, cw, ch)
+                        })
+                    }
+                    Some(frame) => {
+                        source.report_native_source_error(
+                            *asset,
+                            format!(
+                                "native MediaIn video geometry changed: expected {w}x{h}, decoded {}x{}",
+                                frame.width, frame.height,
+                            ),
+                        );
+                        None
+                    }
+                    None => {
+                        if let Some(error) = source.native_video_failure(*asset, *src_time) {
+                            self.computation_errors.push(format!(
+                                "Native video source {asset} at tick {}: {error}",
+                                src_time.0
+                            ));
+                            self.pending_computations = 0;
+                            self.subject_matte_used = false;
+                            let hash =
+                                crate::graph::ir::ContentHash(0x6e61746976655f6465636f64655f6572);
+                            let (target, valid) = self.cache.lookup_or_alloc(
+                                hash,
+                                TextureDesc {
+                                    width: cw,
+                                    height: ch,
+                                },
+                            );
+                            if !valid {
+                                self.passes.fill(&self.gpu, &target, [0.0; 4]);
+                                self.cache.mark_rendered(hash);
+                            }
+                            let frame = GpuFrame::new(target, cw, ch);
+                            return (Some(frame.clone()), tap.map(|_| frame));
+                        }
+                        None
+                    }
+                },
+                IrOp::NativeMediaStill {
+                    asset,
+                    w,
+                    h,
+                    native_extent,
+                } => match source.native_media_still_texture(&self.gpu, *asset, *w, *h) {
+                    Some(frame) if (frame.width, frame.height) == (*w, *h) => {
+                        if *native_extent {
+                            Some(self.render_cached(node, &[frame], *w, *h, glam::Vec2::ONE))
+                        } else {
+                            let normalized = self.normalize_source_cached(
+                                crate::graph::ir::ContentHash(
+                                    node.content_hash.0 ^ 0x6d65646961737469,
+                                ),
+                                frame,
+                                cw,
+                                ch,
+                            );
+                            Some(self.render_cached(node, &[normalized], cw, ch, canvas_scale))
+                        }
+                    }
+                    Some(frame) => {
+                        source.report_native_source_error(
+                            *asset,
+                            format!(
+                                "native MediaIn still geometry changed: expected {w}x{h}, decoded {}x{}",
+                                frame.width, frame.height,
+                            ),
+                        );
+                        None
+                    }
+                    None => None,
+                },
+                // K-C8: the still is requested at the LOGICAL canvas size
+                // (`cw`/`ch` — already preview-scaled by `preview_canvas`), not
+                // at a pool bucket size.
                 IrOp::NativeDecodeStill { asset } => {
                     match source.native_still_texture(&self.gpu, *asset, cw, ch) {
                         Some(frame) => {
@@ -795,6 +1460,32 @@ impl Evaluator {
                         None => None,
                     }
                 }
+                IrOp::NativeRasterVector {
+                    vref, doc_state, ..
+                } => {
+                    // Rasterize at actual logical preview size. Separate raster namespace
+                    // and conversion cache prevent Legacy/native and Draft/Full aliases.
+                    let mut key_hash = xxhash_rust::xxh3::Xxh3::new();
+                    key_hash.update(&doc_state.0.to_le_bytes());
+                    key_hash.update(&cw.to_le_bytes());
+                    key_hash.update(&ch.to_le_bytes());
+                    key_hash.update(b"native-vector-v1");
+                    let key = VectorStateKey(key_hash.digest128());
+                    match source.native_vector_texture(&self.gpu, *vref, key, cw, ch) {
+                        Some(frame) => {
+                            let normalized = self.normalize_source_cached(
+                                crate::graph::ir::ContentHash(
+                                    node.content_hash.0 ^ 0x766563746f726e,
+                                ),
+                                frame,
+                                cw,
+                                ch,
+                            );
+                            Some(self.render_cached(node, &[normalized], cw, ch, canvas_scale))
+                        }
+                        None => None,
+                    }
+                }
                 IrOp::RasterVector {
                     vref,
                     doc_state,
@@ -806,11 +1497,17 @@ impl Evaluator {
                     }
                     None => None,
                 },
+                IrOp::NativeMatteExtract if inputs.len() == 1 => {
+                    Some(self.native_matte_frame(node, &inputs[0], cw, ch))
+                }
                 _ if inputs.len() == node.inputs.len() => {
                     Some(self.render_cached(node, &inputs, cw, ch, canvas_scale))
                 }
                 _ => None,
             };
+            if self.frame_failed {
+                return (None, None);
+            }
             results[i] = out;
         }
 
@@ -824,12 +1521,34 @@ impl Evaluator {
             return (None, None);
         }
 
+        if self.frame_failed {
+            return (None, None);
+        }
+
         // The scope tap (K-E2): a node already computed above. Pinned like the
         // output so the consumer's `Arc` cannot alias a recycled pool texture.
         let tap_hit = tap
             .filter(|id| (id.0 as usize) < graph.nodes.len())
             .and_then(|id| {
                 results[id.0 as usize].clone().map(|frame| {
+                    if matches!(
+                        graph.nodes[id.0 as usize].op,
+                        IrOp::NativeMediaVideo {
+                            native_extent: true,
+                            ..
+                        } | IrOp::NativeMediaStill {
+                            native_extent: true,
+                            ..
+                        }
+                    ) {
+                        let hash = self.evaluation_hash(
+                            graph.nodes[id.0 as usize].content_hash,
+                            frame.width,
+                            frame.height,
+                        );
+                        return (hash, frame);
+                    }
+
                     (
                         self.evaluation_hash(graph.nodes[id.0 as usize].content_hash, cw, ch),
                         self.normalize_source_cached(
@@ -883,7 +1602,10 @@ impl Evaluator {
         ch: u32,
         canvas_scale: glam::Vec2,
     ) -> GpuFrame {
-        let (w, h) = op_size(&node.op, cw, ch);
+        let op = node
+            .op
+            .at_evaluation_scale(canvas_scale, self.working_color_domain);
+        let (w, h) = op_size(&op, cw, ch);
         let desc = TextureDesc {
             width: w,
             height: h,
@@ -893,14 +1615,10 @@ impl Evaluator {
         if valid {
             return GpuFrame::new(target, w, h);
         }
-        self.render_op(
-            &node.op.at_canvas_scale(canvas_scale),
-            inputs,
-            &target,
-            w,
-            h,
-        );
-        self.cache.mark_rendered(hash);
+        self.render_op(&op, inputs, &target, w, h);
+        if !self.frame_failed {
+            self.cache.mark_rendered(hash);
+        }
         GpuFrame::new(target, w, h)
     }
 
@@ -936,7 +1654,7 @@ impl Evaluator {
     }
 
     fn render_op(
-        &self,
+        &mut self,
         op: &IrOp,
         inputs: &[GpuFrame],
         target: &wgpu::Texture,
@@ -963,16 +1681,95 @@ impl Evaluator {
                 ),
                 None => self.passes.fill(&self.gpu, target, [0.0; 4]),
             },
-            IrOp::Merge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
+            IrOp::NativeLuminanceMerge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
                 (Some(top), Some(bottom)) => {
-                    self.passes.merge(
+                    let mode = match mode {
+                        BlendMode::DarkerColor => 30,
+                        BlendMode::LighterColor => 31,
+                        _ => unreachable!("native luminance mode validated"),
+                    };
+                    self.passes.merge_mode(
                         &self.gpu,
                         &top.texture,
                         &bottom.texture,
-                        *mode,
+                        mode,
                         *opacity,
                         target,
                     );
+                }
+                _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeBoundedMerge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
+                (Some(top), Some(bottom)) => {
+                    let mode = match mode {
+                        BlendMode::ColorDodge => 32,
+                        BlendMode::ColorBurn => 33,
+                        BlendMode::Divide => 34,
+                        BlendMode::VividLight => 35,
+                        BlendMode::HardMix => 36,
+                        BlendMode::Hue => 37,
+                        BlendMode::Saturation => 38,
+                        BlendMode::Color => 39,
+                        BlendMode::Luminosity => 40,
+                        _ => unreachable!("native bounded mode validated"),
+                    };
+                    self.passes.merge_mode(
+                        &self.gpu,
+                        &top.texture,
+                        &bottom.texture,
+                        mode,
+                        *opacity,
+                        target,
+                    );
+                }
+                _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeArithmeticMerge { mode, opacity } => {
+                match (inputs.first(), inputs.get(1)) {
+                    (Some(top), Some(bottom)) => {
+                        let mode = match mode {
+                            BlendMode::LinearDodge => 26,
+                            BlendMode::LinearBurn => 27,
+                            BlendMode::Subtract => 28,
+                            BlendMode::LinearLight => 29,
+                            _ => unreachable!("native arithmetic mode validated"),
+                        };
+                        self.passes.merge_mode(
+                            &self.gpu,
+                            &top.texture,
+                            &bottom.texture,
+                            mode,
+                            *opacity,
+                            target,
+                        );
+                    }
+                    _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
+                }
+            }
+            IrOp::Merge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
+                (Some(top), Some(bottom)) => {
+                    if self.working_color_domain
+                        == crate::graph::ir::WorkingColorDomain::SceneLinearAcescg
+                        && *mode == BlendMode::SoftLight
+                    {
+                        self.passes.merge_mode(
+                            &self.gpu,
+                            &top.texture,
+                            &bottom.texture,
+                            41,
+                            *opacity,
+                            target,
+                        );
+                    } else {
+                        self.passes.merge(
+                            &self.gpu,
+                            &top.texture,
+                            &bottom.texture,
+                            *mode,
+                            *opacity,
+                            target,
+                        );
+                    }
                 }
                 (Some(only), None) | (None, Some(only)) => {
                     self.passes.blit(&self.gpu, &only.texture, target);
@@ -1048,6 +1845,122 @@ impl Evaluator {
             // `CaptionOverlay` path uses (06 §5.3) — text over transparent, which
             // the clip's `Transform2D`/`Merge` then places in the frame. An absent
             // cue (empty string) stays transparent.
+            IrOp::NativeTextGen { block } | IrOp::NativeDecoratedTextGen { block, .. } => {
+                let temp = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+                    label: Some("native-title-linear709"),
+                    size: target.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                self.passes.fill(&self.gpu, &temp, [0.0; 4]);
+                if let Some(cue) = &block.cue {
+                    let paints = match op {
+                        IrOp::NativeDecoratedTextGen { decoration, .. } => {
+                            vec![photonic_render::caption_decoration::CaptionPaint {
+                                decoration: decoration.clone(),
+                                word_opacity: Vec::new(),
+                                opacity: 1.0,
+                                underlines: Vec::new(),
+                                sweeps: Vec::new(),
+                            }]
+                        }
+                        _ => Vec::new(),
+                    };
+                    if let Err(error) = self.composite_managed_cues(
+                        &temp,
+                        std::slice::from_ref(cue),
+                        &paints,
+                        logical_w,
+                        logical_h,
+                    ) {
+                        tracing::warn!("native title render failed: {error}");
+                        self.frame_failed = true;
+                        return;
+                    }
+                }
+                let rows = crate::color::native::linear_srgb_to_ap1()
+                    .0
+                    .map(|row| row.map(|v| v as f32));
+                if self
+                    .grade_mix
+                    .as_ref()
+                    .expect("title matrix initialized")
+                    .native_linear_matrix_into(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &temp,
+                        target,
+                        rows,
+                    )
+                    .is_err()
+                {
+                    self.frame_failed = true;
+                }
+            }
+            IrOp::NativeCaptionOutput {
+                cue_batch,
+                video,
+                paints,
+            } => {
+                let Some(src) = inputs.first() else {
+                    self.frame_failed = true;
+                    return;
+                };
+                let pass = self
+                    .native_caption
+                    .as_ref()
+                    .expect("caption transfer initialized");
+                let temp = self.gpu.device().create_texture(&wgpu::TextureDescriptor {
+                    label: Some("native-caption-display-linear"),
+                    size: target.size(),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: WORKING_FORMAT,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                let result = pass
+                    .apply_into(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        &src.texture,
+                        &temp,
+                        *video,
+                        false,
+                    )
+                    .map_err(str::to_string)
+                    .and_then(|_| {
+                        self.composite_managed_cues(
+                            &temp,
+                            &cue_batch.cues,
+                            paints,
+                            logical_w,
+                            logical_h,
+                        )
+                    })
+                    .and_then(|_| {
+                        pass.apply_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &temp,
+                            target,
+                            *video,
+                            true,
+                        )
+                        .map_err(str::to_string)
+                    });
+                if let Err(error) = result {
+                    tracing::warn!("native captions failed: {error}");
+                    self.frame_failed = true;
+                }
+            }
             IrOp::TextGen { block } => {
                 self.passes.fill(&self.gpu, target, [0.0; 4]);
                 if let Some(cue) = &block.cue {
@@ -1689,6 +2602,55 @@ impl Evaluator {
                     self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]);
                 }
             }
+            IrOp::NativeTonalExposure { tonal } => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 1
+                    || pass
+                        .native_tonal_exposure_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            target,
+                            *tonal,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0; 4]);
+                }
+            }
+            IrOp::NativeRgbMatrix { rows } => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 1
+                    || pass
+                        .native_linear_matrix_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            target,
+                            *rows,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0; 4]);
+                }
+            }
+            IrOp::NativeMatteCdl { cdl } => {
+                let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
+                if inputs.len() != 2
+                    || pass
+                        .native_matte_cdl_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &inputs[0].texture,
+                            &inputs[1].texture,
+                            target,
+                            *cdl,
+                        )
+                        .is_err()
+                {
+                    self.passes.fill(&self.gpu, target, [0.0; 4]);
+                }
+            }
             IrOp::GradeMatteApply => {
                 let pass = self.grade_mix.as_ref().expect("grade mixer initialized");
                 if inputs.len() != 3
@@ -1739,6 +2701,565 @@ impl Evaluator {
                     );
                     self.passes.blit(&self.gpu, &graded, target);
                 }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLumaWipe {
+                kind,
+                softness,
+                invert,
+                t,
+            } => match (inputs.first(), inputs.get(1)) {
+                (Some(incoming), Some(outgoing)) => self.passes.luma_wipe(
+                    &self.gpu,
+                    &incoming.texture,
+                    &outgoing.texture,
+                    *kind,
+                    *softness,
+                    *invert,
+                    super::luma_wipe::native_edge(*t, *softness),
+                    target,
+                    logical_w,
+                    logical_h,
+                ),
+                _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeDissolve { t } => match (inputs.first(), inputs.get(1)) {
+                (Some(incoming), Some(outgoing)) => self.passes.merge_mode(
+                    &self.gpu,
+                    &incoming.texture,
+                    &outgoing.texture,
+                    u32::MAX,
+                    *t,
+                    target,
+                ),
+                _ => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeCanvas { .. } => match inputs.first() {
+                Some(src) => self.passes.blit(&self.gpu, &src.texture, target),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLumaKey {
+                threshold,
+                softness,
+                invert,
+            } => match inputs.first() {
+                Some(src) => {
+                    let u = [
+                        *threshold,
+                        *threshold + softness.max(crate::graph::ops::KEY_BAND_EPS),
+                        if *invert { 1.0 } else { 0.0 },
+                        0.0,
+                        logical_w as f32,
+                        logical_h as f32,
+                        0.0,
+                        0.0,
+                    ];
+                    self.passes.run_filter(
+                        &self.gpu,
+                        &self.passes.native_luma_key_pipeline,
+                        &src.texture,
+                        target,
+                        &u,
+                    );
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeChromaKey {
+                key,
+                tolerance,
+                softness,
+                spill,
+            } => match inputs.first() {
+                Some(src) => {
+                    let dom = if key[0] >= key[1] && key[0] >= key[2] {
+                        0.0
+                    } else if key[1] >= key[2] {
+                        1.0
+                    } else {
+                        2.0
+                    };
+                    let u = [
+                        key[0],
+                        key[1],
+                        key[2],
+                        *tolerance,
+                        *tolerance + softness.max(crate::graph::ops::KEY_BAND_EPS),
+                        *spill,
+                        dom,
+                        0.0,
+                        logical_w as f32,
+                        logical_h as f32,
+                        0.0,
+                        0.0,
+                    ];
+                    self.passes.run_filter(
+                        &self.gpu,
+                        &self.passes.native_chroma_key_pipeline,
+                        &src.texture,
+                        target,
+                        &u,
+                    );
+                }
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeGlow {
+                sigma,
+                threshold,
+                intensity,
+                tint,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_glow(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *sigma,
+                    *threshold,
+                    *intensity,
+                    *tint,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeMaskShape {
+                rect,
+                center,
+                size,
+                rotation,
+                feather,
+            } => self.passes.native_mask_shape(
+                &self.gpu, target, *rect, *center, *size, *rotation, *feather, logical_w, logical_h,
+            ),
+            IrOp::NativePolygonMask {
+                vertices,
+                center,
+                size,
+                rotation,
+                feather,
+            } => self.passes.native_polygon_mask(
+                &self.gpu, target, vertices, *center, *size, *rotation, *feather, logical_w,
+                logical_h,
+            ),
+            IrOp::NativeDenoise {
+                strength,
+                spatial_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_denoise(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *strength,
+                    *spatial_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeGrain {
+                amount,
+                monochrome,
+                seed,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.run_filter(
+                    &self.gpu,
+                    &self.passes.native_grain_pipeline,
+                    &src.texture,
+                    target,
+                    &[
+                        *amount,
+                        f32::from_bits(u32::from(*monochrome)),
+                        f32::from_bits(*seed),
+                        0.0,
+                        logical_w as f32,
+                        logical_h as f32,
+                        pixel_scale[0],
+                        pixel_scale[1],
+                    ],
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeVignette { amount, feather } => match inputs.first() {
+                Some(src) => self.passes.vignette(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *amount,
+                    feather.max(1e-4),
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeChannelExtract { .. }
+            | IrOp::NativeImageToMask
+            | IrOp::NativeMaskToImage
+            | IrOp::NativeChannelCombine => {
+                let mode = match op {
+                    IrOp::NativeChannelExtract { channel } => *channel as u32,
+                    IrOp::NativeImageToMask => 4,
+                    IrOp::NativeMaskToImage => 5,
+                    _ => 6,
+                };
+                if let Some(first) = inputs.first() {
+                    let textures =
+                        std::array::from_fn(|i| &*inputs.get(i).unwrap_or(first).texture);
+                    self.passes.native_channels.apply(
+                        self.gpu.device(),
+                        self.gpu.queue(),
+                        textures,
+                        target,
+                        (logical_w, logical_h),
+                        mode,
+                    );
+                } else {
+                    self.passes.fill(&self.gpu, target, [0.; 4]);
+                }
+            }
+            IrOp::NativeInvert => match inputs.first() {
+                Some(src) => self.passes.invert(&self.gpu, &src.texture, target),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeUnsharp { amount, sigma } => match inputs.first() {
+                Some(src) => self.passes.native_unsharp(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *amount,
+                    *sigma,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeOutline {
+                thickness,
+                color,
+                opacity,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_outline(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *thickness,
+                    *color,
+                    *opacity,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLinearHsl { vibrance, controls } => match inputs.first() {
+                Some(src) => self.passes.native_linear_hsl(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *vibrance,
+                    *controls,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeSurfaceBlur {
+                radius,
+                threshold,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_surface_blur(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *radius,
+                    *threshold,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeLensBlur {
+                radius,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_lens_blur(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *radius,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeRankFilter {
+                kind,
+                radius,
+                threshold,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_rank_filter(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *kind,
+                    *radius,
+                    *threshold,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeDeflicker { gain, band } => match inputs.first() {
+                Some(src) => self.passes.native_deflicker(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *gain,
+                    *band,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeUnpremultiply => match inputs.first() {
+                Some(src) => self.passes.native_unpremultiply(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeAlphaView { mode } => match inputs.first() {
+                Some(src) => self.passes.native_alpha_view(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *mode,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeTransferLevels {
+                black_white,
+                gamma,
+                output,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_levels(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *black_white,
+                    *gamma,
+                    *output,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeTransferCurves { knots, contrast } => match inputs.first() {
+                Some(src) => self.passes.native_transfer_curves(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *knots,
+                    *contrast,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeColorBalance { shifts, preserve } => match inputs.first() {
+                Some(src) => self.passes.native_color_balance(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *shifts,
+                    *preserve,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativePhotoFilter {
+                color,
+                density,
+                preserve,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_photo_filter(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *color,
+                    *density,
+                    *preserve,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeTransferMatrix { matrix } => match inputs.first() {
+                Some(src) => self.passes.native_transfer_matrix(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *matrix,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeTransferArtistic { kind, parameter } => match inputs.first() {
+                Some(src) => self.passes.native_transfer_artistic(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *kind,
+                    *parameter,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeDropShadow {
+                offset,
+                radius,
+                color,
+                opacity,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_drop_shadow(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *offset,
+                    *radius,
+                    *color,
+                    *opacity,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativePerspective { inverse } => match inputs.first() {
+                Some(src) => self.passes.native_perspective(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    inverse,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeStylize {
+                kind,
+                amount,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_stylize(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *kind,
+                    *amount,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeDetail {
+                kind,
+                amount,
+                sigma,
+                threshold,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_detail(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *kind,
+                    *amount,
+                    *sigma,
+                    *threshold,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeGeometricWarp {
+                kind,
+                amount,
+                wavelength,
+                pixel_scale,
+            } => match inputs.first() {
+                Some(src) => self.passes.native_geometric_warp(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *kind,
+                    *amount,
+                    *wavelength,
+                    *pixel_scale,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeBoxBlur { radius } => match inputs.first() {
+                Some(src) => self.passes.native_box_blur(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *radius,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeMosaic { block } => match inputs.first() {
+                Some(src) => self.passes.native_mosaic(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *block,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeMotionBlur { delta } => match inputs.first() {
+                Some(src) => self.passes.native_motion_blur(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *delta,
+                    logical_w,
+                    logical_h,
+                ),
+                None => self.passes.fill(&self.gpu, target, [0.0; 4]),
+            },
+            IrOp::NativeGaussianBlur { sigma } => match inputs.first() {
+                Some(src) => self.passes.gaussian_blur_planned(
+                    &self.gpu,
+                    &src.texture,
+                    target,
+                    *sigma,
+                    logical_w,
+                    logical_h,
+                    true,
+                ),
                 None => self.passes.fill(&self.gpu, target, [0.0; 4]),
             },
             IrOp::NativeExposure { stops } => match inputs.first() {
@@ -1801,6 +3322,35 @@ impl Evaluator {
                 }
                 None => self.passes.fill(&self.gpu, target, [0.0; 4]),
             },
+            IrOp::BezierMatte { window } => {
+                if let Err(error) = self
+                    .passes
+                    .bezier_matte(&self.gpu, target, window, logical_w, logical_h)
+                {
+                    self.frame_failed = true;
+                    self.computation_errors.push(error.into());
+                    self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]);
+                }
+            }
+            IrOp::WindowMatte { mask } => {
+                let ok = inputs.first().is_some_and(|source| {
+                    self.native_mask
+                        .as_ref()
+                        .expect("window pipeline initialized")
+                        .matte_into(
+                            self.gpu.device(),
+                            self.gpu.queue(),
+                            &source.texture,
+                            target,
+                            mask,
+                            (logical_w, logical_h),
+                        )
+                        .is_ok()
+                });
+                if !ok {
+                    self.passes.fill(&self.gpu, target, [0.0, 0.0, 0.0, 1.0]);
+                }
+            }
             IrOp::NativeMaskMix { mask } => {
                 if let [corrected, original] = inputs {
                     if self
@@ -1840,7 +3390,9 @@ impl Evaluator {
                 }
                 None => self.passes.fill(&self.gpu, target, [0.0; 4]),
             },
-            IrOp::NativeDecodeStill { .. } => match inputs.first() {
+            IrOp::NativeDecodeStill { .. }
+            | IrOp::NativeMediaStill { .. }
+            | IrOp::NativeRasterVector { .. } => match inputs.first() {
                 Some(src) => {
                     if self
                         .native_exposure
@@ -1849,6 +3401,7 @@ impl Evaluator {
                         .apply_still_into(self.gpu.device(), self.gpu.queue(), &src.texture, target)
                         .is_err()
                     {
+                        self.frame_failed = true;
                         self.passes.fill(&self.gpu, target, [0.0; 4]);
                     }
                 }
@@ -2046,6 +3599,7 @@ fn op_size(op: &IrOp, cw: u32, ch: u32) -> (u32, u32) {
 // ── Render pipelines ──────────────────────────────────────────────────────────
 
 struct Passes {
+    native_channels: super::native_channels::ChannelPass,
     fill_pipeline: wgpu::RenderPipeline,
     fill_bgl: wgpu::BindGroupLayout,
     blit_pipeline: wgpu::RenderPipeline,
@@ -2066,6 +3620,8 @@ struct Passes {
     /// + a params uniform), the WGSL twins of `ops::luma_key`/`ops::chroma_key`.
     filter_bgl: wgpu::BindGroupLayout,
     luma_key_pipeline: wgpu::RenderPipeline,
+    native_luma_key_pipeline: wgpu::RenderPipeline,
+    native_chroma_key_pipeline: wgpu::RenderPipeline,
     chroma_key_pipeline: wgpu::RenderPipeline,
     /// Separable Gaussian blur (K-0.2): tex + sampler + `BlurParams` uniform.
     /// Shared by `Effect{Blur}` and the blur half of Sharpen/Glow. Algorithm
@@ -2075,6 +3631,8 @@ struct Passes {
     /// Unsharp combine (K-0.2): two textures (src, blurred) + amount uniform.
     sharpen_bgl: wgpu::BindGroupLayout,
     sharpen_pipeline: wgpu::RenderPipeline,
+    native_detail_pipeline: wgpu::RenderPipeline,
+    native_unsharp_pipeline: wgpu::RenderPipeline,
     /// High-pass combine (K-B16): `src - blurred` on RGB (reuses sharpen BGL).
     high_pass_pipeline: wgpu::RenderPipeline,
     /// Emboss / find-edges / median neighbourhood BGL (tex + logical-dim uniform).
@@ -2091,6 +3649,30 @@ struct Passes {
     vignette_pipeline: wgpu::RenderPipeline,
     mosaic_pipeline: wgpu::RenderPipeline,
     motion_blur_pipeline: wgpu::RenderPipeline,
+    native_motion_blur_pipeline: wgpu::RenderPipeline,
+    native_transfer_curves_pipeline: wgpu::RenderPipeline,
+    native_color_balance_pipeline: wgpu::RenderPipeline,
+    native_outline_seed_pipeline: wgpu::RenderPipeline,
+    native_outline_composite_pipeline: wgpu::RenderPipeline,
+    native_linear_hsl_pipeline: wgpu::RenderPipeline,
+    native_surface_blur_pipeline: wgpu::RenderPipeline,
+    native_lens_blur_pipeline: wgpu::RenderPipeline,
+    native_rank_pipelines: [std::sync::OnceLock<wgpu::RenderPipeline>; 6],
+    native_deflicker_pipeline: wgpu::RenderPipeline,
+    native_unpremultiply_pipeline: wgpu::RenderPipeline,
+    native_alpha_view_pipeline: wgpu::RenderPipeline,
+    native_levels_pipeline: wgpu::RenderPipeline,
+    native_photo_filter_pipeline: wgpu::RenderPipeline,
+    native_transfer_matrix_pipeline: wgpu::RenderPipeline,
+    native_transfer_artistic_pipeline: wgpu::RenderPipeline,
+    native_shadow_shift_pipeline: wgpu::RenderPipeline,
+    native_shadow_composite_pipeline: wgpu::RenderPipeline,
+    native_perspective_pipeline: wgpu::RenderPipeline,
+    native_stylize_pipeline: wgpu::RenderPipeline,
+    native_geometric_warp_pipeline: wgpu::RenderPipeline,
+    native_box_blur_pipeline: wgpu::RenderPipeline,
+    native_mosaic_reduce_pipeline: wgpu::RenderPipeline,
+    native_mosaic_expand_pipeline: wgpu::RenderPipeline,
     hue_sat_pipeline: wgpu::RenderPipeline,
     vibrance_pipeline: wgpu::RenderPipeline,
     channel_mixer_pipeline: wgpu::RenderPipeline,
@@ -2103,6 +3685,8 @@ struct Passes {
     ripple_pipeline: wgpu::RenderPipeline,
     perspective_pipeline: wgpu::RenderPipeline,
     grain_pipeline: wgpu::RenderPipeline,
+    native_grain_pipeline: wgpu::RenderPipeline,
+    native_denoise_pipeline: wgpu::RenderPipeline,
     ca_pipeline: wgpu::RenderPipeline,
     unpremultiply_pipeline: wgpu::RenderPipeline,
     alpha_view_pipeline: wgpu::RenderPipeline,
@@ -2111,12 +3695,17 @@ struct Passes {
     util2_bgl: wgpu::BindGroupLayout,
     /// Glow extract (K-0.2): keep pixels whose straight luma ≥ threshold.
     glow_extract_pipeline: wgpu::RenderPipeline,
+    native_glow_extract_pipeline: wgpu::RenderPipeline,
+    native_glow_comp_pipeline: wgpu::RenderPipeline,
     /// Glow composite (K-0.2): screen-add tinted glow over source.
     glow_comp_bgl: wgpu::BindGroupLayout,
     glow_comp_pipeline: wgpu::RenderPipeline,
     /// `Effect{MaskShapeGen}` (08 §3): a 0-input generator, uniform-only BGL.
     mask_bgl: wgpu::BindGroupLayout,
     mask_shape_pipeline: wgpu::RenderPipeline,
+    native_mask_shape_pipeline: wgpu::RenderPipeline,
+    native_polygon_mask_pipeline: wgpu::RenderPipeline,
+    bezier_matte_pipeline: wgpu::RenderPipeline,
     merge_pipeline: wgpu::RenderPipeline,
     merge_bgl: wgpu::BindGroupLayout,
     /// `WipeMix` (08 §2.0b): binary directional smoothstep wipe. Reuses the merge
@@ -2416,6 +4005,27 @@ fn undistort_theta(td: f32) -> f32 {{\n\
             "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\n@group(0) @binding(1) var s: sampler;\nstruct LK {{ p: vec4<f32> }}\n@group(0) @binding(2) var<uniform> u: LK;\n@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {{\n  let c = textureSample(t, s, i.uv);\n  var straight = vec3<f32>(0.0);\n  if (c.a > 1e-6) {{ straight = c.rgb / c.a; }}\n  let luma = 0.2126 * straight.r + 0.7152 * straight.g + 0.0722 * straight.b;\n  var keep = smoothstep(u.p.x, u.p.y, luma);\n  if (u.p.z > 0.5) {{ keep = 1.0 - keep; }}\n  return c * keep;\n}}\n"
         );
         let luma_key_pipeline = make_pipeline(device, &filter_bgl, &luma_key_src, "fs");
+        // Native kernel uses logical texel coordinates rather than bucket-sized UVs.
+        let native_luma_key_src = format!(
+            "{QUAD_VS}\n{}",
+            r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+struct LK { p: vec4<f32>, dims: vec4<f32> }
+@group(0) @binding(2) var<uniform> u: LK;
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    if (pos.x >= u.dims.x || pos.y >= u.dims.y) { return vec4<f32>(0.0); }
+    let c = textureLoad(t, vec2<i32>(pos.xy), 0);
+    var straight = vec3<f32>(0.0);
+    if (c.a > 1e-6) { straight = c.rgb / c.a; }
+    let y = dot(straight, vec3<f32>(0.27222872, 0.67408174, 0.053689517));
+    var keep = smoothstep(u.p.x, u.p.y, y);
+    if (u.p.z > 0.5) { keep = 1.0 - keep; }
+    return c * keep;
+}
+"#
+        );
+        let native_luma_key_pipeline =
+            make_pipeline(device, &filter_bgl, &native_luma_key_src, "fs");
 
         // ChromaKey (08 §3): key out colours near `key`, feather the matte edge,
         // suppress spill on the dominant key channel. `key = [r,g,b,tolerance]`,
@@ -2424,6 +4034,28 @@ fn undistort_theta(td: f32) -> f32 {{\n\
             "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\n@group(0) @binding(1) var s: sampler;\nstruct CK {{ key: vec4<f32>, aux: vec4<f32> }}\n@group(0) @binding(2) var<uniform> u: CK;\n@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {{\n  let c = textureSample(t, s, i.uv);\n  var straight = vec3<f32>(0.0);\n  if (c.a > 1e-6) {{ straight = c.rgb / c.a; }}\n  let dist = length(straight - u.key.xyz);\n  let keep = smoothstep(u.key.w, u.aux.x, dist);\n  var col = straight;\n  let spill = u.aux.y;\n  let dom = i32(u.aux.z + 0.5);\n  if (dom == 0) {{ let m = 0.5 * (col.g + col.b); if (col.r > m) {{ col.r = col.r + (m - col.r) * spill; }} }}\n  else if (dom == 1) {{ let m = 0.5 * (col.r + col.b); if (col.g > m) {{ col.g = col.g + (m - col.g) * spill; }} }}\n  else {{ let m = 0.5 * (col.r + col.g); if (col.b > m) {{ col.b = col.b + (m - col.b) * spill; }} }}\n  let a = c.a * keep;\n  return vec4<f32>(col * a, a);\n}}\n"
         );
         let chroma_key_pipeline = make_pipeline(device, &filter_bgl, &chroma_key_src, "fs");
+        let native_chroma_key_src = format!(
+            "{QUAD_VS}\n{}",
+            r#"
+@group(0) @binding(0) var t: texture_2d<f32>;
+struct CK { key: vec4<f32>, aux: vec4<f32>, dims: vec4<f32> }
+@group(0) @binding(2) var<uniform> u: CK;
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    if (pos.x >= u.dims.x || pos.y >= u.dims.y) { return vec4<f32>(0.0); }
+    let c = textureLoad(t, vec2<i32>(pos.xy), 0);
+    var straight = vec3<f32>(0.0);
+    if (c.a > 1e-6) { straight = c.rgb / c.a; }
+    let keep = smoothstep(u.key.w, u.aux.x, length(straight-u.key.xyz));
+    let dom = i32(u.aux.z);
+    let mean = 0.5 * (straight[(dom+1)%3] + straight[(dom+2)%3]);
+    if (straight[dom] > mean) { straight[dom] += (mean-straight[dom])*u.aux.y; }
+    let alpha = c.a*keep;
+    return vec4<f32>(straight*alpha, alpha);
+}
+"#
+        );
+        let native_chroma_key_pipeline =
+            make_pipeline(device, &filter_bgl, &native_chroma_key_src, "fs");
 
         // Deflicker (`color.deflicker`): per-channel gain applied to sRGB-ENCODED
         // straight colour, with a highlight rolloff so a brightening gain cannot
@@ -2444,7 +4076,7 @@ fn undistort_theta(td: f32) -> f32 {{\n\
             entries: &[tex_entry(0), uniform_entry(1)],
         });
         let blur_src = format!(
-            "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\nstruct BlurP {{ info: vec4<f32> }}\n@group(0) @binding(1) var<uniform> p: BlurP;\nfn at(px: i32, py: i32) -> vec4<f32> {{\n  let hi = vec2<i32>(i32(p.info.z), i32(p.info.w)) - vec2<i32>(1);\n  return textureLoad(t, clamp(vec2<i32>(px, py), vec2<i32>(0), hi), 0);\n}}\n@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n  let lw = p.info.z; let lh = p.info.w;\n  if (pos.x >= lw || pos.y >= lh) {{ return vec4<f32>(0.0); }}\n  let sigma = p.info.x;\n  let x = i32(pos.x); let y = i32(pos.y);\n  if (sigma < 0.5) {{ return at(x, y); }}\n  let radius = min(i32(ceil(sigma * 3.0)), 128);\n  var acc = vec4<f32>(0.0);\n  var w_total = 0.0;\n  let horiz = p.info.y > 0.5;\n  for (var k = -radius; k <= radius; k++) {{\n    let fi = f32(k);\n    let w = exp(-fi * fi / (2.0 * sigma * sigma));\n    var sx = x; var sy = y;\n    if (horiz) {{ sx = x + k; }} else {{ sy = y + k; }}\n    acc += at(sx, sy) * w;\n    w_total += w;\n  }}\n  return acc / w_total;\n}}\n"
+            "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\nstruct BlurP {{ info: vec4<f32>, spacing: vec4<f32> }}\n@group(0) @binding(1) var<uniform> p: BlurP;\nfn at(px: i32, py: i32) -> vec4<f32> {{\n  let hi = vec2<i32>(i32(p.info.z), i32(p.info.w)) - vec2<i32>(1);\n  return textureLoad(t, clamp(vec2<i32>(px, py), vec2<i32>(0), hi), 0);\n}}\n@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n  let lw = p.info.z; let lh = p.info.w;\n  if (pos.x >= lw || pos.y >= lh) {{ return vec4<f32>(0.0); }}\n  let sigma = p.info.x;\n  let x = i32(pos.x); let y = i32(pos.y);\n  if (sigma < 0.5) {{ return at(x, y); }}\n  let step = max(p.spacing.x, 1.0);\n  let radius = min(i32(ceil(ceil(sigma * 3.0) / step)), 128);\n  var acc = vec4<f32>(0.0);\n  var w_total = 0.0;\n  let horiz = p.info.y > 0.5;\n  for (var k = -radius; k <= radius; k++) {{\n    let fi = f32(k) * step;\n    let w = exp(-fi * fi / (2.0 * sigma * sigma));\n    var sx = x; var sy = y;\n    if (horiz) {{ sx = x + i32(round(fi)); }} else {{ sy = y + i32(round(fi)); }}\n    acc += at(sx, sy) * w;\n    w_total += w;\n  }}\n  return acc / w_total;\n}}\n"
         );
         let blur_pipeline = make_pipeline(device, &blur_bgl, &blur_src, "fs");
 
@@ -2462,6 +4094,34 @@ fn undistort_theta(td: f32) -> f32 {{\n\
             "{QUAD_VS}\n@group(0) @binding(0) var t_src: texture_2d<f32>;\n@group(0) @binding(1) var t_blur: texture_2d<f32>;\n@group(0) @binding(2) var s: sampler;\nstruct S {{ amount: vec4<f32> }}\n@group(0) @binding(3) var<uniform> u: S;\n@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {{\n  let src = textureSample(t_src, s, i.uv);\n  let bl = textureSample(t_blur, s, i.uv);\n  return src + u.amount.x * (src - bl);\n}}\n"
         );
         let sharpen_pipeline = make_pipeline(device, &sharpen_bgl, &sharpen_src, "fs");
+        let native_shadow_composite_src = format!(
+            "{QUAD_VS}\n{}",
+            include_str!("native_shadow_composite.wgsl")
+        );
+        let native_shadow_composite_pipeline =
+            make_pipeline(device, &sharpen_bgl, &native_shadow_composite_src, "fs");
+        let native_detail_src = format!("{QUAD_VS}\n{}", include_str!("native_detail.wgsl"));
+        let native_detail_pipeline = make_pipeline(device, &sharpen_bgl, &native_detail_src, "fs");
+        let native_unsharp_src = format!(
+            r#"{QUAD_VS}
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@group(0) @binding(1) var low_tex: texture_2d<f32>;
+@group(0) @binding(2) var s: sampler;
+struct Params {{ v: vec4<f32> }}
+@group(0) @binding(3) var<uniform> p: Params;
+@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{
+    if (pos.x>=p.v.y || pos.y>=p.v.z) {{ return vec4<f32>(0.0); }}
+    let xy=vec2<i32>(pos.xy);
+    let src=textureLoad(src_tex,xy,0);
+    if (src.a<=0.0) {{ return vec4<f32>(0.0); }}
+    let low=textureLoad(low_tex,xy,0);
+    if (low.a<=1e-8) {{ return src; }}
+    return vec4<f32>(src.rgb+p.v.x*(src.rgb-low.rgb*(src.a/low.a)),src.a);
+}}
+"#
+        );
+        let native_unsharp_pipeline =
+            make_pipeline(device, &sharpen_bgl, &native_unsharp_src, "fs");
 
         // High-pass: src − blurred on RGB, keep src alpha (K-B16).
         let high_pass_src = format!(
@@ -2530,6 +4190,84 @@ fn undistort_theta(td: f32) -> f32 {{\n\
             "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\nstruct P {{ info: vec4<f32> }}\n@group(0) @binding(1) var<uniform> p: P;\nfn at(px: i32, py: i32) -> vec4<f32> {{\n  let hi = vec2<i32>(i32(p.info.z), i32(p.info.w)) - vec2<i32>(1);\n  return textureLoad(t, clamp(vec2<i32>(px, py), vec2<i32>(0), hi), 0);\n}}\n@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n  let lw = p.info.z; let lh = p.info.w;\n  if (pos.x >= lw || pos.y >= lh) {{ return vec4<f32>(0.0); }}\n  let dist = max(i32(p.info.y + 0.5), 0);\n  let x = i32(pos.x); let y = i32(pos.y);\n  if (dist < 1) {{ return at(x, y); }}\n  let n = dist;\n  let half = f32(n - 1) * 0.5;\n  let dx = cos(p.info.x); let dy = sin(p.info.x);\n  var acc = vec4<f32>(0.0);\n  for (var i = 0; i < n; i++) {{\n    let t = f32(i) - half;\n    let sx = i32(round(f32(x) + dx * t));\n    let sy = i32(round(f32(y) + dy * t));\n    acc += at(sx, sy);\n  }}\n  return acc / f32(n);\n}}\n"
         );
         let motion_blur_pipeline = make_pipeline(device, &blur_bgl, &motion_blur_src, "fs");
+        let native_transfer_curves_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_transfer_curves.wgsl"));
+        let native_transfer_curves_pipeline =
+            make_pipeline(device, &blur_bgl, &native_transfer_curves_src, "fs");
+        let native_color_balance_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_color_balance.wgsl"));
+        let native_color_balance_pipeline =
+            make_pipeline(device, &blur_bgl, &native_color_balance_src, "fs");
+        let native_outline_seed_src =
+            [QUAD_VS, include_str!("native_outline_seed.wgsl")].join("\n");
+        let native_outline_seed_pipeline =
+            make_pipeline(device, &blur_bgl, &native_outline_seed_src, "fs");
+        let native_outline_composite_src =
+            [QUAD_VS, include_str!("native_outline_composite.wgsl")].join("\n");
+        let native_outline_composite_pipeline =
+            make_pipeline(device, &sharpen_bgl, &native_outline_composite_src, "fs");
+        let native_linear_hsl_src = [QUAD_VS, include_str!("native_linear_hsl.wgsl")].join("\n");
+        let native_linear_hsl_pipeline =
+            make_pipeline(device, &blur_bgl, &native_linear_hsl_src, "fs");
+        let native_surface_blur_src =
+            [QUAD_VS, include_str!("native_surface_blur.wgsl")].join("\n");
+        let native_surface_blur_pipeline =
+            make_pipeline(device, &blur_bgl, &native_surface_blur_src, "fs");
+        let native_lens_blur_src = [QUAD_VS, include_str!("native_lens_blur.wgsl")].join("\n");
+        let native_lens_blur_pipeline =
+            make_pipeline(device, &blur_bgl, &native_lens_blur_src, "fs");
+        let native_deflicker_src = [QUAD_VS, include_str!("native_deflicker.wgsl")].join("\n");
+        let native_deflicker_pipeline =
+            make_pipeline(device, &blur_bgl, &native_deflicker_src, "fs");
+        let native_unpremultiply_src =
+            [QUAD_VS, include_str!("native_unpremultiply.wgsl")].join("\n");
+        let native_unpremultiply_pipeline =
+            make_pipeline(device, &blur_bgl, &native_unpremultiply_src, "fs");
+        let native_alpha_view_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_alpha_view.wgsl"));
+        let native_alpha_view_pipeline =
+            make_pipeline(device, &blur_bgl, &native_alpha_view_src, "fs");
+        let native_levels_src = format!("{QUAD_VS}\n{}", include_str!("native_levels.wgsl"));
+        let native_levels_pipeline = make_pipeline(device, &blur_bgl, &native_levels_src, "fs");
+        let native_photo_filter_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_photo_filter.wgsl"));
+        let native_photo_filter_pipeline =
+            make_pipeline(device, &blur_bgl, &native_photo_filter_src, "fs");
+        let native_transfer_matrix_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_transfer_matrix.wgsl"));
+        let native_transfer_matrix_pipeline =
+            make_pipeline(device, &blur_bgl, &native_transfer_matrix_src, "fs");
+        let native_transfer_artistic_src = format!(
+            "{QUAD_VS}\n{}",
+            include_str!("native_transfer_artistic.wgsl")
+        );
+        let native_transfer_artistic_pipeline =
+            make_pipeline(device, &blur_bgl, &native_transfer_artistic_src, "fs");
+        let native_shadow_shift_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_shadow_shift.wgsl"));
+        let native_shadow_shift_pipeline =
+            make_pipeline(device, &blur_bgl, &native_shadow_shift_src, "fs");
+        let native_perspective_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_perspective.wgsl"));
+        let native_perspective_pipeline =
+            make_pipeline(device, &blur_bgl, &native_perspective_src, "fs");
+        let native_stylize_src = format!("{QUAD_VS}\n{}", include_str!("native_stylize.wgsl"));
+        let native_stylize_pipeline = make_pipeline(device, &blur_bgl, &native_stylize_src, "fs");
+        let native_geometric_warp_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_geometric_warp.wgsl"));
+        let native_geometric_warp_pipeline =
+            make_pipeline(device, &blur_bgl, &native_geometric_warp_src, "fs");
+        let native_box_blur_src = format!("{QUAD_VS}\n{}", include_str!("native_box_blur.wgsl"));
+        let native_box_blur_pipeline = make_pipeline(device, &blur_bgl, &native_box_blur_src, "fs");
+        let native_mosaic_src = format!("{QUAD_VS}\n{}", include_str!("native_mosaic.wgsl"));
+        let native_mosaic_reduce_pipeline =
+            make_pipeline(device, &blur_bgl, &native_mosaic_src, "reduce");
+        let native_mosaic_expand_pipeline =
+            make_pipeline(device, &blur_bgl, &native_mosaic_src, "expand");
+        let native_motion_blur_src =
+            format!("{QUAD_VS}\n{}", include_str!("native_motion_blur.wgsl"));
+        let native_motion_blur_pipeline =
+            make_pipeline(device, &blur_bgl, &native_motion_blur_src, "fs");
 
         // Hue/saturation: p = [hue_deg, sat, lightness, pad]
         let hue_sat_src = format!(
@@ -2607,6 +4345,66 @@ fn undistort_theta(td: f32) -> f32 {{\n\
             "{QUAD_VS}\n@group(0) @binding(0) var t: texture_2d<f32>;\n@group(0) @binding(1) var s: sampler;\nstruct P {{ p: vec4<f32> }}\n@group(0) @binding(2) var<uniform> u: P;\nfn hash21(p: vec2<f32>) -> f32 {{\n  var p3 = fract(vec3<f32>(p.xyx) * 0.1031 + u.p.z * 0.017);\n  p3 += dot(p3, p3.yzx + 33.33);\n  return fract((p3.x + p3.y) * p3.z) * 2.0 - 1.0;\n}}\n@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {{\n  let c = textureSample(t, s, i.uv);\n  let amt = clamp(u.p.x, 0.0, 1.0);\n  if (amt < 1e-6) {{ return c; }}\n  let px = i.uv * 1024.0;\n  if (u.p.y > 0.5) {{\n    let n = hash21(px) * amt;\n    return vec4<f32>(c.rgb + vec3<f32>(n, n, n) * c.a, c.a);\n  }}\n  let nr = hash21(px) * amt;\n  let ng = hash21(px + vec2<f32>(17.0, 0.0)) * amt;\n  let nb = hash21(px + vec2<f32>(0.0, 31.0)) * amt;\n  return vec4<f32>(c.r + nr * c.a, c.g + ng * c.a, c.b + nb * c.a, c.a);\n}}\n"
         );
         let grain_pipeline = make_pipeline(device, &filter_bgl, &grain_src, "fs");
+
+        let native_grain_src = [
+            QUAD_VS,
+            r#"
+@group(0) @binding(0) var image: texture_2d<f32>;
+struct P { amount:f32, mono:u32, seed:u32, pad:u32, dims:vec4<f32> }
+@group(0) @binding(2) var<uniform> p:P;
+fn noise(x:u32,y:u32,c:u32)->f32 {
+    var h=p.seed ^ 0xa511e9b3u ^ (x*0x9e3779b9u) ^ (y*0x85ebca6bu) ^ (c*0xc2b2ae35u);
+    h=h^(h>>16u); h=h*0x7feb352du; h=h^(h>>15u); h=h*0x846ca68bu; h=h^(h>>16u);
+    return f32(h>>8u)*(2.0/16777215.0)-1.0;
+}
+@fragment fn fs(@builtin(position) pos:vec4<f32>)->@location(0) vec4<f32> {
+    if (pos.x>=p.dims.x || pos.y>=p.dims.y) { return vec4<f32>(0.0); }
+    let value=textureLoad(image,vec2<i32>(pos.xy),0);
+    if (p.amount==0.0 || value.a==0.0) { return value; }
+    let x=u32(floor(pos.x/p.dims.z)); let y=u32(floor(pos.y/p.dims.w));
+    var n=vec3<f32>(noise(x,y,0u));
+    if (p.mono==0u) { n=vec3<f32>(n.x,noise(x,y,1u),noise(x,y,2u)); }
+    return vec4<f32>(value.rgb+n*p.amount*value.a,value.a);
+}
+"#,
+        ]
+        .concat();
+        let native_grain_pipeline = make_pipeline(device, &filter_bgl, &native_grain_src, "fs");
+
+        let native_denoise_src = [
+            QUAD_VS,
+            r#"
+@group(0) @binding(0) var image:texture_2d<f32>;
+struct P {info:vec4<f32>}
+@group(0) @binding(1) var<uniform> p:P;
+fn at(x:i32,y:i32)->vec4<f32> {
+ return textureLoad(image,clamp(vec2<i32>(x,y),vec2<i32>(0),vec2<i32>(p.info.zw)-vec2<i32>(1)),0);
+}
+@fragment fn fs(@builtin(position) pos:vec4<f32>)->@location(0) vec4<f32> {
+ if (pos.x>=p.info.z || pos.y>=p.info.w) {return vec4<f32>(0.0);}
+ let x=i32(pos.x);let y=i32(pos.y);let center=at(x,y);
+ if (p.info.x==0.0) {return center;}
+ if (center.a<=0.0) {return vec4<f32>(0.0);}
+ let rgb=center.rgb/center.a;
+ let radius=i32(clamp(ceil(2.0*p.info.y),1.0,8.0));
+ let sigma_s=max((1.5+1.5*p.info.x)*p.info.y,0.0001);
+ let sigma_r=(10.0+70.0*p.info.x)/255.0;
+ var accum=vec3<f32>(0.0);var coverage=0.0;
+ for(var dy=-radius;dy<=radius;dy++) {for(var dx=-radius;dx<=radius;dx++) {
+   let sample=at(x+dx,y+dy);
+   if(sample.a>0.0) {
+     let delta=sample.rgb/sample.a-rgb;
+     let weight=exp(-f32(dx*dx+dy*dy)/(2.0*sigma_s*sigma_s)-dot(delta,delta)/(2.0*sigma_r*sigma_r));
+     accum+=sample.rgb*weight;coverage+=sample.a*weight;
+   }
+ }}
+ if(coverage>0.0) {return vec4<f32>(accum/coverage*center.a,center.a);}
+ return center;
+}
+"#,
+        ]
+        .concat();
+        let native_denoise_pipeline = make_pipeline(device, &blur_bgl, &native_denoise_src, "fs");
 
         // Chromatic aberration: info = [amount_px, 0, logical_w, logical_h]
         let ca_src = format!(
@@ -2720,6 +4518,42 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             "{QUAD_VS}\n@group(0) @binding(0) var t_src: texture_2d<f32>;\n@group(0) @binding(1) var t_glow: texture_2d<f32>;\n@group(0) @binding(2) var s: sampler;\nstruct GC {{ tint: vec4<f32>, intensity: vec4<f32> }}\n@group(0) @binding(3) var<uniform> u: GC;\n@fragment fn fs(i: VOut) -> @location(0) vec4<f32> {{\n  let src = textureSample(t_src, s, i.uv);\n  let g = textureSample(t_glow, s, i.uv);\n  let gr = g.r * u.tint.x * u.intensity.x;\n  let gg = g.g * u.tint.y * u.intensity.x;\n  let gb = g.b * u.tint.z * u.intensity.x;\n  let ga = clamp(g.a * u.intensity.x, 0.0, 1.0);\n  return vec4<f32>(\n    src.r + gr * max(1.0 - src.r, 0.0),\n    src.g + gg * max(1.0 - src.g, 0.0),\n    src.b + gb * max(1.0 - src.b, 0.0),\n    src.a + ga * (1.0 - src.a)\n  );\n}}\n"
         );
         let glow_comp_pipeline = make_pipeline(device, &glow_comp_bgl, &glow_comp_src, "fs");
+        let native_glow_extract_src = format!(
+            "{QUAD_VS}\n{}",
+            r#"
+@group(0) @binding(0) var t:texture_2d<f32>;
+struct P { p:vec4<f32> }
+@group(0) @binding(2) var<uniform> u:P;
+@fragment fn fs(@builtin(position) pos:vec4<f32>)->@location(0) vec4<f32> {
+    if(pos.x>=u.p.y || pos.y>=u.p.z){return vec4<f32>(0.0);}
+    let c=textureLoad(t,vec2<i32>(pos.xy),0);
+    var rgb=vec3<f32>(0.0); if(c.a>1e-6){rgb=c.rgb/c.a;}
+    let y=dot(rgb,vec3<f32>(0.27222872,0.67408174,0.053689517));
+    return c*select(0.0,1.0,y>=u.p.x);
+}
+"#
+        );
+        let native_glow_extract_pipeline =
+            make_pipeline(device, &filter_bgl, &native_glow_extract_src, "fs");
+        let native_glow_comp_src = format!(
+            "{QUAD_VS}\n{}",
+            r#"
+@group(0) @binding(0) var src:texture_2d<f32>;
+@group(0) @binding(1) var glow:texture_2d<f32>;
+struct P { tint:vec4<f32>, info:vec4<f32> }
+@group(0) @binding(3) var<uniform> u:P;
+@fragment fn fs(@builtin(position) pos:vec4<f32>)->@location(0) vec4<f32> {
+    if(pos.x>=u.info.y || pos.y>=u.info.z){return vec4<f32>(0.0);}
+    let s=textureLoad(src,vec2<i32>(pos.xy),0);
+    let g=textureLoad(glow,vec2<i32>(pos.xy),0);
+    let rgb=s.rgb+g.rgb*u.tint.rgb*u.info.x*max(vec3<f32>(1.0)-s.rgb,vec3<f32>(0.0));
+    let a=s.a+clamp(g.a*u.info.x,0.0,1.0)*(1.0-s.a);
+    return vec4<f32>(rgb,a);
+}
+"#
+        );
+        let native_glow_comp_pipeline =
+            make_pipeline(device, &glow_comp_bgl, &native_glow_comp_src, "fs");
 
         // MaskShapeGen (08 §3): a uniform-only ellipse-matte generator (no input).
         // `center = [cx, cy, sx, sy]`, `aux = [cos(-rot), sin(-rot), inner, pad]`
@@ -2738,6 +4572,29 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             "{QUAD_VS}\nstruct MS {{ center: vec4<f32>, aux: vec4<f32>, dims: vec4<f32> }}\n@group(0) @binding(0) var<uniform> u: MS;\n@fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {{\n  let uv = vec2<f32>(pos.x / u.dims.x, pos.y / u.dims.y);\n  let d = uv - u.center.xy;\n  let rd = vec2<f32>(d.x * u.aux.x - d.y * u.aux.y, d.x * u.aux.y + d.y * u.aux.x);\n  var ex = 1e18; var ey = 1e18;\n  if (abs(u.center.z) > 1e-6) {{ ex = rd.x / u.center.z; }}\n  if (abs(u.center.w) > 1e-6) {{ ey = rd.y / u.center.w; }}\n  let r = sqrt(ex * ex + ey * ey);\n  let a = 1.0 - smoothstep(u.aux.z, 1.0, r);\n  return vec4<f32>(a, a, a, a);\n}}\n"
         );
         let mask_shape_pipeline = make_pipeline(device, &mask_bgl, &mask_shape_src, "fs");
+        let native_mask_shape_src = format!(
+            "{QUAD_VS}\n{}",
+            r#"
+struct P { center:vec4<f32>, aux:vec4<f32>, dims:vec4<f32> }
+@group(0) @binding(0) var<uniform> u:P;
+@fragment fn fs(@builtin(position) pos:vec4<f32>)->@location(0) vec4<f32> {
+    if(pos.x>=u.dims.x || pos.y>=u.dims.y || u.center.z<=1e-6 || u.center.w<=1e-6){return vec4<f32>(0.0);}
+    let d=pos.xy/u.dims.xy-u.center.xy;
+    let rd=vec2<f32>(d.x*u.aux.x-d.y*u.aux.y,d.x*u.aux.y+d.y*u.aux.x)/u.center.zw;
+    let radius=select(length(rd),max(abs(rd.x),abs(rd.y)),u.aux.w>0.5);
+    let a=1.0-smoothstep(u.aux.z,1.0,radius);
+    return vec4<f32>(a);
+}
+"#
+        );
+        let native_mask_shape_pipeline =
+            make_pipeline(device, &mask_bgl, &native_mask_shape_src, "fs");
+
+        let bezier_matte_src = format!("{QUAD_VS}\n{}", include_str!("bezier_matte.wgsl"));
+        let bezier_matte_pipeline = make_pipeline(device, &mask_bgl, &bezier_matte_src, "fs");
+        let native_polygon_mask_src = format!("{QUAD_VS}\n{}", include_str!("native_polygon.wgsl"));
+        let native_polygon_mask_pipeline =
+            make_pipeline(device, &mask_bgl, &native_polygon_mask_src, "fs");
 
         // Merge: premultiplied `over`, all 26 blend modes (K-0.3a, 03 §2.4).
         let merge_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2772,6 +4629,7 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         let push_pipeline = make_pipeline(device, &push_bgl, &push_src, "fs");
 
         Passes {
+            native_channels: super::native_channels::ChannelPass::new(device),
             fill_pipeline,
             fill_bgl,
             blit_pipeline,
@@ -2787,11 +4645,15 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             deinterlace_pipeline,
             filter_bgl,
             luma_key_pipeline,
+            native_luma_key_pipeline,
+            native_chroma_key_pipeline,
             chroma_key_pipeline,
             blur_bgl,
             blur_pipeline,
             sharpen_bgl,
             sharpen_pipeline,
+            native_detail_pipeline,
+            native_unsharp_pipeline,
             high_pass_pipeline,
             emboss_pipeline,
             find_edges_pipeline,
@@ -2803,6 +4665,30 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             vignette_pipeline,
             mosaic_pipeline,
             motion_blur_pipeline,
+            native_motion_blur_pipeline,
+            native_transfer_curves_pipeline,
+            native_color_balance_pipeline,
+            native_outline_seed_pipeline,
+            native_outline_composite_pipeline,
+            native_linear_hsl_pipeline,
+            native_surface_blur_pipeline,
+            native_lens_blur_pipeline,
+            native_rank_pipelines: std::array::from_fn(|_| std::sync::OnceLock::new()),
+            native_deflicker_pipeline,
+            native_unpremultiply_pipeline,
+            native_alpha_view_pipeline,
+            native_levels_pipeline,
+            native_photo_filter_pipeline,
+            native_transfer_matrix_pipeline,
+            native_transfer_artistic_pipeline,
+            native_shadow_shift_pipeline,
+            native_shadow_composite_pipeline,
+            native_perspective_pipeline,
+            native_stylize_pipeline,
+            native_geometric_warp_pipeline,
+            native_box_blur_pipeline,
+            native_mosaic_reduce_pipeline,
+            native_mosaic_expand_pipeline,
             hue_sat_pipeline,
             vibrance_pipeline,
             channel_mixer_pipeline,
@@ -2815,6 +4701,8 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             ripple_pipeline,
             perspective_pipeline,
             grain_pipeline,
+            native_grain_pipeline,
+            native_denoise_pipeline,
             ca_pipeline,
             unpremultiply_pipeline,
             alpha_view_pipeline,
@@ -2822,10 +4710,15 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             drop_shadow_pipeline,
             util2_bgl,
             glow_extract_pipeline,
+            native_glow_extract_pipeline,
+            native_glow_comp_pipeline,
             glow_comp_bgl,
             glow_comp_pipeline,
             mask_bgl,
             mask_shape_pipeline,
+            native_mask_shape_pipeline,
+            native_polygon_mask_pipeline,
+            bezier_matte_pipeline,
             merge_pipeline,
             merge_bgl,
             wipe_pipeline,
@@ -3372,6 +5265,42 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         self.run_filter(gpu, &self.desaturate_pipeline, src, target, &[0.0; 4]);
     }
 
+    fn native_denoise(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        strength: f32,
+        spatial_scale: f32,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [strength, spatial_scale, logical_w as f32, logical_h as f32];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_denoise_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_denoise_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_denoise_pipeline, &bind, target);
+    }
+
     fn vignette(
         &self,
         gpu: &GpuContext,
@@ -3441,6 +5370,1174 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             logical_w,
             logical_h,
         );
+    }
+
+    /// Signed perceptual-code-value operations with an AP1 roundtrip.
+    #[allow(clippy::too_many_arguments)]
+    fn native_transfer_curves(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        knots: [[f32; 2]; 5],
+        contrast: f32,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let curve = photonic_core::raster::adjust::TransferCurve::new(
+            &photonic_core::raster::adjust::catalog_curve_points(knots, contrast),
+        );
+        let mut uniform = vec![
+            curve.coefficients().len() as f32,
+            if curve.is_identity() { 1.0 } else { 0.0 },
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        for i in 0..5 {
+            let row = curve.coefficients().get(i).copied().unwrap_or([0.0; 3]);
+            uniform.extend([row[0], row[1], row[2], 0.0]);
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_transfer_curves_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_transfer_curves_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_transfer_curves_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_color_balance(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        shifts: [[f32; 3]; 3],
+        preserve: bool,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            0.0,
+            preserve as u32 as f32,
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        for row in shifts {
+            uniform.extend([row[0], row[1], row[2], 0.0]);
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_color_balance_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_color_balance_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_color_balance_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_outline(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        thickness: f32,
+        color: [f32; 3],
+        opacity: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let scratch = || {
+            gpu.device().create_texture(&wgpu::TextureDescriptor {
+                label: Some("native_outline_seed_scratch"),
+                size: target.size(),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: WORKING_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        };
+        let a = scratch();
+        let b = scratch();
+        let seed_pass = |input: &wgpu::Texture, output: &wgpu::Texture, step: u32, phase: u32| {
+            let u = [
+                logical_w as f32,
+                logical_h as f32,
+                step as f32,
+                phase as f32,
+                pixel_scale[0],
+                pixel_scale[1],
+                0.0,
+                0.0,
+            ];
+            let buf = gpu
+                .device()
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("native_outline_seed_params"),
+                    contents: bytemuck::cast_slice(&u),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let view = input.create_view(&Default::default());
+            let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("native_outline_seed_bg"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf.as_entire_binding(),
+                    },
+                ],
+            });
+            self.run(gpu, &self.native_outline_seed_pipeline, &bind, output);
+        };
+        seed_pass(src, &a, 0, 0);
+        let (mut previous, mut next) = (&a, &b);
+        let mut step = 1;
+        while step < logical_w.max(logical_h) {
+            step *= 2;
+        }
+        step /= 2;
+        if thickness > 0.0 && opacity > 0.0 {
+            while step >= 1 {
+                seed_pass(previous, next, step, 1);
+                std::mem::swap(&mut previous, &mut next);
+                step /= 2;
+            }
+        }
+        let sv = src.create_view(&Default::default());
+        let dv = previous.create_view(&Default::default());
+        let u = [
+            logical_w as f32,
+            logical_h as f32,
+            thickness,
+            opacity,
+            color[0],
+            color[1],
+            color[2],
+            0.0,
+            pixel_scale[0],
+            pixel_scale[1],
+            0.0,
+            0.0,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_outline_composite_params"),
+                contents: bytemuck::cast_slice(&u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_outline_composite_bg"),
+            layout: &self.sharpen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&dv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_outline_composite_pipeline, &bind, target);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_lens_blur(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        radius: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [
+            radius,
+            0.0,
+            logical_w as f32,
+            logical_h as f32,
+            pixel_scale[0],
+            pixel_scale[1],
+            0.0,
+            0.0,
+        ];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_lens_blur_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_lens_blur_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_lens_blur_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_surface_blur(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        radius: u32,
+        threshold: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            radius as f32,
+            threshold,
+            logical_w as f32,
+            logical_h as f32,
+            pixel_scale[0],
+            pixel_scale[1],
+            0.0,
+            0.0,
+        ];
+        for row in crate::color::native::ap1_to_linear_srgb().0 {
+            uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_surface_blur_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_surface_blur_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_surface_blur_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_rank_filter(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        kind: crate::graph::ir::NativeRankKind,
+        radius: u32,
+        threshold: u8,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let radius =
+            super::native_rank::effective_radius(radius, logical_w, logical_h, pixel_scale);
+        let (slot, capacity, _, _) = super::native_rank::layout(radius);
+        let pipeline = self.native_rank_pipelines[slot].get_or_init(|| {
+            let rank = if capacity == 0 {
+                include_str!("native_rank_radix.wgsl").to_owned()
+            } else {
+                include_str!("native_rank_sort.wgsl").replace("__CAPACITY__", &capacity.to_string())
+            };
+            let shader = [QUAD_VS, include_str!("native_rank_common.wgsl"), &rank].join("\n");
+            make_pipeline(gpu.device(), &self.blur_bgl, &shader, "fs")
+        });
+        let mut uniform = vec![
+            radius as f32,
+            threshold as f32 / 255.0,
+            logical_w as f32,
+            logical_h as f32,
+            pixel_scale[0],
+            pixel_scale[1],
+            kind as u32 as f32,
+            0.0,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_rank_filter_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_rank_filter_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn native_deflicker(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        gain: [f32; 3],
+        band: [f32; 3],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            0.0,
+            0.0,
+            logical_w as f32,
+            logical_h as f32,
+            gain[0],
+            gain[1],
+            gain[2],
+            0.0,
+            band[0],
+            band[1],
+            band[2],
+            0.0,
+        ];
+        for m in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in m.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_deflicker_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_deflicker_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_deflicker_pipeline, &bind, target);
+    }
+    fn native_unpremultiply(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [0.0, logical_w as f32, logical_h as f32, 0.0];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_unpremultiply_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_unpremultiply_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_unpremultiply_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_alpha_view(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        mode: u8,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [mode as f32, logical_w as f32, logical_h as f32, 0.0];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_alpha_view_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_alpha_view_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_alpha_view_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_linear_hsl(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        vibrance: bool,
+        controls: [f32; 3],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            vibrance as u32 as f32,
+            (controls == [0.0; 3]) as u32 as f32,
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        uniform.extend([controls[0], controls[1], controls[2], 0.0]);
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_linear_hsl_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_linear_hsl_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_linear_hsl_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_levels(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        black_white: [f32; 2],
+        gamma: f32,
+        output: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            gamma,
+            if black_white == [0.0, 1.0] && gamma == 1.0 && output == [0.0, 1.0] {
+                1.0
+            } else {
+                0.0
+            },
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        uniform.extend([black_white[0], black_white[1], output[0], output[1]]);
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_levels_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_levels_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_levels_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_photo_filter(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        color: [f32; 3],
+        density: f32,
+        preserve: bool,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            density,
+            preserve as u32 as f32,
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        uniform.extend([color[0], color[1], color[2], 0.0]);
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_photo_filter_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_photo_filter_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_photo_filter_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_transfer_matrix(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        matrix: [[f32; 3]; 3],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![0.0, 0.0, logical_w as f32, logical_h as f32];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        for row in matrix {
+            uniform.extend([row[0], row[1], row[2], 0.0]);
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_transfer_matrix_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_transfer_matrix_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_transfer_matrix_pipeline, &bind, target);
+    }
+    /// Per-kind signed transfer operation; only the bounded artistic kinds clip.
+    #[allow(clippy::too_many_arguments)]
+    fn native_transfer_artistic(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        kind: super::ir::NativeTransferArtisticKind,
+        parameter: f32,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let mut uniform = vec![
+            kind as u32 as f32,
+            parameter,
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        for matrix in [
+            crate::color::native::ap1_to_linear_srgb(),
+            crate::color::native::linear_srgb_to_ap1(),
+        ] {
+            for row in matrix.0 {
+                uniform.extend([row[0] as f32, row[1] as f32, row[2] as f32, 0.0]);
+            }
+        }
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_transfer_artistic_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_transfer_artistic_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_transfer_artistic_pipeline, &bind, target);
+    }
+    /// Shift alpha, convolve with the bounded box kernel, then composite in AP1.
+    #[allow(clippy::too_many_arguments)]
+    fn native_drop_shadow(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        offset: [f32; 2],
+        radius: u32,
+        color: [f32; 3],
+        opacity: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        if opacity == 0.0 {
+            self.blit(gpu, src, target);
+            return;
+        }
+        let shifted = Self::temp_like(gpu, target);
+        let blurred = Self::temp_like(gpu, target);
+        let sv = src.create_view(&Default::default());
+        let u = [
+            offset[0] * pixel_scale[0],
+            offset[1] * pixel_scale[1],
+            logical_w as f32,
+            logical_h as f32,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_shadow_shift_params"),
+                contents: bytemuck::cast_slice(&u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_shadow_shift_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_shadow_shift_pipeline, &bind, &shifted);
+        self.native_box_blur(
+            gpu,
+            &shifted,
+            &blurred,
+            super::ops::native_shadow_radius(radius, pixel_scale),
+            logical_w,
+            logical_h,
+        );
+        let bv = blurred.create_view(&Default::default());
+        let u = [
+            color[0],
+            color[1],
+            color[2],
+            opacity,
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+            0.0,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_shadow_composite_params"),
+                contents: bytemuck::cast_slice(&u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_shadow_composite_bg"),
+            layout: &self.sharpen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&bv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_shadow_composite_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_perspective(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        inverse: &[f32; 9],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [
+            inverse[0],
+            inverse[1],
+            inverse[2],
+            0.0,
+            inverse[3],
+            inverse[4],
+            inverse[5],
+            0.0,
+            inverse[6],
+            inverse[7],
+            inverse[8],
+            0.0,
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+            0.0,
+        ];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_perspective_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_perspective_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_perspective_pipeline, &bind, target);
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn native_stylize(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        kind: super::ir::NativeStylizeKind,
+        amount: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [
+            kind as u32 as f32,
+            amount,
+            logical_w as f32,
+            logical_h as f32,
+            pixel_scale[0],
+            pixel_scale[1],
+            0.0,
+            0.0,
+        ];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_stylize_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_stylize_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_stylize_pipeline, &bind, target);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_geometric_warp(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        kind: super::ir::NativeWarpKind,
+        amount: f32,
+        wavelength: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let uniform = [
+            kind as u32 as f32,
+            amount,
+            logical_w as f32,
+            logical_h as f32,
+            wavelength,
+            pixel_scale[0],
+            pixel_scale[1],
+            0.0,
+        ];
+        let view = src.create_view(&Default::default());
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_geometric_warp_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_geometric_warp_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_geometric_warp_pipeline, &bind, target);
+    }
+
+    fn native_box_blur(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        radius: [u32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let intermediate = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("native_box_blur_intermediate"),
+            size: target.size(),
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        for (input, output, r, axis) in [
+            (src, &intermediate, radius[0], 0u32),
+            (&intermediate, target, radius[1], 1u32),
+        ] {
+            let uniform = [r, axis, logical_w, logical_h];
+            let buf = gpu
+                .device()
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("native_box_blur_params"),
+                    contents: bytemuck::cast_slice(&uniform),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+            let view = input.create_view(&Default::default());
+            let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("native_box_blur_bg"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf.as_entire_binding(),
+                    },
+                ],
+            });
+            self.run(gpu, &self.native_box_blur_pipeline, &bind, output);
+        }
+    }
+
+    fn native_mosaic(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        block: [u32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let cells = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("native_mosaic_cells"),
+            size: wgpu::Extent3d {
+                width: logical_w.div_ceil(block[0]).max(1),
+                height: logical_h.div_ceil(block[1]).max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let uniform = [block[0], block[1], logical_w, logical_h];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_mosaic_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        for (input, output, pipeline) in [
+            (src, &cells, &self.native_mosaic_reduce_pipeline),
+            (&cells, target, &self.native_mosaic_expand_pipeline),
+        ] {
+            let view = input.create_view(&Default::default());
+            let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("native_mosaic_bg"),
+                layout: &self.blur_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: buf.as_entire_binding(),
+                    },
+                ],
+            });
+            self.run(gpu, pipeline, &bind, output);
+        }
+    }
+
+    fn native_motion_blur(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        delta: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let view = src.create_view(&Default::default());
+        let uniform = [
+            delta[0],
+            delta[1],
+            logical_w as f32,
+            logical_h as f32,
+            super::ops::native_motion_blur_steps(delta) as f32,
+            0.0,
+            0.0,
+            0.0,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_motion_blur_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_motion_blur_bg"),
+            layout: &self.blur_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_motion_blur_pipeline, &bind, target);
     }
 
     fn motion_blur(
@@ -4094,6 +7191,7 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         src: &wgpu::Texture,
         target: &wgpu::Texture,
         sigma: f32,
+        step: f32,
         horizontal: bool,
         logical_w: u32,
         logical_h: u32,
@@ -4103,6 +7201,10 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             if horizontal { 1.0 } else { 0.0 },
             logical_w as f32,
             logical_h as f32,
+            step,
+            0.0,
+            0.0,
+            0.0,
         ];
         let view = src.create_view(&Default::default());
         let buf = gpu
@@ -4142,13 +7244,28 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         logical_w: u32,
         logical_h: u32,
     ) {
+        self.gaussian_blur_planned(gpu, src, target, sigma, logical_w, logical_h, false);
+    }
+
+    /// Native mode follows the CPU plan's texel spacing at large radii.
+    /// Legacy mode deliberately retains its established unit-spacing output.
+    fn gaussian_blur_planned(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        sigma: f32,
+        logical_w: u32,
+        logical_h: u32,
+        native: bool,
+    ) {
         let plan = crate::graph::ops::blur_plan(sigma);
         if plan.iterations == 0 {
             self.blit(gpu, src, target);
             return;
         }
-        // GPU path: multi-iter with unit-step kernels (shader has no step
-        // uniform). Large-σ quality comes from σ_pass = σ/√n stacking.
+        // Multi-iteration Gaussian. Native processing also applies the plan
+        // spacing; the Legacy path retains unit-spaced kernels.
         let h_tmp = Self::temp_like(gpu, target);
         let ping = Self::temp_like(gpu, target);
         let pong = Self::temp_like(gpu, target);
@@ -4175,6 +7292,7 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
                 from,
                 &h_tmp,
                 plan.sigma_pass,
+                if native { plan.step } else { 1.0 },
                 true,
                 logical_w,
                 logical_h,
@@ -4185,6 +7303,7 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
                 &h_tmp,
                 to,
                 plan.sigma_pass,
+                if native { plan.step } else { 1.0 },
                 false,
                 logical_w,
                 logical_h,
@@ -4193,6 +7312,127 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
                 gpu.device().poll(wgpu::Maintain::Wait);
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_detail(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        kind: super::ir::NativeDetailKind,
+        amount: f32,
+        sigma: f32,
+        threshold: f32,
+        pixel_scale: [f32; 2],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let radius =
+            super::ops::native_detail_sigma(kind, sigma, pixel_scale, logical_w, logical_h);
+        if kind != super::ir::NativeDetailKind::HighPass && (amount == 0.0 || radius < 0.5) {
+            self.blit(gpu, src, target);
+            return;
+        }
+        let blurred = Self::temp_like(gpu, target);
+        self.gaussian_blur_planned(gpu, src, &blurred, radius, logical_w, logical_h, true);
+        let sv = src.create_view(&Default::default());
+        let bv = blurred.create_view(&Default::default());
+        let uniform = [
+            kind as u32 as f32,
+            amount,
+            threshold,
+            0.0,
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+            0.0,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_detail_params"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_detail_bg"),
+            layout: &self.sharpen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&bv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_detail_pipeline, &bind, target);
+    }
+
+    /// Native coverage-preserving AP1 unsharp with logical-pixel sampling.
+    #[allow(clippy::too_many_arguments)]
+    fn native_unsharp(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        amount: f32,
+        radius: f32,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let amount = if amount.is_finite() { amount } else { 0.0 };
+        if amount == 0.0 || radius < 0.5 {
+            self.blit(gpu, src, target);
+            return;
+        }
+        let blurred = Self::temp_like(gpu, target);
+        self.gaussian_blur_planned(gpu, src, &blurred, radius, logical_w, logical_h, true);
+        gpu.device().poll(wgpu::Maintain::Wait);
+        let sv = src.create_view(&Default::default());
+        let bv = blurred.create_view(&Default::default());
+        let uniform = [amount, logical_w as f32, logical_h as f32, 0.0];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("sharpen_uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("sharpen_bg"),
+            layout: &self.sharpen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&bv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_unsharp_pipeline, &bind, target);
     }
 
     /// `Effect{Sharpen}` — unsharp mask via blur intermediate + combine pass.
@@ -4327,6 +7567,91 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
             ],
         });
         self.run(gpu, &self.glow_comp_pipeline, &bind, target);
+    }
+
+    /// Native AP1 extraction and logical-pixel screen-add glow.
+    #[allow(clippy::too_many_arguments)]
+    fn native_glow(
+        &self,
+        gpu: &GpuContext,
+        src: &wgpu::Texture,
+        target: &wgpu::Texture,
+        radius: f32,
+        threshold: f32,
+        intensity: f32,
+        tint_linear: [f32; 3],
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let intensity = if intensity.is_finite() {
+            intensity.max(0.0)
+        } else {
+            0.0
+        };
+        if intensity == 0.0 {
+            self.blit(gpu, src, target);
+            return;
+        }
+        let threshold = if threshold.is_finite() {
+            threshold.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let extract = Self::temp_like(gpu, target);
+        let uniform = [threshold, logical_w as f32, logical_h as f32, 0.0];
+        self.run_filter(
+            gpu,
+            &self.native_glow_extract_pipeline,
+            src,
+            &extract,
+            &uniform,
+        );
+        gpu.device().poll(wgpu::Maintain::Wait);
+        let blurred = Self::temp_like(gpu, target);
+        self.gaussian_blur_planned(gpu, &extract, &blurred, radius, logical_w, logical_h, true);
+        gpu.device().poll(wgpu::Maintain::Wait);
+        let sv = src.create_view(&Default::default());
+        let gv = blurred.create_view(&Default::default());
+        let u = [
+            tint_linear[0],
+            tint_linear[1],
+            tint_linear[2],
+            0.0,
+            intensity,
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("glow_comp_uniform"),
+                contents: bytemuck::cast_slice(&u),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("glow_comp_bg"),
+            layout: &self.glow_comp_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&sv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&gv),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buf.as_entire_binding(),
+                },
+            ],
+        });
+        self.run(gpu, &self.native_glow_comp_pipeline, &bind, target);
     }
 
     /// `Effect{LumaKey}` pass — tex + sampler + a `[threshold, hi, invert, pad]`
@@ -4497,6 +7822,156 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         self.run(gpu, &self.mask_shape_pipeline, &bind, target);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn native_mask_shape(
+        &self,
+        gpu: &GpuContext,
+        target: &wgpu::Texture,
+        rect: bool,
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation: f32,
+        feather: f32,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        let (cos_r, sin_r) = ((-rotation).cos(), (-rotation).sin());
+        let inner = 1.0 - feather.clamp(0.0, 1.0).max(crate::graph::ops::KEY_BAND_EPS);
+        let uniform = [
+            center[0],
+            center[1],
+            size[0],
+            size[1],
+            cos_r,
+            sin_r,
+            inner,
+            if rect { 1.0 } else { 0.0 },
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+            0.0,
+        ];
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("mask_uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask_bg"),
+            layout: &self.mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            }],
+        });
+        self.run(gpu, &self.native_mask_shape_pipeline, &bind, target);
+    }
+
+    fn bezier_matte(
+        &self,
+        gpu: &GpuContext,
+        target: &wgpu::Texture,
+        window: &photonic_core::timeline::BezierWindow,
+        logical_w: u32,
+        logical_h: u32,
+    ) -> Result<(), &'static str> {
+        let vertices = window.flatten(logical_w, logical_h)?;
+        if u64::from(target.width()) * u64::from(target.height()) * vertices.len() as u64
+            > 536_870_912
+        {
+            return Err("Bezier target exceeds pixel-edge work budget");
+        }
+        let mut uniform = vec![0.0_f32; 8 + 512 * 4];
+        uniform[..8].copy_from_slice(&[
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+            0.0,
+            vertices.len() as f32,
+            window.feather * logical_w.min(logical_h) as f32,
+            u8::from(window.invert) as f32,
+            0.0,
+        ]);
+        for (i, v) in vertices.iter().enumerate() {
+            uniform[8 + i * 4] = v[0];
+            uniform[9 + i * 4] = v[1];
+        }
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("bezier_matte_uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("bezier_matte_bg"),
+            layout: &self.mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            }],
+        });
+        self.run(gpu, &self.bezier_matte_pipeline, &bind, target);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn native_polygon_mask(
+        &self,
+        gpu: &GpuContext,
+        target: &wgpu::Texture,
+        vertices: &[[f32; 2]],
+        center: [f32; 2],
+        size: [f32; 2],
+        rotation: f32,
+        feather: f32,
+        logical_w: u32,
+        logical_h: u32,
+    ) {
+        if !super::ops::native_polygon_vertices_valid(vertices) {
+            self.fill(gpu, target, [0.0; 4]);
+            return;
+        }
+        let (sin, cos) = (-rotation).sin_cos();
+        let mut uniform = vec![0.0_f32; 12 + 128 * 4];
+        uniform[..12].copy_from_slice(&[
+            center[0],
+            center[1],
+            size[0],
+            size[1],
+            cos,
+            sin,
+            feather,
+            vertices.len() as f32,
+            logical_w as f32,
+            logical_h as f32,
+            0.0,
+            0.0,
+        ]);
+        for (i, v) in vertices.iter().enumerate() {
+            uniform[12 + i * 4] = v[0] * 2.0 - 1.0;
+            uniform[13 + i * 4] = v[1] * 2.0 - 1.0;
+        }
+        let buf = gpu
+            .device()
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("native_polygon_uniform"),
+                contents: bytemuck::cast_slice(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let bind = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("native_polygon_bg"),
+            layout: &self.mask_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buf.as_entire_binding(),
+            }],
+        });
+        self.run(gpu, &self.native_polygon_mask_pipeline, &bind, target);
+    }
+
     fn merge(
         &self,
         gpu: &GpuContext,
@@ -4506,11 +7981,23 @@ fn alpha_at(x: i32, y: i32, hi: vec2<i32>) -> f32 {{
         opacity: f32,
         target: &wgpu::Texture,
     ) {
+        self.merge_mode(gpu, top, bottom, merge_mode_index(mode), opacity, target);
+    }
+
+    fn merge_mode(
+        &self,
+        gpu: &GpuContext,
+        top: &wgpu::Texture,
+        bottom: &wgpu::Texture,
+        mode: u32,
+        opacity: f32,
+        target: &wgpu::Texture,
+    ) {
         let tv = top.create_view(&Default::default());
         let bv = bottom.create_view(&Default::default());
         // Clamp opacity to match the CPU reference `graph::ops::merge` exactly.
         let uni = MergeParams {
-            mode: merge_mode_index(mode),
+            mode,
             opacity: opacity.clamp(0.0, 1.0),
             _pad: [0.0; 2],
         };
@@ -4949,6 +8436,151 @@ mod tests {
         evaluator.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
         let managed = evaluator.evaluation_hash(ContentHash(7), 17, 9);
         assert_ne!(legacy, managed);
+    }
+
+    #[test]
+    fn native_gaussian_preserves_extended_rgba_and_matches_reference() {
+        let gpu =
+            GpuContext::request_blocking().expect("GPU required for native Gaussian qualification");
+        let (w, h) = (17u32, 9u32);
+        let mut input = Image::new(w, h);
+        let mut half = vec![0x7bffu16; 64 * 64 * 4]; // poison padded pixels
+        for y in 0..h {
+            for x in 0..w {
+                let red = if x == 8 && y == 4 { 4.0 } else { 0.0 };
+                input.set(x, y, [red, -0.5, 2.0, 0.5]);
+                let i = (y as usize * 64 + x as usize) * 4;
+                half[i..i + 4].copy_from_slice(&[
+                    if red > 0.0 { 0x4400 } else { 0 },
+                    0xb800,
+                    0x4000,
+                    0x3800,
+                ]);
+            }
+        }
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("native Gaussian fixture"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let source = gpu.device().create_texture(&descriptor);
+        gpu.queue().write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&half),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 8),
+                rows_per_image: Some(64),
+            },
+            descriptor.size,
+        );
+        let target = gpu.device().create_texture(&descriptor);
+        let passes = Passes::new(gpu.device());
+        for sigma in [0.0, 1.0, 2.5, 48.0, 180.0, 500.0] {
+            passes.gaussian_blur_planned(&gpu, &source, &target, sigma, w, h, true);
+            let actual = read_texture_rgba16f(&gpu, &target, w, h);
+            let expected = crate::graph::ops::blur(&input, sigma);
+            for (a, e) in actual.iter().zip(&expected.pixels) {
+                for c in 0..4 {
+                    assert!(
+                        (a[c] - e[c]).abs() < 0.03,
+                        "sigma {sigma}, channel {c}: {a:?} != {e:?}"
+                    );
+                }
+            }
+            if sigma == 1.0 {
+                let normalization: f64 = (-3..=3).map(|x| (-(x * x) as f64 / 2.0).exp()).sum();
+                let center = 4.0 / (normalization * normalization);
+                assert!((f64::from(actual[(4 * w + 8) as usize][0]) - center).abs() < 0.002);
+                assert_eq!(actual[0][1], -0.5);
+                assert_eq!(actual[0][2], 2.0);
+                assert_eq!(actual[0][3], 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn native_gaussian_large_radius_keeps_planned_texel_spacing() {
+        let gpu =
+            GpuContext::request_blocking().expect("GPU required for native Gaussian qualification");
+        let (w, h) = (513u32, 1u32);
+        let mut input = Image::new(w, h);
+        let mut half = vec![0u16; 576 * 64 * 4];
+        for x in 0..w {
+            let red = if x < 256 { 4.0 } else { 0.0 };
+            input.set(x, 0, [red, -0.5, 2.0, 0.5]);
+            let i = x as usize * 4;
+            half[i..i + 4].copy_from_slice(&[
+                if red > 0.0 { 0x4400 } else { 0 },
+                0xb800,
+                0x4000,
+                0x3800,
+            ]);
+        }
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("large native blur"),
+            size: wgpu::Extent3d {
+                width: 576,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let source = gpu.device().create_texture(&descriptor);
+        gpu.queue().write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&half),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(576 * 8),
+                rows_per_image: Some(64),
+            },
+            descriptor.size,
+        );
+        let target = gpu.device().create_texture(&descriptor);
+        let passes = Passes::new(gpu.device());
+        passes.gaussian_blur_planned(&gpu, &source, &target, 500.0, w, h, true);
+        let native = read_texture_rgba16f(&gpu, &target, w, h);
+        let reference = crate::graph::ops::blur(&input, 500.0);
+        for (actual, expected) in native.iter().zip(&reference.pixels) {
+            assert!(
+                (actual[0] - expected[0]).abs() < 0.035,
+                "{actual:?} != {expected:?}"
+            );
+        }
+        // The old unit-spacing GPU path truncates the intended support at this
+        // radius. Ensure this fixture detects accidentally selecting that path.
+        passes.gaussian_blur_planned(&gpu, &source, &target, 500.0, w, h, false);
+        let legacy = read_texture_rgba16f(&gpu, &target, w, h);
+        let difference = native
+            .iter()
+            .zip(legacy)
+            .map(|(a, b)| (a[0] - b[0]).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            difference > 0.1,
+            "large-radius fixture does not distinguish the two plans: {difference}"
+        );
     }
 
     #[test]
@@ -6686,6 +10318,1199 @@ mod tests {
             read_texture_rgba16f(&gpu, &retained, 8, 8),
             pixels,
             "retained Arc was overwritten during recycling"
+        );
+    }
+    #[test]
+    #[ignore = "requires explicitly provisioned pinned local model"]
+    fn native_subject_matte_pending_to_ready_invalidates_downstream_cache() {
+        use std::time::{Duration, Instant};
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let model = photonic_matte::CachedMatteModel::load_cached().unwrap();
+        let mut image = Image::new(96, 96);
+        for pixel in &mut image.pixels {
+            *pixel = [0., 0., 0., 1.];
+        }
+        for y in 30..66 {
+            for x in 30..66 {
+                image.pixels[y * 96 + x] = [1., 1., 0., 1.];
+            }
+        }
+        let mut source = PatternSource {
+            frame: GpuFrame::new(upload_pattern(&gpu, &image), 96, 96),
+        };
+        let graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![
+                IrNode {
+                    op: IrOp::NativeDecodeStill {
+                        asset: AssetId::new(),
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(99101),
+                },
+                IrNode {
+                    op: IrOp::NativeMatteExtract,
+                    inputs: vec![(IrNodeId(0), OutPort::default())],
+                    content_hash: ContentHash(99102),
+                },
+                IrNode {
+                    op: IrOp::NativeMaskToImage,
+                    inputs: vec![(IrNodeId(1), OutPort::default())],
+                    content_hash: ContentHash(99103),
+                },
+                IrNode {
+                    op: IrOp::NativeInvert,
+                    inputs: vec![(IrNodeId(2), OutPort::default())],
+                    content_hash: ContentHash(99104),
+                },
+            ],
+            output: Some(IrNodeId(3)),
+        };
+        assert!(graph.validate_working_color_domain().is_ok());
+        let mut evaluator = Evaluator::new(gpu.clone());
+        for size in [96u32, 48, 96] {
+            let mut input =
+                photonic_core::raster::image::RasterImage::filled(size, size, [0, 0, 0, 255]);
+            for y in size * 30 / 96..size * 66 / 96 {
+                for x in size * 30 / 96..size * 66 / 96 {
+                    input.set_pixel(x, y, [255, 255, 0, 255]);
+                }
+            }
+            let expected = model.matte(&input).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut saw_pending = false;
+            let output = loop {
+                let output = evaluator
+                    .evaluate(&graph, (size, size), &mut source)
+                    .unwrap();
+                assert!(
+                    evaluator.computation_errors().is_empty(),
+                    "{:?}",
+                    evaluator.computation_errors()
+                );
+                if evaluator.pending_computations() == 0 {
+                    break output;
+                }
+                saw_pending = true;
+                assert!(Instant::now() < deadline, "subject matte never completed");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            if size == 48 {
+                assert!(saw_pending, "quality change reused wrong matte");
+            }
+            let actual = read_texture_rgba16f(&gpu, &output, size, size);
+            for (pixel, weight) in actual.iter().zip(&expected.data) {
+                let reference = 1.0 - *weight as f32 / 255.0;
+                for c in 0..3 {
+                    assert!(
+                        (pixel[c] - reference).abs() < 0.0042,
+                        "size{size} {pixel:?} expected{reference}"
+                    );
+                }
+                assert_eq!(pixel[3], 1.0);
+            }
+            assert!(
+                actual.iter().any(|p| p[0] > 0.9),
+                "provisional opaque mask was cached as final"
+            );
+            let again = evaluator
+                .evaluate(&graph, (size, size), &mut source)
+                .unwrap();
+            assert_eq!(evaluator.pending_computations(), 0);
+            assert_eq!(actual, read_texture_rgba16f(&gpu, &again, size, size));
+        }
+
+        // Relinking can change source pixels without changing the asset/node ID.
+        let mut changed = Image::new(96, 96);
+        for pixel in &mut changed.pixels {
+            *pixel = [0., 0., 0., 1.];
+        }
+        let mut input = photonic_core::raster::image::RasterImage::filled(96, 96, [0, 0, 0, 255]);
+        for y in 30..66 {
+            for x in 5..25 {
+                changed.pixels[y * 96 + x] = [1., 1., 0., 1.];
+                input.set_pixel(x as u32, y as u32, [255, 255, 0, 255]);
+            }
+        }
+        source.frame = GpuFrame::new(upload_pattern(&gpu, &changed), 96, 96);
+        let expected = model.matte(&input).unwrap();
+        evaluator.invalidate_matching(|_| true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let output = loop {
+            let output = evaluator.evaluate(&graph, (96, 96), &mut source).unwrap();
+            assert!(evaluator.computation_errors().is_empty());
+            if evaluator.pending_computations() == 0 {
+                break output;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "invalidated matte never completed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let actual = read_texture_rgba16f(&gpu, &output, 96, 96);
+        for (pixel, weight) in actual.iter().zip(expected.data) {
+            assert!(
+                (pixel[0] - (1.0 - weight as f32 / 255.0)).abs() < 0.0042,
+                "relink reused stale subject mask"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_outline_qualification {
+    use super::*;
+    use crate::graph::ops::{self, Image};
+    fn reference(
+        input: &Image,
+        thick: f64,
+        color: [f64; 3],
+        opacity: f64,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        let (w, h) = (input.width, input.height);
+        let sites: Vec<_> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| input.pixel(x, y)[3] >= 0.5)
+            .collect();
+        (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let src = input.pixel(x, y).map(f64::from);
+                if thick == 0.0 || opacity == 0.0 {
+                    return src;
+                }
+                let dist = if src[3] >= 0.5 {
+                    -1.0
+                } else {
+                    sites
+                        .iter()
+                        .map(|&(sx, sy)| {
+                            ((x as f64 - sx as f64) / scale[0])
+                                .hypot((y as f64 - sy as f64) / scale[1])
+                        })
+                        .fold(f64::INFINITY, f64::min)
+                };
+                let t = ((dist - (thick - 1.0)) / 2.0).clamp(0.0, 1.0);
+                let a = (1.0 - t * t * (3.0 - 2.0 * t)) * opacity * (1.0 - src[3]);
+                [
+                    (src[0] + color[0] * a).clamp(-65504.0, 65504.0),
+                    (src[1] + color[1] * a).clamp(-65504.0, 65504.0),
+                    (src[2] + color[2] * a).clamp(-65504.0, 65504.0),
+                    src[3] + a,
+                ]
+            })
+            .collect()
+    }
+    fn run_fixture(
+        gpu: &GpuContext,
+        passes: &Passes,
+        input: &Image,
+        cases: &[(f32, f32, [f32; 2])],
+    ) {
+        let (w, h) = (input.width, input.height);
+        let (pw, ph) = (w.div_ceil(64) * 64, h.div_ceil(64) * 64);
+        let desc = wgpu::TextureDescriptor {
+            label: Some("outline poisoned-padding qualification"),
+            size: wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let source = gpu.device().create_texture(&desc);
+        let target = gpu.device().create_texture(&desc);
+        let mut half = vec![0x7bffu16; (pw * ph * 4) as usize];
+        let bits = |v: f32| match v {
+            0.0 => 0,
+            0.25 => 0x3400,
+            0.5 => 0x3800,
+            0.75 => 0x3a00,
+            0.499755859375 => 0x37ff,
+            65504.0 => 0x7bff,
+            1.0 => 0x3c00,
+            -0.5 => 0xb800,
+            4.0 => 0x4400,
+            _ => panic!("fixture not a known exact half: {v}"),
+        };
+        for y in 0..h {
+            for x in 0..w {
+                let p = input.pixel(x, y);
+                for c in 0..4 {
+                    half[((y * pw + x) * 4) as usize + c] = bits(p[c]);
+                }
+            }
+        }
+        gpu.queue().write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&half),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(pw * 8),
+                rows_per_image: Some(ph),
+            },
+            desc.size,
+        );
+        let color = [0.125f32, 0.5, 1.0];
+        for &(thick, opacity, scale) in cases {
+            passes.native_outline(gpu, &source, &target, thick, color, opacity, scale, w, h);
+            let actual = read_texture_rgba16f(gpu, &target, w, h);
+            let cpu = ops::native_outline(input, thick, color, opacity, scale);
+            let expected = reference(
+                input,
+                thick as f64,
+                color.map(f64::from),
+                opacity as f64,
+                scale.map(f64::from),
+            );
+            for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+                for c in 0..4 {
+                    assert!(
+                        (cpu.pixels[i][c] as f64 - e[c]).abs() < 0.00002,
+                        "CPU {w}x{h} t{thick} s{scale:?} at{i}/{c}: {:?} vs{e:?}",
+                        cpu.pixels[i]
+                    );
+                    assert!(
+                        a[c].is_finite() && (a[c] as f64 - e[c]).abs() < 0.005,
+                        "GPU {w}x{h} t{thick} o{opacity} s{scale:?} at{i}/{c}: {a:?} vs{e:?}"
+                    );
+                }
+                if thick == 0.0 || opacity == 0.0 {
+                    assert_eq!(*a, input.pixels[i]);
+                }
+            }
+            let padded = read_texture_rgba16f(gpu, &target, pw, ph);
+            for y in 0..ph {
+                for x in 0..pw {
+                    if x >= w || y >= h {
+                        assert_eq!(padded[(y * pw + x) as usize], [0.0; 4]);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_outline_gpu_independent_shapes_hdr_alpha_and_padding() {
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let passes = Passes::new(gpu.device());
+        let (w, h) = (25u32, 19u32);
+        let mut cases = Vec::new();
+        for thick in [0.0, 0.25, 1.0, 3.5, 12.0, 64.0] {
+            for scale in [[1.0; 2], [0.5, 0.25], [0.25, 0.5]] {
+                cases.push((thick, 0.75, scale));
+            }
+        }
+        cases.push((4.0, 0.0, [1.0; 2]));
+        for shape in 0..8 {
+            let mut input = Image::new(w, h);
+            for y in 0..h {
+                for x in 0..w {
+                    let (dx, dy) = (x as i32 - 12, y as i32 - 9);
+                    let covered = match shape {
+                        0 => false,
+                        1 => true,
+                        2 => dx * dx + dy * dy <= 36,
+                        3 => dx * dx + dy * dy <= 64 && dx * dx + dy * dy >= 16,
+                        4 => dx.abs() + dy.abs() <= 7,
+                        5 => x == 5 || x == 18 || y == 9,
+                        6 => (x < 5 && y < 4) || (x > 18 && y > 13),
+                        _ => x == 0 || y == 0 || x == w - 1 || y == h - 1,
+                    };
+                    let a = if covered {
+                        if (x + y) % 3 == 0 {
+                            0.5
+                        } else {
+                            1.0
+                        }
+                    } else if (x + y) % 7 == 0 {
+                        0.25
+                    } else {
+                        0.0
+                    };
+                    let rgb = if a > 0.0 { [-0.5, 4.0, 0.25] } else { [0.0; 3] };
+                    input.set(x, y, [rgb[0], rgb[1], rgb[2], a]);
+                }
+            }
+            run_fixture(&gpu, &passes, &input, &cases);
+        }
+    }
+    #[test]
+    fn native_outline_gpu_exact_large_seed_coordinates_and_empty_tiny_frames() {
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let passes = Passes::new(gpu.device());
+        for (w, h) in [(1, 1), (7, 5), (2057, 3), (3, 2057)] {
+            let mut input = Image::new(w, h);
+            run_fixture(&gpu, &passes, &input, &[(64.0, 1.0, [1.0; 2])]);
+            input.set(
+                w.saturating_sub(2),
+                h.saturating_sub(2),
+                [-0.5, 4.0, 0.25, 0.75],
+            );
+            run_fixture(
+                &gpu,
+                &passes,
+                &input,
+                &[
+                    (0.25, 1.0, [1.0; 2]),
+                    (3.5, 1.0, [1.0; 2]),
+                    (64.0, 1.0, [0.5, 0.25]),
+                ],
+            );
+        }
+    }
+    #[test]
+    fn native_outline_gpu_half_coverage_cutoff_and_storage_extremes() {
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let passes = Passes::new(gpu.device());
+        for alpha in [0.499755859375, 0.5] {
+            let mut input = Image::new(7, 5);
+            input.set(3, 2, [65504.0, -0.5, 0.25, alpha]);
+            run_fixture(
+                &gpu,
+                &passes,
+                &input,
+                &[
+                    (0.0, 1.0, [1.0; 2]),
+                    (3.5, 1.0, [1.0; 2]),
+                    (64.0, 1.0, [1.0; 2]),
+                ],
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_surface_blur_spatial_qualification {
+    use super::*;
+    use crate::graph::ops::{self, Image};
+    /// Independent binary64 authored-tap bilateral reference, with explicit bilinear
+    /// sampling and fixed independently recorded AP1-to-Rec709 coefficients.
+    fn surface_blur_reference(
+        input: &[[f32; 4]],
+        w: u32,
+        h: u32,
+        radius: u32,
+        threshold: f64,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        if radius == 0 || threshold == 0.0 {
+            return input.iter().map(|p| p.map(f64::from)).collect();
+        }
+        let matrix = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let sample = |px: f64, py: f64| {
+            let x = px.clamp(0.0, w as f64 - 1.0);
+            let y = py.clamp(0.0, h as f64 - 1.0);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            let fx = x - x0 as f64;
+            let fy = y - y0 as f64;
+            let mut p = [0.0; 4];
+            for (xx, yy, weight) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+            ] {
+                for c in 0..4 {
+                    p[c] += input[(yy * w + xx) as usize][c] as f64 * weight;
+                }
+            }
+            p
+        };
+        let sigma_s = (radius as f64).max(1.0);
+        let sigma_r = threshold.max(1.0 / 255.0);
+        let mut output = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let center = input[(y * w + x) as usize].map(f64::from);
+                if center[3] <= 0.0 {
+                    output.push([0.0; 4]);
+                    continue;
+                }
+                let mut sum = [0.0; 4];
+                for dy in -(radius as i32)..=radius as i32 {
+                    for dx in -(radius as i32)..=radius as i32 {
+                        let p = sample(
+                            x as f64 + dx as f64 * scale[0],
+                            y as f64 + dy as f64 * scale[1],
+                        );
+                        let d = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+                        let distance = matrix
+                            .map(|m| m[0] * d[0] + m[1] * d[1] + m[2] * d[2])
+                            .into_iter()
+                            .map(|v| v * v)
+                            .sum::<f64>();
+                        let weight = (-(dx * dx + dy * dy) as f64 / (2.0 * sigma_s * sigma_s))
+                            .exp()
+                            * (-distance / (2.0 * sigma_r * sigma_r)).exp();
+                        for c in 0..4 {
+                            sum[c] += p[c] * weight;
+                        }
+                    }
+                }
+                if sum[3] > 0.0 {
+                    output.push([
+                        (sum[0] * center[3] / sum[3]).clamp(-65504.0, 65504.0),
+                        (sum[1] * center[3] / sum[3]).clamp(-65504.0, 65504.0),
+                        (sum[2] * center[3] / sum[3]).clamp(-65504.0, 65504.0),
+                        center[3],
+                    ]);
+                } else {
+                    output.push(center);
+                }
+            }
+        }
+        output
+    }
+    fn run(
+        gpu: &GpuContext,
+        passes: &Passes,
+        input: &Image,
+        cases: &[(u32, f32, [f32; 2])],
+        expect_smoothing: bool,
+    ) {
+        let (w, h) = (input.width, input.height);
+        let (pw, ph) = (w.div_ceil(64) * 64, h.div_ceil(64) * 64);
+        let desc = wgpu::TextureDescriptor {
+            label: Some("surface multicolor poison-pad fixture"),
+            size: wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let source = gpu.device().create_texture(&desc);
+        let target = gpu.device().create_texture(&desc);
+        let mut bytes = vec![0x7bffu16; (pw * ph * 4) as usize];
+        let half = |v: f32| {
+            if v == 0.0 {
+                return 0u16;
+            }
+            let bits = v.to_bits();
+            assert_eq!(
+                bits & 0x1fff,
+                0,
+                "fixture must be exactly representable in half"
+            );
+            let exp = ((bits >> 23) & 255) as i32 - 127 + 15;
+            assert!((1..31).contains(&exp));
+            ((bits >> 16) & 0x8000) as u16 | ((exp as u16) << 10) | ((bits >> 13) & 1023) as u16
+        };
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    bytes[((y * pw + x) * 4) as usize + c] = half(input.pixel(x, y)[c]);
+                }
+            }
+        }
+        gpu.queue().write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&bytes),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(pw * 8),
+                rows_per_image: Some(ph),
+            },
+            desc.size,
+        );
+        let mut floor = None;
+        for &(radius, threshold, scale) in cases {
+            passes.native_surface_blur(gpu, &source, &target, radius, threshold, scale, w, h);
+            let actual = read_texture_rgba16f(gpu, &target, w, h);
+            let expected = surface_blur_reference(
+                &input.pixels,
+                w,
+                h,
+                radius,
+                threshold as f64,
+                scale.map(f64::from),
+            );
+            let cpu = ops::native_surface_blur(input, radius, threshold, scale);
+            let mut changed = false;
+            for (i, p) in actual.iter().enumerate() {
+                for c in 0..4 {
+                    assert!(
+                        (cpu.pixels[i][c] as f64 - expected[i][c]).abs()
+                            < 0.0004 * expected[i][c].abs().max(1.0),
+                        "CPU r{radius} t{threshold} s{scale:?} {i}/{c}: {:?} vs{:?}",
+                        cpu.pixels[i],
+                        expected[i]
+                    );
+                    assert!(
+                        p[c].is_finite()
+                            && (p[c] as f64 - expected[i][c]).abs()
+                                < 0.006 * expected[i][c].abs().max(1.0),
+                        "GPU r{radius} t{threshold} s{scale:?} {i}/{c}: {p:?} vs{:?}",
+                        expected[i]
+                    );
+                }
+                assert_eq!(p[3], input.pixels[i][3]);
+                changed |= p[..3] != input.pixels[i][..3];
+                if radius == 0 || threshold == 0.0 {
+                    assert_eq!(*p, input.pixels[i]);
+                }
+            }
+            if expect_smoothing && radius > 0 && threshold >= 0.25 {
+                assert!(changed, "test must actually exercise smoothing");
+            }
+            if radius == 1 && threshold == 0.0001 {
+                floor = Some(actual.clone());
+            }
+            if radius == 1 && threshold == 1.0 / 255.0 {
+                assert_eq!(floor.as_ref().unwrap(), &actual);
+            }
+            let pad = read_texture_rgba16f(gpu, &target, pw, ph);
+            for y in 0..ph {
+                for x in 0..pw {
+                    if x >= w || y >= h {
+                        assert_eq!(pad[(y * pw + x) as usize], [0.0; 4]);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_surface_blur_multicolor_smoothing_threshold_floor_and_storage() {
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let passes = Passes::new(gpu.device());
+        let (w, h) = (17, 9);
+        let mut input = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let alpha = if x < 2 && y < 2 {
+                    0.0
+                } else {
+                    [0.25, 0.5, 1.0][(x % 3) as usize]
+                };
+                let red = if x == 8 && y == 4 {
+                    -0.5
+                } else if x == 9 && y == 4 {
+                    4.0
+                } else {
+                    (x % 5) as f32 * 0.125
+                };
+                let green = (y % 3) as f32 * 0.25;
+                let blue = if (x + y) % 2 == 0 { 0.25 } else { 0.5 };
+                input.set(x, y, [red * alpha, green * alpha, blue * alpha, alpha]);
+            }
+        }
+        run(
+            &gpu,
+            &passes,
+            &input,
+            &[
+                (0, 0.25, [1.0; 2]),
+                (3, 0.0, [1.0; 2]),
+                (1, 0.0001, [1.0; 2]),
+                (1, 1.0 / 255.0, [1.0; 2]),
+                (2, 0.25, [1.0; 2]),
+                (3, 0.6, [1.0; 2]),
+                (4, 1.0, [1.0; 2]),
+                (8, 1.0, [1.0; 2]),
+                (4, 0.7, [0.5, 0.25]),
+                (4, 0.7, [0.25, 0.5]),
+                (4, 0.7, [2.0, 1.0]),
+                (64, 1.0, [1.0; 2]),
+            ],
+            true,
+        );
+        let mut extremes = Image::new(5, 1);
+        for x in 0..5 {
+            extremes.set(
+                x,
+                0,
+                [
+                    65504.0,
+                    -65504.0,
+                    32752.0,
+                    if x == 2 { 1.0 } else { 0.0009765625 },
+                ],
+            );
+        }
+        run(&gpu, &passes, &extremes, &[(2, 1.0, [1.0; 2])], true);
+    }
+}
+
+#[cfg(test)]
+mod native_lens_blur_spatial_qualification {
+    use super::*;
+    use crate::graph::ops::{self, Image};
+    /// Independent binary64 discrete-aperture reference with clamp-edge bilinear taps.
+    fn lens_blur_reference(
+        input: &[[f32; 4]],
+        w: u32,
+        h: u32,
+        radius: f64,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        if radius < 1.0 {
+            return input.iter().map(|p| p.map(f64::from)).collect();
+        }
+        let sample = |px: f64, py: f64| {
+            let x = px.clamp(0.0, w as f64 - 1.0);
+            let y = py.clamp(0.0, h as f64 - 1.0);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            let fx = x - x0 as f64;
+            let fy = y - y0 as f64;
+            let mut p = [0.0; 4];
+            for (xx, yy, weight) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+            ] {
+                for c in 0..4 {
+                    p[c] += input[(yy * w + xx) as usize][c] as f64 * weight;
+                }
+            }
+            p
+        };
+
+        let r = radius.ceil() as i32;
+        let radius2 = ((radius as f32) * (radius as f32)) as f64;
+        let mut output = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = [0.0; 4];
+                let mut count = 0u32;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if (dx * dx + dy * dy) as f64 > radius2 {
+                            continue;
+                        }
+                        let p = sample(
+                            x as f64 + dx as f64 * scale[0],
+                            y as f64 + dy as f64 * scale[1],
+                        );
+                        for c in 0..4 {
+                            sum[c] += p[c];
+                        }
+                        count += 1;
+                    }
+                }
+                output.push([
+                    (sum[0] / count as f64).clamp(-65504.0, 65504.0),
+                    (sum[1] / count as f64).clamp(-65504.0, 65504.0),
+                    (sum[2] / count as f64).clamp(-65504.0, 65504.0),
+                    sum[3] / count as f64,
+                ]);
+            }
+        }
+        output
+    }
+    fn run(
+        gpu: &GpuContext,
+        passes: &Passes,
+        input: &Image,
+        cases: &[(f32, [f32; 2])],
+        expect_smoothing: bool,
+    ) {
+        let (w, h) = (input.width, input.height);
+        let (pw, ph) = (w.div_ceil(64) * 64, h.div_ceil(64) * 64);
+        let desc = wgpu::TextureDescriptor {
+            label: Some("lens multicolor poison-pad fixture"),
+            size: wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let source = gpu.device().create_texture(&desc);
+        let target = gpu.device().create_texture(&desc);
+        let mut bytes = vec![0x7bffu16; (pw * ph * 4) as usize];
+        let half = |v: f32| {
+            if v == 0.0 {
+                return 0u16;
+            }
+            let bits = v.to_bits();
+            assert_eq!(
+                bits & 0x1fff,
+                0,
+                "fixture must be exactly representable in half"
+            );
+            let exp = ((bits >> 23) & 255) as i32 - 127 + 15;
+            assert!((1..31).contains(&exp));
+            ((bits >> 16) & 0x8000) as u16 | ((exp as u16) << 10) | ((bits >> 13) & 1023) as u16
+        };
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    bytes[((y * pw + x) * 4) as usize + c] = half(input.pixel(x, y)[c]);
+                }
+            }
+        }
+        gpu.queue().write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&bytes),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(pw * 8),
+                rows_per_image: Some(ph),
+            },
+            desc.size,
+        );
+        for &(radius, scale) in cases {
+            passes.native_lens_blur(gpu, &source, &target, radius, scale, w, h);
+            let actual = read_texture_rgba16f(gpu, &target, w, h);
+            let expected =
+                lens_blur_reference(&input.pixels, w, h, radius as f64, scale.map(f64::from));
+            let cpu = ops::native_lens_blur(input, radius, scale);
+            let mut changed = false;
+            for (i, p) in actual.iter().enumerate() {
+                for c in 0..4 {
+                    assert!(
+                        (cpu.pixels[i][c] as f64 - expected[i][c]).abs()
+                            < 0.0004 * expected[i][c].abs().max(1.0),
+                        "CPU r{radius} s{scale:?} {i}/{c}: {:?} vs{:?}",
+                        cpu.pixels[i],
+                        expected[i]
+                    );
+                    assert!(
+                        p[c].is_finite()
+                            && (p[c] as f64 - expected[i][c]).abs()
+                                < 0.006 * expected[i][c].abs().max(1.0),
+                        "GPU r{radius} s{scale:?} {i}/{c}: {p:?} vs{:?}",
+                        expected[i]
+                    );
+                }
+                changed |= p[..3] != input.pixels[i][..3];
+                if radius < 1.0 {
+                    assert_eq!(*p, input.pixels[i]);
+                }
+            }
+            if expect_smoothing && radius >= 1.0 {
+                assert!(changed, "test must actually exercise smoothing");
+            }
+            let pad = read_texture_rgba16f(gpu, &target, pw, ph);
+            for y in 0..ph {
+                for x in 0..pw {
+                    if x >= w || y >= h {
+                        assert_eq!(pad[(y * pw + x) as usize], [0.0; 4]);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_lens_blur_multicolor_fractional_aperture_alpha_and_storage() {
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let passes = Passes::new(gpu.device());
+        let (w, h) = (17, 9);
+        let mut input = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let alpha = if x < 2 && y < 2 {
+                    0.0
+                } else {
+                    [0.25, 0.5, 1.0][(x % 3) as usize]
+                };
+                let red = if x == 8 && y == 4 {
+                    -0.5
+                } else if x == 9 && y == 4 {
+                    4.0
+                } else {
+                    (x % 5) as f32 * 0.125
+                };
+                let green = (y % 3) as f32 * 0.25;
+                let blue = if (x + y) % 2 == 0 { 0.25 } else { 0.5 };
+                input.set(x, y, [red * alpha, green * alpha, blue * alpha, alpha]);
+            }
+        }
+        run(
+            &gpu,
+            &passes,
+            &input,
+            &[
+                (0.0, [1.0; 2]),
+                (0.99, [1.0; 2]),
+                (1.0, [1.0; 2]),
+                (f32::from_bits(0x3fb504f3), [1.0; 2]),
+                (f32::from_bits(0x3fb504f4), [1.0; 2]),
+                (1.999, [1.0; 2]),
+                (2.0, [1.0; 2]),
+                (3.25, [1.0; 2]),
+                (8.0, [1.0; 2]),
+                (4.25, [0.5, 0.25]),
+                (4.25, [0.25, 0.5]),
+                (4.25, [2.0, 1.0]),
+                (64.0, [1.0; 2]),
+            ],
+            true,
+        );
+        let mut extremes = Image::new(3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                extremes.set(
+                    x,
+                    y,
+                    [
+                        if x == 1 { 65504.0 } else { -65504.0 },
+                        32752.0,
+                        0.0,
+                        if x == 1 { 1.0 } else { 0.0009765625 },
+                    ],
+                );
+            }
+        }
+        run(&gpu, &passes, &extremes, &[(500.0, [1.0; 2])], true);
+    }
+}
+
+#[cfg(test)]
+mod native_rank_spatial_qualification {
+    use super::*;
+    use crate::graph::ops::{self, Image};
+    /// Independent binary64 sorted-window reference; no implementation helpers.
+    /// Independent binary64 sorted-window reference; no implementation helpers.
+    fn rank_reference(
+        input: &[[f32; 4]],
+        w: u32,
+        h: u32,
+        dust: bool,
+        radius: u32,
+        threshold: u8,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        if radius == 0 {
+            return input.iter().map(|p| p.map(f64::from)).collect();
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let operand = |v: [f64; 4]| {
+            let alpha = v[3].clamp(0.0, 1.0);
+            let rgb = if alpha > 1e-6 {
+                a.map(|m| {
+                    v[1] / alpha + m[0] * (v[0] - v[1]) / alpha + m[2] * (v[2] - v[1]) / alpha
+                })
+            } else {
+                [0.0; 3]
+            };
+            [rgb[0], rgb[1], rgb[2], alpha]
+        };
+        let sample = |px: f64, py: f64| {
+            let x = px.clamp(0.0, w as f64 - 1.0);
+            let y = py.clamp(0.0, h as f64 - 1.0);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            let fx = x - x0 as f64;
+            let fy = y - y0 as f64;
+            let mut p = [0.0; 4];
+            for (xx, yy, weight) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+            ] {
+                for c in 0..4 {
+                    p[c] += input[(yy * w + xx) as usize][c] as f64 * weight;
+                }
+            }
+            operand(p)
+        };
+        let r = radius.min(((w as f64 / scale[0]).max(h as f64 / scale[1]).ceil() as u32).max(1))
+            as i32;
+        let mut output = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let mut channels: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let p = sample(
+                            x as f64 + dx as f64 * scale[0],
+                            y as f64 + dy as f64 * scale[1],
+                        );
+                        for c in 0..4 {
+                            channels[c].push(p[c]);
+                        }
+                    }
+                }
+                let mut med = channels.map(|mut c| {
+                    c.sort_by(f64::total_cmp);
+                    c[c.len() / 2]
+                });
+                if dust {
+                    let orig = operand(input[(y * w + x) as usize].map(f64::from));
+                    for c in 0..3 {
+                        if (orig[c] - med[c]).abs() <= threshold as f64 / 255.0 {
+                            med[c] = orig[c];
+                        }
+                    }
+                    med[3] = orig[3];
+                }
+                let rgb = b.map(|m| {
+                    ((med[1] + m[0] * (med[0] - med[1]) + m[2] * (med[2] - med[1])) * med[3])
+                        .clamp(-65504.0, 65504.0)
+                });
+                output.push([rgb[0], rgb[1], rgb[2], med[3]]);
+            }
+        }
+        output
+    }
+    fn run(
+        gpu: &GpuContext,
+        passes: &Passes,
+        input: &Image,
+        cases: &[(bool, u32, u8, [f32; 2])],
+        expect_smoothing: bool,
+    ) {
+        let (w, h) = (input.width, input.height);
+        let (pw, ph) = (w.div_ceil(64) * 64, h.div_ceil(64) * 64);
+        let desc = wgpu::TextureDescriptor {
+            label: Some("rank multicolor poison-pad fixture"),
+            size: wgpu::Extent3d {
+                width: pw,
+                height: ph,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        };
+        let source = gpu.device().create_texture(&desc);
+        let target = gpu.device().create_texture(&desc);
+        let mut bytes = vec![0x7bffu16; (pw * ph * 4) as usize];
+        let half = |v: f32| {
+            if v == 0.0 {
+                return 0u16;
+            }
+            let bits = v.to_bits();
+            assert_eq!(
+                bits & 0x1fff,
+                0,
+                "fixture must be exactly representable in half"
+            );
+            let exp = ((bits >> 23) & 255) as i32 - 127 + 15;
+            assert!((1..31).contains(&exp));
+            ((bits >> 16) & 0x8000) as u16 | ((exp as u16) << 10) | ((bits >> 13) & 1023) as u16
+        };
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..4 {
+                    bytes[((y * pw + x) * 4) as usize + c] = half(input.pixel(x, y)[c]);
+                }
+            }
+        }
+        gpu.queue().write_texture(
+            source.as_image_copy(),
+            bytemuck::cast_slice(&bytes),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(pw * 8),
+                rows_per_image: Some(ph),
+            },
+            desc.size,
+        );
+        for &(dust, radius, threshold, scale) in cases {
+            let kind = if dust {
+                crate::graph::ir::NativeRankKind::DustScratches
+            } else {
+                crate::graph::ir::NativeRankKind::Median
+            };
+            passes.native_rank_filter(gpu, &source, &target, kind, radius, threshold, scale, w, h);
+            let actual = read_texture_rgba16f(gpu, &target, w, h);
+            let expected = rank_reference(
+                &input.pixels,
+                w,
+                h,
+                dust,
+                radius,
+                threshold,
+                scale.map(f64::from),
+            );
+            let cpu = ops::native_rank_filter(input, kind, radius, threshold, scale);
+            let mut changed = false;
+            for (i, p) in actual.iter().enumerate() {
+                for c in 0..4 {
+                    assert!(
+                        (cpu.pixels[i][c] as f64 - expected[i][c]).abs()
+                            < 0.0004 * expected[i][c].abs().max(1.0),
+                        "CPU dust{dust}/r{radius}/t{threshold}/s{scale:?} {i}/{c}: {:?} vs{:?}",
+                        cpu.pixels[i],
+                        expected[i]
+                    );
+                    assert!(
+                        p[c].is_finite()
+                            && (p[c] as f64 - expected[i][c]).abs()
+                                < 0.006 * expected[i][c].abs().max(1.0),
+                        "GPU dust{dust}/r{radius}/t{threshold}/s{scale:?} {i}/{c}: {p:?} vs{:?}",
+                        expected[i]
+                    );
+                }
+                changed |= p[..3] != input.pixels[i][..3];
+                if radius == 0 {
+                    assert_eq!(*p, input.pixels[i]);
+                }
+            }
+            if expect_smoothing && radius > 0 && threshold == 0 {
+                assert!(changed, "test must actually exercise smoothing");
+            }
+            let pad = read_texture_rgba16f(gpu, &target, pw, ph);
+            for y in 0..ph {
+                for x in 0..pw {
+                    if x >= w || y >= h {
+                        assert_eq!(pad[(y * pw + x) as usize], [0.0; 4]);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn native_rank_filters_multicolor_sorting_radix_alpha_and_storage() {
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let passes = Passes::new(gpu.device());
+        let (w, h) = (17, 9);
+        let mut input = Image::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let alpha = if x < 2 && y < 2 {
+                    0.0
+                } else {
+                    [0.25, 0.5, 1.0][(x % 3) as usize]
+                };
+                let red = if x == 8 && y == 4 {
+                    -0.5
+                } else if x == 9 && y == 4 {
+                    4.0
+                } else {
+                    (x % 5) as f32 * 0.125
+                };
+                let green = (y % 3) as f32 * 0.25;
+                let blue = if (x + y) % 2 == 0 { 0.25 } else { 0.5 };
+                input.set(x, y, [red * alpha, green * alpha, blue * alpha, alpha]);
+            }
+        }
+        run(
+            &gpu,
+            &passes,
+            &input,
+            &[
+                (false, 0, 0, [1.0; 2]),
+                (false, 1, 0, [1.0; 2]),
+                (false, 2, 0, [1.0; 2]),
+                (false, 3, 0, [1.0; 2]),
+                (false, 4, 0, [1.0; 2]),
+                (false, 5, 0, [1.0; 2]),
+                (false, 6, 0, [1.0; 2]),
+                (false, 7, 0, [1.0; 2]),
+                (false, 8, 0, [1.0; 2]),
+                (false, 500, 0, [1.0; 2]),
+                (true, 0, 16, [1.0; 2]),
+                (true, 1, 16, [1.0; 2]),
+                (true, 4, 0, [1.0; 2]),
+                (true, 8, 255, [1.0; 2]),
+                (true, 16, 16, [1.0; 2]),
+                (false, 4, 0, [0.5, 0.25]),
+                (false, 8, 0, [0.25, 0.5]),
+                (true, 8, 0, [0.5, 1.0]),
+            ],
+            true,
+        );
+        let mut extremes = Image::new(3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                extremes.set(
+                    x,
+                    y,
+                    [
+                        if x == 1 { 65504.0 } else { -65504.0 },
+                        32752.0,
+                        0.0,
+                        if x == 1 { 1.0 } else { 0.0009765625 },
+                    ],
+                );
+            }
+        }
+        run(
+            &gpu,
+            &passes,
+            &extremes,
+            &[(false, 500, 0, [1.0; 2]), (true, 16, 0, [1.0; 2])],
+            false,
+        );
+        let mut neutral = Image::new(3, 3);
+        for y in 0..3 {
+            for x in 0..3 {
+                neutral.set(x, y, [0.0, 0.0, 0.0, 1.0]);
+            }
+        }
+        neutral.set(1, 1, [1.0; 4]);
+        run(
+            &gpu,
+            &passes,
+            &neutral,
+            &[(true, 1, 255, [1.0; 2]), (true, 1, 254, [1.0; 2])],
+            false,
         );
     }
 }

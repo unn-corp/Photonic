@@ -121,6 +121,11 @@ impl<T> StillCache<T> {
         self
     }
 
+    /// Original decoded dimensions, independent of a requested preview size.
+    pub fn native_size(&self, asset: AssetId) -> Option<(u32, u32)> {
+        self.native.get(&asset).copied()
+    }
+
     pub fn resident_bytes(&self) -> u64 {
         self.entries.values().map(|entry| entry.bytes).sum()
     }

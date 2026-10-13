@@ -96,6 +96,8 @@ struct KfDrag {
 /// One animatable property of the targeted clip: its registry entry plus the
 /// [`AnimTarget`] that addresses its keyframe lane.
 struct PropRow {
+    stage_op: Option<std::sync::Arc<photonic_core::timeline::GradeOp>>,
+    editable: bool,
     group: String,
     label: String,
     path: PropPath,
@@ -106,12 +108,14 @@ struct PropRow {
 
 /// Flatten a clip's animatable properties into picker rows: the eight
 /// `transform.*` fields, then each effect's registry params (01 §6.2). Grade-op
-/// automation is authored from the color page (07); the picker scope here is
-/// "clip / effect / transform" per 13 §5.
+/// scalar automation is included for each local clip-grade corrector. Shared
+/// and group grades remain outside this clip-addressed editor.
 fn build_rows(clip: &Clip) -> Vec<PropRow> {
     let mut rows = Vec::new();
     for e in prop_registry::entries(PropTargetKind::ClipTransform) {
         rows.push(PropRow {
+            stage_op: None,
+            editable: true,
             group: "Transform".to_string(),
             label: pretty_label(e.path.strip_prefix("transform.").unwrap_or(e.path)),
             path: PropPath::new(e.path),
@@ -122,8 +126,10 @@ fn build_rows(clip: &Clip) -> Vec<PropRow> {
     }
     for (i, fx) in clip.effects.iter().enumerate() {
         let group = effect_name(fx.kind).to_string();
-        for e in prop_registry::entries(PropTargetKind::Effect(fx.kind)) {
+        for e in photonic_core::timeline::effect_manifest::entries_for_effect(fx.kind) {
             rows.push(PropRow {
+                stage_op: None,
+                editable: true,
                 group: group.clone(),
                 label: pretty_label(e.path.strip_prefix("params.").unwrap_or(e.path)),
                 path: PropPath::new(e.path),
@@ -136,11 +142,42 @@ fn build_rows(clip: &Clip) -> Vec<PropRow> {
             });
         }
     }
+    if let Some(grade) = &clip.grade {
+        for (index, op) in grade.ops.iter().enumerate() {
+            for entry in prop_registry::entries(PropTargetKind::GradeOp(op.kind))
+                .iter()
+                .chain(prop_registry::grade_mask_entries())
+            {
+                if op.scalar_property(entry.path).is_none() {
+                    continue;
+                }
+                rows.push(PropRow {
+                    stage_op: None,
+                    editable: true,
+                    group: format!(
+                        "Grade {} · {}",
+                        index + 1,
+                        super::color_page::kind_label(op.kind)
+                    ),
+                    label: grade_property_label(op.kind, entry.path),
+                    path: PropPath::new(entry.path),
+                    target: AnimTarget::GradeOp {
+                        clip: clip.id,
+                        op: op.id,
+                    },
+                    kind: entry.kind,
+                    range: entry.range,
+                });
+            }
+        }
+    }
     // Proposal 210 / 211: clip gain is a first-class animatable lane for the
     // graph editor and on-clip envelope.
     if clip.audio.is_some() {
         for e in prop_registry::entries(PropTargetKind::ClipAudioParams) {
             rows.push(PropRow {
+                stage_op: None,
+                editable: true,
                 group: "Audio".to_string(),
                 label: pretty_label(e.path.strip_prefix("params.").unwrap_or(e.path)),
                 path: PropPath::new(e.path),
@@ -153,6 +190,133 @@ fn build_rows(clip: &Clip) -> Vec<PropRow> {
     rows
 }
 
+/// Build one selected member's exact stage rows. Shared keys evaluate in each
+/// linked/member clip's local clock, matching the existing compiler contract.
+fn build_stage_rows(project: &TimelineProject, clip: &Clip) -> Vec<PropRow> {
+    use photonic_core::timeline::{ClipLook, GradeInspectionStage as S};
+    let mut rows = build_rows(clip);
+    for row in &mut rows {
+        row.editable = ops::ensure_anim_target_editable(project, &row.target).is_ok();
+    }
+    let mut stages = Vec::new();
+    if let Some(look) = &clip.look {
+        stages.push(match look {
+            ClipLook::Local(_) => (S::LocalLook, "Local look".to_string()),
+            ClipLook::Shared(id) => (
+                S::SharedLook { id: *id },
+                format!("Shared look {}", &id.to_string()[..8]),
+            ),
+        });
+    }
+    if let Some(sequence) = project
+        .sequences
+        .values()
+        .find(|s| s.tracks().any(|t| t.clips.iter().any(|c| c.id == clip.id)))
+    {
+        if let Some(group) = clip.group {
+            for id in sequence.group_chain(group) {
+                stages.push((
+                    S::GroupPre { id },
+                    format!("Group pre {}", &id.to_string()[..8]),
+                ));
+                stages.push((
+                    S::GroupPost { id },
+                    format!("Group post {}", &id.to_string()[..8]),
+                ));
+            }
+        }
+    }
+    for (stage, label) in stages {
+        let Some(grade) = stage.resolve_grade(project, clip) else {
+            continue;
+        };
+        for (index, op) in grade.ops.iter().enumerate() {
+            let snapshot = std::sync::Arc::new(op.clone());
+            let target = AnimTarget::GradeStageOp {
+                clip: clip.id,
+                stage,
+                op: op.id,
+            };
+            let editable = ops::ensure_anim_target_editable(project, &target).is_ok();
+            for entry in prop_registry::entries(PropTargetKind::GradeOp(op.kind))
+                .iter()
+                .chain(prop_registry::grade_mask_entries())
+            {
+                if op.scalar_property(entry.path).is_none() {
+                    continue;
+                }
+                rows.push(PropRow {
+                    stage_op: Some(snapshot.clone()),
+                    editable,
+                    group: format!(
+                        "{} · {} · {}",
+                        label,
+                        index + 1,
+                        super::color_page::kind_label(op.kind)
+                    ),
+                    label: grade_property_label(op.kind, entry.path),
+                    path: PropPath::new(entry.path),
+                    target: target.clone(),
+                    kind: entry.kind,
+                    range: entry.range,
+                });
+            }
+        }
+    }
+    rows
+}
+
+fn row_track<'a>(clip: &'a Clip, row: &'a PropRow) -> Option<&'a PropertyTrack> {
+    if let Some(op) = &row.stage_op {
+        op.params.track(&row.path)
+    } else {
+        track_for(clip, &row.target, &row.path)
+    }
+}
+fn row_base(clip: &Clip, row: &PropRow) -> Option<PropValue> {
+    if let Some(op) = &row.stage_op {
+        op.scalar_property(row.path.as_str())
+            .map(|v| PropValue::Float(f64::from(v)))
+    } else {
+        base_value(clip, &row.target, &row.path)
+    }
+}
+fn row_value_at(clip: &Clip, row: &PropRow, dt: Tick) -> Option<PropValue> {
+    let base = row_base(clip, row)?;
+    match row_track(clip, row) {
+        Some(track) if !track.keyframes.is_empty() => Some(anim::eval(track, &base, dt)),
+        _ => Some(base),
+    }
+}
+
+fn grade_property_label(kind: photonic_core::timeline::GradeOpKind, path: &str) -> String {
+    use photonic_core::timeline::GradeOpKind;
+    let named = match (kind, path) {
+        (_, "mask.center[0]") => Some("Window center X"),
+        (_, "mask.center[1]") => Some("Window center Y"),
+        (_, "mask.size[0]") => Some("Window half-width"),
+        (_, "mask.size[1]") => Some("Window half-height"),
+        (_, "mask.rotation") => Some("Window rotation (rad)"),
+        (_, "mask.softness") => Some("Window feather"),
+        (GradeOpKind::TonalExposure, "params.stops[0]") => Some("Shadows"),
+        (GradeOpKind::TonalExposure, "params.stops[1]") => Some("Midtones"),
+        (GradeOpKind::TonalExposure, "params.stops[2]") => Some("Highlights"),
+        (GradeOpKind::TonalExposure, "params.boundaries[0]") => Some("Shadow boundary"),
+        (GradeOpKind::TonalExposure, "params.boundaries[1]") => Some("Highlight boundary"),
+        (GradeOpKind::WhiteBalanceCct, "params.source_kelvin") => Some("Source white (K)"),
+        (GradeOpKind::WhiteBalanceCct, "params.target_kelvin") => Some("Target white (K)"),
+        _ => None,
+    };
+    if let Some(label) = named {
+        return label.into();
+    }
+    let leaf = path.strip_prefix("params.").unwrap_or(path);
+    pretty_label(leaf)
+        .replace("[0]", " R")
+        .replace("[1]", " G")
+        .replace("[2]", " B")
+}
+
 fn effect_name(kind: photonic_core::timeline::EffectKind) -> &'static str {
     use photonic_core::timeline::EffectKind as K;
     match kind {
@@ -163,7 +327,8 @@ fn effect_name(kind: photonic_core::timeline::EffectKind) -> &'static str {
         K::LumaKey => "Luma Key",
         K::Invert => "Invert",
         K::MaskShapeGen => "Mask Shape",
-        _ => "Effect",
+        _ => photonic_core::timeline::effect_manifest::manifest(kind.effect_id())
+            .map_or("Effect", |m| m.name),
     }
 }
 
@@ -200,6 +365,14 @@ fn track_for<'a>(
         AnimTarget::ClipEffect { effect_index, .. } => {
             clip.effects.get(*effect_index)?.params.track(path)
         }
+        AnimTarget::GradeOp { op, .. } => clip
+            .grade
+            .as_ref()?
+            .ops
+            .iter()
+            .find(|o| o.id == *op)?
+            .params
+            .track(path),
         AnimTarget::ClipAudio { .. } => clip.audio.as_ref()?.params.track(path),
         _ => None,
     }
@@ -231,6 +404,14 @@ fn base_value(clip: &Clip, target: &AnimTarget, path: &PropPath) -> Option<PropV
             .base
             .get(path.as_str())
             .copied(),
+        AnimTarget::GradeOp { op, .. } => clip
+            .grade
+            .as_ref()?
+            .ops
+            .iter()
+            .find(|o| o.id == *op)?
+            .scalar_property(path.as_str())
+            .map(|v| PropValue::Float(f64::from(v))),
         AnimTarget::ClipAudio { .. } => {
             let g = clip.audio.as_ref()?.params.base.gain_db;
             match path.as_str() {
@@ -486,7 +667,9 @@ fn commit(history: &mut CommandHistory, doc: &mut Document, cmd: TimelineCmd) {
 /// duplicating the ops-building logic per surface.
 fn kf_action_cmds(project: &TimelineProject, action: KfAction) -> Vec<TimelineCmd> {
     match action {
-        KfAction::Set { target, path, kf } => vec![ops::set_keyframe(project, target, path, kf)],
+        KfAction::Set { target, path, kf } => ops::set_keyframe_checked(project, target, path, kf)
+            .into_iter()
+            .collect(),
         KfAction::Remove { target, path, at } => ops::remove_keyframe(project, target, path, at)
             .into_iter()
             .collect(),
@@ -523,7 +706,9 @@ fn kf_action_cmds(project: &TimelineProject, action: KfAction) -> Vec<TimelineCm
             let Ok(rm) = ops::remove_keyframe(project, target.clone(), path.clone(), old_at) else {
                 return Vec::new();
             };
-            let set = ops::set_keyframe(project, target, path, kf);
+            let Ok(set) = ops::set_keyframe_checked(project, target, path, kf) else {
+                return Vec::new();
+            };
             vec![rm, set]
         }
     }
@@ -675,14 +860,14 @@ pub(crate) fn draw_window(
         return;
     };
 
-    let rows = build_rows(&clip);
+    let rows = build_stage_rows(doc.timeline.as_ref().unwrap(), &clip);
     sync_state_for_clip(&mut st, clip_id, rows.len());
 
     let mut actions: Vec<KfAction> = Vec::new();
     let mut open = true;
 
     egui::Window::new(format!("{}  Keyframes", ph::CHART_LINE))
-        .id(egui::Id::new("photonic_kf_editor_window"))
+        .id(egui::Id::new("photonic_kf_editor_window").with(doc.id))
         .open(&mut open)
         .resizable(true)
         .collapsible(true)
@@ -690,6 +875,12 @@ pub(crate) fn draw_window(
         .min_width(360.0)
         .min_height(200.0)
         .show(ctx, |ui| {
+            if doc.timeline.as_ref().is_some_and(|p| {
+                ops::ensure_anim_target_editable(p, &AnimTarget::ClipTransform { clip: clip.id })
+                    .is_err()
+            }) {
+                ui.label(egui::RichText::new("Track locked · keyframes are read-only").weak());
+            }
             render_editor(ui, &clip, fps, playhead, &rows, &mut st, &mut actions);
         });
 
@@ -748,7 +939,12 @@ pub(crate) fn draw_embedded(
     project: &TimelineProject,
     clip: &Clip,
 ) -> Option<PanelAction> {
-    let rows = build_rows(clip);
+    let rows = build_stage_rows(project, clip);
+    if ops::ensure_anim_target_editable(project, &AnimTarget::ClipTransform { clip: clip.id })
+        .is_err()
+    {
+        ui.label(egui::RichText::new("Track locked · keyframes are read-only").weak());
+    }
     if rows.is_empty() {
         ui.label(
             egui::RichText::new("No animatable properties on this clip.")
@@ -792,6 +988,10 @@ pub(crate) fn draw_embedded(
     kf_actions_to_panel_action(project, actions)
 }
 
+fn local_time_readout(time: Tick) -> String {
+    format!("t {:.2}s", time.as_seconds_f64())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_editor(
     ui: &mut egui::Ui,
@@ -813,7 +1013,7 @@ fn render_editor(
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             match playhead_local(playhead, clip) {
                 Some(dt) => ui.label(
-                    egui::RichText::new(format!("t {:.2}s", dt.0 as f64 / 30_000.0))
+                    egui::RichText::new(local_time_readout(dt))
                         .monospace()
                         .weak(),
                 ),
@@ -859,7 +1059,7 @@ fn draw_interchange_bar(
             .on_hover_text("Copy every keyframed track on this target");
         if let Some(row) = row {
             if copy_one.clicked() {
-                if let Some(tr) = track_for(clip, &row.target, &row.path) {
+                if let Some(tr) = row_track(clip, row) {
                     if !tr.keyframes.is_empty() {
                         let board = KeyframeClipboard::from_tracks(vec![tr.clone()]);
                         ui.ctx().data_mut(|d| {
@@ -873,7 +1073,7 @@ fn draw_interchange_bar(
                 let tracks: Vec<PropertyTrack> = rows
                     .iter()
                     .filter(|r| r.target == row.target)
-                    .filter_map(|r| track_for(clip, &r.target, &r.path).cloned())
+                    .filter_map(|r| row_track(clip, r).cloned())
                     .filter(|t| !t.keyframes.is_empty())
                     .collect();
                 if !tracks.is_empty() {
@@ -892,13 +1092,13 @@ fn draw_interchange_bar(
             .unwrap_or(false);
         let paste = ui
             .add_enabled(
-                has_clip && row.is_some(),
+                has_clip && row.is_some_and(|row| row.editable),
                 egui::Button::new("Paste").small(),
             )
             .on_hover_text("Paste clipboard onto the selected target (identity paths, offset 0)");
         let paste_re = ui
             .add_enabled(
-                has_clip && row.is_some(),
+                has_clip && row.is_some_and(|row| row.editable),
                 egui::Button::new("Paste @0").small(),
             )
             .on_hover_text("Paste re-anchored so the first key lands at clip start");
@@ -963,7 +1163,7 @@ fn draw_prop_picker(
                     last_group = Some(row.group.as_str());
                 }
 
-                let track = track_for(clip, &row.target, &row.path);
+                let track = row_track(clip, row);
                 let has_any = track.map(|t| !t.keyframes.is_empty()).unwrap_or(false);
                 let at_dt = local.and_then(|dt| {
                     track.and_then(|t| t.keyframes.iter().find(|k| k.at == dt).map(|_| dt))
@@ -992,7 +1192,7 @@ fn draw_prop_picker(
                             "Add keyframe at playhead"
                         });
                     }
-                    if dresp.clicked() {
+                    if dresp.clicked() && row.editable {
                         if let Some(dt) = local {
                             if let Some(at) = at_dt {
                                 actions.push(KfAction::Remove {
@@ -1000,7 +1200,7 @@ fn draw_prop_picker(
                                     path: row.path.clone(),
                                     at,
                                 });
-                            } else if let Some(v) = value_at(clip, &row.target, &row.path, dt) {
+                            } else if let Some(v) = row_value_at(clip, row, dt) {
                                 actions.push(KfAction::Set {
                                     target: row.target.clone(),
                                     path: row.path.clone(),
@@ -1020,7 +1220,7 @@ fn draw_prop_picker(
                     // Current value readout (right-aligned, mono).
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let text = local
-                            .and_then(|dt| value_at(clip, &row.target, &row.path, dt))
+                            .and_then(|dt| row_value_at(clip, row, dt))
                             .map(fmt_value)
                             .unwrap_or_else(|| "—".to_string());
                         ui.label(egui::RichText::new(text).monospace().small().color(muted));
@@ -1122,10 +1322,10 @@ fn draw_curve_area(
         ui.separator();
         let sel_at = st.sel_kf_at.map(Tick);
         let cur_interp = sel_at.and_then(|at| {
-            track_for(clip, &row.target, &row.path)
+            row_track(clip, row)
                 .and_then(|t| t.keyframes.iter().find(|k| k.at == at).map(|k| k.interp))
         });
-        ui.add_enabled_ui(sel_at.is_some(), |ui| {
+        ui.add_enabled_ui(sel_at.is_some() && row.editable, |ui| {
             for preset in anim::EasePreset::ALL {
                 let active = preset_is_active(cur_interp.as_ref(), *preset);
                 if ui
@@ -1146,7 +1346,10 @@ fn draw_curve_area(
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
-                .add_enabled(sel_at.is_some(), egui::Button::new(ph::TRASH).small())
+                .add_enabled(
+                    sel_at.is_some() && row.editable,
+                    egui::Button::new(ph::TRASH).small(),
+                )
                 .on_hover_text("Delete selected keyframe (Del)")
                 .clicked()
             {
@@ -1183,7 +1386,24 @@ fn draw_curve_area(
         return;
     }
 
-    draw_float_curve(ui, clip, fps, playhead, row, st, actions);
+    if matches!(row.target, AnimTarget::GradeStageOp { .. }) {
+        ui.label(egui::RichText::new("Stage keys use each member clip's local time. Shared/group edits affect all users.").small().weak());
+    }
+    if !row.editable {
+        ui.label(egui::RichText::new("Scope locked · keyframes are read-only").weak());
+    }
+    ui.add_enabled_ui(row.editable, |ui| {
+        draw_float_curve(ui, clip, fps, playhead, row, st, actions);
+    });
+}
+
+fn curve_drag_identity(surface: egui::Id, clip: ClipId, row: &PropRow) -> egui::Id {
+    surface.with((
+        DRAG_ID,
+        clip,
+        format!("{:?}", row.target),
+        row.path.as_str(),
+    ))
 }
 
 /// The Float curve editor: grid, playhead, keyframe diamonds, interpolation
@@ -1208,10 +1428,8 @@ fn draw_float_curve(
     let text = v.text_color();
     let muted = v.weak_text_color();
 
-    let track = track_for(clip, &row.target, &row.path);
-    let base = base_value(clip, &row.target, &row.path)
-        .and_then(|b| as_f64(&b))
-        .unwrap_or(0.0);
+    let track = row_track(clip, row);
+    let base = row_base(clip, row).and_then(|b| as_f64(&b)).unwrap_or(0.0);
     let (vmin, vmax) = value_range(row.range, track, base);
     let dur = clip.duration;
 
@@ -1277,7 +1495,7 @@ fn draw_float_curve(
         .collect();
 
     // ── Pointer editing ──────────────────────────────────────────────────────
-    let drag_id = egui::Id::new(DRAG_ID);
+    let drag_id = curve_drag_identity(ui.id(), clip.id, row);
     let hover = resp.hover_pos();
 
     // Selected keyframe's Bezier handle screen positions (if applicable).
@@ -1301,8 +1519,14 @@ fn draw_float_curve(
     });
 
     // Begin a drag: prefer a handle grip, else a keyframe point.
-    if resp.drag_started() {
-        if let Some(pos) = resp.interact_pointer_pos() {
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|m| m.remove::<KfDrag>(drag_id));
+    }
+    if resp.drag_started() && !ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if let Some(pos) = ui
+            .input(|i| i.pointer.press_origin())
+            .or_else(|| resp.interact_pointer_pos())
+        {
             let mut started = None;
             if let Some((hi, (out_p, in_p))) = handles {
                 if out_p.distance(pos) <= 7.0 {
@@ -1575,6 +1799,15 @@ pub(crate) fn paint_clip_automation(
             }
         }
     }
+    if let Some(grade) = &clip.grade {
+        for op in &grade.ops {
+            for tr in &op.params.tracks {
+                for key in &tr.keyframes {
+                    ats.push(key.at.0);
+                }
+            }
+        }
+    }
     if let Some(audio) = &clip.audio {
         for tr in &audio.params.tracks {
             for k in &tr.keyframes {
@@ -1781,6 +2014,25 @@ mod tests {
     }
 
     #[test]
+    fn catalog_motion_blur_has_named_animation_lanes() {
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(1000));
+        clip.effects.push(
+            photonic_core::timeline::ClipEffect::from_manifest(
+                photonic_core::timeline::EffectId::new("blur.motion"),
+            )
+            .unwrap(),
+        );
+        let rows = build_rows(&clip);
+        for path in ["params.angle", "params.distance"] {
+            let row = rows.iter().find(|r| r.path.as_str() == path).unwrap();
+            assert_eq!(row.group, "Motion Blur");
+            assert!(
+                matches!(row.target, AnimTarget::ClipEffect {clip: id, effect_index: 0} if id == clip.id)
+            );
+        }
+    }
+
+    #[test]
     fn build_rows_covers_transform_and_effects() {
         let mut clip = Clip::new(
             ClipSource::Vector {
@@ -1802,6 +2054,463 @@ mod tests {
                 ..
             }
         ) && r.path.as_str() == "params.radius"));
+    }
+
+    #[test]
+    fn keyframe_time_readout_uses_timeline_ticks_per_second() {
+        assert_eq!(local_time_readout(Tick::ZERO), "t 0.00s");
+        assert_eq!(
+            local_time_readout(Tick(FrameRate::FPS_30.ticks_per_frame().0 * 18)),
+            "t 0.60s"
+        );
+        assert_eq!(local_time_readout(Tick::from_seconds(60)), "t 60.00s");
+    }
+
+    #[test]
+    fn grade_curve_drag_uses_press_origin_and_escape_cancels() {
+        use photonic_core::timeline::{Grade, GradeOp, GradeOpKind, GradeOpParams};
+        let duration = FrameRate::FPS_30.ticks_per_frame().0 * 30;
+        for cancel in [false, true] {
+            let ctx = egui::Context::default();
+            let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(duration));
+            let mut grade = Grade::new();
+            let mut op = GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 0.0 },
+            );
+            let target = AnimTarget::GradeOp {
+                clip: clip.id,
+                op: op.id,
+            };
+            let path = PropPath::new("params.stops");
+            op.params.track_mut(&path).insert_keyframe(Keyframe::new(
+                Tick(duration / 2),
+                PropValue::Float(0.0),
+                Interp::Linear,
+            ));
+            grade.ops.push(op);
+            clip.grade = Some(grade);
+            let row = PropRow {
+                stage_op: None,
+                editable: true,
+                group: "Grade".into(),
+                label: "Stops".into(),
+                path,
+                target: target.clone(),
+                kind: PropValueKind::Float,
+                range: Some((-8.0, 8.0)),
+            };
+            let mut st = EditorState::default();
+            let mut time = 0.0;
+            let mut frame = |events: Vec<egui::Event>| {
+                time += 0.02;
+                let mut actions = Vec::new();
+                let mut rect = Rect::NOTHING;
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(500.0, 300.0))),
+                        time: Some(time),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            rect = ui.available_rect_before_wrap();
+                            draw_float_curve(
+                                ui,
+                                &clip,
+                                FrameRate::FPS_30,
+                                Tick(0),
+                                &row,
+                                &mut st,
+                                &mut actions,
+                            );
+                        });
+                    },
+                );
+                (rect, actions)
+            };
+            let (rect, _) = frame(vec![]);
+            let origin = rect.center();
+            let moved = origin + Vec2::new(20.0, -20.0);
+            frame(vec![
+                egui::Event::PointerMoved(origin),
+                egui::Event::PointerButton {
+                    pos: origin,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            frame(vec![egui::Event::PointerMoved(moved)]);
+            if cancel {
+                frame(vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: Some(egui::Key::Escape),
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            let (_, actions) = frame(vec![egui::Event::PointerButton {
+                pos: moved,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            if cancel {
+                assert!(actions.is_empty());
+            } else {
+                assert_eq!(actions.len(), 1);
+                let KfAction::Move {
+                    target: actual,
+                    old_at,
+                    kf,
+                    ..
+                } = &actions[0]
+                else {
+                    panic!("expected one move")
+                };
+                assert_eq!(*actual, target);
+                assert_eq!(*old_at, Tick(duration / 2));
+                assert!(kf.at.0 > duration / 2);
+                assert!(matches!(kf.value,PropValue::Float(v) if v>0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn stage_animation_rows_resolve_exact_values_and_shared_locks() {
+        use photonic_core::timeline::{
+            ClipLook, ClipSource, Grade, GradeInspectionStage as S, GradeOp, GradeOpKind,
+            GradeOpParams, GroupKind, GroupNode, Sequence, SharedLook, SharedLookId, Track,
+            TrackKind,
+        };
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Rows", FrameRate::FPS_30, 16, 16);
+        let seq = sequence.id;
+        let mut group = GroupNode::new(GroupKind::Normal);
+        let gid = group.id;
+        let look = SharedLookId::new();
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.0 },
+        );
+        let mut lane = PropertyTrack::new(PropPath::new("params.stops"));
+        lane.keyframes = vec![
+            Keyframe::new(Tick(0), PropValue::Float(0.0), Interp::Linear),
+            Keyframe::new(Tick(100), PropValue::Float(2.0), Interp::Linear),
+        ];
+        op.params.tracks.push(lane);
+        grade.ops.push(op);
+        group.pre_grade = Some(grade.clone());
+        group.post_grade = Some(grade.clone());
+        sequence.groups.insert(gid, group);
+        project.shared_looks.insert(
+            look,
+            SharedLook {
+                versions: Vec::new(),
+                active_version: None,
+                id: look,
+                name: "Shared".into(),
+                grade: grade.clone(),
+            },
+        );
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(200), Tick(100));
+        clip.grade = Some(grade.clone());
+        clip.look = Some(ClipLook::Shared(look));
+        clip.group = Some(gid);
+        let mut first = Track::new(TrackKind::Video, "First");
+        first.clips.push(clip.clone());
+        sequence.video_tracks.push(first);
+        let mut second = Track::new(TrackKind::Video, "Second");
+        second.locked = true;
+        let mut sibling = clip.clone();
+        sibling.id = ClipId::new();
+        second.clips.push(sibling);
+        sequence.video_tracks.push(second);
+        project.insert_sequence(sequence);
+        let rows = build_stage_rows(&project, &clip);
+        let stages: Vec<_> = rows
+            .iter()
+            .filter(|r| {
+                r.path.as_str() == "params.stops"
+                    && matches!(r.target, AnimTarget::GradeStageOp { .. })
+            })
+            .collect();
+        assert_eq!(stages.len(), 3);
+        for row in &stages {
+            assert!(!row.editable);
+            assert_eq!(
+                row_value_at(&clip, row, Tick(50)),
+                Some(PropValue::Float(1.0))
+            );
+        }
+        assert!(rows
+            .iter()
+            .filter(|r| matches!(r.target, AnimTarget::GradeOp { .. }))
+            .all(|r| r.editable));
+        for (i, row) in stages.iter().enumerate() {
+            for other in stages.iter().skip(i + 1) {
+                assert_ne!(
+                    curve_drag_identity(egui::Id::new("stage"), clip.id, row),
+                    curve_drag_identity(egui::Id::new("stage"), clip.id, other)
+                );
+            }
+        }
+        clip.look = Some(ClipLook::Local(Box::new(grade)));
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0].clips[0] = clip.clone();
+        let rows = build_stage_rows(&project, &clip);
+        let local = rows
+            .iter()
+            .find(|r| {
+                matches!(
+                    r.target,
+                    AnimTarget::GradeStageOp {
+                        stage: S::LocalLook,
+                        ..
+                    }
+                ) && r.path.as_str() == "params.stops"
+            })
+            .unwrap();
+        assert!(local.editable);
+        assert_eq!(
+            row_value_at(&clip, local, Tick(50)),
+            Some(PropValue::Float(1.0))
+        );
+    }
+
+    #[test]
+    fn grade_property_labels_name_tonal_ranges_kelvin_and_channels() {
+        use photonic_core::timeline::GradeOpKind;
+        assert_eq!(
+            grade_property_label(GradeOpKind::TonalExposure, "params.stops[1]"),
+            "Midtones"
+        );
+        assert_eq!(
+            grade_property_label(GradeOpKind::WhiteBalanceCct, "params.source_kelvin"),
+            "Source white (K)"
+        );
+        assert_eq!(
+            grade_property_label(GradeOpKind::Wheels, "params.gamma[2]"),
+            "Gamma B"
+        );
+        assert_eq!(
+            grade_property_label(GradeOpKind::Exposure, "params.stops"),
+            "Stops"
+        );
+    }
+
+    #[test]
+    fn grade_curve_drag_identity_separates_correctors_properties_and_surfaces() {
+        use photonic_core::timeline::GradeOpId;
+        let clip = ClipId::new();
+        let op = GradeOpId::new();
+        let mut row = PropRow {
+            stage_op: None,
+            editable: true,
+            group: "Grade".into(),
+            label: "Stops".into(),
+            path: PropPath::new("params.stops"),
+            target: AnimTarget::GradeOp { clip, op },
+            kind: PropValueKind::Float,
+            range: None,
+        };
+        let surface = egui::Id::new("one");
+        let initial = curve_drag_identity(surface, clip, &row);
+        row.target = AnimTarget::GradeOp {
+            clip,
+            op: GradeOpId::new(),
+        };
+        assert_ne!(initial, curve_drag_identity(surface, clip, &row));
+        row.target = AnimTarget::GradeOp { clip, op };
+        row.path = PropPath::new("params.pivot");
+        assert_ne!(initial, curve_drag_identity(surface, clip, &row));
+        row.path = PropPath::new("params.stops");
+        assert_ne!(
+            initial,
+            curve_drag_identity(egui::Id::new("two"), clip, &row)
+        );
+        assert_eq!(initial, curve_drag_identity(surface, clip, &row));
+    }
+
+    #[test]
+    fn grade_animation_rows_share_scalar_mapping_and_resolve_keyframes() {
+        use photonic_core::timeline::{Grade, GradeOp, GradeOpKind, GradeOpParams};
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+        let mut grade = Grade::new();
+        for (kind, params) in [
+            (
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 0.0 },
+            ),
+            (
+                GradeOpKind::WhiteBalanceCct,
+                GradeOpParams::WhiteBalanceCct {
+                    source_kelvin: 6500.0,
+                    target_kelvin: 6500.0,
+                },
+            ),
+            (
+                GradeOpKind::TonalExposure,
+                GradeOpParams::TonalExposure {
+                    stops: [0.0; 3],
+                    boundaries: [-2.0, 2.0],
+                    softness: 1.0,
+                },
+            ),
+        ] {
+            grade.ops.push(GradeOp::new(kind, params));
+        }
+        let op_id = grade.ops[1].id;
+        let mut lane = PropertyTrack::new("params.source_kelvin");
+        lane.insert_keyframe(Keyframe::new(
+            Tick(0),
+            PropValue::Float(3200.0),
+            Interp::Linear,
+        ));
+        lane.insert_keyframe(Keyframe::new(
+            Tick(100),
+            PropValue::Float(6400.0),
+            Interp::Linear,
+        ));
+        grade.ops[1].params.tracks.push(lane);
+        clip.grade = Some(grade);
+        let before = clip.clone();
+        let rows = build_rows(&clip);
+        let grade_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| matches!(r.target, AnimTarget::GradeOp { .. }))
+            .collect();
+        assert_eq!(grade_rows.len(), 9);
+        assert_eq!(clip, before);
+        for row in grade_rows {
+            assert!(base_value(&clip, &row.target, &row.path).is_some());
+        }
+        let target = AnimTarget::GradeOp {
+            clip: clip.id,
+            op: op_id,
+        };
+        let path = PropPath::new("params.source_kelvin");
+        assert_eq!(
+            base_value(&clip, &target, &path),
+            Some(PropValue::Float(6500.0))
+        );
+        assert_eq!(
+            value_at(&clip, &target, &path, Tick(50)),
+            Some(PropValue::Float(4800.0))
+        );
+        assert!(track_for(&clip, &target, &path).is_some());
+    }
+
+    #[test]
+    fn window_animation_rows_use_mask_bases_and_hide_inapplicable_gradient_fields() {
+        use photonic_core::timeline::{
+            Grade, GradeMask, GradeOp, GradeOpKind, GradeOpParams, WindowShape,
+        };
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        op.mask = Some(GradeMask::PowerWindow {
+            shape: WindowShape::Ellipse,
+            center: [0.5; 2],
+            size: [0.2; 2],
+            rotation: 0.0,
+            softness: 0.3,
+            invert: false,
+        });
+        let target = AnimTarget::GradeOp {
+            clip: clip.id,
+            op: op.id,
+        };
+        grade.ops.push(op);
+        clip.grade = Some(grade);
+        let rows = build_rows(&clip);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.path.as_str().starts_with("mask."))
+                .count(),
+            6
+        );
+        let Some(PropValue::Float(value)) =
+            base_value(&clip, &target, &PropPath::new("mask.softness"))
+        else {
+            panic!("missing feather base")
+        };
+        assert!((value - 0.3).abs() < 1e-6);
+        let Some(GradeMask::PowerWindow { shape, .. }) =
+            &mut clip.grade.as_mut().unwrap().ops[0].mask
+        else {
+            unreachable!()
+        };
+        *shape = WindowShape::Gradient;
+        let rows = build_rows(&clip);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| r.path.as_str().starts_with("mask."))
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn grade_animation_ui_actions_undo_once_and_respect_locked_tracks() {
+        use photonic_core::timeline::{
+            Grade, GradeOp, GradeOpKind, GradeOpParams, Sequence, Track, TrackKind,
+        };
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+        let mut grade = Grade::new();
+        let op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.0 },
+        );
+        let target = AnimTarget::GradeOp {
+            clip: clip.id,
+            op: op.id,
+        };
+        grade.ops.push(op);
+        clip.grade = Some(grade);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Grade animation", FrameRate::FPS_30, 16, 16);
+        let seq = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let tid = track.id;
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        let mut doc = Document::new("Animation", 100., 100.);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::new(100);
+        let path = PropPath::new("params.stops");
+        let action = || KfAction::Set {
+            target: target.clone(),
+            path: path.clone(),
+            kf: Keyframe::new(Tick(10), PropValue::Float(1.0), Interp::Linear),
+        };
+        apply_action(&mut doc, &mut history, action());
+        assert_eq!(history.revision(), 1);
+        assert!(history.undo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert!(!history.undo(&mut doc));
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .track_mut(tid)
+            .unwrap()
+            .locked = true;
+        let before = serde_json::to_value(&doc).unwrap();
+        let revision = history.revision();
+        apply_action(&mut doc, &mut history, action());
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert_eq!(history.revision(), revision);
     }
 
     #[test]

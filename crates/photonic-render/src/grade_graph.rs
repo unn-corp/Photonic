@@ -10,7 +10,7 @@ const SHADER: &str = r#"
 @group(0) @binding(0) var top: texture_2d<f32>;
 @group(0) @binding(1) var bottom: texture_2d<f32>;
 @group(0) @binding(2) var matte: texture_2d<f32>;
-struct Params { flags: vec4<u32>, values: vec4<f32> }
+struct Params { flags: vec4<u32>, values: vec4<f32>, slope: vec4<f32>, offset: vec4<f32>, power: vec4<f32> }
 @group(0) @binding(3) var<uniform> params: Params;
 @vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
     var positions = array<vec2<f32>, 3>(vec2<f32>(-1.0,-1.0),vec2<f32>(3.0,-1.0),vec2<f32>(-1.0,3.0));
@@ -20,11 +20,58 @@ fn key_sample(pixel: vec2<i32>) -> f32 {
     let bounds=vec2<i32>(i32(params.flags.y)-1,i32(params.flags.z)-1);
     return clamp(textureLoad(top,clamp(pixel,vec2<i32>(0),bounds),0).r,0.0,1.0);
 }
+fn cct_encode(value: f32) -> f32 {
+    if (value <= 0.0078125) { return value*10.5402377416545+0.0729055341958355; }
+    return (log2(value)+9.72)/17.52;
+}
+fn cct_decode(value: f32) -> f32 {
+    if (value <= 0.155251141552511) { return (value-0.0729055341958355)/10.5402377416545; }
+    if (value >= (log2(65504.0)+9.72)/17.52) { return 65504.0; }
+    return exp2(value*17.52-9.72);
+}
+fn cdl_channel(value: f32, power: f32) -> f32 {
+    if (value <= 0.0) { return max(value,-65504.0); }
+    let ceiling=exp2(min(log2(65504.0)/power,126.0));
+    return min(pow(min(value,ceiling),power),65504.0);
+}
 @fragment fn fs_main(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
     let a = textureLoad(top,pixel,0);
     let b = textureLoad(bottom,pixel,0);
     let mode = params.flags.x;
+    if (mode == 15u) {
+        if (b.a <= 0.0) { return vec4<f32>(0.0); }
+        if (all(params.slope.xyz==vec3<f32>(0.0))) {return b;}
+        let y=dot(b.rgb/b.a,vec3<f32>(0.27222872,0.67408174,0.053689517));
+        var weights=vec3<f32>(1.0,0.0,0.0);
+        if (y > 0.0) {
+            let relative=log2(y/0.18);
+            let low=smoothstep(params.offset.x-params.offset.z,params.offset.x+params.offset.z,relative);
+            let high=smoothstep(params.offset.y-params.offset.z,params.offset.y+params.offset.z,relative);
+            weights=vec3<f32>(1.0-low,low-high,high);
+        }
+        let rgb=b.rgb*exp2(dot(weights,params.slope.xyz));
+        return vec4<f32>(clamp(rgb,vec3<f32>(-65504.0),vec3<f32>(65504.0)),b.a);
+    }
+    if (mode == 14u) {
+        if (b.a <= 0.0) { return vec4<f32>(0.0); }
+        let rgb=vec3<f32>(dot(params.slope.xyz,b.rgb),dot(params.offset.xyz,b.rgb),dot(params.power.xyz,b.rgb));
+        return vec4<f32>(clamp(rgb,vec3<f32>(-65504.0),vec3<f32>(65504.0)),b.a);
+    }
+    if (mode == 13u) {
+        if (b.a <= 0.0) { return vec4<f32>(0.0); }
+        let weight=clamp(textureLoad(matte,pixel,0).r,0.0,1.0);
+        if (weight <= 0.0 || (all(params.slope.xyz==vec3<f32>(1.0)) && all(params.offset.xyz==vec3<f32>(0.0)) && all(params.power.xyz==vec3<f32>(1.0)) && params.power.w==1.0)) { return b; }
+        let rgb=b.rgb/b.a;
+        let log_rgb=vec3<f32>(cct_encode(rgb.r),cct_encode(rgb.g),cct_encode(rgb.b));
+        let sop=log_rgb*params.slope.xyz+params.offset.xyz;
+        let corrected=vec3<f32>(cdl_channel(sop.r,params.power.x),cdl_channel(sop.g,params.power.y),cdl_channel(sop.b,params.power.z));
+        let luma=dot(corrected,vec3<f32>(0.2126,0.7152,0.0722));
+        let saturated=vec3<f32>(luma)+params.power.w*(corrected-vec3<f32>(luma));
+        let mixed=mix(log_rgb,saturated,weight);
+        let linear=vec3<f32>(cct_decode(mixed.r),cct_decode(mixed.g),cct_decode(mixed.b));
+        return vec4<f32>(clamp(linear*b.a,vec3<f32>(-65504.0),vec3<f32>(65504.0)),b.a);
+    }
     if (mode >= 2u && mode <= 5u) {
         let first = clamp(a.r,0.0,1.0);
         let second = clamp(b.r,0.0,1.0);
@@ -32,6 +79,10 @@ fn key_sample(pixel: vec2<i32>) -> f32 {
         if (mode == 3u) { weight = min(first,second); }
         if (mode == 4u) { weight = max(first-second,0.0); }
         if (mode == 5u) { weight = first*second; }
+        return vec4<f32>(vec3<f32>(weight),1.0);
+    }
+    if (mode == 12u) {
+        let weight = clamp(a.r,0.0,1.0)*clamp(b.a,0.0,1.0);
         return vec4<f32>(vec3<f32>(weight),1.0);
     }
     if (mode >= 6u) {
@@ -76,10 +127,13 @@ fn key_sample(pixel: vec2<i32>) -> f32 {
 "#;
 
 #[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Default, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     flags: [u32; 4],
     values: [f32; 4],
+    slope: [f32; 4],
+    offset: [f32; 4],
+    power: [f32; 4],
 }
 
 pub struct GradeGraphMixPass {
@@ -199,6 +253,102 @@ impl GradeGraphMixPass {
         self.run(device, queue, corrected, original, matte, output, 1, 0.0)
     }
 
+    pub fn native_tonal_exposure_into(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &wgpu::Texture,
+        output: &wgpu::Texture,
+        tonal: crate::tonal_exposure::ResolvedTonalExposure,
+    ) -> Result<(), &'static str> {
+        tonal.validate()?;
+        if !tonal.native_ap1
+            || input.size() != output.size()
+            || [input, output].iter().any(|t| t.format() != WORKING_FORMAT)
+        {
+            return Err("native tonal exposure requires scene AP1 and equal working textures");
+        }
+        let params = Params {
+            flags: [15, 0, 0, 0],
+            slope: [tonal.stops[0], tonal.stops[1], tonal.stops[2], 0.0],
+            offset: [
+                tonal.boundaries[0],
+                tonal.boundaries[1],
+                tonal.softness,
+                0.0,
+            ],
+            ..Default::default()
+        };
+        self.run_params(device, queue, input, input, input, output, params)
+    }
+
+    pub fn native_linear_matrix_into(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &wgpu::Texture,
+        output: &wgpu::Texture,
+        rows: [[f32; 3]; 3],
+    ) -> Result<(), &'static str> {
+        crate::white_balance::validate_matrix(&rows)?;
+        if input.size() != output.size()
+            || [input, output].iter().any(|t| t.format() != WORKING_FORMAT)
+        {
+            return Err("linear color matrix requires equal-sized working textures");
+        }
+        let params = Params {
+            flags: [14, 0, 0, 0],
+            slope: [rows[0][0], rows[0][1], rows[0][2], 0.0],
+            offset: [rows[1][0], rows[1][1], rows[1][2], 0.0],
+            power: [rows[2][0], rows[2][1], rows[2][2], 0.0],
+            ..Default::default()
+        };
+        self.run_params(device, queue, input, input, input, output, params)
+    }
+
+    /// Encode, correct, mix and decode in one f32 shader invocation, avoiding
+    /// separate half-float logarithmic image intermediates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_matte_cdl_into(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        input: &wgpu::Texture,
+        matte: &wgpu::Texture,
+        output: &wgpu::Texture,
+        cdl: crate::grade::ResolvedCdl,
+    ) -> Result<(), &'static str> {
+        crate::native_transfer::validate_native_cdl(&cdl)?;
+        if input.size() != output.size()
+            || matte.size() != output.size()
+            || [input, matte, output]
+                .iter()
+                .any(|t| t.format() != WORKING_FORMAT)
+        {
+            return Err("native matte CDL requires equal-sized working textures");
+        }
+        let params = Params {
+            flags: [13, 0, 0, 0],
+            slope: [cdl.slope[0], cdl.slope[1], cdl.slope[2], 0.0],
+            offset: [cdl.offset[0], cdl.offset[1], cdl.offset[2], 0.0],
+            power: [cdl.power[0], cdl.power[1], cdl.power[2], cdl.sat],
+            ..Default::default()
+        };
+        self.run_params(device, queue, input, input, matte, output, params)
+    }
+
+    /// Convert an unassociated key to a visible coverage-weighted inspection.
+    pub fn coverage_into(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: &wgpu::Texture,
+        image: &wgpu::Texture,
+        output: &wgpu::Texture,
+    ) -> Result<(), &'static str> {
+        self.run(device, queue, key, image, image, output, 12, 0.0)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn refine_into(
         &self,
@@ -276,6 +426,7 @@ impl GradeGraphMixPass {
                 Params {
                     flags: [*mode, logical.0, logical.1, *radius],
                     values: *values,
+                    ..Default::default()
                 },
             )?;
         }
@@ -303,6 +454,7 @@ impl GradeGraphMixPass {
         let params = Params {
             flags: [mode, 0, 0, 0],
             values: [opacity, 0.0, 0.0, 0.0],
+            ..Default::default()
         };
         self.run_params(device, queue, top, bottom, matte, output, params)
     }

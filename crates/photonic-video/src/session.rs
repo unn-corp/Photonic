@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+mod native_deflicker_runtime;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 
@@ -316,6 +317,12 @@ impl RenderSnapshot {
                 .assets
                 .values()
                 .any(|asset| matches!(asset.source, AssetSource::EmbeddedVector { .. }))
+                || project.graphs.values().any(|graph| {
+                    graph
+                        .nodes
+                        .values()
+                        .any(|n| matches!(n.op, photonic_core::timeline::GraphOp::VectorIn { .. }))
+                })
         });
         Self {
             revision,
@@ -332,11 +339,16 @@ struct PublishedSnapshot {
 /// What the GUI presents (02 §1): `Rgba16Float`, premultiplied. The
 /// interpretation is carried by `output_encoding`, not inferred from format.
 pub struct EngineFrame {
+    pub subject_matte_used: bool,
+    /// Provisional opaque subject masks still awaiting exact inference.
+    pub pending_computations: usize,
     pub output_encoding: crate::graph::ir::FrameColorEncoding,
     /// Interpretation of the resolved intermediate scope tap, if present.
     pub scope_tap_encoding: Option<crate::graph::ir::FrameColorEncoding>,
     /// Unsupported technical color requirements bound to this frame.
     pub color_errors: Vec<String>,
+    /// Nonfatal substitutions attached to this exact frame, one entry per cue.
+    pub caption_notes: Vec<String>,
     /// Compile failures bound to this exact rendered frame.
     pub grading_errors: Vec<photonic_render::grade::GradeDiagnostic>,
     /// Lossy cached playback provenance. Native exports reject these frames.
@@ -385,7 +397,18 @@ pub struct EngineFrame {
         photonic_core::timeline::GradeOpId,
         crate::graph::ir::IrNodeId,
     )>,
-    pub native_graph_mattes: Vec<(photonic_core::timeline::ClipId, u32, crate::graph::ir::IrNodeId)>,
+    pub native_graph_mattes: Vec<(
+        photonic_core::timeline::ClipId,
+        u32,
+        crate::graph::ir::IrNodeId,
+    )>,
+    pub native_graph_images: Vec<(
+        photonic_core::timeline::ClipId,
+        u32,
+        crate::graph::ir::IrNodeId,
+    )>,
+    pub native_stage_graph_outputs: Vec<crate::graph::compile::GradeGraphStageOutput>,
+    pub native_stage_grade_inputs: Vec<crate::graph::compile::NativeStageGradeInput>,
     /// K-B5: when compare-effects is on, the clean (no clip effects/grade)
     /// evaluation for the same tick. `None` when compare is off or the clean
     /// path failed.
@@ -395,6 +418,10 @@ pub struct EngineFrame {
 /// Engine → GUI state (02 §1: playhead, dropped frames, cache stats, xruns).
 #[derive(Clone, Debug)]
 pub struct EngineStatus {
+    pub pending_computations: usize,
+    pub computation_errors: Vec<String>,
+    /// Inspection that produced these errors, assigned only after evaluation.
+    pub computation_error_inspection: Option<u64>,
     pub source_audition: Option<crate::source_audition::SourceAuditionStatus>,
     pub source_audition_error: Option<String>,
     pub memory: EngineMemoryStatus,
@@ -546,6 +573,9 @@ pub(crate) struct LiveAudioMeters {
 impl Default for EngineStatus {
     fn default() -> Self {
         EngineStatus {
+            pending_computations: 0,
+            computation_errors: Vec::new(),
+            computation_error_inspection: None,
             source_audition: None,
             source_audition_error: None,
             memory: EngineMemoryStatus::default(),
@@ -1106,7 +1136,32 @@ enum PendingPreviewAction {
     Clear(SequenceId, Option<(Tick, Tick)>),
 }
 
+/// One bounded analysis job advances at most one GPU sample per engine turn.
+/// The event loop stays available for new snapshots, cancellation and shutdown.
+struct PendingDeflickerAnalysis {
+    native_key: Option<crate::graph::deflicker::NativeDeflickerKey>,
+    native_analysis_params:
+        Option<photonic_core::timeline::AnimProps<photonic_core::timeline::EffectParams>>,
+    native_solved: Vec<[f32; 3]>,
+    native_solve_cache: Option<((usize, usize, u32), Vec<[f32; 3]>)>,
+    native_input: Option<photonic_core::timeline::color::NativeInputColorInterpretation>,
+    clip: ClipId,
+    asset: AssetId,
+    source_in: Tick,
+    fingerprint: u64,
+    params: crate::graph::deflicker::DeflickerParams,
+    grid: crate::graph::deflicker::AnalysisGrid,
+    frame_ticks: i64,
+    fps: f32,
+    speed: photonic_core::timeline::SpeedMap,
+    samples: Vec<Option<[f32; 3]>>,
+    burst_ticks: Vec<Tick>,
+    burst: Vec<Vec<f32>>,
+    started: Instant,
+}
+
 struct EngineThread {
+    native_deflicker_runtime: native_deflicker_runtime::NativeAnalysisRuntime,
     preview_loading: Option<
         JoinHandle<(
             u64,
@@ -1131,6 +1186,9 @@ struct EngineThread {
     status_out: Arc<ArcSwap<EngineStatus>>,
 
     evaluator: Evaluator,
+    pending_computations: usize,
+    computation_errors: Vec<String>,
+    computation_error_inspection: Option<u64>,
     media: MediaSources,
     controller: PlaybackController,
     inspection_request_id: Option<u64>,
@@ -1148,6 +1206,7 @@ struct EngineThread {
     /// from, so an edit that changes them re-measures and one that does not
     /// costs nothing.
     deflicker_fingerprints: std::collections::HashMap<ClipId, u64>,
+    deflicker_pending_job: Option<PendingDeflickerAnalysis>,
     /// D-12 warm per-clip stabilization analyses (22 §6.4), read lock-free by
     /// the compiler exactly as `lut_cache` is.
     stabilization: crate::graph::stabilize::StabilizationCache,
@@ -1220,6 +1279,7 @@ impl EngineThread {
     ) -> Self {
         let tools = locate().ok();
         EngineThread {
+            native_deflicker_runtime: Default::default(),
             preview_loading: None,
             preview_directory_epoch: 0,
             preview_error: None,
@@ -1239,10 +1299,14 @@ impl EngineThread {
             mailbox: None,
             frame_out,
             status_out,
+            pending_computations: 0,
+            computation_errors: Vec::new(),
+            computation_error_inspection: None,
             evaluator: Evaluator::with_budget(
                 gpu,
                 SESSION_GPU_CACHE_BYTES
                     - UPLOAD_CACHE_BYTES
+                    - NATIVE_UPLOAD_CACHE_BYTES
                     - STILL_CACHE_BYTES
                     - VECTOR_CACHE_BYTES,
             ),
@@ -1255,6 +1319,7 @@ impl EngineThread {
             lut_cache: LutCache::default(),
             deflicker_gains: crate::graph::deflicker::GainTable::new(),
             deflicker_fingerprints: std::collections::HashMap::new(),
+            deflicker_pending_job: None,
             stabilization: crate::graph::stabilize::StabilizationCache::default(),
             last_revision: None,
             active_sequence_override: None,
@@ -1292,7 +1357,17 @@ impl EngineThread {
             // 1. Wait briefly for commands, then drain the burst (a scrub
             //    produces many Seeks per engine tick — coalesced latest-wins).
             self.cmd_batch.clear();
-            let poll_interval = if self.controller.is_playing()
+            // A paused inference result does not need the 250 Hz decode/audio
+            // poll cadence. Commands still wake the mailbox immediately.
+            let poll_interval = if !self.controller.is_playing()
+                && self.pending_computations > 0
+                && self
+                    .source_audition
+                    .as_ref()
+                    .is_none_or(|a| !a.status().playing)
+            {
+                Duration::from_millis(16)
+            } else if self.controller.is_playing()
                 || self
                     .source_audition
                     .as_ref()
@@ -2152,33 +2227,67 @@ impl EngineThread {
     /// See [`Self::DEFLICKER_SAMPLE_W`].
     const DEFLICKER_SAMPLE_H: u32 = 180;
 
-    /// Fingerprint the inputs a clip's measurement depends on. Changing the
-    /// source, the trimmed range or any deflicker param re-measures; moving the
-    /// clip on the timeline, renaming it or editing an unrelated effect does not.
-    fn deflicker_fingerprint(clip: &Clip, fx: &photonic_core::timeline::ClipEffect) -> u64 {
+    /// Analysis identity includes every source-clock/color input and the complete
+    /// authored parameter lanes. Cosmetic edits and clip placement are omitted.
+    /// The media epoch invalidates same-path replacement without filesystem I/O
+    /// in this render-thread check.
+    fn deflicker_fingerprint(
+        project: &TimelineProject,
+        seq: &photonic_core::timeline::Sequence,
+        clip: &Clip,
+        fx: &photonic_core::timeline::ClipEffect,
+        media_epoch: u64,
+    ) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        match &clip.source {
-            ClipSource::Asset { asset } | ClipSource::Vector { asset } => asset.hash(&mut h),
-            other => std::mem::discriminant(other).hash(&mut h),
-        }
+        let asset = match clip.source {
+            ClipSource::Asset { asset } | ClipSource::Vector { asset } => {
+                project.media.assets.get(&asset)
+            }
+            _ => None,
+        };
+        media_epoch.hash(&mut h);
         clip.source_in.0.hash(&mut h);
         clip.duration.0.hash(&mut h);
-        for (path, value) in &fx.params.base.entries {
-            path.as_str().hash(&mut h);
-            format!("{value:?}").hash(&mut h);
-        }
+        seq.frame_rate.num.hash(&mut h);
+        seq.frame_rate.den.hash(&mut h);
+        // Debug formatting preserves non-finite values and float sign bits well
+        // enough for invalidation; no key contains credentials or is persisted.
+        format!(
+            "{:?}",
+            (
+                &clip.source,
+                &clip.speed,
+                &clip.input_color,
+                &clip.native_input_color,
+                &seq.color,
+                &fx.params,
+                asset.map(|a| (
+                    &a.source,
+                    &a.content_hash,
+                    &a.probe,
+                    &a.input_color,
+                    &a.native_input_color
+                )),
+            )
+        )
+        .hash(&mut h);
         h.finish()
     }
 
     /// True when some clip carries an enabled deflicker whose measurement is
-    /// missing or stale. Borrow-only and allocation-free, so it is cheap enough
-    /// to run every present.
+    /// missing or stale. Identity calculation performs no filesystem or decode I/O.
     fn deflicker_pending(&self, project: &TimelineProject, seq_id: SequenceId) -> bool {
         use photonic_core::timeline::EffectKind;
         let Some(seq) = project.sequences.get(&seq_id) else {
             return false;
         };
+        if matches!(
+            seq.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        ) {
+            return self.native_analysis_pending(project, seq_id);
+        }
         seq.video_tracks.iter().any(|track| {
             track.clips.iter().any(|clip| {
                 matches!(clip.source, ClipSource::Asset { .. })
@@ -2187,7 +2296,13 @@ impl EngineThread {
                             && f.enabled
                             && !f.inert
                             && self.deflicker_fingerprints.get(&clip.id)
-                                != Some(&Self::deflicker_fingerprint(clip, f))
+                                != Some(&Self::deflicker_fingerprint(
+                                    project,
+                                    seq,
+                                    clip,
+                                    f,
+                                    self.media.invalidation_epoch(),
+                                ))
                     })
             })
         })
@@ -2202,10 +2317,15 @@ impl EngineThread {
             return;
         };
         if !self.deflicker_pending(project, seq_id) {
+            self.deflicker_pending_job = None;
             return;
         }
         let project = Arc::clone(project);
-        self.ensure_deflicker_measured(project.as_ref(), seq_id, 0);
+        let format = project
+            .sequences
+            .get(&seq_id)
+            .map_or(0, |seq| seq.active_format);
+        self.ensure_deflicker_measured(project.as_ref(), seq_id, format);
     }
 
     /// Run the deflicker analysis for any clip that needs it (32 §2's two-pass
@@ -2222,204 +2342,311 @@ impl EngineThread {
         _format_index: usize,
     ) {
         use photonic_core::timeline::EffectKind;
-
         let Some(seq) = project.sequences.get(&seq_id) else {
             return;
         };
-        // Collect the work under the immutable borrow, run it after.
-        struct Job {
-            clip: ClipId,
-            asset: AssetId,
-            source_in: Tick,
-            duration: Tick,
-            fingerprint: u64,
-            params: crate::graph::deflicker::DeflickerParams,
-            /// Ticks per sequence frame — the sample grid. Derived from the
-            /// sequence rate, not assumed, or `params.window` (documented in
-            /// seconds) would be scaled by `fps / assumed_fps`.
-            frame_ticks: i64,
-            /// Sequence frame rate, needed to snap the band advance to mains.
-            fps: f32,
-            speed: photonic_core::timeline::SpeedMap,
+        let native = matches!(
+            seq.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        );
+        if native {
+            self.advance_native_analysis(project, seq_id, _format_index);
+            return;
         }
-        let mut todo: Vec<Job> = Vec::new();
-        for track in &seq.video_tracks {
-            for clip in &track.clips {
-                let Some(fx) = clip
+        let candidate = seq
+            .video_tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .find_map(|clip| {
+                let ClipSource::Asset { asset } = clip.source else {
+                    return None;
+                };
+                let fx = clip
                     .effects
                     .iter()
-                    .find(|f| f.kind == EffectKind::Deflicker && f.enabled && !f.inert)
-                else {
-                    continue;
-                };
-                let ClipSource::Asset { asset } = clip.source else {
-                    continue;
-                };
-                let fp = Self::deflicker_fingerprint(clip, fx);
-                if self.deflicker_fingerprints.get(&clip.id) == Some(&fp) {
-                    continue;
-                }
-                let fps = seq.frame_rate.num as f32 / seq.frame_rate.den.max(1) as f32;
-                let f = |path: &str, dflt: f32| -> f32 {
-                    match fx.params.base.get(path) {
-                        Some(photonic_core::timeline::PropValue::Float(v)) => *v as f32,
-                        _ => dflt,
-                    }
-                };
-                let params = crate::graph::deflicker::params_for(
-                    f("params.amount", 0.85),
-                    f("params.window", 4.0),
-                    f("params.max_change", 0.25),
-                    f("params.chroma_amount", 0.0),
-                    fps,
-                );
-                let frame_ticks = (photonic_core::timeline::TICKS_PER_SECOND
-                    * seq.frame_rate.den.max(1) as i64)
-                    / seq.frame_rate.num.max(1) as i64;
-                todo.push(Job {
-                    clip: clip.id,
-                    asset,
-                    source_in: clip.source_in,
-                    duration: clip.duration,
-                    fingerprint: fp,
-                    params,
-                    frame_ticks: frame_ticks.max(1),
-                    fps,
-                    speed: clip.speed.clone(),
-                });
-            }
-        }
-
-        // One clip per call: a project with several unmeasured clips makes
-        // progress each present instead of freezing the render thread for the
-        // sum of them. The remainder is picked up on the next frame.
-        for job in todo.into_iter().take(1) {
-            let Job {
-                clip: clip_id,
-                asset,
-                source_in,
-                duration,
-                fingerprint: fp,
-                mut params,
-                frame_ticks: frame,
-                fps: fps_for_band,
-                speed,
-            } = job;
-            let total = (duration.0 / frame.max(1)).max(1) as usize;
-            let stride = total.div_ceil(Self::DEFLICKER_MAX_SAMPLES).max(1);
-            let step_ticks = frame * stride as i64;
-            // The solver's window is in *samples*, so a strided measurement must
-            // shrink it by the same factor or the baseline spans far longer than
-            // the user asked for.
-            params.window_frames = (params.window_frames / stride).max(1) | 1;
-            params.smooth_frames = (params.smooth_frames / stride).max(1) | 1;
-
-            let mut images = Vec::new();
-            let mut t = 0i64;
-            while t < duration.0 {
-                // Map clip-relative `t` through the speed map: `ClipGains` is
-                // indexed by clip-relative dt at compile time, so a retimed clip
-                // must be *measured* at the source frames it actually shows or
-                // the curve is misaligned with the rendered frames.
-                let src = Tick(source_in.0 + speed.source_delta(Tick(t)).0);
-                let compiled = compile_asset_peek(
+                    .find(|f| f.kind == EffectKind::Deflicker && f.enabled && !f.inert)?;
+                let fp = Self::deflicker_fingerprint(
                     project,
-                    asset,
-                    src,
-                    Quality::PREVIEW,
-                    Self::DEFLICKER_SAMPLE_W,
-                    Self::DEFLICKER_SAMPLE_H,
+                    seq,
+                    clip,
+                    fx,
+                    self.media.invalidation_epoch(),
                 );
-                if let Some(tex) = self.evaluator.evaluate(
-                    &compiled.graph,
-                    (Self::DEFLICKER_SAMPLE_W, Self::DEFLICKER_SAMPLE_H),
-                    &mut self.media,
-                ) {
-                    let px = crate::graph::eval::read_texture_rgba16f(
-                        self.evaluator.gpu(),
-                        &tex,
-                        Self::DEFLICKER_SAMPLE_W,
-                        Self::DEFLICKER_SAMPLE_H,
-                    );
-                    images.push(crate::graph::ops::Image {
-                        width: Self::DEFLICKER_SAMPLE_W,
-                        height: Self::DEFLICKER_SAMPLE_H,
-                        pixels: px,
-                    });
-                }
-                t += step_ticks;
-            }
-            if images.is_empty() {
-                // Record the fingerprint anyway. Without this the clip stays
-                // "pending" and the whole 240-sample loop re-runs on every
-                // present, forever, for a clip that cannot be measured.
-                tracing::warn!(clip = ?clip_id, "deflicker: no frames decoded; leaving clip uncorrected");
-                self.deflicker_fingerprints.insert(clip_id, fp);
-                continue;
-            }
-            let gains = crate::graph::deflicker::measure_clip(&images, Tick(0), step_ticks, params);
+                (self.deflicker_fingerprints.get(&clip.id) != Some(&fp))
+                    .then_some((clip, asset, fx, fp))
+            });
+        let Some((clip, asset, fx, fp)) = candidate else {
+            self.deflicker_pending_job = None;
+            return;
+        };
+        if self
+            .deflicker_pending_job
+            .as_ref()
+            .is_none_or(|j| j.clip != clip.id || j.fingerprint != fp)
+        {
+            self.deflicker_gains.remove(&clip.id);
+            let native_input = if native {
+                let candidate = clip
+                    .native_input_color
+                    .as_ref()
+                    .or_else(|| {
+                        project
+                            .media
+                            .assets
+                            .get(&asset)
+                            .and_then(|a| a.native_input_color.as_ref())
+                    })
+                    .cloned();
+                let Some(input) = candidate.filter(|input| {
+                    project
+                        .media
+                        .assets
+                        .get(&asset)
+                        .is_some_and(|a| input.validate_asset_kind(a.kind).is_ok())
+                }) else {
+                    self.deflicker_fingerprints.insert(clip.id, fp);
+                    self.deflicker_pending_job = None;
+                    return;
+                };
+                Some(input)
+            } else {
+                None
+            };
 
-            // Rolling bands need CONSECUTIVE frames — the strided pass above
-            // aliases the per-frame phase advance into nonsense — so they get
-            // their own short burst from the middle of the clip. One burst is
-            // enough: the advance is set by the beat between the mains frequency
-            // and the frame rate, and does not drift over a shot.
-            let burst_start = (duration.0 / 2).max(0);
-            let mut burst = Vec::new();
-            for k in 0..Self::DEFLICKER_BURST_FRAMES {
-                let t = burst_start + frame * k as i64;
-                if t >= duration.0 {
-                    break;
-                }
-                let src = Tick(source_in.0 + speed.source_delta(Tick(t)).0);
-                let compiled = compile_asset_peek(
-                    project,
-                    asset,
-                    src,
-                    Quality::PREVIEW,
-                    Self::DEFLICKER_SAMPLE_W,
-                    Self::DEFLICKER_SAMPLE_H,
-                );
-                if let Some(tex) = self.evaluator.evaluate(
-                    &compiled.graph,
-                    (Self::DEFLICKER_SAMPLE_W, Self::DEFLICKER_SAMPLE_H),
-                    &mut self.media,
-                ) {
-                    let px = crate::graph::eval::read_texture_rgba16f(
-                        self.evaluator.gpu(),
-                        &tex,
-                        Self::DEFLICKER_SAMPLE_W,
-                        Self::DEFLICKER_SAMPLE_H,
-                    );
-                    burst.push(crate::graph::rolling_bands::row_profile(
-                        &crate::graph::ops::Image {
-                            width: Self::DEFLICKER_SAMPLE_W,
-                            height: Self::DEFLICKER_SAMPLE_H,
-                            pixels: px,
-                        },
-                    ));
-                }
-            }
-            // The burst starts mid-clip, so its frame index is the anchor; and the
-            // advance is snapped to the mains value for this rate, which is what
-            // makes extrapolating to the clip's ends safe.
-            let anchor_frame = burst_start / frame.max(1);
-            let band =
-                crate::graph::rolling_bands::track_from_burst(&burst, fps_for_band, anchor_frame);
-            if let Some(b) = band {
-                tracing::info!(clip = ?clip_id, cycles = b.cycles, amplitude = b.amplitude,
-                    dphase = b.dphase, "deflicker: rolling band detected");
-            }
-            let gains = gains.with_band(band, frame);
-            tracing::info!(
-                clip = ?clip_id,
-                samples = images.len(),
-                stride,
-                "deflicker: measured clip"
+            let frame = ((photonic_core::timeline::TICKS_PER_SECOND as i128
+                * seq.frame_rate.den.max(1) as i128)
+                / seq.frame_rate.num.max(1) as i128)
+                .clamp(1, i64::MAX as i128) as i64;
+            let Some(grid) = crate::graph::deflicker::AnalysisGrid::new(
+                clip.duration,
+                frame,
+                Self::DEFLICKER_MAX_SAMPLES,
+            ) else {
+                self.deflicker_fingerprints.insert(clip.id, fp);
+                self.deflicker_pending_job = None;
+                return;
+            };
+            let fps = seq.frame_rate.num as f32 / seq.frame_rate.den.max(1) as f32;
+            let value = |path, default| match fx.params.base.get(path) {
+                Some(photonic_core::timeline::PropValue::Float(v)) => *v as f32,
+                _ => default,
+            };
+            let mut params = crate::graph::deflicker::params_for(
+                value("params.amount", 0.85),
+                value("params.window", 4.0),
+                value("params.max_change", 0.25),
+                value("params.chroma_amount", 0.0),
+                fps,
             );
-            self.deflicker_gains.insert(clip_id, gains);
-            self.deflicker_fingerprints.insert(clip_id, fp);
+            if native {
+                params.amount = 1.0;
+                params.chroma_amount = 1.0;
+            }
+            params.window_frames = (params.window_frames / grid.stride).max(1) | 1;
+            params.smooth_frames = (params.smooth_frames / grid.stride).max(1) | 1;
+            let anchor = clip.duration.0 / frame / 2;
+            let burst_ticks = (0..Self::DEFLICKER_BURST_FRAMES)
+                .filter_map(|k| {
+                    let t = (anchor as i128 + k as i128) * frame as i128;
+                    (t < clip.duration.0 as i128).then_some(Tick(t as i64))
+                })
+                .collect();
+            self.deflicker_pending_job = Some(PendingDeflickerAnalysis {
+                native_key: native.then(|| crate::graph::deflicker::NativeDeflickerKey {
+                    sequence: seq_id,
+                    owner: photonic_core::timeline::VfxOwner::Clip(clip.id),
+                    clip_context: Some(clip.id),
+                    effect_index: clip
+                        .effects
+                        .iter()
+                        .position(|candidate| std::ptr::eq(candidate, fx))
+                        .unwrap() as u32,
+                }),
+                native_analysis_params: (native
+                    && fx.params.tracks.iter().any(|t| {
+                        matches!(t.property.as_str(), "params.window" | "params.max_change")
+                            && !t.keyframes.is_empty()
+                    }))
+                .then(|| fx.params.clone()),
+                native_solved: Vec::new(),
+                native_solve_cache: None,
+                native_input,
+                clip: clip.id,
+                asset,
+                source_in: clip.source_in,
+                fingerprint: fp,
+                params,
+                grid,
+                frame_ticks: frame,
+                fps,
+                speed: clip.speed.clone(),
+                samples: Vec::new(),
+                burst_ticks,
+                burst: Vec::new(),
+                started: Instant::now(),
+            });
         }
+        let mut job = self.deflicker_pending_job.take().unwrap();
+        if job.started.elapsed() >= Duration::from_secs(20) {
+            tracing::warn!(clip=?job.clip,"deflicker: analysis deadline; leaving Legacy clip uncorrected");
+            self.deflicker_fingerprints
+                .insert(job.clip, job.fingerprint);
+            self.controller.request_present();
+            return;
+        }
+        if job.samples.len() == job.grid.ticks.len() && job.burst.len() == job.burst_ticks.len() {
+            self.finish_deflicker_measurement(job);
+            return;
+        }
+        let exposure = job.samples.len() < job.grid.ticks.len();
+        let tick = if exposure {
+            job.grid.ticks[job.samples.len()]
+        } else {
+            job.burst_ticks[job.burst.len()]
+        };
+        let delta = job.speed.source_delta(tick).0;
+        let Some(source_tick) = job.source_in.0.checked_add(delta) else {
+            self.deflicker_fingerprints
+                .insert(job.clip, job.fingerprint);
+            return;
+        };
+        let compiled = if let Some(input) = &job.native_input {
+            match crate::graph::compile::compile_native_asset_analysis(
+                project,
+                job.asset,
+                Tick(source_tick),
+                input,
+                Self::DEFLICKER_SAMPLE_W,
+                Self::DEFLICKER_SAMPLE_H,
+            ) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    tracing::warn!(clip=?job.clip,%error,"native deflicker analysis rejected");
+                    self.deflicker_fingerprints
+                        .insert(job.clip, job.fingerprint);
+                    self.controller.request_present();
+                    return;
+                }
+            }
+        } else {
+            compile_asset_peek(
+                project,
+                job.asset,
+                Tick(source_tick),
+                Quality::PREVIEW,
+                Self::DEFLICKER_SAMPLE_W,
+                Self::DEFLICKER_SAMPLE_H,
+            )
+        };
+        let image = self
+            .evaluator
+            .evaluate(
+                &compiled.graph,
+                (Self::DEFLICKER_SAMPLE_W, Self::DEFLICKER_SAMPLE_H),
+                &mut self.media,
+            )
+            .map(|tex| crate::graph::ops::Image {
+                width: Self::DEFLICKER_SAMPLE_W,
+                height: Self::DEFLICKER_SAMPLE_H,
+                pixels: crate::graph::eval::read_texture_rgba16f(
+                    self.evaluator.gpu(),
+                    &tex,
+                    Self::DEFLICKER_SAMPLE_W,
+                    Self::DEFLICKER_SAMPLE_H,
+                ),
+            })
+            .filter(|image| {
+                image.pixels.len() == (Self::DEFLICKER_SAMPLE_W * Self::DEFLICKER_SAMPLE_H) as usize
+                    && image.pixels.iter().flatten().all(|v| v.is_finite())
+            });
+        if let Some(image) = image {
+            let image = if job.native_input.is_some() {
+                crate::graph::deflicker::native_meter_image(&image)
+            } else {
+                image
+            };
+            if exposure {
+                job.samples
+                    .push(Some(crate::graph::deflicker::measure_frame(&image)));
+            } else {
+                job.burst
+                    .push(crate::graph::rolling_bands::row_profile(&image));
+            }
+        }
+        // A cold source returns None until its worker is ready. Keep the exact
+        // same slot pending; never pack a later frame into this sample's time.
+        if job.samples.len() == job.grid.ticks.len() && job.burst.len() == job.burst_ticks.len() {
+            self.finish_deflicker_measurement(job);
+        } else {
+            self.deflicker_pending_job = Some(job);
+        }
+    }
+
+    /// At most one animated analysis-setting solve per engine turn. The curve
+    /// has at most240samples; identical adjacent settings reuse the prior solve.
+    fn finish_deflicker_measurement(&mut self, mut job: PendingDeflickerAnalysis) {
+        let gains = if let Some(authored) = &job.native_analysis_params {
+            let index = job.native_solved.len();
+            let Some(params) = crate::graph::deflicker::native_analysis_params_at(
+                authored,
+                job.grid.ticks[index],
+                job.fps,
+                job.grid.stride,
+            ) else {
+                self.deflicker_fingerprints
+                    .insert(job.clip, job.fingerprint);
+                self.controller.request_present();
+                return;
+            };
+            let key = (
+                params.window_frames,
+                params.smooth_frames,
+                params.max_change.to_bits(),
+            );
+            if job
+                .native_solve_cache
+                .as_ref()
+                .is_none_or(|(cached, _)| *cached != key)
+            {
+                let Some(solved) = job.grid.solve_complete_native(&job.samples, params) else {
+                    self.deflicker_fingerprints
+                        .insert(job.clip, job.fingerprint);
+                    self.controller.request_present();
+                    return;
+                };
+                job.native_solve_cache = Some((key, solved.gains));
+            }
+            job.native_solved
+                .push(job.native_solve_cache.as_ref().unwrap().1[index]);
+            if job.native_solved.len() < job.grid.ticks.len() {
+                self.deflicker_pending_job = Some(job);
+                return;
+            }
+            Some(crate::graph::deflicker::ClipGains {
+                first: Tick(0),
+                step: job.grid.step,
+                gains: std::mem::take(&mut job.native_solved),
+                band: None,
+                frame_ticks: job.frame_ticks,
+            })
+        } else if job.native_input.is_some() {
+            job.grid.solve_complete_native(&job.samples, job.params)
+        } else {
+            job.grid.solve_complete(&job.samples, job.params)
+        };
+        if let Some(gains) = gains {
+            let anchor = job.burst_ticks.first().map_or(0, |t| t.0 / job.frame_ticks);
+            let band = crate::graph::rolling_bands::track_from_burst(&job.burst, job.fps, anchor);
+            let gains = gains.with_band(band, job.frame_ticks);
+            if let Some(key) = job.native_key {
+                self.deflicker_gains.insert_native(key, gains);
+            } else {
+                self.deflicker_gains.insert(job.clip, gains);
+            }
+        }
+        self.deflicker_fingerprints
+            .insert(job.clip, job.fingerprint);
+        self.controller.request_present();
     }
 
     /// D-12: analyze `clip` and warm the stabilization cache (22 §6.4).
@@ -2531,6 +2758,16 @@ impl EngineThread {
         // job needs `&mut self`. The pending check is a borrow-only scan, so the
         // steady state costs no Arc bump — the reason that borrow exists.
         self.measure_deflicker_if_pending();
+        let analysis_pending = self.snapshot.as_ref().is_some_and(|project| {
+            self.effective_sequence(project)
+                .is_some_and(|seq| self.deflicker_pending(project, seq))
+        });
+        if analysis_pending {
+            self.pending_computations = 1;
+            self.buffering = true;
+            self.controller.request_present();
+            return;
+        }
         // Borrow the snapshot Arc — no atomic bump every tick (was `.clone()`).
         let Some(project) = self.snapshot.as_ref() else {
             return;
@@ -2573,7 +2810,7 @@ impl EngineThread {
                     }
                 }
 
-                let (compiled, canvas, frame_time, preview_asset) = match &self.preview_target {
+                let (mut compiled, canvas, frame_time, preview_asset) = match &self.preview_target {
                     PreviewTarget::Asset { asset, source_time }
                         if !self.controller.is_playing()
                             && (seq.color.is_legacy()
@@ -2607,7 +2844,7 @@ impl EngineThread {
                             seq.color,
                             photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
                         ) {
-                            crate::graph::compile::compile_native_live_with_luts(
+                            crate::graph::compile::compile_native_live_with_analysis(
                                 project.as_ref(),
                                 seq_id,
                                 format_index,
@@ -2616,6 +2853,7 @@ impl EngineThread {
                                 self.native_delivery,
                                 &self.media.native_source_errors,
                                 &self.lut_cache,
+                                &self.deflicker_gains,
                             )
                         } else {
                             compile_full(
@@ -2648,12 +2886,12 @@ impl EngineThread {
                 // compiled frame references a `RasterVector` op do we clone the
                 // document for the offscreen vector rasterizer, so a project with
                 // no embedded-vector clips never pays the clone.
-                if compiled
-                    .graph
-                    .nodes
-                    .iter()
-                    .any(|n| matches!(n.op, IrOp::RasterVector { .. }))
-                {
+                if compiled.graph.nodes.iter().any(|n| {
+                    matches!(
+                        n.op,
+                        IrOp::RasterVector { .. } | IrOp::NativeRasterVector { .. }
+                    )
+                }) {
                     if self.snapshot_generation == 0 {
                         if let Ok(doc) = self.doc.try_lock() {
                             self.media
@@ -2661,6 +2899,7 @@ impl EngineThread {
                         }
                     }
                 }
+                compiled.qualify_native_vectors(self.media.document.as_deref());
                 // K-E2: resolve the requested scope tap against THIS frame's
                 // graph. `resolve_tap` applies the 13 §10.2 fallback (a clip the
                 // playhead is not over → the program tap), and reports which
@@ -2708,6 +2947,32 @@ impl EngineThread {
                         tap_node,
                     )
                 };
+                let subject_matte_used = self.evaluator.subject_matte_used();
+                self.pending_computations = self.evaluator.pending_computations();
+                self.computation_errors = self.evaluator.computation_errors().to_vec();
+                for diagnostic in &compiled.diagnostics {
+                    if diagnostic.code
+                        == Some(crate::graph::compile::CompileCode::ColorPipelineUnavailable)
+                        && !self.computation_errors.contains(&diagnostic.message)
+                    {
+                        self.computation_errors.push(diagnostic.message.clone());
+                    }
+                }
+                if matches!(
+                    seq.color,
+                    photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                ) {
+                    if let Some(error) = self.native_analysis_error().map(str::to_owned) {
+                        if !self.computation_errors.contains(&error) {
+                            self.computation_errors.push(error);
+                        }
+                    }
+                }
+                self.computation_error_inspection = if self.computation_errors.is_empty() {
+                    None
+                } else {
+                    self.inspection_request_id
+                };
                 let logical_size = evaluated_frame
                     .as_ref()
                     .map(|frame| (frame.width, frame.height));
@@ -2740,15 +3005,16 @@ impl EngineThread {
                         .map(|id| compiled.graph.node_color_encoding(id))
                         .transpose();
                     self.frame_out.store(Some(Arc::new(EngineFrame {
+                        subject_matte_used,
+                        pending_computations:self.pending_computations,
                         output_encoding: output_encoding
                             .unwrap_or(crate::graph::ir::FrameColorEncoding::SceneLinearAcescg),
                         scope_tap_encoding: scope_tap_encoding.as_ref().ok().copied().flatten(),
-                        color_errors: compiled.diagnostics.iter()
-                            .filter(|d| d.code == Some(crate::graph::compile::CompileCode::ColorPipelineUnavailable))
-                            .map(|d| d.message.clone())
+                        color_errors: self.computation_errors.iter().cloned()
                             .chain(output_encoding.err().map(str::to_owned))
                             .chain(scope_tap_encoding.err().map(str::to_owned))
                             .collect(),
+                        caption_notes: compiled.diagnostics.iter().filter(|d|d.code==Some(crate::graph::compile::CompileCode::CaptionSweepDirectionFallback)).map(|d|d.message.clone()).collect(),
                         grading_errors: compiled
                             .diagnostics
                             .iter()
@@ -2781,14 +3047,24 @@ impl EngineThread {
                         native_graph_qualifier_inspections: compiled.native_graph_qualifier_inspections.clone(),
                         native_graph_curve_inputs: compiled.native_graph_curve_inputs.clone(),
                         native_graph_mattes: compiled.native_graph_mattes.clone(),
+                        native_graph_images: compiled.native_graph_images.clone(),
+                        native_stage_graph_outputs: compiled.native_stage_graph_outputs.clone(),
+            native_stage_grade_inputs: compiled.native_stage_grade_inputs.clone(),
                         compare_clean,
                     })));
                     self.frames_published = self.frames_published.saturating_add(1);
-                    self.buffering = false;
+                    self.buffering = self.pending_computations > 0;
+                    if self.buffering && !self.controller.is_playing() {
+                        self.controller.request_present();
+                    }
                 } else {
                     self.evaluation_misses = self.evaluation_misses.saturating_add(1);
-                    self.buffering = true;
-                    self.controller.request_present();
+                    // A terminal computation refusal cannot improve by polling.
+                    // A document edit or new inspection will request a new present.
+                    self.buffering = self.computation_errors.is_empty();
+                    if self.buffering {
+                        self.controller.request_present();
+                    }
                 }
                 let evaluate_elapsed = evaluate_started.elapsed();
                 self.last_evaluate_micros =
@@ -2993,8 +3269,41 @@ impl EngineThread {
             h = h
                 .wrapping_mul(0x9E37_79B9)
                 .wrapping_add(match self.scope_tap {
+                    ScopeTapPoint::GradeStageInput {
+                        clip,
+                        stage,
+                        node,
+                        op,
+                    } => {
+                        use std::hash::{Hash, Hasher};
+                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        (clip, stage, node, op, "grade-stage-input").hash(&mut hash);
+                        hash.finish()
+                    }
+                    ScopeTapPoint::GradeStageGraphImageOutput { clip, stage, node }
+                    | ScopeTapPoint::GradeStageGraphMatteOutput { clip, stage, node } => {
+                        use std::hash::{Hash, Hasher};
+                        let mut hash = std::collections::hash_map::DefaultHasher::new();
+                        (
+                            clip,
+                            stage,
+                            node,
+                            matches!(
+                                self.scope_tap,
+                                ScopeTapPoint::GradeStageGraphImageOutput { .. }
+                            ),
+                        )
+                            .hash(&mut hash);
+                        hash.finish()
+                    }
                     ScopeTapPoint::Program => 0,
-                    ScopeTapPoint::GradeGraphMatteOutput { clip, node } => 7 ^ (clip.0.as_u128() as u64) ^ (node as u64).rotate_left(17),
+                    ScopeTapPoint::NativeSceneProgram => 9,
+                    ScopeTapPoint::GradeGraphImageOutput { clip, node } => {
+                        8 ^ (clip.0.as_u128() as u64) ^ (node as u64).rotate_left(17)
+                    }
+                    ScopeTapPoint::GradeGraphMatteOutput { clip, node } => {
+                        7 ^ (clip.0.as_u128() as u64) ^ (node as u64).rotate_left(17)
+                    }
                     ScopeTapPoint::Clip(id) => 1 ^ (id.0.as_u128() as u64),
                     ScopeTapPoint::ClipPreGrade(id) => 2 ^ (id.0.as_u128() as u64),
                     ScopeTapPoint::NativeQualifierInput { clip, op } => {
@@ -3024,6 +3333,11 @@ impl EngineThread {
         let sig = sig
             .wrapping_mul(0x9E37_79B9)
             .wrapping_add(self.snapshot_generation)
+            .wrapping_add(
+                self.computation_error_inspection
+                    .unwrap_or(0)
+                    .rotate_left(19),
+            )
             .wrapping_add(command_admission.pending as u64)
             .wrapping_add(command_admission.coalesced)
             .wrapping_add(command_admission.rejected)
@@ -3040,6 +3354,9 @@ impl EngineThread {
         }
         self.last_status_sig = sig;
         self.status_out.store(Arc::new(EngineStatus {
+            pending_computations: self.pending_computations,
+            computation_errors: self.computation_errors.clone(),
+            computation_error_inspection: self.computation_error_inspection,
             memory,
             readiness,
             source_audition,
@@ -3170,8 +3487,9 @@ fn stabilization_analysis_key(
 
 /// Cache identity for a video input. The boolean records the *resolved* input,
 /// not a graph's proxy request: a requested proxy that is not ready on disk is
-/// the same original decode/upload as an explicit original request.
-type VideoSourceKey = (AssetId, bool);
+/// the same original decode/upload as an explicit original request. The final
+/// component is a bounded independent native clock lane, zero for Legacy.
+type VideoSourceKey = (AssetId, bool, u16);
 
 struct ResolvedVideoInput {
     key: VideoSourceKey,
@@ -3194,6 +3512,8 @@ struct VideoSourceEntry {
     /// buffered frames under the old project's native source interpretation.
     file_identity: Option<SourceFileIdentity>,
     rate: FrameRate,
+    /// Actual VFR boundaries; shared with the decoder, not another frame buffer.
+    pts_table: Option<Arc<PtsIndex>>,
     /// Monotonic use-stamp for LRU eviction (bumped on every steer/read).
     last_used: u64,
 }
@@ -3237,6 +3557,9 @@ struct MediaSources {
     /// Native-managed source mismatches discovered by the decode worker. The
     /// next compile turns these into a coded, transparent error frame.
     native_source_errors: HashMap<AssetId, String>,
+    /// Stable sorted clock slots per asset for the current demanded graph.
+    /// Separate workers prevent widely separated offsets from resetting one ring.
+    native_decode_lanes: HashMap<(AssetId, Tick), u16>,
     /// Sources whose expensive open (ffprobe + keyframe/pts index build, each a
     /// subprocess) is running on a background thread, so the engine present loop
     /// never stalls on a cold source. `drain_pending` promotes the completed
@@ -3252,6 +3575,8 @@ struct MediaSources {
     /// over the same frames skips the GPU upload. LRU eviction preserves hot
     /// nearby frames when a timeline exceeds the bounded texture budget.
     uploads: UploadCache<GpuFrame>,
+    native_uploads: UploadCache<GpuFrame, NativeUploadKey>,
+    native_upload_aliases: HashMap<NativeUploadKey, NativeUploadKey>,
     /// Decoded still images uploaded to the working format, cached by
     /// `(asset, logical size)` (26 K-C8). A still's pixels never change until
     /// relink/`InvalidateRange`, but the size it is wanted at does — Draft vs
@@ -3289,6 +3614,35 @@ struct MediaSources {
 const UPLOAD_CACHE_CAP: usize = 32;
 
 type UploadKey = (AssetId, Tick, bool);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct NativeUploadKey {
+    asset: AssetId,
+    time: Tick,
+    intent: [u32; 8],
+}
+impl NativeUploadKey {
+    fn new(
+        asset: AssetId,
+        time: Tick,
+        input: &photonic_core::timeline::color::NativeInputColorInterpretation,
+    ) -> Self {
+        Self {
+            asset,
+            time,
+            intent: [
+                input.version,
+                input.standard as u32,
+                input.range as u32,
+                input.matrix as u32,
+                input.chroma_location.map(|c| c as u32).unwrap_or(u32::MAX),
+                input.hlg_peak_nits.unwrap_or(0),
+                input.reference_white_nits.unwrap_or(0),
+                1,
+            ],
+        }
+    }
+}
 
 struct UploadCacheEntry<T> {
     value: T,
@@ -3388,6 +3742,7 @@ impl<T> UploadCache<T> {
 /// audio/FFmpeg internals and temporary renderer allocations are separate.
 pub const SESSION_GPU_CACHE_BYTES: u64 = 1536 * 1024 * 1024;
 const UPLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const NATIVE_UPLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 const STILL_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const VECTOR_CACHE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_SOURCE_BUILDS: usize = 2;
@@ -3402,10 +3757,12 @@ const RASTER_ENCODED_BYTES: u64 = 64 * 1024 * 1024;
 enum RasterKey {
     Still(AssetId, u32, u32),
     Vector(VectorStateKey),
+    NativeVector(VectorStateKey),
 }
 enum RasterTask {
     Still(PathBuf, (u32, u32)),
     Vector(Arc<Document>, u32, u32),
+    NativeVector(Arc<Document>, u32, u32),
 }
 struct PreparedRaster {
     native: (u32, u32),
@@ -3467,6 +3824,25 @@ fn prepare_raster(
                 photonic_core::RasterImage::from_rgba(rgba.width(), rgba.height(), rgba.into_raw())
                     .ok()?;
             (image, target)
+        }
+        RasterTask::NativeVector(document, w, h) => {
+            photonic_render::native_vector::validate_document(&document).ok()?;
+            if w == 0 || h == 0 || w > 8192 || h > 8192 || u64::from(w) * u64::from(h) > 16_777_216
+            {
+                return None;
+            }
+            let mut renderer = headless.lock().unwrap_or_else(|e| e.into_inner());
+            let renderer =
+                renderer.get_or_insert_with(|| pollster::block_on(HeadlessRenderer::new()));
+            let (bytes, rw, rh) = renderer.render_managed_vector_rgba(&document, w, h).ok()?;
+            let texels =
+                photonic_render::native_vector::decode_premultiplied_scene(&bytes, rw, rh).ok()?;
+            return Some(PreparedRaster {
+                native: (rw, rh),
+                width: rw,
+                height: rh,
+                texels,
+            });
         }
         RasterTask::Vector(document, w, h) => {
             if w == 0 || h == 0 || u64::from(w) * u64::from(h) * 12 > RASTER_JOB_BYTES {
@@ -3603,6 +3979,7 @@ impl MediaSources {
             project: None,
             sources: HashMap::new(),
             native_source_errors: HashMap::new(),
+            native_decode_lanes: HashMap::new(),
             pending: HashMap::new(),
             source_builds: Arc::new(AtomicU64::new(0)),
             upload_aliases: HashMap::new(),
@@ -3618,6 +3995,9 @@ impl MediaSources {
             raster_epoch: Arc::new(AtomicU64::new(0)),
             raster_failed: HashSet::new(),
             uploads: UploadCache::new(UPLOAD_CACHE_CAP).with_byte_budget(UPLOAD_CACHE_BYTES),
+            native_uploads: UploadCache::new(UPLOAD_CACHE_CAP)
+                .with_byte_budget(NATIVE_UPLOAD_CACHE_BYTES),
+            native_upload_aliases: HashMap::new(),
             stills: StillCache::new(STILL_CACHE_CAP).with_byte_budget(STILL_CACHE_BYTES),
             converter: None,
             playing: false,
@@ -3653,7 +4033,7 @@ impl MediaSources {
         self.project = Some(project);
         self.native_source_errors.clear();
         if let Some(project) = self.project.as_ref() {
-            for ((asset, proxy), entry) in &self.sources {
+            for ((asset, proxy, _lane), entry) in &self.sources {
                 if *proxy {
                     continue;
                 }
@@ -3802,7 +4182,10 @@ impl MediaSources {
     fn invalidate_all(&mut self) {
         self.sources.clear();
         self.pending.clear();
+        self.native_decode_lanes.clear();
         self.uploads.clear();
+        self.native_uploads.clear();
+        self.native_upload_aliases.clear();
         self.upload_aliases.clear();
         self.stills.clear();
         self.vectors.clear();
@@ -3821,11 +4204,20 @@ impl MediaSources {
         if assets.is_empty() {
             return;
         }
-        self.sources.retain(|(asset, _), _| !assets.contains(asset));
+        self.sources
+            .retain(|(asset, _, _), _| !assets.contains(asset));
+        self.native_decode_lanes
+            .retain(|(asset, _), _| !assets.contains(asset));
         self.native_source_errors
             .retain(|asset, _| !assets.contains(asset));
-        self.pending.retain(|(asset, _), _| !assets.contains(asset));
+        self.pending
+            .retain(|(asset, _, _), _| !assets.contains(asset));
         self.uploads.remove_assets(assets);
+        self.native_uploads
+            .entries
+            .retain(|key, _| !assets.contains(&key.asset));
+        self.native_upload_aliases
+            .retain(|key, _| !assets.contains(&key.asset));
         self.upload_aliases
             .retain(|(asset, _, _), _| !assets.contains(asset));
         self.stills.remove_assets(assets);
@@ -3841,7 +4233,7 @@ impl MediaSources {
             return;
         }
         use std::sync::mpsc::TryRecvError;
-        let mut done: Vec<((AssetId, bool), Option<VideoSourceEntry>)> = Vec::new();
+        let mut done: Vec<(VideoSourceKey, Option<VideoSourceEntry>)> = Vec::new();
         self.pending.retain(|key, rx| match rx.try_recv() {
             Ok(entry) => {
                 done.push((*key, entry));
@@ -4005,7 +4397,7 @@ impl MediaSources {
             .filter_map(|entry| entry.as_ref())
             .map(|entry| entry.ring.resident_bytes())
             .sum();
-        let upload_bytes = self.uploads.resident_bytes();
+        let upload_bytes = self.uploads.resident_bytes() + self.native_uploads.resident_bytes();
         let still_bytes = self.stills.resident_bytes();
         let vector_bytes = self.vectors.resident_bytes();
         let gpu_cache_bytes = graph_bytes + upload_bytes + still_bytes + vector_bytes;
@@ -4059,7 +4451,7 @@ impl MediaSources {
         );
         let resolved_proxy = requested_proxy && path != *original;
         Some(ResolvedVideoInput {
-            key: (asset, resolved_proxy),
+            key: (asset, resolved_proxy, 0),
             path,
         })
     }
@@ -4088,6 +4480,10 @@ fn build_source_entry(tools: FfmpegTools, path: std::path::PathBuf) -> Option<Vi
     } else {
         PtsKind::Cfr(video.frame_rate)
     };
+    let pts_table = match &pts_kind {
+        PtsKind::Vfr(table) => Some(Arc::clone(table)),
+        _ => None,
+    };
     let params = SourceParams {
         input: path,
         width: video.width,
@@ -4106,8 +4502,31 @@ fn build_source_entry(tools: FfmpegTools, path: std::path::PathBuf) -> Option<Vi
         pixel_format: details.pixel_format,
         file_identity,
         rate: video.frame_rate,
+        pts_table,
         last_used: 0,
     })
+}
+
+fn decoded_frame_covers(
+    pts: Tick,
+    requested: Tick,
+    rate: FrameRate,
+    table: Option<&PtsIndex>,
+) -> bool {
+    if requested < pts {
+        return false;
+    }
+    if let Some(table) = table {
+        let Ok(index) = table.pts.binary_search(&pts) else {
+            return false;
+        };
+        if let Some(end) = table.pts.get(index + 1) {
+            return requested < *end;
+        }
+    }
+    // Without a following PTS, retain the nominal last-frame interval. No
+    // fabricated VFR extrapolation or stale frame beyond that interval.
+    (requested.0 as i128 - pts.0 as i128) < rate.ticks_per_frame().0.max(1) as i128
 }
 
 fn native_source_format_error(
@@ -4147,7 +4566,14 @@ impl MediaSources {
                 .and_then(|media| media.probe.as_ref())
                 .and_then(|probe| probe.pixel_format.clone())
         });
-        let input = self.resolve_video_input(asset, proxy)?;
+        let mut input = self.resolve_video_input(asset, proxy)?;
+        if native_input.is_some() {
+            input.key.2 = self
+                .native_decode_lanes
+                .get(&(asset, src_time))
+                .copied()
+                .unwrap_or(0);
+        }
         let source_path = native_input.map(|_| input.path.clone());
         let requested_key = (asset, src_time, input.key.1);
         if native_input.is_none() && !self.scrubbing {
@@ -4200,6 +4626,29 @@ impl MediaSources {
             }
             self.native_source_errors.remove(&asset);
         }
+        let native_requested_key = if let Some(intent) = native_input {
+            if let Err(error) = intent.validate() {
+                self.native_source_errors.insert(
+                    asset,
+                    format!("native source {asset} conversion failed: {error}"),
+                );
+                return None;
+            }
+            let key = NativeUploadKey::new(asset, src_time, intent);
+            // Only exact requests are aliased. File identity and stored/current
+            // format have already been checked, even for a hot cached frame.
+            if !scrubbing {
+                if let Some(measured) = self.native_upload_aliases.get(&key) {
+                    if let Some(frame) = self.native_uploads.get(measured, stamp) {
+                        self.sources_ready += 1;
+                        return Some(frame.clone());
+                    }
+                }
+            }
+            Some(key)
+        } else {
+            None
+        };
         let colorimetry = entry.colorimetry;
 
         // Steer the background decode worker off the engine thread (decode ∥
@@ -4212,14 +4661,15 @@ impl MediaSources {
             entry.worker.steer(src_time);
         }
 
-        // Ring-hit acceptance. Normally require the covering frame within one
-        // frame tick (a discontinuous seek must not serve an old frame; Step
+        // Ring-hit acceptance uses actual VFR boundaries or one nominal CFR
+        // interval (a discontinuous seek must not serve an old frame; Step
         // must never re-serve the previous one). While scrubbing, accept any
         // resident frame at/before src_time — the keyframe preview may be up to
         // a GOP stale, which is the intended cheap-scrub tradeoff.
-        let tolerance = entry.rate.ticks_per_frame().0;
-        let within =
-            |f: &Arc<crate::decode::DecodedFrame>| scrubbing || src_time.0 - f.pts.0 < tolerance;
+        let within = |f: &Arc<crate::decode::DecodedFrame>| {
+            scrubbing
+                || decoded_frame_covers(f.pts, src_time, entry.rate, entry.pts_table.as_deref())
+        };
 
         let ready = if playing || scrubbing {
             entry.ring.try_frame_covering(src_time).filter(within)
@@ -4242,6 +4692,19 @@ impl MediaSources {
         saturating_increment(&RING_HITS);
 
         if let Some(native_input) = native_input {
+            let measured_key = NativeUploadKey::new(asset, frame.pts, native_input);
+            if let Some(cached) = self.native_uploads.get(&measured_key, stamp) {
+                let cached = cached.clone();
+                if !scrubbing {
+                    if self.native_upload_aliases.len() >= 256 {
+                        self.native_upload_aliases.clear();
+                    }
+                    self.native_upload_aliases
+                        .insert(native_requested_key.unwrap(), measured_key);
+                }
+                self.sources_ready += 1;
+                return Some(cached);
+            }
             let converter = self
                 .converter
                 .get_or_insert_with(|| YuvConverter::new(gpu.device()));
@@ -4265,8 +4728,22 @@ impl MediaSources {
                     return None;
                 }
             };
+            let texture = GpuFrame::new(Arc::new(converted), width, height);
+            self.native_uploads.insert_sized(
+                measured_key,
+                texture.clone(),
+                stamp,
+                gpu_frame_bytes(&texture),
+            );
+            if !scrubbing {
+                if self.native_upload_aliases.len() >= 256 {
+                    self.native_upload_aliases.clear();
+                }
+                self.native_upload_aliases
+                    .insert(native_requested_key.unwrap(), measured_key);
+            }
             self.sources_ready += 1;
-            return Some(GpuFrame::new(Arc::new(converted), width, height));
+            return Some(texture);
         }
 
         // Upload (cached by decoded pts) and record as the new last-good frame.
@@ -4306,19 +4783,48 @@ impl MediaSources {
 }
 
 impl GpuFrameSource for MediaSources {
+    fn prepare_native_video_sources(&mut self, requests: &[(AssetId, Tick)]) -> bool {
+        self.native_decode_lanes.clear();
+        let mut requests = requests.to_vec();
+        requests.sort_by_key(|(asset, tick)| (asset.0.as_u128(), tick.0));
+        requests.dedup();
+        if requests.len() > MAX_LIVE_SOURCES {
+            self.capacity_limited = true;
+            return false;
+        }
+        let mut previous = None;
+        let mut lane = 0u16;
+        for (asset, tick) in requests {
+            if previous == Some(asset) {
+                lane += 1;
+            } else {
+                lane = 0;
+                previous = Some(asset);
+            }
+            self.native_decode_lanes.insert((asset, tick), lane);
+        }
+        true
+    }
+
+    fn invalidation_epoch(&self) -> u64 {
+        self.raster_epoch.load(Ordering::Acquire)
+    }
     fn cache_namespace(&self) -> u64 {
-        let document = if self.document.is_some() {
-            self.raster_epoch
-                .load(Ordering::Acquire)
-                .wrapping_add(1)
-                .wrapping_mul(0x9e3779b97f4a7c15)
-        } else {
+        // Source relinks/probes invalidate computed GPU nodes and subject masks,
+        // even when no vector document is attached and the asset ID is unchanged.
+        let epoch = self.raster_epoch.load(Ordering::Acquire);
+        let source = if epoch == 0 && self.document.is_none() {
             0
+        } else {
+            let mut bytes = [0u8; 9];
+            bytes[..8].copy_from_slice(&epoch.to_le_bytes());
+            bytes[8] = u8::from(self.document.is_some());
+            xxhash_rust::xxh3::xxh3_64(&bytes)
         };
         if self.scrubbing {
-            document ^ self.use_counter.wrapping_add(1).max(1)
+            source ^ self.use_counter.wrapping_add(1).max(1)
         } else {
-            document
+            source
         }
     }
     fn video_texture(
@@ -4339,6 +4845,45 @@ impl GpuFrameSource for MediaSources {
         input: &photonic_core::timeline::color::NativeInputColorInterpretation,
     ) -> Option<GpuFrame> {
         self.video_texture_with_input(gpu, asset, src_time, false, Some(input))
+    }
+
+    fn native_video_failure(&self, asset: AssetId, src_time: Tick) -> Option<String> {
+        let mut input = self.resolve_video_input(asset, false)?;
+        input.key.2 = self
+            .native_decode_lanes
+            .get(&(asset, src_time))
+            .copied()
+            .unwrap_or(0);
+        self.sources
+            .get(&input.key)?
+            .as_ref()?
+            .worker
+            .failure_at(src_time, self.scrubbing)
+    }
+
+    fn report_native_source_error(&mut self, asset: AssetId, error: String) {
+        self.native_source_errors.insert(asset, error);
+    }
+
+    fn native_media_still_texture(
+        &mut self,
+        gpu: &GpuContext,
+        asset: AssetId,
+        w: u32,
+        h: u32,
+    ) -> Option<GpuFrame> {
+        let frame = self.native_still_texture(gpu, asset, w, h)?;
+        if self.stills.native_size(asset) != Some((w, h)) {
+            self.native_source_errors.insert(
+                asset,
+                format!(
+                    "native MediaIn still geometry changed: expected {w}x{h}, decoded {:?}",
+                    self.stills.native_size(asset)
+                ),
+            );
+            return None;
+        }
+        Some(frame)
     }
 
     fn native_still_texture(
@@ -4392,6 +4937,35 @@ impl GpuFrameSource for MediaSources {
         self.stills
             .insert(asset, prepared.native, requested, frame.clone());
         self.sources_ready += 1;
+        Some(frame)
+    }
+
+    fn native_vector_texture(
+        &mut self,
+        gpu: &GpuContext,
+        vref: VectorRef,
+        key: VectorStateKey,
+        w: u32,
+        h: u32,
+    ) -> Option<GpuFrame> {
+        self.sources_requested += 1;
+        if vref != VectorRef::WholeDocument {
+            return None;
+        }
+        let stamp = self.next_use_stamp();
+        if let Some(frame) = self.vectors.get(&key, stamp) {
+            self.sources_ready += 1;
+            return Some(frame.clone());
+        }
+        let document = self.document.clone()?;
+        let prepared = self.prepare_raster(
+            RasterKey::NativeVector(key),
+            RasterTask::NativeVector(document, w, h),
+        )?;
+        let frame = upload_prepared(gpu, &prepared);
+        self.sources_ready += 1;
+        self.vectors
+            .insert_sized(key, frame.clone(), stamp, gpu_frame_bytes(&frame));
         Some(frame)
     }
 
@@ -4921,6 +5495,633 @@ fn feeder_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_deflicker_cold_video_analysis_reduces_real_frame_flicker() {
+        run_native_deflicker_video(false);
+    }
+    #[test]
+    fn native_deflicker_animated_analysis_controls_reduce_real_frame_flicker() {
+        run_native_deflicker_video(true);
+    }
+    fn run_native_deflicker_video(animated: bool) {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+            NativeManagedColorConfig, SequenceColorConfig,
+        };
+        use photonic_core::timeline::{
+            AssetKind, ClipEffect, EffectKind, MediaAsset, Sequence, Track, TrackKind,
+        };
+        use std::io::Write;
+        let tools = crate::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let dir = std::env::temp_dir().join(format!(
+            "photonic-native-deflicker-video-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("flicker.mkv");
+        let mut process = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                "16x16",
+                "-framerate",
+                "30",
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+            ])
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut stdin = process.stdin.take().unwrap();
+            for frame in 0..60 {
+                let v = if (frame / 3) % 2 == 0 { 80 } else { 110 };
+                stdin.write_all(&vec![v; 16 * 16 * 3]).unwrap();
+            }
+        }
+        assert!(process.wait().unwrap().success());
+        let input = NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+        };
+        let mut asset = MediaAsset::from_file(AssetKind::Video, &path);
+        asset.native_input_color = Some(input);
+        asset.probe = Some(crate::media::probe::probe_asset(&tools, &path).unwrap());
+        let aid = asset.id;
+        let mut project = TimelineProject::new();
+        project.media.insert(asset);
+        let mut seq = Sequence::new("native flicker", FrameRate::FPS_30, 16, 16);
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: aid },
+            Tick(0),
+            Tick(2 * photonic_core::timeline::TICKS_PER_SECOND),
+        );
+        clip.effects.push(ClipEffect::new(EffectKind::Deflicker));
+        if animated {
+            for (path, first, last) in
+                [("params.window", 0.5, 1.5), ("params.max_change", 0.2, 0.4)]
+            {
+                let mut lane = photonic_core::timeline::PropertyTrack::new(
+                    photonic_core::timeline::PropPath::new(path),
+                );
+                for (at, value) in [
+                    (0, first),
+                    (photonic_core::timeline::TICKS_PER_SECOND, last),
+                ] {
+                    lane.keyframes.push(photonic_core::timeline::Keyframe::new(
+                        Tick(at),
+                        photonic_core::timeline::PropValue::Float(value),
+                        photonic_core::timeline::Interp::Linear,
+                    ));
+                }
+                clip.effects[0].params.tracks.push(lane);
+            }
+        }
+        let cid = clip.id;
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        let sid = seq.id;
+        project.insert_sequence(seq);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut engine = EngineThread::new(
+            gpu.clone(),
+            Arc::new(Mutex::new(Document::new("native analysis", 16.0, 16.0))),
+            Arc::new(Mutex::new(CommandHistory::new(1))),
+            rx,
+            Arc::new(ArcSwapOption::from(None)),
+            Arc::new(ArcSwap::from_pointee(EngineStatus::default())),
+        );
+        engine.media.set_project(Arc::new(project.clone()));
+        engine.snapshot = Some(Arc::new(project.clone()));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut attempts = 0;
+        while engine.deflicker_pending(&project, sid) {
+            assert!(
+                Instant::now() < deadline,
+                "native analysis did not complete"
+            );
+            engine.ensure_deflicker_measured(&project, sid, 0);
+            attempts += 1;
+            std::thread::sleep(Duration::from_millis(4));
+        }
+        assert!(
+            attempts >= 72,
+            "must actually collect60exposure and12burst samples"
+        );
+        assert!(
+            engine
+                .deflicker_gains
+                .contains_native(&crate::graph::deflicker::NativeDeflickerKey {
+                    sequence: sid,
+                    owner: photonic_core::timeline::VfxOwner::Clip(cid),
+                    clip_context: Some(cid),
+                    effect_index: 0
+                }),
+            "analysis must not fall back to unmeasured"
+        );
+        let mut raw = Vec::new();
+        let mut fixed = Vec::new();
+        for frame in [
+            0, 3, 6, 9, 12, 15, 18, 21, 24, 27, 30, 33, 36, 39, 42, 45, 48, 51, 54, 57,
+        ] {
+            let tick = Tick(frame * photonic_core::timeline::TICKS_PER_SECOND / 30);
+            for enabled in [false, true] {
+                let mut candidate = project.clone();
+                candidate.sequences.get_mut(&sid).unwrap().video_tracks[0].clips[0].effects[0]
+                    .enabled = enabled;
+                let compiled = crate::graph::compile::compile_native_live_with_analysis(
+                    &candidate,
+                    sid,
+                    0,
+                    tick,
+                    Quality::FULL,
+                    false,
+                    &HashMap::new(),
+                    &engine.lut_cache,
+                    &engine.deflicker_gains,
+                );
+                assert!(
+                    compiled.diagnostics.is_empty(),
+                    "{:?}",
+                    compiled.diagnostics
+                );
+                let stop = Instant::now() + Duration::from_secs(5);
+                let tap = loop {
+                    let (_, tap) = engine.evaluator.evaluate_with_tap_frame(
+                        &compiled.graph,
+                        (16, 16),
+                        &mut engine.media,
+                        compiled.program_tap,
+                    );
+                    if let Some(tap) = tap {
+                        break tap;
+                    }
+                    assert!(Instant::now() < stop, "sample frame not ready");
+                    std::thread::sleep(Duration::from_millis(4));
+                };
+                let image = crate::graph::ops::Image {
+                    width: tap.width,
+                    height: tap.height,
+                    pixels: crate::graph::eval::read_texture_rgba16f(
+                        &gpu,
+                        &tap.texture,
+                        tap.width,
+                        tap.height,
+                    ),
+                };
+                let mean = crate::graph::deflicker::measure_frame(
+                    &crate::graph::deflicker::native_meter_image(&image),
+                )[0];
+                if enabled {
+                    fixed.push(mean)
+                } else {
+                    raw.push(mean)
+                }
+            }
+        }
+        let spread = |values: &[f32]| {
+            let mean = values.iter().sum::<f32>() / values.len() as f32;
+            (values.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / values.len() as f32).sqrt()
+        };
+        assert!(spread(&raw) > 0.02, "fixture must flicker");
+        assert!(
+            spread(&fixed) < spread(&raw) * 0.5,
+            "raw {:?}, fixed {:?}",
+            raw,
+            fixed
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_deflicker_analysis_tap_is_pre_display_bounded_and_linear() {
+        use photonic_core::timeline::color::{
+            InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
+        };
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let dir = std::env::temp_dir().join(format!(
+            "photonic-native-deflicker-meter-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, aid) = quadrant_still_project(&dir);
+        let mut project = (*project).clone();
+        let input = NativeInputColorInterpretation {
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+            version: 1,
+            standard: NativeInputStandard::SrgbDisplay,
+            range: InputSignalRange::Full,
+            matrix: InputMatrix::Rgb,
+            chroma_location: None,
+        };
+        project
+            .media
+            .assets
+            .get_mut(&aid)
+            .unwrap()
+            .native_input_color = Some(input.clone());
+        let mut media = MediaSources::new(None);
+        media.set_project(Arc::new(project.clone()));
+        let mut evaluator = Evaluator::new(gpu.clone());
+        for (w, h) in [(16, 12), (32, 18), (320, 180)] {
+            let frame = crate::graph::compile::compile_native_asset_analysis(
+                &project,
+                aid,
+                Tick(0),
+                &input,
+                w,
+                h,
+            )
+            .unwrap();
+            assert!(frame.graph.validate_working_color_domain().is_ok());
+            assert!(!frame.graph.nodes.iter().any(|n| matches!(
+                n.op,
+                IrOp::NativeSdrOutput | IrOp::NativeSdrVideoOutput { .. }
+            )));
+            let texture = evaluator
+                .evaluate(&frame.graph, (w, h), &mut media)
+                .expect("analysis image");
+            let image = crate::graph::ops::Image {
+                width: w,
+                height: h,
+                pixels: crate::graph::eval::read_texture_rgba16f(&gpu, &texture, w, h),
+            };
+            let meter = crate::graph::deflicker::native_meter_image(&image);
+            for (x, y, want) in [
+                (w / 4, h / 4, [1.0, 0.0, 0.0]),
+                (3 * w / 4, h / 4, [0.0, 1.0, 0.0]),
+                (w / 4, 3 * h / 4, [0.0, 0.0, 1.0]),
+                (3 * w / 4, 3 * h / 4, [1.0; 3]),
+            ] {
+                let p = meter.pixels[(y * w + x) as usize];
+                for c in 0..3 {
+                    assert!((p[c] - want[c]).abs() < 0.003, "{w}x{h} {p:?} vs{want:?}");
+                }
+                assert_eq!(p[3], 1.0);
+            }
+        }
+        for (w, h) in [(0, 1), (1, 0), (641, 1), (1, 361)] {
+            assert!(crate::graph::compile::compile_native_asset_analysis(
+                &project,
+                aid,
+                Tick(0),
+                &input,
+                w,
+                h
+            )
+            .is_err());
+        }
+        assert!(crate::graph::compile::compile_native_asset_analysis(
+            &project,
+            aid,
+            Tick(-1),
+            &input,
+            16,
+            12
+        )
+        .is_err());
+        let mut bad = input;
+        bad.version = 99;
+        assert!(crate::graph::compile::compile_native_asset_analysis(
+            &project,
+            aid,
+            Tick(0),
+            &bad,
+            16,
+            12
+        )
+        .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deflicker_incremental_analysis_commits_only_complete_grid_and_restarts_edits() {
+        use photonic_core::timeline::{
+            ClipEffect, EffectKind, PropPath, PropValue, Sequence, Track, TrackKind,
+        };
+        let Some(gpu) = GpuContext::request_blocking() else {
+            return;
+        };
+        let dir =
+            std::env::temp_dir().join(format!("photonic-deflicker-job-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (project, aid) = quadrant_still_project(&dir);
+        let mut project = (*project).clone();
+        let mut seq = Sequence::new("analysis", FrameRate::FPS_30, 320, 180);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: aid },
+            Tick(0),
+            Tick(photonic_core::timeline::TICKS_PER_SECOND),
+        );
+        clip.effects.push(ClipEffect::new(EffectKind::Deflicker));
+        let cid = clip.id;
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        let sid = seq.id;
+        project.insert_sequence(seq);
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut engine = EngineThread::new(
+            gpu,
+            Arc::new(Mutex::new(Document::new("test", 320.0, 180.0))),
+            Arc::new(Mutex::new(CommandHistory::new(1))),
+            rx,
+            Arc::new(ArcSwapOption::from(None)),
+            Arc::new(ArcSwap::from_pointee(EngineStatus::default())),
+        );
+        engine.media.set_project(Arc::new(project.clone()));
+        engine.snapshot = Some(Arc::new(project.clone()));
+        engine.present();
+        assert!(
+            engine.frame_out.load_full().is_none(),
+            "must not publish an unmeasured frame"
+        );
+        assert_eq!(engine.pending_computations, 1);
+        let job = engine
+            .deflicker_pending_job
+            .as_ref()
+            .expect("partial job retained");
+        assert!(job.samples.len() <= 1);
+        assert!(!engine.deflicker_gains.contains(&cid));
+        let old = job.fingerprint;
+        project.sequences.get_mut(&sid).unwrap().video_tracks[0].clips[0].effects[0]
+            .params
+            .base
+            .entries
+            .push((PropPath::new("params.amount"), PropValue::Float(0.5)));
+        engine.ensure_deflicker_measured(&project, sid, 0);
+        let job = engine.deflicker_pending_job.as_ref().unwrap();
+        assert_ne!(job.fingerprint, old);
+        assert!(job.samples.len() <= 1);
+        for _ in 0..100 {
+            if !engine.deflicker_pending(&project, sid) {
+                break;
+            }
+            let before = engine
+                .deflicker_pending_job
+                .as_ref()
+                .map_or(0, |j| j.samples.len() + j.burst.len());
+            engine.ensure_deflicker_measured(&project, sid, 0);
+            if let Some(job) = &engine.deflicker_pending_job {
+                assert!(job.samples.len() + job.burst.len() <= before + 1);
+            }
+        }
+        assert!(!engine.deflicker_pending(&project, sid));
+        assert!(engine.deflicker_gains.contains(&cid));
+        assert!(engine.deflicker_pending_job.is_none());
+        let gains =
+            crate::graph::compile::DeflickerGains::gain(&engine.deflicker_gains, cid, Tick(0))
+                .unwrap();
+        assert_eq!(gains, [1.0; 3]);
+        // A new edit starts a replacement job, never serving the stale table.
+        project.sequences.get_mut(&sid).unwrap().video_tracks[0].clips[0].source_in = Tick(10);
+        engine.ensure_deflicker_measured(&project, sid, 0);
+        assert!(!engine.deflicker_gains.contains(&cid));
+        engine.deflicker_pending_job.as_mut().unwrap().started =
+            Instant::now() - Duration::from_secs(21);
+        engine.ensure_deflicker_measured(&project, sid, 0);
+        assert!(engine.deflicker_pending_job.is_none());
+        assert!(!engine.deflicker_gains.contains(&cid));
+        assert!(!engine.deflicker_pending(&project, sid));
+        // Removing an effect cancels its pending replacement job.
+        project.sequences.get_mut(&sid).unwrap().video_tracks[0].clips[0].source_in = Tick(20);
+        engine.ensure_deflicker_measured(&project, sid, 0);
+        assert!(engine.deflicker_pending_job.is_some());
+        project.sequences.get_mut(&sid).unwrap().video_tracks[0].clips[0]
+            .effects
+            .clear();
+        engine.snapshot = Some(Arc::new(project.clone()));
+        engine.measure_deflicker_if_pending();
+        assert!(engine.deflicker_pending_job.is_none());
+        // A native sequence stays explicitly unavailable, never measured after
+        // its display transform by the Legacy meter.
+        project.sequences.get_mut(&sid).unwrap().video_tracks[0].clips[0]
+            .effects
+            .push(ClipEffect::new(EffectKind::Deflicker));
+        project.sequences.get_mut(&sid).unwrap().color =
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(Box::new(
+                photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft(),
+            ));
+        engine.ensure_deflicker_measured(&project, sid, 0);
+        assert!(engine.deflicker_pending_job.is_none());
+        assert!(!engine.deflicker_pending(&project, sid));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn deflicker_analysis_identity_tracks_source_clock_and_parameters() {
+        use photonic_core::timeline::{
+            AssetKind, ClipEffect, EffectKind, Interp, Keyframe, MediaAsset, PropPath, PropValue,
+            PropertyTrack, Ratio, Sequence, SpeedMap,
+        };
+        let mut project = TimelineProject::new();
+        let asset = MediaAsset::from_file(AssetKind::Video, "/tmp/deflicker-source.mp4");
+        let aid = asset.id;
+        project.media.assets.insert(aid, asset);
+        let seq = Sequence::new("sequence", FrameRate::FPS_30, 320, 180);
+        let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(100));
+        let fx = ClipEffect::new(EffectKind::Deflicker);
+        let key = |p: &TimelineProject, s: &Sequence, c: &Clip, f: &ClipEffect, e| {
+            EngineThread::deflicker_fingerprint(p, s, c, f, e)
+        };
+        let base = key(&project, &seq, &clip, &fx, 0);
+        let mut cosmetic = clip.clone();
+        cosmetic.name = "renamed".into();
+        cosmetic.start = Tick(999);
+        assert_eq!(base, key(&project, &seq, &cosmetic, &fx, 0));
+        assert_ne!(base, key(&project, &seq, &clip, &fx, 1));
+        let mut c = clip.clone();
+        c.speed = SpeedMap::Constant(Ratio::new(2, 1));
+        assert_ne!(base, key(&project, &seq, &c, &fx, 0));
+        let mut c = clip.clone();
+        c.source_in = Tick(1);
+        assert_ne!(base, key(&project, &seq, &c, &fx, 0));
+        let mut c = clip.clone();
+        c.duration = Tick(101);
+        assert_ne!(base, key(&project, &seq, &c, &fx, 0));
+        let mut s = seq.clone();
+        s.frame_rate = FrameRate { num: 60, den: 1 };
+        assert_ne!(base, key(&project, &s, &clip, &fx, 0));
+        let mut p = project.clone();
+        p.media.assets.get_mut(&aid).unwrap().content_hash = Some("replacement".into());
+        assert_ne!(base, key(&p, &seq, &clip, &fx, 0));
+        let mut p = project.clone();
+        p.media.assets.get_mut(&aid).unwrap().source = photonic_core::timeline::AssetSource::File {
+            path: "/tmp/relinked.mp4".into(),
+            rel_path: None,
+        };
+        assert_ne!(base, key(&p, &seq, &clip, &fx, 0));
+        let mut f = fx.clone();
+        f.params
+            .base
+            .entries
+            .push((PropPath::new("params.amount"), PropValue::Float(0.4)));
+        assert_ne!(base, key(&project, &seq, &clip, &f, 0));
+        let mut f = fx.clone();
+        let mut lane = PropertyTrack::new(PropPath::new("params.amount"));
+        lane.keyframes.push(Keyframe::new(
+            Tick(10),
+            PropValue::Float(0.4),
+            Interp::Linear,
+        ));
+        f.params.tracks.push(lane);
+        assert_ne!(base, key(&project, &seq, &clip, &f, 0));
+    }
+
+    #[test]
+    fn native_vector_session_raster_gamut_draft_cache_revision_and_padding() {
+        use crate::graph::ir::{ContentHash, FrameGraph, IrNode, IrNodeId, WorkingColorDomain};
+        use photonic_core::{
+            color::Color,
+            node::{PathNode, SceneNode, SceneNodeKind},
+            path::PathData,
+            style::Fill,
+        };
+        let gpu = GpuContext::request_blocking().expect("GPU required");
+        let mut doc = Document::new("native vector", 65.0, 33.0);
+        let id = doc.add_node(
+            SceneNode::new(
+                "logo",
+                doc.active_layer_id.unwrap(),
+                SceneNodeKind::Path(
+                    PathNode::new(PathData::rect(0.0, 0.0, 65.0, 33.0))
+                        .with_fill(Fill::solid(Color::new(0.5, 0.2, 0.8, 0.5))),
+                ),
+            ),
+            None,
+        );
+        let mut media = MediaSources::new(None);
+        media.set_document(&doc, 1);
+        let mut evaluator = Evaluator::new(gpu.clone());
+        let graph = FrameGraph {
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+            nodes: vec![IrNode {
+                op: IrOp::NativeRasterVector {
+                    vref: VectorRef::WholeDocument,
+                    doc_state: VectorStateKey(717),
+                    w: 65,
+                    h: 33,
+                },
+                inputs: vec![],
+                content_hash: ContentHash(988778),
+            }],
+            output: Some(IrNodeId(0)),
+        };
+        let matrix = [
+            [0.6130974024, 0.3395231462, 0.0473794514],
+            [0.0701937225, 0.9163538791, 0.0134523984],
+            [0.0206155920, 0.1095697729, 0.8698146351],
+        ];
+        let decode = |s: f64| {
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        for revision in 1..=2 {
+            let rgb = if revision == 1 {
+                [0.5, 0.2, 0.8]
+            } else {
+                [0.1, 0.7, 0.3]
+            };
+            if revision == 2 {
+                if let SceneNodeKind::Path(p) = &mut doc.nodes.get_mut(&id).unwrap().kind {
+                    p.fill = Fill::solid(Color::new(0.1, 0.7, 0.3, 0.5));
+                }
+                media.set_document(&doc, 2);
+            }
+            for canvas in [(65, 33), (32, 16), (65, 33)] {
+                let frame = evaluator
+                    .evaluate_with_tap_frame(&graph, canvas, &mut media, None)
+                    .0
+                    .expect("native raster available");
+                assert_eq!((frame.width, frame.height), canvas);
+                let pixels = crate::graph::eval::read_texture_rgba16f(
+                    &gpu,
+                    &frame.texture,
+                    frame.texture.width(),
+                    frame.texture.height(),
+                );
+                let center = pixels[(canvas.1 / 2 * frame.texture.width() + canvas.0 / 2) as usize];
+                for c in 0..3 {
+                    let expected = (0..3)
+                        .map(|k| matrix[c][k] * decode(rgb[k]) * 0.5)
+                        .sum::<f64>();
+                    assert!(
+                        (f64::from(center[c]) - expected).abs() < 0.006,
+                        "{center:?} vs {expected} revision{revision} {canvas:?}"
+                    );
+                }
+                assert!((center[3] - 0.5).abs() < 0.004);
+                for y in 0..frame.texture.height() {
+                    for x in 0..frame.texture.width() {
+                        if x >= canvas.0 || y >= canvas.1 {
+                            assert_eq!(pixels[(y * frame.texture.width() + x) as usize], [0.0; 4]);
+                        }
+                    }
+                }
+            }
+        }
+        let mut invalid = graph.clone();
+        invalid.working_color_domain = WorkingColorDomain::LegacyLinearRec709;
+        assert!(invalid.validate_working_color_domain().is_err());
+        if let IrOp::NativeRasterVector { w, .. } = &mut invalid.nodes[0].op {
+            *w = 0;
+        }
+        invalid.working_color_domain = WorkingColorDomain::SceneLinearAcescg;
+        assert!(invalid.validate_working_color_domain().is_err());
+    }
+
+    #[test]
+    fn media_identity_changes_namespace_without_a_vector_document() {
+        let mut media = MediaSources::new(None);
+        assert_eq!(media.cache_namespace(), 0);
+        let epoch = media.invalidation_epoch();
+        media.invalidate_assets(&HashSet::from([AssetId::new()]));
+        assert_ne!(media.invalidation_epoch(), epoch);
+        let changed = media.cache_namespace();
+        assert_ne!(changed, 0);
+        let epoch = media.invalidation_epoch();
+        media.set_scrubbing(true);
+        assert_eq!(media.invalidation_epoch(), epoch);
+        assert_ne!(media.cache_namespace(), changed);
+        media.set_scrubbing(false);
+        assert_eq!(media.cache_namespace(), changed);
+        media.invalidate_all();
+        assert_ne!(media.cache_namespace(), changed);
+    }
 
     #[test]
     fn native_session_source_interpretation_does_not_reuse_legacy_upload() {
@@ -4990,6 +6191,13 @@ mod tests {
             }
         };
         let first = wait_native(&mut media, &input709);
+        let repeated = wait_native(&mut media, &input709);
+        assert!(
+            Arc::ptr_eq(&first.texture, &repeated.texture),
+            "identical native requests reuse the converted texture"
+        );
+        assert_eq!(media.native_uploads.len(), 1);
+        assert_eq!(media.memory_status(0).upload_bytes, gpu_frame_bytes(&first));
         let mut invalid_input = input709.clone();
         invalid_input.range = InputSignalRange::FromMetadata;
         assert!(media
@@ -4998,6 +6206,22 @@ mod tests {
         assert!(media.native_source_errors[&asset_id].contains("conversion failed"));
         let second = wait_native(&mut media, &input2020);
         assert!(!media.native_source_errors.contains_key(&asset_id));
+        assert!(
+            !Arc::ptr_eq(&first.texture, &second.texture),
+            "different input interpretation cannot share conversion"
+        );
+        let first_again = wait_native(&mut media, &input709);
+        assert!(Arc::ptr_eq(&first.texture, &first_again.texture));
+        media.invalidate_assets(&HashSet::from([asset_id]));
+        assert_eq!(media.native_uploads.len(), 0);
+        assert!(media.native_upload_aliases.is_empty());
+        let reopened = wait_native(&mut media, &input709);
+        assert!(!Arc::ptr_eq(&first.texture, &reopened.texture));
+        media.invalidate_all();
+        assert_eq!(media.native_uploads.len(), 0);
+        assert!(media.native_upload_aliases.is_empty());
+        let _reopened = wait_native(&mut media, &input709);
+
         let a = crate::graph::eval::read_texture_rgba16f(&gpu, &first.texture, 16, 16);
         let b = crate::graph::eval::read_texture_rgba16f(&gpu, &second.texture, 16, 16);
         assert!(a.iter().zip(&b).any(|(left, right)| {
@@ -5268,7 +6492,7 @@ mod tests {
             .get_mut(&seq_id)
             .unwrap()
             .video_tracks[0]
-            .blend = photonic_core::layer::BlendMode::Multiply;
+            .opacity = 2.0; // All 26 blend modes now qualify; malformed opacity must still fail closed.
         let rejected_generation = session.publish_snapshot(RenderSnapshot {
             revision: 3,
             project: Some(Arc::new(rejected_project)),
@@ -5337,6 +6561,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         drop(session);
+        // The earlier file replacement invalidated this MediaSources decoder.
+        // Reopening is asynchronous; one evaluate call is not a readiness wait.
+        // Reuse the bounded source-readiness helper before testing canvas fit.
+        let _ready = wait_native(&mut media, &input709);
         let canvas_peek = crate::graph::compile::compile_asset_peek(
             &project,
             asset_id,
@@ -5578,6 +6806,59 @@ mod tests {
     }
 
     #[test]
+    fn native_upload_keys_keep_all_intent_fields_and_pts_separate() {
+        use photonic_core::timeline::color::*;
+        let input = NativeInputColorInterpretation {
+            version: 1,
+            standard: NativeInputStandard::Bt709Scene,
+            range: InputSignalRange::Limited,
+            matrix: InputMatrix::Bt709,
+            chroma_location: None,
+            hlg_peak_nits: None,
+            reference_white_nits: None,
+        };
+        let asset = AssetId::new();
+        let key = NativeUploadKey::new(asset, Tick(0), &input);
+        assert_ne!(key, NativeUploadKey::new(asset, Tick(1), &input));
+        assert_ne!(key, NativeUploadKey::new(AssetId::new(), Tick(0), &input));
+        for field in 0..7 {
+            let mut other = input.clone();
+            match field {
+                0 => other.version = 2,
+                1 => other.standard = NativeInputStandard::Bt2020Scene,
+                2 => other.range = InputSignalRange::Full,
+                3 => other.matrix = InputMatrix::Bt2020NonConstant,
+                4 => other.chroma_location = Some(NativeChromaLocation::Center),
+                5 => other.hlg_peak_nits = Some(1000),
+                _ => other.reference_white_nits = Some(100),
+            };
+            assert_ne!(key, NativeUploadKey::new(asset, Tick(0), &other));
+        }
+        let mut cache = UploadCache::new(3).with_byte_budget(20);
+        cache.insert_sized(key, "first", 1, 10);
+        let second = NativeUploadKey {
+            time: Tick(1),
+            ..key
+        };
+        cache.insert_sized(second, "second", 2, 10);
+        assert_eq!(cache.get(&key, 3), Some(&"first"));
+        let third = NativeUploadKey {
+            time: Tick(2),
+            ..key
+        };
+        cache.insert_sized(third, "third", 4, 10);
+        assert!(!cache.contains_key(&second));
+        assert_eq!(cache.resident_bytes(), 20);
+        let large = NativeUploadKey {
+            time: Tick(3),
+            ..key
+        };
+        cache.insert_sized(large, "oversize", 5, 21);
+        assert!(!cache.contains_key(&large));
+        assert_eq!(cache.resident_bytes(), 20);
+    }
+
+    #[test]
     fn upload_cache_evicts_only_the_coldest_frame() {
         let mut cache = UploadCache::new(2);
         let a = AssetId::new();
@@ -5752,7 +7033,7 @@ mod tests {
         let ready_proxy_input = media
             .resolve_video_input(ready_id, true)
             .expect("ready video input");
-        assert_eq!(ready_proxy_input.key, (ready_id, true));
+        assert_eq!(ready_proxy_input.key, (ready_id, true, 0));
         assert_eq!(ready_proxy_input.path, ready_proxy);
 
         let unready_proxy_input = media
@@ -5761,12 +7042,103 @@ mod tests {
         let unready_original_input = media
             .resolve_video_input(unready_id, false)
             .expect("unready original input");
-        assert_eq!(unready_proxy_input.key, (unready_id, false));
+        assert_eq!(unready_proxy_input.key, (unready_id, false, 0));
         assert_eq!(unready_proxy_input.key, unready_original_input.key);
         assert_eq!(unready_proxy_input.path, unready_original);
         assert_eq!(unready_proxy_input.path, unready_original_input.path);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fractional_source_readiness_uses_actual_vfr_intervals() {
+        let rate = FrameRate::FPS_30;
+        let tpf = rate.ticks_per_frame().0;
+        let table = PtsIndex {
+            pts: vec![Tick(0), Tick(2 * tpf), Tick(3 * tpf)],
+        };
+        assert!(decoded_frame_covers(
+            Tick(0),
+            Tick(2 * tpf - 1),
+            rate,
+            Some(&table)
+        ));
+        assert!(!decoded_frame_covers(
+            Tick(0),
+            Tick(2 * tpf),
+            rate,
+            Some(&table)
+        ));
+        assert!(decoded_frame_covers(
+            Tick(2 * tpf),
+            Tick(3 * tpf - 1),
+            rate,
+            Some(&table)
+        ));
+        assert!(!decoded_frame_covers(
+            Tick(1),
+            Tick(tpf),
+            rate,
+            Some(&table)
+        ));
+        assert!(!decoded_frame_covers(Tick(tpf), Tick(tpf - 1), rate, None));
+        assert!(decoded_frame_covers(Tick(0), Tick(tpf - 1), rate, None));
+        assert!(!decoded_frame_covers(Tick(0), Tick(tpf), rate, None));
+        assert!(decoded_frame_covers(
+            Tick(3 * tpf),
+            Tick(4 * tpf - 1),
+            rate,
+            Some(&table)
+        ));
+        assert!(!decoded_frame_covers(
+            Tick(3 * tpf),
+            Tick(4 * tpf),
+            rate,
+            Some(&table)
+        ));
+    }
+
+    #[test]
+    fn native_decode_lane_plan_is_stable_bounded_and_invalidated_per_asset() {
+        let a = AssetId::new();
+        let b = AssetId::new();
+        let mut media = MediaSources::new(None);
+        assert!(media.prepare_native_video_sources(&[
+            (a, Tick(90)),
+            (a, Tick(0)),
+            (b, Tick(0)),
+            (a, Tick(30)),
+            (a, Tick(60)),
+            (a, Tick(30))
+        ]));
+        assert_eq!(media.native_decode_lanes.len(), 5);
+        for (lane, tick) in [0, 30, 60, 90].into_iter().enumerate() {
+            assert_eq!(media.native_decode_lanes[&(a, Tick(tick))], lane as u16);
+        }
+        assert_eq!(media.native_decode_lanes[&(b, Tick(0))], 0);
+        assert!(media.prepare_native_video_sources(&[
+            (a, Tick(31)),
+            (a, Tick(91)),
+            (a, Tick(1)),
+            (b, Tick(1)),
+            (a, Tick(61))
+        ]));
+        for (lane, tick) in [1, 31, 61, 91].into_iter().enumerate() {
+            assert_eq!(media.native_decode_lanes[&(a, Tick(tick))], lane as u16);
+        }
+        media.invalidate_assets(&HashSet::from([a]));
+        assert_eq!(media.native_decode_lanes.len(), 1);
+        assert_eq!(media.native_decode_lanes[&(b, Tick(1))], 0);
+        let too_many: Vec<_> = (0..=MAX_LIVE_SOURCES)
+            .map(|i| (a, Tick(i as i64)))
+            .collect();
+        assert!(!media.prepare_native_video_sources(&too_many));
+        assert!(media.native_decode_lanes.is_empty());
+        assert!(media.sources.is_empty() && media.pending.is_empty());
+        assert!(media.capacity_limited);
+        assert!(media.prepare_native_video_sources(&too_many[..MAX_LIVE_SOURCES]));
+        media.invalidate_all();
+        assert!(media.native_decode_lanes.is_empty());
     }
 
     #[test]
@@ -5803,7 +7175,7 @@ mod tests {
         media.set_project(Arc::new(project));
         media.prefetch_upcoming(&seq, Tick::ZERO, Tick(1_000_000), Quality::FULL);
 
-        let key = (asset_id, false);
+        let key = (asset_id, false, 0);
         assert!(
             media.pending.contains_key(&key),
             "playing cut-ahead must queue the expensive source build"

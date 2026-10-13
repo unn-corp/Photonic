@@ -296,6 +296,67 @@ mod tests {
     }
 
     #[test]
+    fn grading_graph_edits_survive_embedded_history_save_reload_and_undo() {
+        use crate::timeline::{
+            self, Clip, ClipSource, FrameRate, Grade, GradeGraphNode, GradeOp, GradeOpKind,
+            GradeOpParams, Sequence, Tick, TimelineProject, Track, TrackKind,
+        };
+        use crate::{Command, CommandHistory};
+        let mut doc = sample_doc();
+        let mut project = TimelineProject::new();
+        let mut seq = Sequence::new("history", FrameRate::FPS_30, 64, 64);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: crate::Color::WHITE,
+            },
+            Tick::ZERO,
+            Tick(100),
+        );
+        let mut grade = Grade::new();
+        let op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.0 },
+        );
+        let op_id = op.id;
+        grade.ops.push(op);
+        grade.convert_to_graph();
+        clip.grade = Some(grade.clone());
+        let (sid, tid, cid) = (seq.id, track.id, clip.id);
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        doc.timeline = Some(project);
+        let initial = serde_json::to_value(&doc.timeline).unwrap();
+        let mut history = CommandHistory::new(200);
+        grade
+            .add_graph_utility(GradeGraphNode::WindowMatte {
+                input: 0,
+                op: op_id,
+                label: "Window".into(),
+            })
+            .unwrap();
+        let cmd =
+            timeline::ops::set_grade(doc.timeline.as_ref().unwrap(), sid, tid, cid, Some(grade))
+                .unwrap();
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        let encoded = save_photon(&doc, Some(&history.snapshot_state())).unwrap();
+        let (mut loaded, snapshot) = load_photon(&encoded).unwrap();
+        let mut restored = CommandHistory::new(200);
+        restored.restore_state(
+            snapshot.expect("numeric graph IDs inside commands must preserve history"),
+        );
+        assert_eq!(restored.undo_depth(), 1);
+        assert!(restored.undo(&mut loaded));
+        assert_eq!(serde_json::to_value(&loaded.timeline).unwrap(), initial);
+        assert!(restored.redo(&mut loaded));
+        assert_eq!(
+            serde_json::to_value(&loaded.timeline).unwrap(),
+            serde_json::to_value(&doc.timeline).unwrap()
+        );
+    }
+
+    #[test]
     fn legacy_bare_document_still_loads() {
         // A pre-history file is just the document's own JSON.
         let bare = sample_doc().to_json().unwrap();

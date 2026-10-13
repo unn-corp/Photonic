@@ -87,6 +87,28 @@ pub enum MaskShapeKind {
     },
 }
 
+impl MaskShapeKind {
+    /// Native static polygon budget and normalized coordinates.
+    pub fn validate_vertices(vertices: &[[f32; 2]]) -> Result<(), &'static str> {
+        if !(3..=128).contains(&vertices.len())
+            || vertices
+                .iter()
+                .flatten()
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        {
+            return Err("polygon requires 3..128 finite vertices in normalized 0..1 coordinates");
+        }
+        Ok(())
+    }
+    /// Geometry lanes are animatable; individual vertices are static in v1.
+    pub fn validate_native(&self) -> Result<(), &'static str> {
+        if let Self::Polygon { vertices } = self {
+            Self::validate_vertices(vertices)?;
+        }
+        Ok(())
+    }
+}
+
 /// Static styled-text payload for a `Text` generator node (08 §2). A subset of
 /// `CaptionStyle` fields; the string may be keyframed via params in a later phase
 /// but is carried structurally here.
@@ -97,6 +119,28 @@ pub struct TextGen {
     pub font_size: f32,
     pub fill: crate::Color,
     pub position: [f32; 2],
+}
+
+impl TextGen {
+    /// Bounded static native text payload; reading older values never clamps them.
+    pub fn validate_native(&self) -> Result<(), &'static str> {
+        if self.text.len() > 4096
+            || self.font_family.is_empty()
+            || self.font_family.len() > 128
+            || !self.font_size.is_finite()
+            || !(1.0..=512.0).contains(&self.font_size)
+            || self
+                .position
+                .iter()
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+            || [self.fill.r, self.fill.g, self.fill.b, self.fill.a]
+                .iter()
+                .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+        {
+            return Err("text node requires at most 4096 UTF-8 bytes, a font family up to 128 bytes, size 1..=512 and finite normalized fill/position");
+        }
+        Ok(())
+    }
 }
 
 impl Default for TextGen {
@@ -187,6 +231,26 @@ pub enum GraphOp {
 }
 
 impl GraphOp {
+    /// Structural port arity of the editor catalog. Image/Mask coercions are
+    /// permitted; this does not qualify an operation for a rendering domain.
+    pub fn port_counts(&self) -> (u16, u16) {
+        match self {
+            Self::Output => (1, 0),
+            Self::ClipIn
+            | Self::MediaIn { .. }
+            | Self::VectorIn { .. }
+            | Self::SolidColor
+            | Self::MaskShape { .. }
+            | Self::Text { .. } => (0, 1),
+            Self::Merge { .. } => (2, 1),
+            Self::Switch | Self::ChannelCombine => (4, 1),
+            Self::ChannelSplit => (1, 4),
+            Self::Note { .. } => (0, 0),
+            // Unknown nodes retain the existing inert unary compatibility surface.
+            _ => (1, 1),
+        }
+    }
+
     /// True for ops with no input ports (sources / generators, 08 §3.3).
     ///
     /// `Unknown` falls through to `false` (no wildcard needed): it is treated

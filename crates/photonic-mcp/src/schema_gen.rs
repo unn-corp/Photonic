@@ -1,5 +1,22 @@
 use serde_json::{json, Value};
 
+fn caption_style_schema() -> Value {
+    json!({"type":"object","description":"Partial caption style. clear_stroke/clear_background/clear_highlight remove inherited decoration explicitly. Native titles and top-level captions support outer outline up to 8px and rounded boxes with padding/radius up to 128px. Captions also support WordPop, Underline, spatial FillSweep and listed animations; titles support none or whole-title slide_up (200ms from clip start, glyphs and paint together) and require no highlight. Word-timed title animations remain unsupported. Do not combine a clear flag with its corresponding paint value.",
+        "properties":{
+            "font_family":{"type":"string"},"font_size":{"type":"number"},"weight":{"type":"integer"},
+            "fill":{"type":"string","description":"#rrggbb or #rrggbbaa"},
+            "position":{"type":"array","items":{"type":"number"},"minItems":2,"maxItems":2},
+            "max_width":{"type":"number"},"clear_stroke":{"type":"boolean"},"clear_highlight":{"type":"boolean"},"clear_background":{"type":"boolean"},
+            "stroke":{"type":"object","properties":{"color":{"type":"string"},"width":{"type":"number","minimum":0,"maximum":8}},"required":["color","width"],"additionalProperties":false},
+            "background":{"type":"object","properties":{"color":{"type":"string"},"padding":{"type":"number","minimum":0,"maximum":128},"corner_radius":{"type":"number","minimum":0,"maximum":128}},"required":["color","padding","corner_radius"],"additionalProperties":false},
+            "direction":{"type":"string","enum":["auto","ltr","rtl"],"description":"Explicit paragraph base direction at track/cue scope; word-level edits refuse. Auto preserves existing first-strong behavior."},
+            "animation":{"type":"string","enum":["none","fade_words","slide_up","typewriter"]},
+            "word_pop":{"type":"object","properties":{"active_color":{"type":"string"},"inactive_color":{"type":"string"}},"required":["active_color","inactive_color"],"additionalProperties":false},
+            "fill_sweep":{"type":"object","description":"Left-to-right spatial glyph-color sweep; RTL words use WordPop with a cue diagnostic.","properties":{"active_color":{"type":"string"},"inactive_color":{"type":"string"}},"required":["active_color","inactive_color"],"additionalProperties":false},
+            "underline":{"type":"object","description":"Active-word underline; uses stroke color/width when supplied, otherwise active_color with a bounded font-relative width. Glyph fill is unchanged.","properties":{"active_color":{"type":"string"}},"required":["active_color"],"additionalProperties":false}
+        },"additionalProperties":false})
+}
+
 /// Returns the MCP tool list manifest (the `tools/list` response payload).
 ///
 /// Public so tooling (e.g. the `dump_tools` binary that regenerates
@@ -5284,7 +5301,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "set_track_prop",
-                "description": "Universal track-property setter — name/enabled/locked/height_px, only supplied fields change. Supports undo.",
+                "description": "Universal track-property setter — name/enabled/locked/height_px and video/text blend/opacity. Only supplied fields change. Composite edits reject locked tracks; opacity must be finite in 0..1. Unsupported Native modes still refuse rendering. Supports undo.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -5292,7 +5309,9 @@ pub fn tool_list() -> Value {
                         "name": { "type": "string" },
                         "enabled": { "type": "boolean" },
                         "locked": { "type": "boolean" },
-                        "height_px": { "type": "number" }
+                        "height_px": { "type": "number" },
+                        "blend": { "type": "string", "enum": ["normal","multiply","screen","overlay","darken","lighten","color_dodge","color_burn","hard_light","soft_light","difference","exclusion","hue","saturation","color","luminosity","linear_dodge","linear_burn","subtract","divide","vivid_light","linear_light","pin_light","hard_mix","darker_color","lighter_color"] },
+                        "opacity": { "type": "number", "minimum": 0, "maximum": 1 }
                     },
                     "required": ["track_id"]
                 }
@@ -5644,13 +5663,13 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "insert_text_clip",
-                "description": "Title/text clip (G-12): create a ClipSource::Text title/graphics clip spanning [start, start+duration) on track_id. `style` patches CaptionStyle::default() using the same partial-style vocabulary as set_caption_style (font_family/font_size/weight/fill/position/max_width) — omit for the default style. Returns the new clip's id. Supports undo.",
+                "description": "Title/text clip (G-12): create a ClipSource::Text title/graphics clip spanning [start, start+duration) on track_id. `style` patches CaptionStyle::default() using the same partial-style vocabulary as set_caption_style (font_family/font_size/weight/fill/clear_stroke/position/max_width; caption animation and WordPop are explicit optional fields) — omit for the default style. Returns the new clip's id. Supports undo.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "track_id": { "type": "string" },
                         "text": { "type": "string" },
-                        "style": { "type": "object", "description": "Partial CaptionStyle patch: {\"font_family\":str,\"font_size\":number,\"weight\":int,\"fill\":\"#rrggbb\",\"position\":[x,y],\"max_width\":number} — every field optional." },
+                        "style": caption_style_schema(),
                         "start_ticks": { "type": "integer" },
                         "start_tc": { "type": "string" },
                         "start_seconds": { "type": "number" },
@@ -5741,13 +5760,13 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "set_transition",
-                "description": "Add, replace, or remove (transition=null) a clip's in or out transition. Supports undo.",
+                "description": "Add, replace, or remove (transition=null) a clip's in or out transition. In uses the selected two-source effect at an adjacent cut. Out at a gap or sequence end always uses an eased fade to transparent for every supported kind; only duration and curve affect that fade. Supports undo.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "clip_id": { "type": "string" },
                         "edge": { "type": "string", "enum": ["in","out"] },
-                        "transition": { "type": ["object","null"], "description": "{\"kind\":\"cross_dissolve\"|\"dip_to_black\"|\"dip_to_color\"|\"wipe\"|\"push\",\"duration_ticks\":int,\"params\":{\"curve\":\"linear\"|\"ease_in\"|\"ease_out\"|\"ease_in_out\",\"color\":\"#rrggbb\"?,\"direction\":\"left\"|\"right\"|\"up\"|\"down\",\"softness\":number}}" }
+                        "transition": { "type": ["object","null"], "description": "{\"kind\":\"cross_dissolve\"|\"dip_to_black\"|\"dip_to_color\"|\"wipe\"|\"push\"|\"luma_wipe\",\"duration_ticks\":int,\"params\":{\"curve\":\"linear\"|\"ease_in\"|\"ease_out\"|\"ease_in_out\",\"color\":\"#rrggbb\"?,\"direction\":\"left\"|\"right\"|\"up\"|\"down\",\"softness\":number,\"luma_map\":\"linear_h\"|\"linear_v\"|\"radial\"|\"barn_door_h\"|\"clock\",\"invert\":boolean}}" }
                     },
                     "required": ["clip_id","edge"]
                 }
@@ -5879,7 +5898,7 @@ pub fn tool_list() -> Value {
                         "value": { "type": "object", "description": "op=set_param: PropValue - {\"t\":\"float\",\"v\":number} | {\"t\":\"vec2\",\"v\":[number,number]} | {\"t\":\"color\",\"v\":{\"r\":n,\"g\":n,\"b\":n,\"a\":n}} | {\"t\":\"bool\",\"v\":boolean} | {\"t\":\"enum\",\"v\":integer}" },
                         "grade": { "type": "object", "description": "op=set_grade: a Grade object (07 §1), or null to clear." },
                         "grade_op": { "type": "object", "description": "op=add_grade_graph_node: a complete GradeOp object with id, kind, params, enabled and optional mask." },
-                        "grade_graph_node": { "type": "object", "description": "op=add_grade_graph_utility: GradeGraphNode object tagged by kind: qualifier_matte {input,op,label}, key_mixer {top,bottom,mode,label}, matte_refine {input,refinement,label}, or matte_apply {original,corrected,matte,label}. Refinement: denoise (3x3 median), grow within -0.02..=0.02 and blur within 0..=0.02 as fractions of the logical frame shorter dimension, matte_levels [clean_black,clean_white] each nonnegative with sum below one. Key modes: union, intersect, subtract, multiply. Port types and cycles are validated before one undoable edit." },
+                        "grade_graph_node": { "type": "object", "description": "op=add_grade_graph_utility: GradeGraphNode object tagged by kind: window_matte {input,op,label} (geometry only, ignores RGB and alpha; no mask means full key, disabled op means zero key), bezier_matte {input,window,label}, where window has 3..32 knots {anchor:[x,y],incoming:[x,y],outgoing:[x,y]} in finite -4..=4 normalized coordinates, feather 0..=0.25 of the shorter frame dimension and invert boolean; closed even-odd geometry with 0.25-pixel flatten tolerance and explicit resource limits. animated_bezier_matte {input,track:{keys:[{at,window,interpolation}]},label} has 1..128 strictly increasing nonnegative integer-tick keys with matching knot counts; interpolation is linear or hold, inversion is held, and values clamp to first/last key outside the key range. Clip/asset/local/shared-look and selected-member group grades use clip-relative ticks; track/master use sequence ticks. Invalid sampled geometry blocks rendering/export. Automatic tracking and topology-changing interpolation are not provided. qualifier_matte {input,op,label}, key_mixer {top,bottom,mode,label}, matte_refine {input,refinement,label}, or matte_apply {original,corrected,matte,label}. Refinement: denoise (3x3 median), grow within -0.02..=0.02 and blur within 0..=0.02 as fractions of the logical frame shorter dimension, matte_levels [clean_black,clean_white] each nonnegative with sum below one. Key modes: union, intersect, subtract, multiply. Port types and cycles are validated before one undoable edit." },
                         "parallel": { "type": "boolean", "description": "op=add_grade_graph_node: add a new branch with a 50% layer mixer instead of appending serially." },
                         "node_id": { "type": "integer", "minimum": 0, "description": "op=remove_grade_graph_node: local graph node id; removing a mixer keeps its bottom branch." }
                     },
@@ -6004,12 +6023,20 @@ pub fn tool_list() -> Value {
             // Keyframes (10 §3.7)
             {
                 "name": "set_keyframe",
-                "description": "Upsert one keyframe on a PropertyTrack (creates the track if absent), creating animation. target=clip_transform needs only clip_id; target=clip_effect also needs effect_index. P2 scope: clip transform + clip-effect params only (grade/audio/graph-node targets land with their domains). Supports undo.",
+                "description": "Upsert one keyframe on a PropertyTrack (creates the track if absent), creating animation. target=clip_transform needs only clip_id; target=clip_effect also needs effect_index; target=grade_op also needs op_id and addresses a local clip-grade scalar; grade_stage_op additionally requires an exact stage. Shared/group keys repeat in each member clip’s local clock. Any affected locked track rejects mutations. Supports undo.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target": { "type": "string", "enum": ["clip_transform","clip_effect"] },
+                        "target": { "type": "string", "enum": ["clip_transform","clip_effect","grade_op","grade_stage_op"] },
                         "clip_id": { "type": "string" },
+                        "op_id": { "type": "string", "format": "uuid", "description": "Required when target=grade_op or grade_stage_op." },
+                        "stage": { "description": "Required for grade_stage_op. Exact selected-member stage; keys use each member clip's local clock.", "oneOf": [
+                            { "type": "object", "properties": { "kind": { "const": "clip" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "local_look" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "shared_look" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_pre" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_post" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false }
+                        ] },
                         "effect_index": { "type": "integer", "description": "Required when target=clip_effect." },
                         "path": { "type": "string", "description": "Registry PropPath, e.g. \"transform.x\" or \"params.radius\"." },
                         "at_ticks": { "type": "integer" },
@@ -6027,8 +6054,16 @@ pub fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target": { "type": "string", "enum": ["clip_transform","clip_effect"] },
+                        "target": { "type": "string", "enum": ["clip_transform","clip_effect","grade_op","grade_stage_op"] },
                         "clip_id": { "type": "string" },
+                        "op_id": { "type": "string", "format": "uuid", "description": "Required when target=grade_op or grade_stage_op." },
+                        "stage": { "description": "Required for grade_stage_op. Exact selected-member stage; keys use each member clip's local clock.", "oneOf": [
+                            { "type": "object", "properties": { "kind": { "const": "clip" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "local_look" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "shared_look" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_pre" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_post" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false }
+                        ] },
                         "effect_index": { "type": "integer" },
                         "path": { "type": "string" },
                         "at_ticks": { "type": "integer" },
@@ -6049,8 +6084,16 @@ pub fn tool_list() -> Value {
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "target": { "type": "string", "enum": ["clip_transform","clip_effect"] },
+                                    "target": { "type": "string", "enum": ["clip_transform","clip_effect","grade_op","grade_stage_op"] },
                                     "clip_id": { "type": "string" },
+                                    "op_id": { "type": "string", "format": "uuid", "description": "Required when target=grade_op or grade_stage_op." },
+                        "stage": { "description": "Required for grade_stage_op. Exact selected-member stage; keys use each member clip's local clock.", "oneOf": [
+                            { "type": "object", "properties": { "kind": { "const": "clip" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "local_look" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "shared_look" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_pre" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_post" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false }
+                        ] },
                                     "effect_index": { "type": "integer" },
                                     "path": { "type": "string" },
                                     "at_ticks": { "type": "integer" },
@@ -6072,8 +6115,16 @@ pub fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target": { "type": "string", "enum": ["clip_transform","clip_effect"] },
+                        "target": { "type": "string", "enum": ["clip_transform","clip_effect","grade_op","grade_stage_op"] },
                         "clip_id": { "type": "string" },
+                        "op_id": { "type": "string", "format": "uuid", "description": "Required when target=grade_op or grade_stage_op." },
+                        "stage": { "description": "Required for grade_stage_op. Exact selected-member stage; keys use each member clip's local clock.", "oneOf": [
+                            { "type": "object", "properties": { "kind": { "const": "clip" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "local_look" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "shared_look" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_pre" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_post" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false }
+                        ] },
                         "effect_index": { "type": "integer", "description": "Required when target=clip_effect." }
                     },
                     "required": ["target","clip_id"]
@@ -6085,8 +6136,16 @@ pub fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target": { "type": "string", "enum": ["clip_transform","clip_effect"] },
+                        "target": { "type": "string", "enum": ["clip_transform","clip_effect","grade_op","grade_stage_op"] },
                         "clip_id": { "type": "string" },
+                        "op_id": { "type": "string", "format": "uuid", "description": "Required when target=grade_op or grade_stage_op." },
+                        "stage": { "description": "Required for grade_stage_op. Exact selected-member stage; keys use each member clip's local clock.", "oneOf": [
+                            { "type": "object", "properties": { "kind": { "const": "clip" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "local_look" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "shared_look" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_pre" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_post" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false }
+                        ] },
                         "effect_index": { "type": "integer" },
                         "paths": {
                             "type": "array",
@@ -6103,8 +6162,16 @@ pub fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "target": { "type": "string", "enum": ["clip_transform","clip_effect"] },
+                        "target": { "type": "string", "enum": ["clip_transform","clip_effect","grade_op","grade_stage_op"] },
                         "clip_id": { "type": "string" },
+                        "op_id": { "type": "string", "format": "uuid", "description": "Required when target=grade_op or grade_stage_op." },
+                        "stage": { "description": "Required for grade_stage_op. Exact selected-member stage; keys use each member clip's local clock.", "oneOf": [
+                            { "type": "object", "properties": { "kind": { "const": "clip" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "local_look" } }, "required": ["kind"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "shared_look" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_pre" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false },
+                            { "type": "object", "properties": { "kind": { "const": "group_post" }, "id": { "type": "string", "format": "uuid" } }, "required": ["kind","id"], "additionalProperties": false }
+                        ] },
                         "effect_index": { "type": "integer" },
                         "clipboard": {
                             "type": "object",
@@ -6682,7 +6749,7 @@ pub fn tool_list() -> Value {
                         "cue_id": { "type": "string" },
                         "word_index": { "type": "integer" },
                         "clear": { "type": "boolean" },
-                        "style": { "type": "object", "description": "{font_family?, font_size?, weight?, fill? (#hex), position? [x,y], max_width?}" }
+                        "style": caption_style_schema(),
                     }
                 }
             },
@@ -6763,11 +6830,12 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "grade_version",
-                "description": "List, save, activate, rename or remove a named clip grade version. Versions are live: edits to the active grade update its saved look. Mutations are one undo step and respect track locks.",
+                "description": "List, save, activate, rename or remove a named grade version. Missing stage defaults to the clip. An explicit shared_look stage must match the selected clip link; its versions affect all linked shots across sequences and any linked locked track blocks mutation. Shared looks allow 64 versions with unique names of 1–128 characters. Active edits remain live; deleting the active snapshot keeps the current rendered grade. Mutations are one undo step. Local/group versions are not supported.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "clip_id": { "type": "string" },
+                        "stage": {"anyOf":[{"type":"null"},{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
                         "op": { "type": "string", "enum": ["list", "add", "activate", "rename", "remove"] },
                         "version_id": { "type": "string", "description": "Required for activate, rename and remove." },
                         "name": { "type": "string", "description": "Required for add and rename." }
@@ -6781,11 +6849,11 @@ pub fn tool_list() -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "op": { "type": "string", "enum": ["list", "create", "update", "remove", "link", "make_independent"] },
+                        "op": { "type": "string", "enum": ["list", "create", "update", "remove", "link", "make_independent", "update_independent"] },
                         "look_id": { "type": "string", "description": "Required for update, remove, and link." },
-                        "clip_id": { "type": "string", "description": "Required for link and make_independent." },
+                        "clip_id": { "type": "string", "description": "Required for link, make_independent, and update_independent." },
                         "name": { "type": "string", "description": "Required for create; optional for update." },
-                        "grade": { "type": "object", "description": "Full Grade serde shape for create or update." }
+                        "grade": { "type": "object", "description": "Full Grade serde shape for create or update; required for update_independent, which edits an already detached look without changing the ordinary clip grade." }
                     },
                     "required": ["op"]
                 }
@@ -6798,6 +6866,20 @@ pub fn tool_list() -> Value {
                     "properties": {
                         "sequence_id": { "type": "string", "description": "Defaults to the active sequence." }
                     }
+                }
+            },
+            {
+                "name": "copy_reference_still",
+                "description": "Copy an immutable reference into another sequence-owned gallery as one undoable edit. Keeps exact image/hash, Native balance and original capture provenance; assigns a new gallery identity. Requires identical color configuration and canvas dimensions, maps to the destination active format, and refuses same-sequence or destination galleries with 256 stills. Source remains unchanged; this is not a live shared link. No image files are copied or removed. Existing comparison independently verifies image integrity.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "source_sequence_id": {"type":"string","format":"uuid"},
+                        "destination_sequence_id": {"type":"string","format":"uuid","description":"Defaults to active sequence."},
+                        "still_id": {"type":"string","format":"uuid"},
+                        "name": {"type":"string","minLength":1,"maxLength":128}
+                    },
+                    "required":["source_sequence_id","still_id"]
                 }
             },
             {
@@ -6814,7 +6896,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "capture_reference_still",
-                "description": "Capture a full-resolution frame from original media into the sequence reference gallery. Requires a saved project; rejects stale frames and color or grading errors. Adds image and still in one undo step.",
+                "description": "Capture a full-resolution frame from original media into the sequence reference gallery. Requires a saved project; rejects stale frames and color or grading errors. Adds image and still in one undo step. Native Managed captures up to 16777216 pixels also retain optional same-frame AP1 balance measurements when enough eligible samples exist.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6828,7 +6910,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "compare_reference_still",
-                "description": "Compare a verified captured still with a newly rendered full-quality frame. Returns display-referred sRGB error metrics for Legacy SDR or qualified Native Managed preview. Legacy SDR may also return an editable Printer Lights shot-match proposal when enough opaque non-clipped pixels exist. Defaults to the still's source time. Rejects stale frames, mismatched color/format and changed reference images.",
+                "description": "Compare a verified captured still with a newly rendered full-quality frame. Returns display-referred sRGB error metrics for Legacy SDR or qualified Native Managed preview. May also return an editable Printer Lights proposal: Legacy SDR uses opaque non-clipped pixels; Native Managed uses validated image-bound scene-linear AP1 measurements from capture and a same-frame current scene tap, never inverted PNG values. Native display-only references require recapture for matching. Proposals require enough eligible samples and are capped at two stops. Defaults to the still's source time. Rejects stale frames, mismatched color/format and changed reference images.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6841,7 +6923,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "apply_shot_match",
-                "description": "Recompute and accept the Printer Lights proposal from compare_reference_still as one undoable clip corrector. Requires the exact compared time and revision, an unchanged verified still, and the target as the only visible video clip. The proposed correction remains editable. Legacy SDR only.",
+                "description": "Recompute and accept the Printer Lights proposal from compare_reference_still as one undoable clip corrector. Requires the exact compared time and revision, an unchanged verified still, and the target as the only visible video clip. The proposed correction remains editable. Supports Legacy SDR and Native Managed references with qualified scene-linear AP1 balance measurements. Global estimates can be misled by different subjects or later nonlinear grades; inspect the result.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6895,9 +6977,31 @@ pub fn tool_list() -> Value {
                 }
             },
             {
+                "name": "track_grade_window",
+                "description": "Analyze a bounded ellipse/rectangle power-window center translation without editing the document or user transport. Uses isolated Full/original pre-grade frames in Legacy or Native Managed, normalized canvas coordinates and clip-local output keys. start_ticks/end_ticks are required sequence times snapped to frames; forward or backward, at most 121 samples and 120 seconds. NCC analysis is at most 256 pixels on the longest side; search_radius is analysis pixels. Fixed-reference matching is the default. Optional adaptive_bidirectional uses previous-frame templates and a one-analysis-pixel forward/backward consistency bound; it can still drift and is not occlusion recovery. Stops on ambiguity, low confidence, no texture, cut, search boundary or inconsistent roundtrip. No scale, rotation, perspective, graph, nested or compound tracking. Poll get_job_status; cancel_job is cooperative. Apply is a separate explicit call; stale document/source metadata refuses. One tracking job per session.",
+                "inputSchema":{"type":"object","properties":{
+                    "clip_id":{"type":"string"},"op_id":{"type":"string"},
+                    "start_ticks":{"type":"integer"},"end_ticks":{"type":"integer"},
+                    "step_frames":{"type":"integer","minimum":1,"maximum":60,"default":1},
+                    "format_index":{"type":"integer","minimum":0},
+                    "method":{"type":"string","enum":["fixed_reference","adaptive_bidirectional"],"default":"fixed_reference"},
+                    "search_radius":{"type":"integer","minimum":2,"maximum":24,"default":12},
+                    "minimum_score":{"type":"number","minimum":0.5,"maximum":1,"default":0.75},
+                    "minimum_margin":{"type":"number","minimum":0,"maximum":0.5,"default":0.05}
+                },"required":["clip_id","op_id","start_ticks","end_ticks"]}
+            },
+            {
+                "name":"apply_window_track",
+                "description":"Apply a retained completed track_grade_window job as one undoable grade edit. Rejects stale documents/revisions/source file metadata and locked targets. Writes only linear center X/Y keys; other window properties remain. Existing center animation requires replace_center_keys=true; outside keys are retained but adjacent interpolation can change and endpoints hold outside the sampled interval. Partial confidence-stop results require allow_partial=true and at least two samples. No keys are changed on refusal.",
+                "inputSchema":{"type":"object","properties":{
+                    "job_id":{"type":"string"},"replace_center_keys":{"type":"boolean","default":false},"allow_partial":{"type":"boolean","default":false}
+                },"required":["job_id"]}
+            },
+            {
                 "name": "sample_grade_input",
-                "description": "Sample the exact input before an enabled Native Managed clip curve or qualifier from an ordered grade, an unambiguous graph corrector, or an explicit graph_node_id. Returns bounded straight ACEScct/AP1 RGB coordinates, AP1 log luma, source alpha, pixel location and frame provenance. Earlier grades contribute; the selected and later correctors do not. Coordinates x/y are normalized canvas edges in [0,1], with endpoints selecting the first/last pixel. Read-only; missing/inactive inputs, unsupported grade scopes and zero coverage fail instead of sampling program output.",
+                "description": "Optional stage addresses the clip grade (default), its local look, or its exact linked shared look. Look input inspection requires Native Managed color. Sample the exact input before an enabled Native Managed clip curve or qualifier from an ordered grade, an unambiguous graph corrector, or an explicit graph_node_id. Returns bounded straight ACEScct/AP1 RGB coordinates, AP1 log luma, source alpha, pixel location and frame provenance. Earlier grades contribute; the selected and later correctors do not. Coordinates x/y are normalized canvas edges in [0,1], with endpoints selecting the first/last pixel. Read-only; missing/inactive inputs, unqualified grade scopes and zero coverage fail instead of sampling program output.",
                 "inputSchema": {"type":"object","properties":{
+                    "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"null"},{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
                     "clip_id":{"type":"string"},"op_id":{"type":"string"},
                         "graph_node_id": { "type": "integer", "minimum": 0, "description": "Optional Native Managed clip grading-graph node ID: selects this exact curve/HSL corrector instance or qualifier key source. Must reference op_id. Required when operator-only image input is ambiguous; key source inspection excludes downstream mixing/refinement." },
                     "x":{"type":"number","minimum":0,"maximum":1},"y":{"type":"number","minimum":0,"maximum":1},
@@ -6905,9 +7009,37 @@ pub fn tool_list() -> Value {
                 },"required":["clip_id","op_id","x","y"]}
             },
             {
+                "name": "inspect_grade_matte",
+                "description": "Inspect a reachable Native Managed clip, local-look or currently linked shared-look grading-graph matte output, including key mixing and spatial refinement. Returns opaque grayscale PNG, raw unassociated-weight statistics and frame provenance without editing the document. Requires graph_node_id; inactive, image, unreachable and unqualified nodes fail instead of returning program pixels. No display transform or alpha division is applied.",
+                "inputSchema": {"type":"object","properties":{
+                    "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"null"},{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
+                    "clip_id":{"type":"string"},"graph_node_id":{"type":"integer","minimum":0},
+                    "at_ticks":{"type":"integer"},"at_tc":{"type":"string"},"at_seconds":{"type":"number"},
+                    "format_index":{"type":"integer","minimum":0}
+                },"required":["clip_id","graph_node_id"]}
+            },
+            {
+                "name": "measure_native_output",
+                "description": "Read-only paired measurements of a Native Managed sequence immediately before and after its SDR output transform, from one Full/original rendered frame. Returns actual display PNG, unclipped straight AP1 and sRGB min/max/mean, coverage and signed/out-of-range counts, and a 128-bin AP1 luminance histogram over -12..12 stops relative to 0.18 with explicit nonpositive/under/overflow counts. Covered pixels have equal weight; empty statistics are null. Bounded to 16777216 pixels; larger formats are rejected, never silently downsampled. Not calibrated nits, HDR delivery, video IRE, a waveform or vectorscope. Rejects Legacy, stale and unqualified frames; does not edit history.",
+                "inputSchema": {"type":"object","properties":{
+                    "sequence_id":{"type":"string"},"at_ticks":{"type":"integer"},"at_tc":{"type":"string"},"at_seconds":{"type":"number"},"format_index":{"type":"integer","minimum":0}
+                },"required":["sequence_id"]}
+            },
+            {
+                "name": "inspect_grade_image",
+                "description": "Inspect an exact reachable Native Managed clip, local-look or currently linked shared-look grading-graph image output without editing the document. Returns an ACES-rendered SDR sRGB PNG preserving alpha, unclipped straight scene-linear AP1 extrema over covered pixels and frame provenance. Requires graph_node_id; matte, inactive, unreachable and unqualified nodes fail instead of returning program pixels. This is a display preview, not a scene-linear export or HDR scope.",
+                "inputSchema": {"type":"object","properties":{
+                    "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"null"},{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
+                    "clip_id":{"type":"string"},"graph_node_id":{"type":"integer","minimum":0},
+                    "at_ticks":{"type":"integer"},"at_tc":{"type":"string"},"at_seconds":{"type":"number"},
+                    "format_index":{"type":"integer","minimum":0}
+                },"required":["clip_id","graph_node_id"]}
+            },
+            {
                 "name": "inspect_qualifier",
-                "description": "Render a qualifier isolation matte at an exact frame without editing the document. Returns an opaque grayscale PNG and coverage statistics/provenance. Earlier correctors and the qualifier's key, window, matte thresholds and source alpha contribute; its own CDL and later grades are excluded. Native Managed uses bounded ACEScct/AP1 key coordinates; Legacy uses linear Rec.709 HSL. Requires an enabled qualifier in an enabled clip grade: ordered grades or Native Managed graph input nodes. Multiple image instances require graph_node_id. Key-source utilities can be addressed explicitly; downstream key mixing/refinement is excluded. Missing/inactive inputs fail rather than falling back to program pixels.",
+                "description": "Optional stage addresses the clip grade (default), its local look, or its exact linked shared look. Look input inspection requires Native Managed color. Render a qualifier isolation matte at an exact frame without editing the document. Returns an opaque grayscale PNG and coverage statistics/provenance. Earlier correctors and the qualifier's key, window, matte thresholds and source alpha contribute; its own CDL and later grades are excluded. Native Managed uses bounded ACEScct/AP1 key coordinates; Legacy uses linear Rec.709 HSL. Requires an enabled qualifier in an enabled selected clip/local/linked-shared grade: ordered grades or Native Managed graph input nodes. Multiple image instances require graph_node_id. Key-source utilities can be addressed explicitly; downstream key mixing/refinement is excluded. Missing/inactive inputs fail rather than falling back to program pixels.",
                 "inputSchema": { "type": "object", "properties": {
+                    "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"null"},{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
                     "clip_id": { "type": "string" }, "op_id": { "type": "string" },
                         "graph_node_id": { "type": "integer", "minimum": 0, "description": "Optional Native Managed clip grading-graph node ID: selects this exact curve/HSL corrector instance or qualifier key source. Must reference op_id. Required when operator-only image input is ambiguous; key source inspection excludes downstream mixing/refinement." },
                     "at_ticks": { "type": "integer" }, "at_tc": { "type": "string" }, "at_seconds": { "type": "number" },
@@ -6916,7 +7048,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "get_scopes",
-                "description": "Waveform/vectorscope/histogram data for a clip at a tick (07 §5) — data, not an image. Renders headlessly (requires a GPU adapter). Reads the clip's post-Grade tap by default, before the track fold, or the requested program tap. Reports the actual tap and signal interpretation. Legacy linear pixels are BT.709 signal-encoded for measurement. For qualified Native Managed preview, request tap=program: its sRGB display pixels are measured directly at full range, with chroma derived from selected BT.709/BT.601 coefficients and no video-legal range claim. Scene-linear clip taps remain gated.",
+                "description": "Waveform/vectorscope/histogram data for a clip at a tick (07 §5) — data, not an image. Renders headlessly (requires a GPU adapter). Reads the clip's post-Grade tap by default, before the track fold, or the requested program tap. Reports the actual tap and signal interpretation. Legacy linear pixels are BT.709 signal-encoded for measurement. For qualified Native Managed preview, request tap=program: its sRGB display pixels are measured directly at full range, with chroma derived from selected BT.709/BT.601 coefficients and no video-legal range claim. Scene-linear AP1 clip taps return relative-stop Y/R/G/B histograms and spatial waveforms over -12..12 stops relative to 0.18, with separate transparent, invalid, nonpositive and out-of-range counts. This is not nits or IRE; vectorscope and video_legal are null for AP1. Bounded to 16777216 logical pixels and at most 256 measured columns; each covered pixel counts equally.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6973,7 +7105,7 @@ pub fn tool_list() -> Value {
             },
             {
                 "name": "add_graph_edge",
-                "description": "Connect one node's output port to another's input port. Cycle-checked at edit time (01 §8) — fails clean with error_code CycleDetected, never panics.",
+                "description": "Connect one node's output port to another's input port. Atomically replaces an existing connection to that input; repeating the same wire is a no-op. Invalid port indices fail with GraphTypeMismatch; cycles fail with CycleDetected; locked composition owners fail with TrackLocked. Undo restores the exact previous edge order.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -6995,6 +7127,36 @@ pub fn tool_list() -> Value {
                     },
                     "required": ["graph_id","edge_index"]
                 }
+            },
+            {
+                "name":"set_graph_time_offset",
+                "description":"Set a TimeOffset node's structural constant in integer ticks (705600000 ticks/second) as one undo step. Positive values read earlier upstream frames. Preserves node identity, layout and wiring; locked clip graphs refuse and exact repeats are no-ops. Native rendering rejects time overflow, negative source/program time and invalid or out-of-range source speed maps. Checked hold, linear and bounded Bezier speed ramps are supported.",
+                "inputSchema":{"type":"object","additionalProperties":false,"properties":{
+                    "graph_id":{"type":"string"},"node_id":{"type":"string"},"offset_ticks":{"type":"integer"}
+                },"required":["graph_id","node_id","offset_ticks"]}
+            },
+            {
+                "name":"set_graph_mask_shape",
+                "description":"Replace a MaskShape node's static ellipse, rectangle or polygon payload in one undo step. Preserves node identity, geometry animation, edges and layout; refuses locked clip graphs. Polygon uses 3..128 normalized static vertices, even-odd fill and inward feather; exact repeats are no-ops. Native Managed rendering only; Legacy polygon rendering remains unqualified.",
+                "inputSchema":{"type":"object","additionalProperties":false,"properties":{
+                    "graph_id":{"type":"string"},"node_id":{"type":"string"},
+                    "shape":{"oneOf":[
+                        {"type":"object","additionalProperties":false,"properties":{"shape":{"enum":["ellipse","rect"]}},"required":["shape"]},
+                        {"type":"object","additionalProperties":false,"properties":{"shape":{"const":"polygon"},"vertices":{"type":"array","minItems":3,"maxItems":128,"items":{"type":"array","minItems":2,"maxItems":2,"items":{"type":"number","minimum":0,"maximum":1}}}},"required":["shape","vertices"]}
+                    ]}
+                },"required":["graph_id","node_id","shape"]}
+            },
+            {
+                "name":"set_graph_text",
+                "description":"Replace a Text graph node's complete static payload as one undo step, preserving identity, edges, params and layout. Refuses graphs referenced by locked clips. Native rendering supports finite plain sRGB fill; Legacy graph Text rendering remains unqualified. Exact repeats are no-ops.",
+                "inputSchema":{"type":"object","properties":{
+                    "graph_id":{"type":"string"},"node_id":{"type":"string"},
+                    "text":{"type":"object","properties":{
+                        "text":{"type":"string","description":"At most 4096 UTF-8 bytes"},"font_family":{"type":"string","maxLength":128},"font_size":{"type":"number","minimum":1,"maximum":512},
+                        "fill":{"type":"object","properties":{"r":{"type":"number"},"g":{"type":"number"},"b":{"type":"number"},"a":{"type":"number"}},"required":["r","g","b","a"]},
+                        "position":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":2,"maxItems":2}
+                    },"required":["text","font_family","font_size","fill","position"]}
+                },"required":["graph_id","node_id","text"]}
             },
             {
                 "name": "set_graph_node_param",
@@ -7378,12 +7540,14 @@ fn known_output_schema(name: &str) -> Option<Value> {
         ),
         "sample_grade_input" => object_schema(
             json!({
+                "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
                 "clip_id":{"type":"string"},"op_id":{"type":"string"},"graph_node_id":{"type":["integer","null"],"minimum":0},"tick":{"type":"integer"},"revision":{"type":"integer"},"snapshot_generation":{"type":"integer"},
                 "width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"pixel":{"type":"object","properties":{"x":{"type":"integer"},"y":{"type":"integer"}},"required":["x","y"]},
                 "coordinates":{"type":"string","enum":["acescct_ap1_bounded"]},"rgb":{"type":"array","items":{"type":"number","minimum":0,"maximum":1},"minItems":3,"maxItems":3},
                 "ap1_log_luma":{"type":"number"},"alpha":{"type":"number"}
             }),
             &[
+                "stage",
                 "clip_id",
                 "op_id",
                 "tick",
@@ -7398,8 +7562,74 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "alpha",
             ],
         ),
+        "inspect_grade_matte" => object_schema(
+            json!({
+                "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
+                "clip_id":{"type":"string"},"graph_node_id":{"type":"integer","minimum":0},
+                "tick":{"type":"integer"},"revision":{"type":"integer"},"snapshot_generation":{"type":"integer"},
+                "width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},
+                "matte_encoding":{"type":"string","enum":["unassociated_weight"]},
+                "coverage":{"type":"object","properties":{"min":{"type":"number"},"max":{"type":"number"},"mean":{"type":"number"}},"required":["min","max","mean"]}
+            }),
+            &[
+                "stage",
+                "clip_id",
+                "graph_node_id",
+                "tick",
+                "revision",
+                "snapshot_generation",
+                "width",
+                "height",
+                "matte_encoding",
+                "coverage",
+            ],
+        ),
+        "measure_native_output" => object_schema(
+            json!({"document_id":{"type":"string"},"sequence_id":{"type":"string"},"tick":{"type":"integer"},"revision":{"type":"integer"},"snapshot_generation":{"type":"integer"},"content_hash":{"type":"string"},"width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},"scene_encoding":{"type":"string","enum":["scene_linear_acescg"]},"display_encoding":{"type":"string","enum":["srgb_display"]},"measurements":{"type":"object"},"note":{"type":"string"}}),
+            &[
+                "document_id",
+                "sequence_id",
+                "tick",
+                "revision",
+                "snapshot_generation",
+                "content_hash",
+                "width",
+                "height",
+                "scene_encoding",
+                "display_encoding",
+                "measurements",
+                "note",
+            ],
+        ),
+        "inspect_grade_image" => object_schema(
+            json!({
+                "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
+                "clip_id":{"type":"string"},"graph_node_id":{"type":"integer","minimum":0},
+                "tick":{"type":"integer"},"revision":{"type":"integer"},"snapshot_generation":{"type":"integer"},
+                "width":{"type":"integer","minimum":1},"height":{"type":"integer","minimum":1},
+                "image_encoding":{"type":"string","enum":["srgb_display"]},
+                "scene_encoding":{"type":"string","enum":["scene_linear_acescg"]},
+                "scene_rgb":{"type":"object","properties":{"min":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3},"max":{"type":"array","items":{"type":"number"},"minItems":3,"maxItems":3}},"required":["min","max"]},
+                "coverage":{"type":"object","properties":{"min":{"type":"number"},"max":{"type":"number"}},"required":["min","max"]}
+            }),
+            &[
+                "stage",
+                "clip_id",
+                "graph_node_id",
+                "tick",
+                "revision",
+                "snapshot_generation",
+                "width",
+                "height",
+                "image_encoding",
+                "scene_encoding",
+                "scene_rgb",
+                "coverage",
+            ],
+        ),
         "inspect_qualifier" => object_schema(
             json!({
+                "stage":{"description":"Selected clip's exact grade stage. Missing/null defaults to clip; shared ID must match its current link; group IDs must belong to the selected member’s valid ancestry. Group stages are per-member, never a synthetic group composite.","anyOf":[{"type":"object","properties":{"kind":{"const":"clip"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"local_look"}},"required":["kind"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"shared_look"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_pre"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false},{"type":"object","properties":{"kind":{"const":"group_post"},"id":{"type":"string","format":"uuid"}},"required":["kind","id"],"additionalProperties":false}]},
                 "clip_id": {"type":"string"}, "op_id": {"type":"string"}, "graph_node_id":{"type":["integer","null"],"minimum":0}, "tick": {"type":"integer"},
                 "revision": {"type":"integer"}, "snapshot_generation": {"type":"integer"},
                 "width": {"type":"integer","minimum":1}, "height": {"type":"integer","minimum":1},
@@ -7408,6 +7638,7 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "coverage": {"type":"object","properties":{"min":{"type":"number"},"max":{"type":"number"},"mean":{"type":"number"}}}
             }),
             &[
+                "stage",
                 "clip_id",
                 "op_id",
                 "tick",
@@ -7464,7 +7695,11 @@ fn known_output_schema(name: &str) -> Option<Value> {
             json!({"verified":{"type":"boolean"},"manifest":{"type":"object"}}),
             &["verified", "manifest"],
         ),
-        "measure_scopes" => object_schema(
+        "apply_window_track" => object_schema(
+            json!({"job_id":{"type":"string"},"samples":{"type":"integer"},"revision":{"type":"integer"},"partial":{"type":"boolean"}}),
+            &["job_id", "samples", "revision", "partial"],
+        ),
+        "track_grade_window" | "measure_scopes" => object_schema(
             json!({"job_id":{"type":"string"},"expected_revision":{"type":"integer","minimum":0}}),
             &["job_id", "expected_revision"],
         ),
@@ -7603,6 +7838,20 @@ fn known_output_schema(name: &str) -> Option<Value> {
                 "points",
                 "revision",
                 "method",
+            ],
+        ),
+        "copy_reference_still" => object_schema(
+            json!({
+                "sequence_id":{"type":"string","format":"uuid"},
+                "still_id":{"type":"string","format":"uuid"},
+                "source_sequence_id":{"type":"string","format":"uuid"},
+                "source_still_id":{"type":"string","format":"uuid"}
+            }),
+            &[
+                "sequence_id",
+                "still_id",
+                "source_sequence_id",
+                "source_still_id",
             ],
         ),
         "list_reference_stills" => object_schema(
@@ -8060,6 +8309,9 @@ fn known_output_schema(name: &str) -> Option<Value> {
         | "remove_graph_node"
         | "add_graph_edge"
         | "remove_graph_edge"
+        | "set_graph_text"
+        | "set_graph_mask_shape"
+        | "set_graph_time_offset"
         | "set_graph_node_param"
         | "set_clip_audio"
         | "set_track_audio"
@@ -8116,6 +8368,10 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "get_media_toolchain_status"
         | "inspect_render_manifest"
         | "inspect_qualifier"
+        | "inspect_grade_matte"
+        | "inspect_grade_image"
+        | "measure_native_output"
+        | "track_grade_window"
         | "sample_grade_input" => ExternalRead,
         "create_shape"
         | "create_sequence"
@@ -8199,6 +8455,7 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "group_grade"
         | "grade_version"
         | "shared_look"
+        | "copy_reference_still"
         | "remove_reference_still"
         | "capture_reference_still"
         | "copy_grade"
@@ -8206,6 +8463,9 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "remove_graph_node"
         | "add_graph_edge"
         | "remove_graph_edge"
+        | "set_graph_text"
+        | "set_graph_mask_shape"
+        | "set_graph_time_offset"
         | "set_graph_node_param"
         | "set_project_graph"
         | "set_clip_audio"
@@ -8213,6 +8473,7 @@ fn known_behavior(name: &str) -> Option<ToolBehavior> {
         | "audio_fx"
         | "set_master_bus"
         | "set_stabilization"
+        | "apply_window_track"
         | "insert_title_template" => Mutation,
         "execute_action"
         | "save_document"
@@ -8306,6 +8567,122 @@ mod qualifier_inspection_contract_tests {
                 .unwrap()
                 .iter()
                 .any(|value| value == name));
+        }
+    }
+}
+
+#[cfg(test)]
+mod matte_output_contract_tests {
+    #[test]
+    fn matte_output_inspection_requires_node_and_advertises_raw_readonly_data() {
+        let tools = super::tool_list();
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "inspect_grade_matte")
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            serde_json::json!(["clip_id", "graph_node_id"])
+        );
+        assert_eq!(
+            tool["outputSchema"]["anyOf"][0]["properties"]["matte_encoding"]["enum"],
+            serde_json::json!(["unassociated_weight"])
+        );
+        for name in [
+            "graph_node_id",
+            "revision",
+            "snapshot_generation",
+            "tick",
+            "coverage",
+        ] {
+            assert!(tool["outputSchema"]["anyOf"][0]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == name));
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_caption_style_contract_tests {
+    #[test]
+    fn caption_style_animation_fields_are_explicit_and_shared() {
+        let tools = super::tool_list();
+        let list = tools.as_array().unwrap();
+        let get = |name: &str| {
+            list.iter().find(|t| t["name"] == name).unwrap()["inputSchema"]["properties"]["style"]
+                .clone()
+        };
+        let caption = get("set_caption_style");
+        assert_eq!(caption, get("insert_text_clip"));
+        assert_eq!(
+            caption["properties"]["animation"]["enum"],
+            serde_json::json!(["none", "fade_words", "slide_up", "typewriter"])
+        );
+        assert_eq!(
+            caption["properties"]["word_pop"]["required"],
+            serde_json::json!(["active_color", "inactive_color"])
+        );
+        assert_eq!(caption["properties"]["clear_highlight"]["type"], "boolean");
+        assert_eq!(caption["additionalProperties"], false);
+    }
+}
+
+#[cfg(test)]
+mod graph_text_contract_tests {
+    #[test]
+    fn graph_text_edit_is_explicit_mutation_with_static_payload() {
+        let manifest = super::tool_list();
+        let tool = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "set_graph_text")
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(
+            tool["inputSchema"]["required"],
+            serde_json::json!(["graph_id", "node_id", "text"])
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["text"]["properties"]["font_size"]["maximum"],
+            512
+        );
+        assert!(tool["description"].as_str().unwrap().contains("locked"));
+    }
+}
+
+#[cfg(test)]
+mod graph_polygon_contract_tests {
+    #[test]
+    fn polygon_edit_schema_is_explicit_bounded_mutation() {
+        let manifest = super::tool_list();
+        let tool = manifest
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "set_graph_mask_shape")
+            .unwrap();
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+        assert_eq!(
+            tool["inputSchema"]["properties"]["shape"]["oneOf"][1]["properties"]["vertices"]
+                ["maxItems"],
+            128
+        );
+        for shape in [
+            serde_json::json!({"shape":"ellipse","vertices":[]}),
+            serde_json::json!({"shape":"polygon","vertices":[[0,0],[1,0],[0.5,1]],"animated":true}),
+        ] {
+            let args = serde_json::json!({"graph_id":uuid::Uuid::new_v4(),"node_id":uuid::Uuid::new_v4(),"shape":shape});
+            assert!(
+                serde_json::from_value::<crate::protocol::args::SetGraphMaskShapeArgs>(args)
+                    .is_err()
+            );
         }
     }
 }

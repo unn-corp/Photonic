@@ -561,7 +561,7 @@ pub fn parse_ass(input: &str, track_name: &str) -> Result<AssImportResult, Inter
 
 pub fn write_ass(track: &CaptionTrack) -> (String, ExportSummary) {
     let res = (1920.0f32, 1080.0f32);
-    let mut notes = Vec::new();
+    let mut notes = super::direction_export_notes(track);
     let mut out = String::new();
 
     out.push_str("[Script Info]\n");

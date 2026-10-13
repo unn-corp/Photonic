@@ -33,9 +33,9 @@ use photonic_core::timeline::clip::SpeedKey;
 use super::param_expr;
 use photonic_core::timeline::commands::VfxOwner;
 use photonic_core::timeline::{
-    ops, prop_registry, Clip, ClipId, EffectKind, EffectParams, Interp, PropTargetKind, PropValue,
-    Ratio, SequenceId, SpeedMap, Tick, TimelineProject, TrackId, TrackKind, Transition,
-    TransitionKind, TransitionParams, TICKS_PER_SECOND,
+    ops, Clip, ClipId, EffectKind, EffectParams, Interp, PropTargetKind, PropValue, Ratio,
+    SequenceId, SpeedMap, Tick, TimelineProject, TrackId, TrackKind, Transition, TransitionKind,
+    TransitionParams, TICKS_PER_SECOND,
 };
 
 const SPEED_CURVE_MAX: f64 = 10.0;
@@ -55,6 +55,13 @@ struct SpeedCurveDrag {
 /// Left-rail Clip Inspector drawer. Reads the timeline selection and clip data
 /// via `ctx` (`ctx.video.selection`, `ctx.doc`).
 pub(crate) fn draw_clip_inspector(ui: &mut Ui, ctx: &mut PropPanelCtx) {
+    // Pending numeric text belongs to this document and exact selection.
+    // A clip/tab switch must not commit it into a different authored target.
+    let salt = ui.make_persistent_id(("clip_inspector_target", ctx.doc.id, ctx.video.selection));
+    ui.push_id(salt, |ui| draw_clip_inspector_contents(ui, ctx));
+}
+
+fn draw_clip_inspector_contents(ui: &mut Ui, ctx: &mut PropPanelCtx) {
     let Some(project) = ctx.doc.timeline.as_ref() else {
         ui.label(
             RichText::new("No video project yet.").color(crate::theme::section_header_color(ui)),
@@ -291,6 +298,7 @@ fn transform_row(
 fn transform_row_suffixed(ui: &mut Ui, label: &str, v: &mut f64, suffix: &str) -> bool {
     ui.label(label);
     let drag = egui::DragValue::new(v)
+        .update_while_editing(false)
         .speed(0.02)
         .fixed_decimals(3)
         .suffix(suffix);
@@ -763,6 +771,7 @@ fn draw_constant_speed_row(
         changed |= ui
             .add(
                 egui::DragValue::new(&mut pct)
+                    .update_while_editing(false)
                     .speed(1.0)
                     .range(1.0..=10000.0)
                     .suffix("%"),
@@ -901,12 +910,14 @@ fn draw_speed_ramp_editor(
                     let mut reversed = key.ratio.num < 0;
                     let at_resp = ui.add(
                         egui::DragValue::new(&mut at_secs)
+                            .update_while_editing(false)
                             .speed(0.05)
                             .range(0.0..=clip_secs)
                             .suffix("s"),
                     );
                     let pct_resp = ui.add(
                         egui::DragValue::new(&mut pct)
+                            .update_while_editing(false)
                             .speed(1.0)
                             .range(0.0..=1000.0)
                             .suffix("%"),
@@ -999,13 +1010,13 @@ fn draw_speed_ramp_editor(
                 let mut changed = false;
                 ui.horizontal(|ui| {
                     ui.label("Out");
-                    changed |= ui.add(egui::Slider::new(&mut out_handle[0], 0.0..=1.0).text("X")).changed();
-                    changed |= ui.add(egui::Slider::new(&mut out_handle[1], 0.0..=1.0).text("Y")).changed();
+                    changed |= param_expr::numeric_slider(ui, &mut out_handle[0], 0.0..=1.0, |slider| slider.text("X")).changed();
+                    changed |= param_expr::numeric_slider(ui, &mut out_handle[1], 0.0..=1.0, |slider| slider.text("Y")).changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label("In");
-                    changed |= ui.add(egui::Slider::new(&mut in_handle[0], 0.0..=1.0).text("X")).changed();
-                    changed |= ui.add(egui::Slider::new(&mut in_handle[1], 0.0..=1.0).text("Y")).changed();
+                    changed |= param_expr::numeric_slider(ui, &mut in_handle[0], 0.0..=1.0, |slider| slider.text("X")).changed();
+                    changed |= param_expr::numeric_slider(ui, &mut in_handle[1], 0.0..=1.0, |slider| slider.text("Y")).changed();
                 });
                 if changed {
                     selected_interp = Interp::Bezier { out_handle, in_handle };
@@ -1196,7 +1207,7 @@ fn draw_level_horizon_section(
                 let label = ui.label("Correction");
                 let changed = ui
                     .add(
-                        egui::DragValue::new(&mut correction_degrees)
+                        egui::DragValue::new(&mut correction_degrees).update_while_editing(false)
                             .speed(0.1)
                             .fixed_decimals(2)
                             .range(-180.0..=180.0)
@@ -1427,14 +1438,15 @@ fn draw_stabilization_section(
             ui.horizontal(|ui| {
                 let label = ui.label("Smoothness");
                 let mut v = edited.smoothness as f64;
-                if ui
-                    .add(egui::Slider::new(&mut v, 0.0..=1.0).fixed_decimals(2))
-                    .labelled_by(label.id)
-                    .on_hover_text(
-                        "How hard to smooth the camera path. Zero follows the original \
+                if param_expr::numeric_slider(ui, &mut v, 0.0..=1.0, |slider| {
+                    slider.fixed_decimals(2)
+                })
+                .labelled_by(label.id)
+                .on_hover_text(
+                    "How hard to smooth the camera path. Zero follows the original \
                          motion exactly; higher is steadier but demands more crop.",
-                    )
-                    .changed()
+                )
+                .changed()
                 {
                     edited.smoothness = v as f32;
                     changed = true;
@@ -1444,14 +1456,15 @@ fn draw_stabilization_section(
             ui.horizontal(|ui| {
                 let label = ui.label("Horizon lock");
                 let mut v = edited.horizon_lock as f64;
-                if ui
-                    .add(egui::Slider::new(&mut v, 0.0..=1.0).fixed_decimals(2))
-                    .labelled_by(label.id)
-                    .on_hover_text(
-                        "Level the horizon against measured gravity. Needs accelerometer \
+                if param_expr::numeric_slider(ui, &mut v, 0.0..=1.0, |slider| {
+                    slider.fixed_decimals(2)
+                })
+                .labelled_by(label.id)
+                .on_hover_text(
+                    "Level the horizon against measured gravity. Needs accelerometer \
                          data in the motion source; has no effect without it.",
-                    )
-                    .changed()
+                )
+                .changed()
                 {
                     edited.horizon_lock = v as f32;
                     changed = true;
@@ -1461,14 +1474,15 @@ fn draw_stabilization_section(
             ui.horizontal(|ui| {
                 let label = ui.label("Max zoom");
                 let mut v = edited.max_zoom as f64;
-                if ui
-                    .add(egui::Slider::new(&mut v, 1.0..=2.0).fixed_decimals(2))
-                    .labelled_by(label.id)
-                    .on_hover_text(
-                        "Ceiling on how far the crop solver may zoom in to hide the edges \
+                if param_expr::numeric_slider(ui, &mut v, 1.0..=2.0, |slider| {
+                    slider.fixed_decimals(2)
+                })
+                .labelled_by(label.id)
+                .on_hover_text(
+                    "Ceiling on how far the crop solver may zoom in to hide the edges \
                          the correction swings out of frame.",
-                    )
-                    .changed()
+                )
+                .changed()
                 {
                     edited.max_zoom = v as f32;
                     changed = true;
@@ -1616,7 +1630,7 @@ fn scope_hint(tab: FxScopeTab, project: &TimelineProject, track: TrackId, clip: 
                 .find_map(|s| s.track(track))
                 .map(|t| t.name.clone())
                 .unwrap_or_default();
-            format!("Every clip on track \"{name}\", after they fold together.")
+            format!("Every clip on track \"{name}\", after the clip effect stack.")
         }
         FxScopeTab::Master => {
             "The whole sequence, after all tracks are merged. Applied last.".to_string()
@@ -1686,7 +1700,10 @@ fn draw_effects_section(
             for i in 0..stack.len() {
                 let effect = &stack[i];
                 ui.push_id(("fx_row", scope_salt(owner), i), |ui| {
-                    ui.horizontal(|ui| {
+                    // Keep long catalog names and all actions inside the drawer.
+                    // A wide single-line row makes the outer two-axis scroller
+                    // pan the entire inspector when a parameter gains focus.
+                    ui.horizontal_wrapped(|ui| {
                         let mut enabled = effect.enabled;
                         if ui.checkbox(&mut enabled, "").changed() {
                             let mut new_effect = effect.clone();
@@ -1839,7 +1856,7 @@ fn draw_effect_params(
     effect_idx: usize,
     action: &mut Option<PanelAction>,
 ) {
-    let entries = prop_registry::entries(PropTargetKind::Effect(effect.kind));
+    let entries = photonic_core::timeline::effect_manifest::entries_for_effect(effect.kind);
     if entries.is_empty() {
         ui.label(
             RichText::new("No parameters.")
@@ -1905,15 +1922,26 @@ fn draw_effect_params(
                     }
                     PropValue::Vec2(v2) => {
                         let mut v = v2;
-                        let r0 = ui.add(egui::DragValue::new(&mut v[0]).speed(0.01));
-                        let r1 = ui.add(egui::DragValue::new(&mut v[1]).speed(0.01));
+                        let r0 = ui.add(
+                            egui::DragValue::new(&mut v[0])
+                                .update_while_editing(false)
+                                .speed(0.01),
+                        );
+                        let r1 = ui.add(
+                            egui::DragValue::new(&mut v[1])
+                                .update_while_editing(false)
+                                .speed(0.01),
+                        );
                         if r0.changed() || r1.changed() {
                             new_value = Some(PropValue::Vec2(v));
                         }
                     }
                     PropValue::Enum(e) => {
                         let mut v = e;
-                        if ui.add(egui::DragValue::new(&mut v)).changed() {
+                        if ui
+                            .add(egui::DragValue::new(&mut v).update_while_editing(false))
+                            .changed()
+                        {
                             new_value = Some(PropValue::Enum(v));
                         }
                     }
@@ -1958,6 +1986,11 @@ fn param_short_label(path: &str) -> &str {
 
 // ── Keyframes (13 §5.2, 14 §G-9 effect-controls unification) ────────────────
 
+fn keyframe_popout_button(ui: &mut Ui) -> egui::Response {
+    ui.small_button("Open editor")
+        .on_hover_text("Open the floating keyframe editor with live playhead scrubbing")
+}
+
 /// The docked keyframe/curve editor section — replaces the floating
 /// `egui::Window` as the default, always-visible per-clip Effect-Controls
 /// surface (14 §G-9: "two surfaces for one concept" between this inspector's
@@ -1978,21 +2011,15 @@ fn draw_keyframes_section(
         .default_open(true)
         .id_salt("clip_inspector_keyframes")
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                if keyframe_popout_button(ui).clicked() {
+                    *ctx.video.keyframe_editor_target = Some(clip.id);
+                }
                 ui.label(
-                    RichText::new("Transform + effect params, animated over the clip")
+                    RichText::new("Transform, effects and grade animation")
                         .color(crate::theme::section_header_color(ui))
                         .small(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::new(RichText::new(ph::ARROW_SQUARE_OUT)).small())
-                        .on_hover_text("Pop out to a floating window (live playhead scrubbing)")
-                        .clicked()
-                    {
-                        *ctx.video.keyframe_editor_target = Some(clip.id);
-                    }
-                });
             });
             if let Some(a) = super::keyframe_editor::draw_embedded(ui, project, clip) {
                 *action = Some(a);
@@ -2059,11 +2086,11 @@ fn draw_one_transition(
     } else {
         &clip.transition_out
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(label).on_hover_text(if is_in {
             "Blends from the preceding clip at the cut using its available source handles"
         } else {
-            "Fades at the end of a clip before a gap or sequence end"
+            "All Out kinds fade to transparent before a gap or sequence end; kind-specific effects apply only to In at a cut"
         });
         match current {
             None => {
@@ -2083,6 +2110,7 @@ fn draw_one_transition(
             }
             Some(t) => {
                 let mut kind = t.kind;
+                if is_in {
                 egui::ComboBox::new(("transition_kind", clip.id, is_in), "")
                     .selected_text(transition_label(kind))
                     .show_ui(ui, |ui| {
@@ -2090,10 +2118,14 @@ fn draw_one_transition(
                             ui.selectable_value(&mut kind, k, transition_label(k));
                         }
                     });
+                } else {
+                    ui.label("Fade out");
+                }
                 let mut secs = t.duration.as_seconds_f64();
                 let dur_changed = ui
                     .add(
                         egui::DragValue::new(&mut secs)
+                            .update_while_editing(false)
                             .speed(0.05)
                             .range(0.01..=60.0)
                             .suffix("s"),
@@ -2130,9 +2162,26 @@ fn draw_one_transition(
         }
     });
     if let Some(t) = current {
+        if !is_in {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("Out: fades to transparent. Only duration and easing apply.")
+                        .small(),
+                )
+                .wrap(),
+            );
+        }
         let mut params = t.params;
         ui.push_id(("transition_parameters", clip.id, is_in), |ui| {
-            draw_transition_parameters(ui, t.kind, &mut params);
+            draw_transition_parameters(
+                ui,
+                if is_in {
+                    t.kind
+                } else {
+                    TransitionKind::CrossDissolve
+                },
+                &mut params,
+            );
         });
         if params != t.params {
             let mut new_clip = clip.clone();
@@ -2149,7 +2198,8 @@ fn draw_one_transition(
 
 fn draw_transition_parameters(ui: &mut Ui, kind: TransitionKind, params: &mut TransitionParams) {
     use photonic_core::timeline::{EaseCurve, LumaWipeMap, WipeDirection};
-    egui::ComboBox::from_label("Easing")
+    ui.label("Easing");
+    egui::ComboBox::from_id_salt("transition_easing")
         .selected_text(match params.curve {
             EaseCurve::Linear => "Linear",
             EaseCurve::EaseIn => "Ease in",
@@ -2202,12 +2252,376 @@ fn draw_transition_parameters(ui: &mut Ui, kind: TransitionKind, params: &mut Tr
         ui.checkbox(&mut params.invert, "Reverse mask");
     }
     if matches!(kind, TransitionKind::Wipe | TransitionKind::LumaWipe) {
-        ui.add(egui::Slider::new(&mut params.softness, 0.0..=0.5).text("Edge softness"));
+        param_expr::numeric_slider(ui, &mut params.softness, 0.0..=0.5, |slider| {
+            slider.text("Edge softness")
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outgoing_transition_view_explains_fade_without_inapplicable_controls_or_edits() {
+        use photonic_core::timeline::{ClipSource, FrameRate, Sequence, Track};
+        for kind in TRANSITION_KINDS {
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("End fade", FrameRate::FPS_30, 320, 240);
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let mut clip = Clip::new(
+                ClipSource::SolidColor {
+                    color: photonic_core::Color::new(0.2, 0.4, 0.6, 0.5),
+                },
+                Tick::ZERO,
+                Tick(TICKS_PER_SECOND),
+            );
+            clip.transition_out = Some(Transition::new(kind, Tick(TICKS_PER_SECOND / 2)));
+            let (sid, tid) = (seq.id, track.id);
+            track.clips.push(clip.clone());
+            seq.video_tracks.push(track);
+            project.insert_sequence(seq);
+            let before = serde_json::to_value(&project).unwrap();
+            let ctx = egui::Context::default();
+            let mut action = None;
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_one_transition(ui, &project, sid, tid, &clip, false, &mut action)
+                    });
+                },
+            );
+            let labels: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| {
+                    if let egui::Shape::Text(t) = &s.shape {
+                        Some(t.galley.text().to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert!(labels
+                .iter()
+                .any(|s| s.contains("Only duration and easing")));
+            assert!(!labels.iter().any(|s| matches!(
+                s.as_str(),
+                "Direction" | "Mask shape" | "Reverse mask" | "Edge softness"
+            )));
+            assert!(action.is_none());
+            assert_eq!(serde_json::to_value(&project).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn outgoing_transition_controls_fit_narrow_drawer_without_mutation() {
+        use photonic_core::timeline::{ClipSource, FrameRate, Sequence, Track};
+        for kind in TRANSITION_KINDS {
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Narrow fade", FrameRate::FPS_30, 320, 240);
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let mut clip = Clip::new(
+                ClipSource::SolidColor {
+                    color: photonic_core::Color::new(0.2, 0.4, 0.6, 0.5),
+                },
+                Tick::ZERO,
+                Tick(TICKS_PER_SECOND),
+            );
+            clip.transition_out = Some(Transition::new(kind, Tick(TICKS_PER_SECOND / 2)));
+            let (sid, tid) = (seq.id, track.id);
+            track.clips.push(clip.clone());
+            seq.video_tracks.push(track);
+            project.insert_sequence(seq);
+            let before = serde_json::to_value(&project).unwrap();
+            for width in [140.0, 180.0, 220.0, 320.0] {
+                let ctx = egui::Context::default();
+                ctx.style_mut(|s| s.animation_time = 0.0);
+                let mut action = None;
+                for frame in 0..3 {
+                    let _ = ctx.run(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(800.0, 700.0),
+                            )),
+                            time: Some(frame as f64 / 60.0),
+                            ..Default::default()
+                        },
+                        |ctx| {
+                            egui::SidePanel::left("transition_drawer")
+                                .exact_width(width)
+                                .show(ctx, |ui| {
+                                    let output = egui::ScrollArea::both()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            draw_one_transition(
+                                                ui,
+                                                &project,
+                                                sid,
+                                                tid,
+                                                &clip,
+                                                false,
+                                                &mut action,
+                                            )
+                                        });
+                                    if frame == 2 {
+                                        assert!(
+                                            output.content_size.x
+                                                <= output.inner_rect.width() + 0.5,
+                                            "{kind:?} width{width}: content{} viewport{}",
+                                            output.content_size.x,
+                                            output.inner_rect.width()
+                                        );
+                                        assert!(output.state.offset.x.abs() < 0.1);
+                                    }
+                                });
+                        },
+                    );
+                }
+                assert!(action.is_none());
+                assert_eq!(serde_json::to_value(&project).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn long_effect_rows_fit_narrow_drawer_without_mutation() {
+        use photonic_core::timeline::{ClipSource, FrameRate, Sequence, Track};
+        let mut project = TimelineProject::new();
+        let mut seq = Sequence::new("Narrow", FrameRate::FPS_30, 320, 240);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(1000));
+        clip.name = "Long effect controls".into();
+        for id in ["stylize.chromatic_aberration", "sharpen.unsharp_raster"] {
+            clip.effects.push(
+                photonic_core::timeline::ClipEffect::from_manifest(
+                    photonic_core::timeline::EffectId::new(id),
+                )
+                .unwrap(),
+            );
+        }
+        let (sid, tid) = (seq.id, track.id);
+        track.clips.push(clip.clone());
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        let before = serde_json::to_value(&project).unwrap();
+        for width in [140.0, 180.0, 220.0, 320.0] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|s| s.animation_time = 0.0);
+            let mut action = None;
+            for frame in 0..3 {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(800.0, 700.0),
+                        )),
+                        time: Some(frame as f64 / 60.0),
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::SidePanel::left("test_drawer")
+                            .exact_width(width)
+                            .show(ctx, |ui| {
+                                let output = egui::ScrollArea::both()
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        draw_effects_section(
+                                            ui,
+                                            &project,
+                                            sid,
+                                            tid,
+                                            &clip,
+                                            &mut action,
+                                        );
+                                    });
+                                if frame == 2 {
+                                    assert!(
+                                        output.content_size.x <= output.inner_rect.width() + 0.5,
+                                        "width{width}: content{} viewport{}",
+                                        output.content_size.x,
+                                        output.inner_rect.width()
+                                    );
+                                    assert!(output.state.offset.x.abs() < 0.1);
+                                }
+                            });
+                    },
+                );
+            }
+            assert!(action.is_none());
+            assert_eq!(serde_json::to_value(&project).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn wrapped_effect_remove_control_is_visible_and_one_step_undoable() {
+        use photonic_core::history::{Command, CommandHistory};
+        use photonic_core::timeline::{ClipSource, FrameRate, Sequence, Track};
+        let mut project = TimelineProject::new();
+        let mut seq = Sequence::new("Narrow", FrameRate::FPS_30, 320, 240);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(1000));
+        clip.name = "Test".into();
+        clip.effects.push(
+            photonic_core::timeline::ClipEffect::from_manifest(
+                photonic_core::timeline::EffectId::new("stylize.chromatic_aberration"),
+            )
+            .unwrap(),
+        );
+        let (sid, tid, cid) = (seq.id, track.id, clip.id);
+        track.clips.push(clip.clone());
+        seq.video_tracks.push(track);
+        project.insert_sequence(seq);
+        let ctx = egui::Context::default();
+        ctx.style_mut(|s| s.animation_time = 0.0);
+        let mut action = None;
+        let mut run = |events| {
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::SidePanel::left("narrow")
+                        .exact_width(180.0)
+                        .show(ctx, |ui| {
+                            egui::ScrollArea::both()
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    draw_effects_section(ui, &project, sid, tid, &clip, &mut action)
+                                });
+                        });
+                },
+            )
+        };
+        let _ = run(vec![]);
+        let output = run(vec![]);
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::Shape::Text(t) if t.galley.text() == "\u{2715}" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("Remove action is rendered");
+        assert!(
+            pos.x < 180.0 && pos.x >= 0.0,
+            "remove outside viewport: {pos:?}"
+        );
+        let _ = run(vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        let _ = run(vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        let Some(PanelAction::ClipEditDiscrete(cmd)) = action else {
+            panic!("Remove must produce one discrete command")
+        };
+        let mut doc = photonic_core::Document::new("test", 320.0, 240.0);
+        doc.timeline = Some(project);
+        let before = doc.timeline.clone();
+        let mut history = CommandHistory::new(10);
+        history.execute_discrete(Command::Timeline(cmd), &mut doc);
+        assert!(locate_clip(doc.timeline.as_ref().unwrap(), cid)
+            .unwrap()
+            .2
+            .effects
+            .is_empty());
+        assert!(history.undo(&mut doc));
+        assert_eq!(doc.timeline, before);
+    }
+
+    #[test]
+    fn catalog_motion_blur_static_controls_render_without_mutation() {
+        let ctx = egui::Context::default();
+        let project = TimelineProject::new();
+        let effect = photonic_core::timeline::ClipEffect::from_manifest(
+            photonic_core::timeline::EffectId::new("blur.motion"),
+        )
+        .unwrap();
+        let before = serde_json::to_value(&effect).unwrap();
+        let mut action = None;
+        let mut labels = String::new();
+        fn text(shape: &egui::Shape, labels: &mut String) {
+            match shape {
+                egui::Shape::Text(t) => labels.push_str(t.galley.text()),
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        text(s, labels);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let owner = VfxOwner::Master(photonic_core::timeline::SequenceId::new());
+        for frame in 0..3 {
+            let output = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_effect_params(ui, &project, owner, &effect, 0, &mut action);
+                    });
+                },
+            );
+            for shape in output.shapes {
+                text(&shape.shape, &mut labels);
+            }
+        }
+        assert!(
+            labels.contains("angle") && labels.contains("distance"),
+            "{labels}"
+        );
+        assert!(!labels.contains("No parameters"));
+        assert!(action.is_none());
+        assert_eq!(serde_json::to_value(&effect).unwrap(), before);
+    }
+
+    #[test]
+    fn keyframe_launcher_fits_a_narrow_inspector() {
+        let ctx = egui::Context::default();
+        for width in [140.0, 180.0, 220.0] {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.set_max_width(width);
+                    let max = ui.max_rect().right();
+                    ui.horizontal_wrapped(|ui| {
+                        let response = super::keyframe_popout_button(ui);
+                        assert!(response.rect.right() <= max + 0.1);
+                        ui.label("Transform, effects and grade animation");
+                    });
+                });
+            });
+        }
+    }
+
     use super::*;
 
     #[test]

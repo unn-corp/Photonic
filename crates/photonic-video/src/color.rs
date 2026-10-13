@@ -297,6 +297,90 @@ pub fn inspect_inputs(project: &TimelineProject, sequence: &Sequence) -> Vec<Col
     findings
 }
 
+/// Vector paints have an intrinsic sRGB contract, not a video/still input tag.
+/// Shared by source compilation and the read-only Color workspace inspection.
+pub fn validate_native_vector_asset(
+    media: &MediaAsset,
+    clip_input: Option<&photonic_core::timeline::color::NativeInputColorInterpretation>,
+) -> Result<(), String> {
+    if media.kind != AssetKind::VectorDoc
+        || !matches!(
+            media.source,
+            photonic_core::timeline::AssetSource::EmbeddedVector {
+                root: photonic_core::timeline::VectorRef::WholeDocument
+            }
+        )
+    {
+        return Err("native vector requires an embedded whole-document vector asset".into());
+    }
+    if clip_input.is_some() || media.native_input_color.is_some() {
+        return Err(
+            "native vector paint uses intrinsic sRGB; video/still input overrides do not apply"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Shared technical input validation for native clips and independent graph media.
+/// Header I/O is optional for static compiler tests; live source checks enable it.
+pub fn validate_native_asset_input(
+    media: &MediaAsset,
+    input: &photonic_core::timeline::color::NativeInputColorInterpretation,
+    inspect_still_file: bool,
+) -> Result<(), String> {
+    input.validate_asset_kind(media.kind)?;
+    if media.kind == AssetKind::Image {
+        let photonic_core::timeline::AssetSource::File { path, .. } = &media.source else {
+            return Err("native still must be file-backed".into());
+        };
+        return if inspect_still_file {
+            validate_native_still_file(path)
+        } else {
+            Ok(())
+        };
+    }
+    let pixel_format = media
+        .probe
+        .as_ref()
+        .and_then(|probe| probe.pixel_format.as_deref());
+    let Some(format) = pixel_format else {
+        return Err(
+            "native broadcast input requires a probed source pixel format \
+                    to preserve bit depth and chroma sampling"
+                .into(),
+        );
+    };
+    if !crate::decode::PixFmt::supports_native_source(format) {
+        return Err(format!(
+            "native broadcast input does not support source pixel format {format}; \
+             select a supported YUV interpretation or keep this sequence in Legacy SDR"
+        ));
+    }
+    let format = format.to_ascii_lowercase();
+    let subsampled = format.contains("420")
+        || format.contains("422")
+        || [
+            "nv12", "nv21", "nv16", "nv61", "p010", "p012", "p016", "p210", "p212", "p216",
+        ]
+        .iter()
+        .any(|prefix| format.starts_with(prefix));
+    if subsampled && input.chroma_location.is_none() {
+        let reported = media
+            .probe
+            .as_ref()
+            .and_then(|probe| probe.video.as_ref())
+            .and_then(|video| video.color.chroma_location.as_deref());
+        return Err(match reported {
+            Some(value) => format!(
+                "subsampled source requires an explicit chroma sample location (probe reports {value})"
+            ),
+            None => "subsampled source requires an explicit chroma sample location".into(),
+        });
+    }
+    Ok(())
+}
+
 pub fn inspect_input(
     project: &TimelineProject,
     sequence: &Sequence,
@@ -308,70 +392,55 @@ pub fn inspect_input(
             _ => return None,
         };
         let media = project.media.assets.get(&asset);
+        if matches!(clip.source, ClipSource::Vector { .. }) {
+            let diagnostic = media
+                .ok_or_else(|| "source asset is missing".to_string())
+                .and_then(|m| validate_native_vector_asset(m, clip.native_input_color.as_ref()))
+                .err();
+            return Some(ColorInputFinding {
+                clip: clip.id,
+                asset,
+                interpretation: if diagnostic.is_none() {
+                    "intrinsic"
+                } else {
+                    "unresolved"
+                },
+                color_space: diagnostic.is_none().then(|| "sRGB vector paint".into()),
+                diagnostic,
+            });
+        }
         let input = clip
             .native_input_color
             .as_ref()
             .or_else(|| media.and_then(|asset| asset.native_input_color.as_ref()));
         let (interpretation, color_space, diagnostic) = match (media, input) {
             (None, _) => ("unresolved", None, Some("source asset is missing".into())),
-            (Some(media), Some(input)) => match input.validate_asset_kind(media.kind).and_then(|()| {
-                if media.kind == AssetKind::Image {
-                    let photonic_core::timeline::AssetSource::File { path, .. } = &media.source else { return Err("native still must be file-backed".into()); };
-                    return validate_native_still_file(path);
-                }
-                let pixel_format = media
-                    .probe
-                    .as_ref()
-                    .and_then(|probe| probe.pixel_format.as_deref());
-                let Some(format) = pixel_format else {
-                    return Err("native broadcast input requires a probed source pixel format to preserve bit depth and chroma sampling".into());
-                };
-                if !crate::decode::PixFmt::supports_native_source(format) {
-                    return Err(format!(
-                        "native broadcast input does not support source pixel format {format}; select a supported YUV interpretation or keep this sequence in Legacy SDR"
-                    ));
-                }
-                let subsampled = pixel_format.is_some_and(|format| {
-                        let format = format.to_ascii_lowercase();
-                        format.contains("420")
-                            || format.contains("422")
-                            || format.starts_with("nv12")
-                            || format.starts_with("nv21")
-                            || format.starts_with("nv16")
-                            || format.starts_with("nv61")
-                            || format.starts_with("p010")
-                            || format.starts_with("p012")
-                            || format.starts_with("p016")
-                            || format.starts_with("p210")
-                            || format.starts_with("p212")
-                            || format.starts_with("p216")
-                    });
-                if subsampled && input.chroma_location.is_none() {
-                    let reported = media.probe.as_ref()
-                        .and_then(|probe| probe.video.as_ref())
-                        .and_then(|video| video.color.chroma_location.as_deref());
-                    Err(match reported {
-                        Some(value) => format!(
-                            "subsampled source requires an explicit chroma sample location (probe reports {value})"
-                        ),
-                        None => "subsampled source requires an explicit chroma sample location".into(),
-                    })
-                } else {
-                    Ok(())
-                }
-            }) {
+            (Some(media), Some(input)) => match validate_native_asset_input(media, input, true) {
                 Ok(()) => (
                     "explicit",
                     Some(match input.standard {
-                        photonic_core::timeline::color::NativeInputStandard::SrgbDisplay => "sRGB display still".into(),
+                        photonic_core::timeline::color::NativeInputStandard::SrgbDisplay => {
+                            "sRGB display still".into()
+                        }
                         photonic_core::timeline::color::NativeInputStandard::Bt709Scene => {
                             "BT.709 scene".into()
                         }
                         photonic_core::timeline::color::NativeInputStandard::Bt2020Scene => {
                             "BT.2020 scene".into()
                         }
-                        photonic_core::timeline::color::NativeInputStandard::Bt2100HlgScene => format!("BT.2100 HLG scene · white {} / peak {} nits", input.reference_white_nits.unwrap_or(0), input.hlg_peak_nits.unwrap_or(0)),
-                        photonic_core::timeline::color::NativeInputStandard::Bt2100PqDisplay => format!("BT.2100 PQ display · reference white {} nits", input.reference_white_nits.unwrap_or(0)),
+                        photonic_core::timeline::color::NativeInputStandard::Bt2100HlgScene => {
+                            format!(
+                                "BT.2100 HLG scene · white {} / peak {} nits",
+                                input.reference_white_nits.unwrap_or(0),
+                                input.hlg_peak_nits.unwrap_or(0)
+                            )
+                        }
+                        photonic_core::timeline::color::NativeInputStandard::Bt2100PqDisplay => {
+                            format!(
+                                "BT.2100 PQ display · reference white {} nits",
+                                input.reference_white_nits.unwrap_or(0)
+                            )
+                        }
                     }),
                     None,
                 ),
@@ -489,5 +558,67 @@ pub fn ensure_supported(sequence: &Sequence) -> Result<(), String> {
     match inspect(sequence).diagnostic {
         Some(error) => Err(error),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod native_vector_input_tests {
+    use super::*;
+    use photonic_core::timeline::color::{
+        NativeInputColorInterpretation, NativeManagedColorConfig,
+    };
+    use photonic_core::timeline::{AssetSource, FrameRate, Tick, VectorRef};
+    #[test]
+    fn native_vector_input_inspection_reports_intrinsic_color_without_mutation() {
+        let mut p = TimelineProject::new();
+        let asset = p.media.insert(MediaAsset::new(
+            AssetKind::VectorDoc,
+            AssetSource::EmbeddedVector {
+                root: VectorRef::WholeDocument,
+            },
+        ));
+        let mut seq = Sequence::new("native", FrameRate::FPS_30, 64, 64);
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let clip = Clip::new(ClipSource::Vector { asset }, Tick::ZERO, Tick(1));
+        let before = serde_json::to_value(&p).unwrap();
+        let f = inspect_input(&p, &seq, &clip).unwrap();
+        assert_eq!(f.interpretation, "intrinsic");
+        assert_eq!(f.color_space.as_deref(), Some("sRGB vector paint"));
+        assert!(f.diagnostic.is_none());
+        assert_eq!(serde_json::to_value(&p).unwrap(), before);
+        let tagged:NativeInputColorInterpretation=serde_json::from_value(serde_json::json!({"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"})).unwrap();
+        for kind in 0..4 {
+            let mut bad = p.clone();
+            let m = bad.media.assets.get_mut(&asset).unwrap();
+            match kind {
+                0 => m.kind = AssetKind::Image,
+                1 => {
+                    m.source = AssetSource::EmbeddedVector {
+                        root: VectorRef::Artboard(0),
+                    }
+                }
+                2 => {
+                    m.source = AssetSource::File {
+                        path: "logo.svg".into(),
+                        rel_path: None,
+                    }
+                }
+                _ => m.native_input_color = Some(tagged.clone()),
+            }
+            assert!(
+                inspect_input(&bad, &seq, &clip)
+                    .unwrap()
+                    .diagnostic
+                    .is_some(),
+                "kind {kind}"
+            );
+        }
+        let mut overridden = clip.clone();
+        overridden.native_input_color = Some(tagged);
+        assert!(inspect_input(&p, &seq, &overridden)
+            .unwrap()
+            .diagnostic
+            .is_some());
     }
 }

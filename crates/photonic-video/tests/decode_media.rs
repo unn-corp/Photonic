@@ -262,6 +262,34 @@ fn decode_vfr_is_pts_true_via_table() {
         .find(|t| **t >= target)
         .expect("a frame at/after target");
 
+    // Independent sequential decode is the picture oracle: PTS labels alone
+    // missed rawvideo auto-sync dropping 22 pictures from this 216-frame file.
+    let reference = std::process::Command::new(&tools.ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(&path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "-1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let bytes_per_frame = 320 * 180 * 3 / 2;
+    assert_eq!(reference.stdout.len(), 216 * bytes_per_frame);
     let params = SourceParams {
         input: path,
         width: 320,
@@ -278,6 +306,30 @@ fn decode_vfr_is_pts_true_via_table() {
         "VFR decode assigns pts from the ground-truth table (pts-true), not a constant rate"
     );
     assert!(frame.pts >= target);
+    for ordinal in [0usize, 10, 95, 96, 97, 150, 214, 215] {
+        let frame = src.seek_covering(pts_index.pts[ordinal]).unwrap();
+        assert_eq!(frame.pts, pts_index.pts[ordinal]);
+        let DecodedPlanes::Yuv420 { data, .. } = &frame.planes else {
+            panic!("expected YUV420");
+        };
+        let expected =
+            &reference.stdout[ordinal * bytes_per_frame..(ordinal + 1) * bytes_per_frame];
+        assert!(
+            data.as_slice() == expected,
+            "VFR picture payload differs at ordinal {ordinal}"
+        );
+    }
+    for ordinal in [10usize, 96, 97, 150] {
+        let start = pts_index.pts[ordinal];
+        let end = pts_index.pts[ordinal + 1];
+        let inside = photonic_core::timeline::Tick(start.0 + (end.0 - start.0) * 9 / 10);
+        assert_eq!(src.seek_covering(inside).unwrap().pts, start);
+        assert_eq!(
+            src.seek(inside).unwrap().pts,
+            end,
+            "public at-or-after seek remains unchanged"
+        );
+    }
 }
 
 // ── 5. Alpha: yuva path, alpha ramps left→right (alpha_gradient.mov) ─────────
@@ -330,4 +382,87 @@ fn decode_alpha_gradient_ramps_across_row() {
 
 fn plane_y(p: &DecodedPlanes) -> &[u8] {
     p.y()
+}
+
+#[test]
+fn cfr_cold_seeks_preserve_picture_ordinals_with_millisecond_keyframe_timestamps() {
+    let tools = locate_for_test().expect("FFmpeg required for cold-seek qualification");
+    let root = std::env::temp_dir().join(format!("photonic-cfr-seek-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let raw = root.join("source.yuv");
+    let mut bytes = Vec::new();
+    for frame in 0..12u8 {
+        bytes.extend(vec![20 + frame * 10; 16 * 16]);
+        bytes.extend(vec![128; 16 * 16 * 2]);
+    }
+    std::fs::write(&raw, bytes).unwrap();
+    for (name, rate, rate_arg) in [
+        ("30", FrameRate::FPS_30, "30"),
+        ("ntsc", FrameRate::FPS_29_97, "30000/1001"),
+    ] {
+        let path = root.join(format!("{name}.mkv"));
+        let encoded = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "yuv444p",
+                "-video_size",
+                "16x16",
+                "-framerate",
+                rate_arg,
+                "-i",
+            ])
+            .arg(&raw)
+            .args(["-c:v", "ffv1", "-g", "1", "-pix_fmt", "yuv444p"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            encoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        let keyframes = KeyframeIndex::build(&tools, &path).unwrap();
+        assert_eq!(keyframes.keyframes.len(), 12);
+        assert!(
+            keyframes
+                .keyframes
+                .iter()
+                .enumerate()
+                .any(|(i, t)| *t != rate.frame_start(i as i64)),
+            "fixture must exercise quantized timestamps"
+        );
+        let params = SourceParams {
+            input: path,
+            width: 16,
+            height: 16,
+            pix_fmt: PixFmt::Yuv444p,
+            pts_kind: PtsKind::Cfr(rate),
+            keyframes,
+        };
+        let mut source = DecodeSource::new(tools.clone(), params, SharedRing::preview());
+        for ordinal in [1, 2, 4, 5, 7, 8, 10, 11, 0, 6, 3, 9] {
+            let target = rate.frame_start(ordinal);
+            let frame = source.seek(target).unwrap();
+            assert_eq!(frame.pts, target, "{name} ordinal {ordinal}");
+            let inside = photonic_core::timeline::Tick(target.0 + rate.ticks_per_frame().0 / 2);
+            let covering = source.seek_covering(inside).unwrap();
+            assert_eq!(covering.pts, target);
+            assert_eq!(covering.planes.y()[0], 20 + ordinal as u8 * 10);
+            assert!(
+                frame
+                    .planes
+                    .y()
+                    .iter()
+                    .all(|v| *v == 20 + ordinal as u8 * 10),
+                "{name} cold seek {ordinal}: got luma {}",
+                frame.planes.y()[0]
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }

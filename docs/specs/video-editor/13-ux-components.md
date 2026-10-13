@@ -330,6 +330,15 @@ Right-rail drawer (220–480px). Ordered sections (mirrors 07 §4.4's default op
 
 The one genuinely new interactive widget this module introduces (no existing egui or Photonic precedent for a 2D-drag-within-a-disc control). Spec: a circular disc (`surface-widget` fill, `border` outline), drag anywhere within it maps radial position to hue (angle) + saturation (distance from center) offset, a draggable ring at the disc's edge maps to luminance offset (drag up/down or a thin peripheral ring-slider — implementer's choice, both are Resolve-precedented). Center dot marks neutral; a thin line from center to the current drag position shows the live offset vector. Numeric readout (three small fields: the effective lift/gamma/gain triplet) beside each disc for precise entry, since drag-only precision is coarse.
 
+**2026-10-06 authoring increment:** each wheel also exposes an `All` numeric/drag
+control for its arithmetic RGB channel mean. It applies one equal shift to all
+three authored values, preserving channel differences, with a common feasible
+interval rather than independent channel clipping. This is a linked authoring
+control, not measured scene luminance; the dedicated peripheral ring and
+separate scene-linear luminance controls remain unqualified. Existing wheel
+render arithmetic and serialized parameters are unchanged. Passive views never
+clamp loaded values. Typed edits commit on completion and Escape cancels.
+
 ### 9.2 States
 
 Op row: enabled/disabled (dim, matches effects-stack convention), being-edited (expanded), has-mask (small mask-shape glyph badge on the row). Wheels dial: default / dragging (live numeric readout updates) / neutral (center dot only, no offset line drawn — visually confirms "this wheel does nothing right now"). Qualifier "Highlight" toggle: on/off, matches rail-icon selected-state visual (`primary-dim` fill).

@@ -281,6 +281,97 @@ mod tests {
     }
 
     #[test]
+    fn parked_grade_versions_survive_cleanup_archive_move_and_activation() {
+        use photonic_core::timeline::grade::LutInterp;
+        use photonic_core::timeline::{
+            ops, Clip, ClipSource, Grade, GradeOp, GradeOpKind, GradeOpParams, Track, TrackKind,
+        };
+        let (root, mut doc, _) = fixture();
+        let p = doc.timeline.as_mut().unwrap();
+        let lut = p
+            .media
+            .assets
+            .values()
+            .find(|a| a.kind == AssetKind::Lut3d)
+            .unwrap()
+            .id;
+        let lut_path = root.join("look.cube");
+        let bytes = b"LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n";
+        fs::write(&lut_path, bytes).unwrap();
+        let hash = crate::media::full_content_hash(&lut_path).unwrap();
+        p.media.assets.get_mut(&lut).unwrap().lut_full_hash = Some(hash.clone());
+        let mut seq = Sequence::new("versions", FrameRate::FPS_24, 16, 16);
+        let sid = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let tid = track.id;
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::rgb(0.2, 0.3, 0.4),
+            },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        let cid = clip.id;
+        let version = uuid::Uuid::new_v4();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Lut3d,
+            GradeOpParams::Lut3d {
+                asset: lut,
+                intensity: 1.0,
+                interp: LutInterp::Trilinear,
+            },
+        ));
+        clip.grade_versions
+            .push(photonic_core::timeline::clip::GradeVersion {
+                id: version,
+                name: "Parked LUT".into(),
+                grade: Some(grade.clone()),
+            });
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        p.insert_sequence(seq);
+        let commands = ops::remove_unused_assets(doc.timeline.as_ref().unwrap());
+        for command in commands {
+            command.apply(&mut doc);
+        }
+        assert!(doc
+            .timeline
+            .as_ref()
+            .unwrap()
+            .media
+            .assets
+            .contains_key(&lut));
+        let destination = root.join("deliverable");
+        let archive = archive_project(&doc, None, &destination).unwrap();
+        let (mut loaded, history) =
+            photonic_core::load_photon(&fs::read_to_string(&archive).unwrap()).unwrap();
+        assert!(history.is_none());
+        fs::remove_file(&lut_path).unwrap();
+        let moved = root.join("moved");
+        fs::rename(destination, &moved).unwrap();
+        resolve_project_relative_assets(&mut loaded, &moved.join("deliverable.photon"));
+        let cmd =
+            ops::activate_grade_version(loaded.timeline.as_ref().unwrap(), sid, tid, cid, version)
+                .unwrap();
+        cmd.apply(&mut loaded);
+        let p = loaded.timeline.as_ref().unwrap();
+        assert_eq!(
+            p.sequences[&sid].track(tid).unwrap().clips[0].grade,
+            Some(grade)
+        );
+        let asset = &p.media.assets[&lut];
+        let AssetSource::File { path, .. } = &asset.source else {
+            panic!("file expected")
+        };
+        assert!(path.starts_with(&moved));
+        assert_eq!(fs::read(path).unwrap(), bytes);
+        assert_eq!(crate::media::full_content_hash(path).unwrap(), hash);
+        assert_eq!(asset.lut_full_hash.as_deref(), Some(hash.as_str()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn offline_asset_and_existing_destination_are_rejected() {
         let (root, mut doc, media) = fixture();
         let destination = root.join("deliverable");
@@ -330,6 +421,7 @@ mod tests {
         project.media.insert(asset);
         let mut sequence = Sequence::new("cut", FrameRate::FPS_24, 16, 16);
         sequence.reference_stills.push(ReferenceStill {
+            copied_from: None,
             id: uuid::Uuid::new_v4(),
             name: "balance".into(),
             image_asset,
@@ -338,6 +430,7 @@ mod tests {
             source_time: Tick::ZERO,
             grade_revision: 1,
             color: sequence.color.clone(),
+            native_balance: None,
             format_index: 0,
         });
         project.insert_sequence(sequence);

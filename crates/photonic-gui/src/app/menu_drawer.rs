@@ -118,16 +118,7 @@ impl PhotonicApp {
                                         if ui.add_enabled(can_save, egui::Button::new("  Save  ")).clicked() {
                                             self.active_drawer = None;
                                             self.selected_drawer_option = None;
-                                            if let Some(path) = &self.current_file.clone() {
-                                                match write_photon_file(path, doc, history) {
-                                                    Ok(_) => {
-                                                        self.welcome.add_recent(path.clone(), doc.name.clone());
-                                                        self.mark_active_tab_saved(history);
-                                                        self.file_status = Some(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
-                                                    }
-                                                    Err(e) => self.file_status = Some(format!("Save failed: {e}")),
-                                                }
-                                            }
+                                            self.dispatch_command("file.save", doc, history);
                                         }
                                         if ui.button("  Save As…  ").clicked() {
                                             self.active_drawer = None;

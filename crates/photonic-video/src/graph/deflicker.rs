@@ -130,6 +130,24 @@ impl DeflickerParams {
     }
 }
 
+/// Convert an isolated associated AP1 analysis image to the meter's linear709
+/// coordinates. This conversion happens before exposure encoding or row means,
+/// never after a display transform. Coverage is preserved.
+pub fn native_meter_image(input: &Image) -> Image {
+    let matrix = crate::color::native::ap1_to_linear_srgb();
+    let mut out = input.clone();
+    for pixel in &mut out.pixels {
+        let p = *pixel;
+        let rgb = matrix.0.map(|row| {
+            p[1] as f64
+                + row[0] * (p[0] as f64 - p[1] as f64)
+                + row[2] * (p[2] as f64 - p[1] as f64)
+        });
+        *pixel = [rgb[0] as f32, rgb[1] as f32, rgb[2] as f32, p[3]];
+    }
+    out
+}
+
 /// Mean sRGB-encoded, unpremultiplied `[r, g, b]` of `img` — one sample of an
 /// [`ExposureCurve`].
 ///
@@ -217,6 +235,51 @@ fn baseline(v: &[f32], window: usize, smooth: usize) -> Vec<f32> {
 /// Returned gains multiply **sRGB-encoded** channel values (see module docs).
 /// A gain of `1.0` is a no-op, and an empty curve yields an empty result.
 pub fn solve_gains(curve: &ExposureCurve, params: DeflickerParams) -> Vec<[f32; 3]> {
+    solve_gains_impl(curve, params, false)
+}
+
+/// Native finite-range analysis uses only observed samples at range edges.
+/// Repeating edge pixels to fill a window longer than the clip invents a
+/// brightness ramp on alternating short footage. Legacy boundary policy stays
+/// unchanged for existing projects.
+pub fn solve_native_gains(curve: &ExposureCurve, params: DeflickerParams) -> Vec<[f32; 3]> {
+    solve_gains_impl(curve, params, true)
+}
+
+fn observed_baseline(v: &[f32], window: usize, smooth: usize) -> Vec<f32> {
+    if v.is_empty() {
+        return Vec::new();
+    }
+    let half = window / 2;
+    let median: Vec<f32> = (0..v.len())
+        .map(|i| {
+            let mut values = v
+                [i.saturating_sub(half)..i.saturating_add(half).saturating_add(1).min(v.len())]
+                .to_vec();
+            values.sort_by(f32::total_cmp);
+            let m = values.len() / 2;
+            if values.len() % 2 == 0 {
+                (values[m - 1] as f64 / 2.0 + values[m] as f64 / 2.0) as f32
+            } else {
+                values[m]
+            }
+        })
+        .collect();
+    let half = smooth / 2;
+    (0..v.len())
+        .map(|i| {
+            let slice = &median
+                [i.saturating_sub(half)..i.saturating_add(half).saturating_add(1).min(v.len())];
+            (slice.iter().map(|v| *v as f64).sum::<f64>() / slice.len() as f64) as f32
+        })
+        .collect()
+}
+
+fn solve_gains_impl(
+    curve: &ExposureCurve,
+    params: DeflickerParams,
+    observed: bool,
+) -> Vec<[f32; 3]> {
     let params = params.sanitized();
     let n = curve.len();
     if n == 0 {
@@ -237,7 +300,11 @@ pub fn solve_gains(curve: &ExposureCurve, params: DeflickerParams) -> Vec<[f32; 
                 .zip(&log_gain)
                 .map(|(sample, gain)| sample[c].max(1e-6).ln() + gain[c])
                 .collect();
-            let base = baseline(&corrected, params.window_frames, params.smooth_frames);
+            let base = if observed {
+                observed_baseline(&corrected, params.window_frames, params.smooth_frames)
+            } else {
+                baseline(&corrected, params.window_frames, params.smooth_frames)
+            };
             for ((gain, b), corr) in log_gain.iter_mut().zip(&base).zip(&corrected) {
                 gain[c] = (gain[c] + (b - corr)).clamp(-lim, lim);
             }
@@ -374,17 +441,51 @@ impl ClipGains {
     }
 }
 
+/// Exact native effect occurrence. Shared owners are evaluated in a particular
+/// clip context except the master, and track/master use sequence-relative time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NativeDeflickerKey {
+    pub sequence: photonic_core::timeline::SequenceId,
+    pub owner: photonic_core::timeline::VfxOwner,
+    pub clip_context: Option<ClipId>,
+    pub effect_index: u32,
+}
+
 /// Measured gains for every analysed clip — the store [`compile_full`] consults.
 ///
 /// [`compile_full`]: crate::graph::compile::compile_full
 #[derive(Clone, Debug, Default)]
 pub struct GainTable {
     clips: HashMap<ClipId, ClipGains>,
+    native: HashMap<NativeDeflickerKey, ClipGains>,
 }
 
 impl GainTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn clear_native(&mut self) {
+        self.native.clear();
+    }
+    pub fn insert_native(&mut self, key: NativeDeflickerKey, gains: ClipGains) {
+        self.native.insert(key, gains);
+    }
+    pub fn remove_native(&mut self, key: &NativeDeflickerKey) {
+        self.native.remove(key);
+    }
+    pub fn contains_native(&self, key: &NativeDeflickerKey) -> bool {
+        self.native.contains_key(key)
+    }
+    pub fn native_gain(&self, key: &NativeDeflickerKey, at: Tick) -> Option<[f32; 3]> {
+        self.native.get(key)?.at(at)
+    }
+    pub fn native_band(
+        &self,
+        key: &NativeDeflickerKey,
+        at: Tick,
+    ) -> Option<crate::graph::rolling_bands::BandModel> {
+        self.native.get(key)?.band_at(at)
     }
 
     pub fn insert(&mut self, clip: ClipId, gains: ClipGains) {
@@ -393,6 +494,7 @@ impl GainTable {
 
     pub fn remove(&mut self, clip: &ClipId) {
         self.clips.remove(clip);
+        self.native.retain(|key, _| key.clip_context != Some(*clip));
     }
 
     pub fn contains(&self, clip: &ClipId) -> bool {
@@ -400,19 +502,31 @@ impl GainTable {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.clips.is_empty()
+        self.clips.is_empty() && self.native.is_empty()
     }
 
     pub fn len(&self) -> usize {
-        self.clips.len()
+        self.clips.len() + self.native.len()
     }
 
     pub fn clear(&mut self) {
         self.clips.clear();
+        self.native.clear();
     }
 }
 
 impl crate::graph::compile::DeflickerGains for GainTable {
+    fn native_gain(&self, key: &NativeDeflickerKey, at: Tick) -> Option<[f32; 3]> {
+        GainTable::native_gain(self, key, at)
+    }
+    fn native_band(
+        &self,
+        key: &NativeDeflickerKey,
+        at: Tick,
+    ) -> Option<crate::graph::rolling_bands::BandModel> {
+        GainTable::native_band(self, key, at)
+    }
+
     fn gain(&self, clip: ClipId, dt: Tick) -> Option<[f32; 3]> {
         self.clips.get(&clip)?.at(dt)
     }
@@ -452,6 +566,128 @@ pub fn params_for(
     .sanitized()
 }
 
+/// A bounded, uniform analysis grid in clip-relative ticks. Construction uses
+/// widened arithmetic, includes a partial final frame, and never creates more
+/// samples than the budget. Failed samples must not be removed from this grid.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnalysisGrid {
+    pub step: i64,
+    pub stride: usize,
+    pub ticks: Vec<Tick>,
+}
+
+impl AnalysisGrid {
+    pub fn new(duration: Tick, frame_ticks: i64, max_samples: usize) -> Option<Self> {
+        if duration.0 <= 0 || frame_ticks <= 0 || max_samples == 0 || max_samples > 4096 {
+            return None;
+        }
+        let duration = duration.0 as i128;
+        let frame = frame_ticks as i128;
+        let total = (duration + frame - 1) / frame;
+        let stride = (total + max_samples as i128 - 1) / max_samples as i128;
+        let step = frame.checked_mul(stride)?;
+        // A sample step beyond Tick's range cannot be represented by ClipGains.
+        let step = i64::try_from(step).ok()?;
+        let stride = usize::try_from(stride).ok()?;
+        let count = (duration + step as i128 - 1) / step as i128;
+        let ticks = (0..count)
+            .map(|i| Tick((i * step as i128) as i64))
+            .collect();
+        Some(Self {
+            step,
+            stride,
+            ticks,
+        })
+    }
+
+    /// Commit only a complete, finite curve. Retaining slot identity until this
+    /// point prevents a missing decode from shifting every following gain.
+    pub fn solve_complete(
+        &self,
+        samples: &[Option<[f32; 3]>],
+        params: DeflickerParams,
+    ) -> Option<ClipGains> {
+        self.solve_complete_impl(samples, params, false)
+    }
+    pub fn solve_complete_native(
+        &self,
+        samples: &[Option<[f32; 3]>],
+        params: DeflickerParams,
+    ) -> Option<ClipGains> {
+        self.solve_complete_impl(samples, params, true)
+    }
+    fn solve_complete_impl(
+        &self,
+        samples: &[Option<[f32; 3]>],
+        params: DeflickerParams,
+        observed: bool,
+    ) -> Option<ClipGains> {
+        if samples.len() != self.ticks.len() || samples.is_empty() {
+            return None;
+        }
+        let samples: Option<Vec<_>> = samples
+            .iter()
+            .map(|s| {
+                let value = (*s)?;
+                value
+                    .iter()
+                    .all(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                    .then_some(value)
+            })
+            .collect();
+        let curve = ExposureCurve { samples: samples? };
+        Some(ClipGains {
+            first: Tick(0),
+            step: self.step,
+            gains: if observed {
+                solve_native_gains(&curve, params)
+            } else {
+                solve_gains(&curve, params)
+            },
+            band: None,
+            frame_ticks: self.step,
+        })
+    }
+}
+
+/// Resolve analysis controls on the same bounded sample grid as exposure data.
+/// Gains interpolate between these grid ticks; amount/chroma stay per-frame.
+pub(crate) fn native_analysis_params_at(
+    authored: &photonic_core::timeline::AnimProps<photonic_core::timeline::EffectParams>,
+    tick: Tick,
+    fps: f32,
+    stride: usize,
+) -> Option<DeflickerParams> {
+    use photonic_core::timeline::{PropPath, PropValue};
+    if !fps.is_finite() || fps <= 0.0 || stride == 0 {
+        return None;
+    }
+    let value = |path: &str, default: f64, lo: f64, hi: f64| {
+        let base = authored
+            .base
+            .get(path)
+            .copied()
+            .unwrap_or(PropValue::Float(default));
+        let v = authored.track(&PropPath::new(path)).map_or(base, |lane| {
+            photonic_core::timeline::anim::eval(lane, &base, tick)
+        });
+        match v {
+            PropValue::Float(v) if v.is_finite() && (lo..=hi).contains(&v) => Some(v as f32),
+            _ => None,
+        }
+    };
+    let mut p = params_for(
+        1.0,
+        value("params.window", 4.0, 0.2, 30.0)?,
+        value("params.max_change", 0.25, 0.0, 0.9)?,
+        1.0,
+        fps,
+    );
+    p.window_frames = (p.window_frames / stride).max(1) | 1;
+    p.smooth_frames = (p.smooth_frames / stride).max(1) | 1;
+    Some(p)
+}
+
 /// Run the deflicker analysis over a clip's frames and solve its gains.
 ///
 /// `frames` must be in presentation order, sampled every `step` ticks starting
@@ -486,6 +722,254 @@ pub fn measure_clip<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_analysis_keys_isolate_owner_occurrence_context_and_sequence() {
+        use photonic_core::timeline::{AssetId, SequenceId, TrackId, VfxOwner};
+        let seq = SequenceId::new();
+        let clip = ClipId::new();
+        let asset = AssetId::new();
+        let track = TrackId::new();
+        let base = NativeDeflickerKey {
+            sequence: seq,
+            owner: VfxOwner::Clip(clip),
+            clip_context: Some(clip),
+            effect_index: 0,
+        };
+        let keys = [
+            base,
+            NativeDeflickerKey {
+                owner: VfxOwner::Asset(asset),
+                ..base
+            },
+            NativeDeflickerKey {
+                owner: VfxOwner::Track(track),
+                ..base
+            },
+            NativeDeflickerKey {
+                owner: VfxOwner::Master(seq),
+                clip_context: None,
+                ..base
+            },
+            NativeDeflickerKey {
+                effect_index: 1,
+                ..base
+            },
+            NativeDeflickerKey {
+                clip_context: Some(ClipId::new()),
+                ..base
+            },
+            NativeDeflickerKey {
+                sequence: SequenceId::new(),
+                ..base
+            },
+        ];
+        let mut table = GainTable::new();
+        for (i, key) in keys.into_iter().enumerate() {
+            table.insert_native(
+                key,
+                ClipGains {
+                    first: Tick(100),
+                    step: 10,
+                    gains: vec![[i as f32 + 1.0; 3], [i as f32 + 2.0; 3]],
+                    band: None,
+                    frame_ticks: 10,
+                },
+            );
+        }
+        assert_eq!(table.len(), keys.len());
+        assert!(!table.is_empty());
+        for (i, key) in keys.into_iter().enumerate() {
+            assert!(table.contains_native(&key));
+            assert_eq!(
+                table.native_gain(&key, Tick(105)),
+                Some([i as f32 + 1.5; 3])
+            );
+            assert_eq!(table.native_gain(&key, Tick(0)), Some([i as f32 + 1.0; 3]));
+            assert_eq!(
+                table.native_gain(&key, Tick(999)),
+                Some([i as f32 + 2.0; 3])
+            );
+        }
+        table.remove_native(&base);
+        assert!(!table.contains_native(&base));
+        assert!(table.contains_native(&keys[1]));
+        table.insert(
+            clip,
+            ClipGains {
+                first: Tick(0),
+                step: 1,
+                gains: vec![[9.0; 3]],
+                band: None,
+                frame_ticks: 1,
+            },
+        );
+        assert_eq!(
+            crate::graph::compile::DeflickerGains::gain(&table, clip, Tick(0)),
+            Some([9.0; 3])
+        );
+        assert_eq!(table.native_gain(&base, Tick(0)), None);
+        table.clear();
+        assert_eq!(table.len(), 0);
+        assert!(table.is_empty());
+    }
+
+    #[test]
+    fn native_analysis_settings_resolve_on_bounded_grid_and_reject_invalid_values() {
+        use photonic_core::timeline::{
+            ClipEffect, EffectKind, Interp, Keyframe, PropPath, PropValue, PropertyTrack,
+        };
+        let mut effect = ClipEffect::new(EffectKind::Deflicker);
+        for (path, a, b) in [("params.window", 0.2, 4.0), ("params.max_change", 0.1, 0.9)] {
+            let mut lane = PropertyTrack::new(PropPath::new(path));
+            lane.keyframes
+                .push(Keyframe::new(Tick(0), PropValue::Float(a), Interp::Linear));
+            lane.keyframes.push(Keyframe::new(
+                Tick(100),
+                PropValue::Float(b),
+                Interp::Linear,
+            ));
+            effect.params.tracks.push(lane);
+        }
+        for (t, window, change) in [
+            (0, 0.2, 0.1),
+            (50, 2.1, 0.5),
+            (100, 4.0, 0.9),
+            (200, 4.0, 0.9),
+        ] {
+            let p = native_analysis_params_at(&effect.params, Tick(t), 30.0, 1).unwrap();
+            let e = params_for(1.0, window, change, 1.0, 30.0);
+            assert_eq!(p.window_frames, e.window_frames);
+            assert!((p.max_change - e.max_change).abs() < 1e-6);
+            assert_eq!(p.amount, 1.0);
+            assert_eq!(p.chroma_amount, 1.0);
+            let strided = native_analysis_params_at(&effect.params, Tick(t), 30.0, 4).unwrap();
+            assert_eq!(strided.window_frames, (e.window_frames / 4).max(1) | 1);
+        }
+        effect.params.tracks[0].keyframes[0].interp = Interp::Hold;
+        assert_eq!(
+            native_analysis_params_at(&effect.params, Tick(50), 30.0, 1)
+                .unwrap()
+                .window_frames,
+            7
+        );
+        effect.params.tracks[0].keyframes[0].value = PropValue::Float(f64::NAN);
+        assert!(native_analysis_params_at(&effect.params, Tick(0), 30.0, 1).is_none());
+        assert!(native_analysis_params_at(&effect.params, Tick(100), f32::NAN, 1).is_none());
+        assert!(native_analysis_params_at(&effect.params, Tick(100), 30.0, 0).is_none());
+    }
+
+    #[test]
+    fn native_observed_boundaries_do_not_invent_short_clip_exposure_ramps() {
+        let curve = ExposureCurve {
+            samples: (0..60)
+                .map(|i| [if (i / 3) % 2 == 0 { 0.55 } else { 0.64 }; 3])
+                .collect(),
+        };
+        let params = DeflickerParams {
+            amount: 1.0,
+            chroma_amount: 1.0,
+            ..DeflickerParams::default()
+        };
+        let gains = solve_native_gains(&curve, params);
+        let corrected: Vec<_> = curve
+            .samples
+            .iter()
+            .zip(&gains)
+            .map(|(s, g)| s[0] * g[0])
+            .collect();
+        let min = corrected.iter().copied().fold(f32::INFINITY, f32::min);
+        let max = corrected.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert!(max - min < 0.00001);
+        assert_eq!(
+            solve_native_gains(
+                &ExposureCurve {
+                    samples: vec![[0.4; 3]; 1]
+                },
+                params
+            ),
+            vec![[1.0; 3]]
+        );
+        assert!(solve_native_gains(&ExposureCurve::default(), params).is_empty());
+        let legacy = solve_gains(&curve, params);
+        assert_ne!(legacy, gains, "Legacy boundary policy remains distinct");
+        assert_eq!(observed_baseline(&[1.0, 3.0], 121, 15), vec![2.0, 2.0]);
+    }
+
+    #[test]
+    fn analysis_grid_is_bounded_uniform_and_includes_partial_frames() {
+        for duration in [1, 2, 9, 10, 11, 2399, 2400, 2401, 240_001, i64::MAX] {
+            for frame in [1, 10, 23_520_000] {
+                for budget in [1, 2, 12, 240, 4096] {
+                    let grid = AnalysisGrid::new(Tick(duration), frame, budget);
+                    if let Some(grid) = grid {
+                        assert!(!grid.ticks.is_empty());
+                        assert!(grid.ticks.len() <= budget);
+                        assert_eq!(grid.ticks[0], Tick(0));
+                        for (i, t) in grid.ticks.iter().enumerate() {
+                            assert_eq!(t.0 as i128, i as i128 * grid.step as i128);
+                            assert!((0..duration).contains(&t.0));
+                        }
+                        assert!(
+                            grid.ticks.last().unwrap().0 as i128 + grid.step as i128
+                                >= duration as i128
+                        );
+                    } else {
+                        let frames = (duration as i128 + frame as i128 - 1) / frame as i128;
+                        let stride = (frames + budget as i128 - 1) / budget as i128;
+                        assert!(stride * frame as i128 > i64::MAX as i128);
+                    }
+                }
+            }
+        }
+        let grid = AnalysisGrid::new(Tick(2401), 10, 240).unwrap();
+        assert_eq!(grid.stride, 2);
+        assert_eq!(grid.ticks.len(), 121);
+        assert_eq!(grid.ticks.last(), Some(&Tick(2400)));
+        for (duration, frame, cap) in [
+            (0, 1, 1),
+            (-1, 1, 1),
+            (1, 0, 1),
+            (1, -1, 1),
+            (1, 1, 0),
+            (1, 1, 4097),
+        ] {
+            assert!(AnalysisGrid::new(Tick(duration), frame, cap).is_none());
+        }
+    }
+
+    #[test]
+    fn analysis_grid_rejects_missing_invalid_or_repacked_samples() {
+        let grid = AnalysisGrid::new(Tick(30), 10, 240).unwrap();
+        let params = DeflickerParams::default();
+        let complete = [Some([0.2; 3]), Some([0.4; 3]), Some([0.2; 3])];
+        let result = grid.solve_complete(&complete, params).unwrap();
+        assert_eq!(result.step, 10);
+        assert_eq!(result.first, Tick(0));
+        assert_eq!(result.gains.len(), 3);
+        assert_eq!(
+            result.gains,
+            solve_gains(
+                &ExposureCurve {
+                    samples: vec![[0.2; 3], [0.4; 3], [0.2; 3]]
+                },
+                params
+            )
+        );
+        for index in 0..3 {
+            let mut missing = complete;
+            missing[index] = None;
+            assert!(grid.solve_complete(&missing, params).is_none());
+            let packed: Vec<_> = missing.into_iter().filter(Option::is_some).collect();
+            assert!(grid.solve_complete(&packed, params).is_none());
+            for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 1.01] {
+                let mut invalid = complete;
+                invalid[index] = Some([bad, 0.2, 0.3]);
+                assert!(grid.solve_complete(&invalid, params).is_none());
+            }
+        }
+        assert!(grid.solve_complete(&[], params).is_none());
+    }
+
     use crate::graph::ir::LinearColor;
 
     fn gray(v: f32) -> Image {

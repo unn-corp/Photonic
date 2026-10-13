@@ -402,6 +402,8 @@ const MOTION_BLUR_PARAMS: &[ParamSpec] = &[
     pf("params.angle", Some((0.0, 360.0)), UiHint::Angle),
     pf_def("params.distance", 8.0, Some((0.0, 500.0)), UiHint::Slider),
 ];
+// Managed gamma uses bounded correction plus linear extended residual tails.
+// Legacy raster retains its input/output clamps.
 const LEVELS_PARAMS: &[ParamSpec] = &[
     pf("params.in_black", Some((0.0, 1.0)), UiHint::Slider),
     pf_def("params.in_white", 1.0, Some((0.0, 1.0)), UiHint::Slider),
@@ -427,6 +429,8 @@ const HUE_SAT_PARAMS: &[ParamSpec] = &[
     pf("params.lightness", Some((-1.0, 1.0)), UiHint::Slider),
 ];
 const VIBRANCE_PARAMS: &[ParamSpec] = &[pf("params.amount", Some((-1.0, 1.0)), UiHint::Slider)];
+// Native managed evaluation retains extended signed transfer values; Legacy
+// raster evaluation retains its u8 output clamp. Same authored coefficients.
 const CHANNEL_MIXER_PARAMS: &[ParamSpec] = &[
     pf_def("params.rr", 1.0, Some((-2.0, 2.0)), UiHint::Slider),
     pf("params.rg", Some((-2.0, 2.0)), UiHint::Slider),
@@ -438,6 +442,8 @@ const CHANNEL_MIXER_PARAMS: &[ParamSpec] = &[
     pf("params.bg", Some((-2.0, 2.0)), UiHint::Slider),
     pf_def("params.bb", 1.0, Some((-2.0, 2.0)), UiHint::Slider),
 ];
+// Native managed Black & White uses normalized encoded-space weights without
+// the Legacy raster output clamp; all-zero weights retain equal-third fallback.
 const BW_PARAMS: &[ParamSpec] = &[
     pf_def("params.wr", 0.299, Some((0.0, 1.0)), UiHint::Slider),
     pf_def("params.wg", 0.587, Some((0.0, 1.0)), UiHint::Slider),
@@ -467,6 +473,8 @@ const CA_PARAMS: &[ParamSpec] = &[pf_def(
 const CLARITY_PARAMS: &[ParamSpec] = &[pf("params.amount", Some((-1.0, 1.0)), UiHint::Slider)];
 /// Multi-point RGB curve: up to 5 knots (x,y in 0..1) plus optional contrast
 /// pivot. Identity defaults; non-zero contrast overrides the middle knot.
+// Native uses floating shared Hermite math and endpoint-tangent extension.
+// Legacy constant-endpoint byte LUT behavior is unchanged.
 const CURVES_PARAMS: &[ParamSpec] = &[
     pf("params.contrast", Some((-1.0, 1.0)), UiHint::Slider),
     pf("params.p0x", Some((0.0, 1.0)), UiHint::Slider),
@@ -480,6 +488,8 @@ const CURVES_PARAMS: &[ParamSpec] = &[
     pf_def("params.p4x", 1.0, Some((0.0, 1.0)), UiHint::Slider),
     pf_def("params.p4y", 1.0, Some((0.0, 1.0)), UiHint::Slider),
 ];
+// Native evaluation preserves extended signed transfer values without the
+// Legacy raster rescale clamp. Preserve Luminosity retains the >0.5 switch.
 const PHOTO_FILTER_PARAMS: &[ParamSpec] = &[
     pf_def("params.r", 1.0, Some((0.0, 1.0)), UiHint::Slider),
     pf_def("params.g", 0.5, Some((0.0, 1.0)), UiHint::Slider),
@@ -492,6 +502,8 @@ const PHOTO_FILTER_PARAMS: &[ParamSpec] = &[
         UiHint::Slider,
     ),
 ];
+// Native managed RGB keeps extended transfer values; bounded tonal masks and
+// Legacy preserve >0.5 semantics remain. Raster RGB clamps are unchanged.
 const COLOR_BALANCE_PARAMS: &[ParamSpec] = &[
     pf("params.shadows_r", Some((-1.0, 1.0)), UiHint::Slider),
     pf("params.shadows_g", Some((-1.0, 1.0)), UiHint::Slider),
@@ -607,7 +619,10 @@ pub static MANIFESTS: &[EffectManifest] = &[
         name: "Lens Blur",
         category: EffectCategory::Blur,
         params: BLUR_PARAMS,
-        caps: Caps::DEFAULT,
+        caps: Caps {
+            alpha: AlphaBehaviour::Modifies,
+            ..Caps::DEFAULT
+        },
         applies: Applicability::ALL_SCOPES,
         space: OperandSpace::LinearStraight,
         arity: 1,
@@ -816,7 +831,10 @@ pub static MANIFESTS: &[EffectManifest] = &[
         name: "Median",
         category: EffectCategory::Blur,
         params: BLUR_PARAMS,
-        caps: Caps::DEFAULT,
+        caps: Caps {
+            alpha: AlphaBehaviour::Modifies,
+            ..Caps::DEFAULT
+        },
         applies: Applicability::ALL_SCOPES,
         space: OperandSpace::LinearStraight,
         arity: 1,
@@ -1025,7 +1043,10 @@ pub static MANIFESTS: &[EffectManifest] = &[
         name: "Alpha View",
         category: EffectCategory::Util,
         params: ALPHA_VIEW_PARAMS,
-        caps: Caps::DEFAULT,
+        caps: Caps {
+            alpha: AlphaBehaviour::Modifies,
+            ..Caps::DEFAULT
+        },
         applies: Applicability::ALL_SCOPES,
         space: OperandSpace::LinearStraight,
         arity: 1,
@@ -1059,7 +1080,10 @@ pub static MANIFESTS: &[EffectManifest] = &[
         name: "Outline",
         category: EffectCategory::Util,
         params: OUTLINE_PARAMS,
-        caps: Caps::DEFAULT,
+        caps: Caps {
+            alpha: AlphaBehaviour::Modifies,
+            ..Caps::DEFAULT
+        },
         applies: Applicability::ALL_SCOPES,
         space: OperandSpace::LinearStraight,
         arity: 1,
@@ -1070,7 +1094,10 @@ pub static MANIFESTS: &[EffectManifest] = &[
         name: "Unpremultiply",
         category: EffectCategory::Util,
         params: INVERT_PARAMS,
-        caps: Caps::DEFAULT,
+        caps: Caps {
+            alpha: AlphaBehaviour::Modifies,
+            ..Caps::DEFAULT
+        },
         applies: Applicability::ALL_SCOPES,
         space: OperandSpace::LinearStraight,
         arity: 1,
@@ -1257,6 +1284,18 @@ mod tests {
     }
 
     #[test]
+    fn native_lens_blur_metadata_matches_existing_coverage_kernel() {
+        let m = manifest(EffectId::new_static("blur.lens")).unwrap();
+        assert_eq!(m.caps.alpha, AlphaBehaviour::Modifies);
+        assert_eq!(m.params[0].default, PropValue::Float(0.0));
+        let mut image = crate::raster::image::RasterImage::new(5, 5);
+        image.set_pixel(2, 2, [255, 0, 0, 255]);
+        crate::raster::advanced::lens_blur(&mut image, 1.0, None);
+        assert_eq!(image.pixel(2, 2)[3], 51);
+        assert_eq!(image.pixel(2, 1)[3], 51);
+        assert_eq!(image.pixel(0, 0)[3], 0);
+    }
+    #[test]
     fn defaults_match_kind_and_range() {
         for m in MANIFESTS {
             for p in m.params {
@@ -1370,5 +1409,63 @@ mod tests {
             Ok(3),
             "unknown id migrate is a no-op"
         );
+    }
+}
+
+#[cfg(test)]
+mod alpha_view_caps_tests {
+    use super::*;
+    #[test]
+    fn alpha_view_declares_modified_coverage() {
+        let m = manifest(EffectId::new_static("util.alpha_view")).unwrap();
+        assert_eq!(m.caps.alpha, AlphaBehaviour::Modifies);
+        assert_eq!(m.caps.gpu, GpuSupport::Native);
+        assert_eq!(m.arity, 1);
+    }
+}
+
+#[cfg(test)]
+mod outline_caps_tests {
+    use super::*;
+    #[test]
+    fn native_outline_declares_modified_coverage() {
+        let m = manifest(EffectId::new_static("util.outline")).unwrap();
+        assert_eq!(m.caps.alpha, AlphaBehaviour::Modifies);
+        assert_eq!(m.caps.gpu, GpuSupport::Native);
+        assert_eq!(m.arity, 1);
+    }
+}
+
+#[cfg(test)]
+mod unpremultiply_caps_tests {
+    use super::*;
+    #[test]
+    fn native_unpremultiply_declares_cutoff_coverage_and_no_parameters() {
+        let m = manifest(EffectId::new_static("util.unpremultiply")).unwrap();
+        assert_eq!(m.caps.alpha, AlphaBehaviour::Modifies);
+        assert!(m.params.is_empty());
+        assert_eq!(m.arity, 1);
+    }
+}
+
+#[cfg(test)]
+mod rank_caps_tests {
+    use super::*;
+    #[test]
+    fn native_rank_catalog_alpha_and_neutral_core_contract() {
+        let median = manifest(EffectId::new_static("filter.median")).unwrap();
+        let dust = manifest(EffectId::new_static("repair.dust_and_scratches")).unwrap();
+        assert_eq!(median.caps.alpha, AlphaBehaviour::Modifies);
+        assert_eq!(dust.caps.alpha, AlphaBehaviour::Preserves);
+        assert_eq!(median.params[0].default, PropValue::Float(0.0));
+        assert_eq!(dust.params[0].default, PropValue::Float(1.0));
+        assert_eq!(dust.params[1].default, PropValue::Float(16.0));
+        let mut image = crate::raster::image::RasterImage::new(5, 5);
+        image.set_pixel(2, 2, [255, 0, 0, 255]);
+        let original = image.clone();
+        crate::raster::filter::median(&mut image, 0, None);
+        assert_eq!(image, original);
+        crate::raster::filter::median(&mut image, 1, None);
+        assert_eq!(image.pixel(2, 2)[3], 0);
     }
 }

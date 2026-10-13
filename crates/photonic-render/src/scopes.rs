@@ -612,123 +612,151 @@ pub fn begin_scope_readback_signal(
     extra_z: u32,
     signal: ScopeSignal,
 ) -> ScopeReadback {
-    let bins = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("scope_bins"),
-        contents: bytemuck::cast_slice(&vec![0u32; out_len]),
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-    });
-    let logical_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("scope_logical"),
-        contents: bytemuck::cast_slice(&[
-            logical.0,
-            logical.1,
-            extra_z,
-            u32::from(signal == ScopeSignal::SrgbDisplay),
-        ]),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("scope_bgl"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("scope_shader"),
-        source: wgpu::ShaderSource::Wgsl(expand(shader_src).into()),
-    });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("scope_layout"),
-        bind_group_layouts: &[&bgl],
-        push_constant_ranges: &[],
-    });
-    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some("scope_pipeline"),
-        layout: Some(&layout),
-        module: &shader,
-        entry_point: entry,
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let view = tex.create_view(&Default::default());
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("scope_bg"),
-        layout: &bgl,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: bins.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: logical_buf.as_entire_binding(),
-            },
-        ],
-    });
-    // Dispatch over the logical extent only — the shader still bounds-checks, but
-    // there is no reason to launch invocations over pool padding.
-    let (w, h) = (
-        logical.0.min(tex.width()).max(1),
-        logical.1.min(tex.height()).max(1),
-    );
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("scope_rb"),
-        size: (out_len * 4) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut enc = device.create_command_encoder(&Default::default());
-    {
-        let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("scope_pass"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind, &[]);
-        pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
-    }
-    enc.copy_buffer_to_buffer(&bins, 0, &staging, 0, (out_len * 4) as u64);
-    queue.submit([enc.finish()]);
+    ScopeKernel::new(device, shader_src, entry)
+        .readback(device, queue, tex, out_len, logical, extra_z, signal)
+}
 
-    let slice = staging.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |r| {
-        let _ = tx.send(r);
-    });
-    ScopeReadback { staging, ready: rx }
+/// Device-local immutable scope pipeline. Keep at most one per scope view;
+/// each readback still owns fresh zeroed counters and a separate staging buffer.
+/// Do not reuse across devices. No document/media content is retained here.
+pub struct ScopeKernel {
+    bgl: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
+impl ScopeKernel {
+    pub fn new(device: &wgpu::Device, shader_src: &str, entry: &str) -> Self {
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("scope_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("scope_shader"),
+            source: wgpu::ShaderSource::Wgsl(expand(shader_src).into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("scope_layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("scope_pipeline"),
+            layout: Some(&layout),
+            module: &shader,
+            entry_point: entry,
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        Self { bgl, pipeline }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn readback(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        tex: &wgpu::Texture,
+        out_len: usize,
+        logical: (u32, u32),
+        extra_z: u32,
+        signal: ScopeSignal,
+    ) -> ScopeReadback {
+        let bins = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scope_bins"),
+            contents: bytemuck::cast_slice(&vec![0u32; out_len]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        });
+        let logical_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("scope_logical"),
+            contents: bytemuck::cast_slice(&[
+                logical.0,
+                logical.1,
+                extra_z,
+                u32::from(signal == ScopeSignal::SrgbDisplay),
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let view = tex.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scope_bg"),
+            layout: &self.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: bins.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: logical_buf.as_entire_binding(),
+                },
+            ],
+        });
+        // Dispatch over the logical extent only — the shader still bounds-checks, but
+        // there is no reason to launch invocations over pool padding.
+        let (w, h) = (
+            logical.0.min(tex.width()).max(1),
+            logical.1.min(tex.height()).max(1),
+        );
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("scope_rb"),
+            size: (out_len * 4) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("scope_pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        enc.copy_buffer_to_buffer(&bins, 0, &staging, 0, (out_len * 4) as u64);
+        queue.submit([enc.finish()]);
+
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        ScopeReadback { staging, ready: rx }
+    }
 }
 
 /// GPU histogram at the readback point (07 §5), measuring the whole texture.
@@ -898,6 +926,271 @@ pub fn scopes_from_texture_gpu_logical(
 mod tests {
     use super::*;
     use crate::pipeline::WORKING_FORMAT;
+
+    #[test]
+    #[ignore = "explicit high-resolution software-GPU scope timing diagnostic"]
+    fn scene_scope_high_resolution_readback_diagnostic() {
+        let (device, queue) = try_device().expect("scope diagnostic requires adapter");
+        let mut rows = Vec::new();
+        for (w, h) in [(512u32, 288u32), (1920, 1080), (3840, 2160)] {
+            // Exact half values: distributed positive scene values spanning 16 stops.
+            // This is synthetic spatial content, not a footage acceptance benchmark.
+            let values: Vec<f32> = (-8..8).map(|e| 2.0f32.powi(e)).collect();
+            let mut px = Vec::with_capacity(w as usize * h as usize * 4);
+            for y in 0..h {
+                for x in 0..w {
+                    px.extend_from_slice(&[
+                        values[((x / 16 + y / 16) % 16) as usize],
+                        values[((x / 32 + y / 8 + 5) % 16) as usize],
+                        values[((x / 8 + y / 32 + 11) % 16) as usize],
+                        1.0,
+                    ]);
+                }
+            }
+            let tex = upload(&device, &queue, &px, w, h);
+            drop(px);
+            device.poll(wgpu::Maintain::Wait);
+            let len = crate::scene_scopes::output_len(w, h).unwrap();
+            let cached_kernel = ScopeKernel::new(&device, crate::scene_scopes::SHADER, "cs_scene");
+            for reuse in [false, true] {
+                let mut samples = Vec::new();
+                for iteration in 0..3 {
+                    let start = std::time::Instant::now();
+                    let request = if reuse {
+                        cached_kernel.readback(
+                            &device,
+                            &queue,
+                            &tex,
+                            len,
+                            (w, h),
+                            0,
+                            ScopeSignal::LegacyLinearRec709,
+                        )
+                    } else {
+                        begin_scope_readback(
+                            &device,
+                            &queue,
+                            &tex,
+                            crate::scene_scopes::SHADER,
+                            "cs_scene",
+                            len,
+                            (w, h),
+                            0,
+                        )
+                    };
+                    let submit_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    device.poll(wgpu::Maintain::Wait);
+                    let bins = request.finish().unwrap();
+                    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let result = crate::scene_scopes::SceneScopes::from_bins(&bins, w, h).unwrap();
+                    assert_eq!(result.transparent, 0);
+                    assert_eq!(result.invalid, 0);
+                    for c in 0..4 {
+                        let excluded = result.nonpositive[c] + result.below[c] + result.above[c];
+                        assert_eq!(result.histogram[c].iter().sum::<u32>() + excluded, w * h);
+                        assert_eq!(
+                            result.waveform[c].data.iter().sum::<u32>() + excluded,
+                            w * h
+                        );
+                    }
+                    samples.push(serde_json::json!({"iteration":iteration,"submit_ms":submit_ms,"readback_total_ms":total_ms}));
+                }
+                rows.push(
+                serde_json::json!({"width":w,"height":h,"reused_kernel":reuse,"output_bytes":len*4,"samples":samples}),
+            );
+            }
+        }
+        let report = serde_json::json!({"kind":"synthetic scene scope diagnostic","iterations_per_size":3,"includes":"dispatch/readback; pipeline creation included only when reused_kernel is false; input upload excluded","results":rows});
+        if let Ok(path) = std::env::var("PHOTONIC_SCENE_SCOPE_BENCH_REPORT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+        println!("{report}");
+    }
+
+    #[test]
+    fn cached_scope_kernel_reuses_pipeline_but_not_counts_or_signal() {
+        let (device, queue) = try_device().expect("kernel qualification needs GPU");
+        let tex = upload(
+            &device,
+            &queue,
+            &[0.25, 0.25, 0.25, 1.0, 0.5, 0.5, 0.5, 1.0],
+            2,
+            1,
+        );
+        let kernel = ScopeKernel::new(&device, HISTOGRAM_SHADER, "cs_hist");
+        for (logical, signal) in [
+            ((2, 1), ScopeSignal::LegacyLinearRec709),
+            ((1, 1), ScopeSignal::SrgbDisplay),
+            ((2, 1), ScopeSignal::SrgbDisplay),
+            ((2, 1), ScopeSignal::LegacyLinearRec709),
+        ] {
+            let cached =
+                kernel.readback(&device, &queue, &tex, HIST_BINS * 4 + 6, logical, 0, signal);
+            device.poll(wgpu::Maintain::Wait);
+            let cached = cached.finish().unwrap();
+            let uncached = begin_scope_readback_signal(
+                &device,
+                &queue,
+                &tex,
+                HISTOGRAM_SHADER,
+                "cs_hist",
+                HIST_BINS * 4 + 6,
+                logical,
+                0,
+                signal,
+            );
+            device.poll(wgpu::Maintain::Wait);
+            assert_eq!(cached, uncached.finish().unwrap());
+            assert_eq!(
+                cached[..HIST_BINS].iter().sum::<u32>(),
+                logical.0 * logical.1
+            );
+        }
+        let kernel = ScopeKernel::new(&device, crate::scene_scopes::SHADER, "cs_scene");
+        for logical in [(2, 1), (1, 1), (2, 1)] {
+            let len = crate::scene_scopes::output_len(logical.0, logical.1).unwrap();
+            let cached = kernel.readback(
+                &device,
+                &queue,
+                &tex,
+                len,
+                logical,
+                0,
+                ScopeSignal::LegacyLinearRec709,
+            );
+            device.poll(wgpu::Maintain::Wait);
+            let cached = cached.finish().unwrap();
+            let direct = begin_scope_readback(
+                &device,
+                &queue,
+                &tex,
+                crate::scene_scopes::SHADER,
+                "cs_scene",
+                len,
+                logical,
+                0,
+            );
+            device.poll(wgpu::Maintain::Wait);
+            assert_eq!(cached, direct.finish().unwrap());
+            let parsed =
+                crate::scene_scopes::SceneScopes::from_bins(&cached, logical.0, logical.1).unwrap();
+            assert_eq!(
+                parsed.histogram[0].iter().sum::<u32>(),
+                logical.0 * logical.1
+            );
+        }
+    }
+
+    #[test]
+    fn scene_scope_gpu_matches_independent_spatial_reference_and_padding() {
+        let (device, queue) = try_device().expect("scene scope qualification needs a GPU adapter");
+        let values = [
+            0.125f32,
+            0.25,
+            0.5,
+            1.0,
+            2.0,
+            4.0,
+            -1.0,
+            0.0,
+            1024.0,
+            0.000030517578125,
+        ];
+        let mut logical = Vec::new();
+        let mut padded = vec![0.0; 64 * 4 * 4];
+        for y in 0..2 {
+            for x in 0..10 {
+                let value = values[x];
+                let p = if y == 0 {
+                    [value, value * 0.5, value * 2.0, 1.0]
+                } else if x == 0 {
+                    [0.0; 4]
+                } else {
+                    [value * 0.5, value * 0.25, value, 0.5]
+                };
+                logical.push(p);
+                padded[(y * 64 + x) * 4..(y * 64 + x + 1) * 4].copy_from_slice(&p);
+            }
+        }
+        let tex = upload(&device, &queue, &padded, 64, 4);
+        // The older SDR test helper intentionally flushes half subnormals.
+        // This scene-range fixture must retain them; all authored components
+        // are exact binary fractions, so the subnormal conversion is exact.
+        let bits: Vec<u16> = padded
+            .iter()
+            .map(|&v| {
+                if v != 0.0 && v.abs() < 0.00006103515625 {
+                    ((v.abs() * 16777216.0).round() as u16)
+                        | if v.is_sign_negative() { 0x8000 } else { 0 }
+                } else {
+                    f32_to_f16_bits(v)
+                }
+            })
+            .collect();
+        queue.write_texture(
+            tex.as_image_copy(),
+            bytemuck::cast_slice(&bits),
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 8),
+                rows_per_image: Some(4),
+            },
+            wgpu::Extent3d {
+                width: 64,
+                height: 4,
+                depth_or_array_layers: 1,
+            },
+        );
+        let request = begin_scope_readback(
+            &device,
+            &queue,
+            &tex,
+            crate::scene_scopes::SHADER,
+            "cs_scene",
+            crate::scene_scopes::output_len(10, 2).unwrap(),
+            (10, 2),
+            0,
+        );
+        device.poll(wgpu::Maintain::Wait);
+        let bins = request.finish().unwrap();
+        let actual = crate::scene_scopes::SceneScopes::from_bins(&bins, 10, 2).unwrap();
+        let expected = crate::scene_scopes::measure(&logical, 10, 2).unwrap();
+        assert_eq!(actual.transparent, 1);
+        assert_eq!(actual.invalid, 0);
+        assert_eq!(actual.nonpositive, expected.nonpositive);
+        assert_eq!(actual.below, expected.below);
+        assert_eq!(actual.above, expected.above);
+        for c in 0..4 {
+            assert_eq!(
+                actual.histogram[c].iter().sum::<u32>(),
+                expected.histogram[c].iter().sum::<u32>()
+            );
+            for x in 0..10 {
+                let a: Vec<_> = (0..256)
+                    .filter(|&b| actual.waveform[c].count(x, b) > 0)
+                    .collect();
+                let b: Vec<_> = (0..256)
+                    .filter(|&b| expected.waveform[c].count(x, b) > 0)
+                    .collect();
+                assert_eq!(a.len(), b.len());
+                for (a, b) in a.iter().zip(&b) {
+                    assert!(a.abs_diff(*b) <= 1);
+                    assert_eq!(
+                        actual.waveform[c].count(x, *a),
+                        expected.waveform[c].count(x, *b)
+                    );
+                }
+            }
+            assert_eq!(
+                actual.histogram[c].iter().sum::<u32>()
+                    + actual.nonpositive[c]
+                    + actual.below[c]
+                    + actual.above[c]
+                    + actual.transparent,
+                20
+            );
+        }
+    }
 
     #[test]
     fn video_legal_scale_maps_endpoints_and_counts_excursions() {

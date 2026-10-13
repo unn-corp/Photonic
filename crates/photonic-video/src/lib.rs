@@ -33,6 +33,7 @@ pub mod decode;
 pub mod export;
 /// Media probing, pool services, keyframe index (02 §1 module map).
 pub mod media;
+pub mod native_shot_match;
 /// Playback controller, clock, prefetch (02 §4).
 pub mod playback;
 /// Content-addressed, bounded disk previews for timeline playback (33).
@@ -69,3 +70,5 @@ pub use session::{
     EngineSession, EngineStatus, ExportJob, MasterMeterSnapshot, PreviewQuality, PreviewTarget,
     PreviewTelemetrySnapshot, ProxyMode, RenderJobOptions, RenderSnapshot, VideoEngine,
 };
+
+pub mod window_tracking;

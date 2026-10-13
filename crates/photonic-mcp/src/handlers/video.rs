@@ -29,6 +29,9 @@
 //!   refreshes it with the real `photonic_video::media::probe::content_hash`
 //!   xxh3 digest.
 
+mod window_tracking;
+pub use window_tracking::{apply_window_track, track_grade_window};
+
 use crate::handlers::video_jobs::{set_job_status, EngineBridge, JobStatus};
 use crate::protocol::*;
 use crate::server::AppState;
@@ -226,6 +229,7 @@ fn map_edit_error(e: EditError) -> ToolResult {
         EditError::Overlap => ToolResult::error("edit would overlap another clip on the track"),
         EditError::TrackLocked => err_code("TrackLocked", "Unlock the target track before editing"),
         EditError::InvalidQualifierKeys(reason) => err_code("InvalidQualifierKeys", reason),
+        EditError::InvalidGradeParameters(reason) => err_code("InvalidGradeParameters", reason),
         EditError::InvalidQualifierMatteLevels(reason) => {
             err_code("InvalidQualifierMatteLevels", reason)
         }
@@ -1040,6 +1044,11 @@ pub async fn set_track_prop(state: &AppState, args: SetTrackPropArgs) -> ToolRes
     let Some(t) = seq.track(args.track_id) else {
         return ToolResult::error(format!("track {} not found", args.track_id));
     };
+    if (args.blend.is_some() || args.opacity.is_some())
+        && t.kind == photonic_core::timeline::TrackKind::Audio
+    {
+        return ToolResult::error("image blend and opacity controls require a video or text track");
+    }
     let mut new_settings = TrackSettings::of(t);
     if let Some(n) = args.name {
         new_settings.name = n;
@@ -1052,6 +1061,15 @@ pub async fn set_track_prop(state: &AppState, args: SetTrackPropArgs) -> ToolRes
     }
     if let Some(h) = args.height_px {
         new_settings.height_px = h;
+    }
+    if let Some(blend) = args.blend {
+        new_settings.blend = Some(blend);
+    }
+    if let Some(opacity) = args.opacity {
+        new_settings.opacity = Some(opacity);
+    }
+    if new_settings == TrackSettings::of(t) {
+        return ToolResult::text("Track settings unchanged");
     }
     match ops::set_track_prop(project, seq_id, args.track_id, new_settings) {
         Ok(cmd) => {
@@ -3687,6 +3705,19 @@ pub async fn list_effect_kinds(_state: &AppState, _args: ListEffectKindsArgs) ->
 
 fn to_anim_target(arg: &AnimTargetArg) -> AnimTarget {
     match arg {
+        AnimTargetArg::GradeStageOp {
+            clip_id,
+            stage,
+            op_id,
+        } => AnimTarget::GradeStageOp {
+            clip: *clip_id,
+            stage: *stage,
+            op: *op_id,
+        },
+        AnimTargetArg::GradeOp { clip_id, op_id } => AnimTarget::GradeOp {
+            clip: *clip_id,
+            op: *op_id,
+        },
         AnimTargetArg::ClipTransform { clip_id } => AnimTarget::ClipTransform { clip: *clip_id },
         AnimTargetArg::ClipEffect {
             clip_id,
@@ -3710,6 +3741,21 @@ fn read_target<'a>(
     let clip = find_clip(project, seq_id, track_id, clip_id)
         .ok_or_else(|| ToolResult::error(format!("clip {clip_id} not found")))?;
     match target {
+        AnimTargetArg::GradeStageOp { stage, op_id, .. } => {
+            let op = stage
+                .resolve_grade(project, clip)
+                .and_then(|g| g.ops.iter().find(|o| o.id == *op_id))
+                .ok_or_else(|| map_edit_error(ops::EditError::NoGradeOp(*op_id)))?;
+            Ok((clip, op.params.tracks.as_slice()))
+        }
+        AnimTargetArg::GradeOp { op_id, .. } => {
+            let op = clip
+                .grade
+                .as_ref()
+                .and_then(|g| g.ops.iter().find(|o| o.id == *op_id))
+                .ok_or_else(|| map_edit_error(ops::EditError::NoGradeOp(*op_id)))?;
+            Ok((clip, op.params.tracks.as_slice()))
+        }
         AnimTargetArg::ClipTransform { .. } => Ok((clip, clip.transform.tracks.as_slice())),
         AnimTargetArg::ClipEffect { effect_index, .. } => {
             let Some(effect) = clip.effects.get(*effect_index) else {
@@ -3744,7 +3790,10 @@ pub async fn set_keyframe(state: &AppState, args: SetKeyframeArgs) -> ToolResult
     };
     let target = to_anim_target(&args.target);
     let kf = Keyframe::new(at, args.value, args.interp);
-    let cmd = ops::set_keyframe(project, target, PropPath::new(args.path), kf);
+    let cmd = match ops::set_keyframe_checked(project, target, PropPath::new(args.path), kf) {
+        Ok(cmd) => cmd,
+        Err(error) => return map_edit_error(error),
+    };
     history.execute_discrete(Command::Timeline(cmd), &mut doc);
     ToolResult::text("Set keyframe")
 }
@@ -3796,12 +3845,10 @@ pub async fn batch_set_keyframes(state: &AppState, args: BatchSetKeyframesArgs) 
         };
         let target = to_anim_target(&op.target);
         let kf = Keyframe::new(at, op.value, op.interp);
-        cmds.push(Command::Timeline(ops::set_keyframe(
-            project,
-            target,
-            PropPath::new(op.path.clone()),
-            kf,
-        )));
+        match ops::set_keyframe_checked(project, target, PropPath::new(op.path.clone()), kf) {
+            Ok(cmd) => cmds.push(Command::Timeline(cmd)),
+            Err(error) => return map_edit_error(error),
+        }
     }
     let n = cmds.len();
     history.execute_discrete(Command::Batch(cmds), &mut doc);
@@ -4784,6 +4831,8 @@ async fn sequence_render_info(
 /// The status payload every transport tool returns (`EngineStatus`, 02 §1).
 fn engine_status_json(status: &photonic_video::EngineStatus) -> serde_json::Value {
     json!({
+        "pending_computations":status.pending_computations,
+        "computation_errors":status.computation_errors,
         "playhead_ticks": status.playhead.0,
         "playing": status.playing,
         "dropped_frames": status.dropped,
@@ -5177,6 +5226,8 @@ pub async fn get_engine_status(state: &AppState, _args: GetEngineStatusArgs) -> 
             "sequence": frame.sequence,
             "diagnostics": frame.grading_errors,
             "color_errors": frame.color_errors,
+            "pending_computations":frame.pending_computations,
+            "subject_matte_used":frame.subject_matte_used,
             "current": frame.doc_revision == status.doc_revision && frame.snapshot_generation == status.snapshot_generation,
         });
     }
@@ -5335,7 +5386,7 @@ pub async fn render_frame_at(state: &AppState, args: RenderFrameAtArgs) -> ToolR
     }
 
     let frame = bridge
-        .wait_fresh_frame(prev, Duration::from_secs(30), |f| {
+        .wait_inspection_frame(prev, Duration::from_secs(30), request_id, |f| {
             f.time == snapped
                 && f.sequence == seq_id
                 && f.preview_asset.is_none()
@@ -5347,6 +5398,10 @@ pub async fn render_frame_at(state: &AppState, args: RenderFrameAtArgs) -> ToolR
                 && f.proxy_mode == call_mode
         })
         .await;
+    let frame = match frame {
+        Ok(frame) => frame,
+        Err(errors) => return err_code("ColorPipelineUnavailable", errors.join("; ")),
+    };
     let result = match frame {
         Some(frame) => {
             if !frame.color_errors.is_empty() {
@@ -5411,6 +5466,7 @@ pub async fn render_frame_at(state: &AppState, args: RenderFrameAtArgs) -> ToolR
                 data["source_height"] = json!(h);
                 data["gpu_downscaled"] = json!(output_size != (w, h));
                 data["cached_preview"] = json!(frame.cached_preview);
+                data["caption_notes"] = json!(frame.caption_notes);
                 data["grading_errors"] = json!(frame
                     .grading_errors
                     .iter()
@@ -7331,6 +7387,105 @@ fn merge_caption_style(
         s.fill = Color::from_hex(hex)
             .ok_or_else(|| ToolResult::error(format!("invalid fill color {hex:?}")))?;
     }
+    if arg.clear_stroke && arg.stroke.is_some() {
+        return Err(ToolResult::error(
+            "clear_stroke and stroke cannot both be supplied",
+        ));
+    }
+    if arg.clear_background && arg.background.is_some() {
+        return Err(ToolResult::error(
+            "clear_background and background cannot both be supplied",
+        ));
+    }
+    if arg.clear_stroke {
+        s.stroke = None;
+    }
+    if arg.clear_background {
+        s.background = None;
+    }
+    if let Some(stroke) = &arg.stroke {
+        if !stroke.width.is_finite() || !(0.0..=8.0).contains(&stroke.width) {
+            return Err(ToolResult::error(
+                "outline width must be finite in 0..=8 pixels",
+            ));
+        }
+        let color = Color::from_hex(&stroke.color)
+            .ok_or_else(|| ToolResult::error("invalid outline color"))?;
+        s.stroke = Some((color, stroke.width));
+    }
+    if let Some(background) = &arg.background {
+        if !background.padding.is_finite()
+            || !(0.0..=128.0).contains(&background.padding)
+            || !background.corner_radius.is_finite()
+            || !(0.0..=128.0).contains(&background.corner_radius)
+        {
+            return Err(ToolResult::error(
+                "background padding and corner_radius must be finite in 0..=128 pixels",
+            ));
+        }
+        let color = Color::from_hex(&background.color)
+            .ok_or_else(|| ToolResult::error("invalid background color"))?;
+        s.background = Some(photonic_core::timeline::CaptionBackground {
+            color,
+            padding: background.padding,
+            corner_radius: background.corner_radius,
+        });
+    }
+    if let Some(direction) = arg.direction {
+        s.direction = direction;
+    }
+    if let Some(animation) = arg.animation {
+        s.animation = animation;
+    }
+    if [
+        arg.clear_highlight,
+        arg.word_pop.is_some(),
+        arg.underline.is_some(),
+        arg.fill_sweep.is_some(),
+    ]
+    .into_iter()
+    .filter(|v| *v)
+    .count()
+        > 1
+    {
+        return Err(ToolResult::error(
+            "clear_highlight, word_pop, underline and fill_sweep are mutually exclusive",
+        ));
+    }
+    if arg.clear_highlight {
+        s.highlight = None;
+    }
+    if let Some(underline) = &arg.underline {
+        let active_color = Color::from_hex(&underline.active_color)
+            .ok_or_else(|| ToolResult::error("invalid underline active color"))?;
+        s.highlight = Some(photonic_core::timeline::KaraokeStyle {
+            mode: photonic_core::timeline::KaraokeMode::Underline,
+            active_color,
+            inactive_color: s.fill,
+        });
+    }
+    if let Some(colors) = &arg.word_pop {
+        let active_color = Color::from_hex(&colors.active_color)
+            .ok_or_else(|| ToolResult::error("invalid active word-pop color"))?;
+        let inactive_color = Color::from_hex(&colors.inactive_color)
+            .ok_or_else(|| ToolResult::error("invalid inactive word-pop color"))?;
+        s.highlight = Some(photonic_core::timeline::KaraokeStyle {
+            mode: photonic_core::timeline::KaraokeMode::WordPop,
+            active_color,
+            inactive_color,
+        });
+    }
+    if let Some(colors) = &arg.fill_sweep {
+        let active_color = Color::from_hex(&colors.active_color)
+            .ok_or_else(|| ToolResult::error("invalid active fill-sweep color"))?;
+        let inactive_color = Color::from_hex(&colors.inactive_color)
+            .ok_or_else(|| ToolResult::error("invalid inactive fill-sweep color"))?;
+        s.highlight = Some(photonic_core::timeline::KaraokeStyle {
+            mode: photonic_core::timeline::KaraokeMode::FillSweep,
+            active_color,
+            inactive_color,
+        });
+    }
     if let Some(pos) = arg.position {
         s.position = pos;
     }
@@ -7341,6 +7496,10 @@ fn merge_caption_style(
 }
 
 pub async fn set_caption_style(state: &AppState, args: SetCaptionStyleArgs) -> ToolResult {
+    if args.word_index.is_some() && args.style.as_ref().is_some_and(|s| s.direction.is_some()) {
+        return ToolResult::error("paragraph direction must be edited at track or cue scope");
+    }
+
     tracing::debug!("tool: set_caption_style");
     let mut doc = state.document.lock().await;
     let mut history = state.history.lock().await;
@@ -7486,10 +7645,13 @@ pub async fn export_captions(state: &AppState, args: ExportCaptionsArgs) -> Tool
     };
     let fmt = caption_format_from(&args.path, args.format.as_deref());
     let (text, notes) = match fmt.as_deref() {
-        Some("srt") => (captions::interchange::srt::write_srt(&ct.cues), Vec::new()),
+        Some("srt") => (
+            captions::interchange::srt::write_srt(&ct.cues),
+            captions::interchange::direction_export_notes(ct),
+        ),
         Some("vtt") => (
             captions::interchange::vtt::write_vtt(&ct.cues, true),
-            Vec::new(),
+            captions::interchange::direction_export_notes(ct),
         ),
         Some("ass") => {
             let (t, summary) = captions::interchange::ass::write_ass(ct);
@@ -7841,6 +8003,16 @@ pub async fn group_grade(state: &AppState, args: GroupGradeArgs) -> ToolResult {
 }
 
 pub async fn grade_version(state: &AppState, args: GradeVersionArgs) -> ToolResult {
+    use photonic_core::timeline::GradeInspectionStage as S;
+    if let S::SharedLook { id } = args.stage {
+        return shared_look_grade_version(state, args, id).await;
+    }
+    if args.stage != S::Clip {
+        return ToolResult::error(
+            "named versions support clip or its exact linked shared look stage",
+        );
+    }
+
     let mut doc = state.document.lock().await;
     let Some(project) = doc.timeline.as_ref() else {
         return ToolResult::error("no timeline project");
@@ -7894,6 +8066,69 @@ pub async fn grade_version(state: &AppState, args: GradeVersionArgs) -> ToolResu
         "active_version": clip.and_then(|c| c.active_grade_version),
         "versions": clip.map(|c| &c.grade_versions),
     }))
+}
+
+async fn shared_look_grade_version(
+    state: &AppState,
+    args: GradeVersionArgs,
+    id: photonic_core::timeline::SharedLookId,
+) -> ToolResult {
+    use photonic_core::timeline::shared_look_versions::{
+        edit_shared_look_version, SharedLookVersionEdit as E,
+    };
+    let mut doc = state.document.lock().await;
+    let Some(project) = doc.timeline.as_ref() else {
+        return ToolResult::error("no timeline project");
+    };
+    let Some((sequence, track)) = locate_clip(project, args.clip_id) else {
+        return ToolResult::error("selected clip not found");
+    };
+    let Some(clip) = find_clip(project, sequence, track, args.clip_id) else {
+        return ToolResult::error("selected clip not found");
+    };
+    if clip.look != Some(photonic_core::timeline::ClipLook::Shared(id)) {
+        return ToolResult::error("selected clip is not linked to the addressed shared look");
+    }
+    let Some(look) = project.shared_looks.get(&id) else {
+        return ToolResult::error("shared look is missing");
+    };
+    let affected = project
+        .sequences
+        .values()
+        .flat_map(|s| s.tracks())
+        .flat_map(|t| &t.clips)
+        .filter(|c| c.look == Some(photonic_core::timeline::ClipLook::Shared(id)))
+        .count();
+    if matches!(args.op, GradeVersionOp::List) {
+        return ToolResult::text("Shared look versions").with_data(json!({"clip_id":args.clip_id,"stage":args.stage,"look_id":id,"affected_linked_clips":affected,"active_version":look.active_version,"versions":look.versions}));
+    }
+    let edit = match args.op {
+        GradeVersionOp::List => unreachable!(),
+        GradeVersionOp::Add => match args.name {
+            Some(name) => E::Add(name),
+            None => return ToolResult::error("name is required for add"),
+        },
+        GradeVersionOp::Activate => match args.version_id {
+            Some(id) => E::Activate(id),
+            None => return ToolResult::error("version_id is required for activate"),
+        },
+        GradeVersionOp::Rename => match (args.version_id, args.name) {
+            (Some(id), Some(name)) => E::Rename(id, name),
+            _ => return ToolResult::error("version_id and name are required for rename"),
+        },
+        GradeVersionOp::Remove => match args.version_id {
+            Some(id) => E::Remove(id),
+            None => return ToolResult::error("version_id is required for remove"),
+        },
+    };
+    let command = match edit_shared_look_version(project, id, edit) {
+        Ok(cmd) => cmd,
+        Err(error) => return map_edit_error(error),
+    };
+    let mut history = state.history.lock().await;
+    history.execute_discrete(Command::Timeline(command), &mut doc);
+    let look = &doc.timeline.as_ref().unwrap().shared_looks[&id];
+    ToolResult::text("Updated shared look version").with_data(json!({"clip_id":args.clip_id,"stage":args.stage,"look_id":id,"affected_linked_clips":affected,"active_version":look.active_version,"versions":look.versions}))
 }
 
 pub async fn shared_look(state: &AppState, args: SharedLookArgs) -> ToolResult {
@@ -7954,6 +8189,31 @@ pub async fn shared_look(state: &AppState, args: SharedLookArgs) -> ToolResult {
                 return ToolResult::error(format!("clip {clip_id} not found"));
             };
             ops::link_shared_look(project, sequence, track, clip_id, id)
+        }
+        SharedLookOp::UpdateIndependent => {
+            if args.look_id.is_some() || args.name.is_some() {
+                return ToolResult::error(
+                    "update_independent accepts clip_id and grade, not look_id or name",
+                );
+            }
+            let (Some(clip_id), Some(value)) = (args.clip_id, args.grade) else {
+                return ToolResult::error("clip_id and grade are required for update_independent");
+            };
+            let Some((sequence, track)) = locate_clip(project, clip_id) else {
+                return ToolResult::error(format!("clip {clip_id} not found"));
+            };
+            let grade = match serde_json::from_value::<Grade>(value) {
+                Ok(grade) => grade,
+                Err(error) => return ToolResult::error(format!("invalid grade object: {error}")),
+            };
+            ops::set_clip_stage_grade(
+                project,
+                sequence,
+                track,
+                clip_id,
+                photonic_core::timeline::GradeInspectionStage::LocalLook,
+                grade,
+            )
         }
         SharedLookOp::MakeIndependent => {
             let Some(clip_id) = args.clip_id else {
@@ -8070,6 +8330,36 @@ pub async fn list_reference_stills(state: &AppState, args: ListReferenceStillsAr
     }))
 }
 
+pub async fn copy_reference_still(state: &AppState, args: CopyReferenceStillArgs) -> ToolResult {
+    let mut doc = state.document.lock().await;
+    let Some(project) = doc.timeline.as_ref() else {
+        return ToolResult::error("no timeline project");
+    };
+    let Some(destination) = args.destination_sequence_id.or(project.active_sequence) else {
+        return ToolResult::error("provide destination_sequence_id");
+    };
+    let command = match photonic_core::timeline::reference_gallery::copy_reference_still(
+        project,
+        args.source_sequence_id,
+        destination,
+        args.still_id,
+        args.name.as_deref(),
+    ) {
+        Ok(c) => c,
+        Err(e) => return map_edit_error(e),
+    };
+    let id = match &command {
+        TimelineCmd::SetReferenceStills { new, .. } => new.last().unwrap().id,
+        _ => unreachable!(),
+    };
+    state
+        .history
+        .lock()
+        .await
+        .execute_discrete(Command::Timeline(command), &mut doc);
+    ToolResult::text("Copied immutable reference to destination gallery").with_data(json!({"sequence_id":destination,"still_id":id,"source_sequence_id":args.source_sequence_id,"source_still_id":args.still_id}))
+}
+
 pub async fn remove_reference_still(
     state: &AppState,
     args: RemoveReferenceStillArgs,
@@ -8093,14 +8383,111 @@ pub async fn remove_reference_still(
     }))
 }
 
-async fn render_reference_png(
+async fn render_reference_frame(
     state: &AppState,
     sequence_id: SequenceId,
     format_index: usize,
     time: i64,
     revision: u64,
+    document_id: uuid::Uuid,
     expected_encoding: photonic_video::graph::ir::FrameColorEncoding,
-) -> Result<(Vec<u8>, Tick), ToolResult> {
+) -> Result<
+    (
+        Vec<u8>,
+        Tick,
+        Option<photonic_core::timeline::native_balance::NativeBalanceSummary>,
+    ),
+    ToolResult,
+> {
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return Err(err_code(
+            "RevisionConflict",
+            "document changed before reference rendering",
+        ));
+    }
+    let native_size = {
+        let doc = state.document.lock().await;
+        doc.timeline
+            .as_ref()
+            .and_then(|p| p.sequences.get(&sequence_id))
+            .filter(|s| {
+                matches!(
+                    s.color,
+                    photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                )
+            })
+            .and_then(|s| s.formats.get(format_index))
+            .map(|f| (f.width, f.height))
+    };
+    // Keep display-only capture available above the analysis bound. Never
+    // reconstruct scene values from the PNG for older or larger references.
+    if expected_encoding == photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay
+        && native_size.is_some_and(|(w, h)| {
+            u64::from(w) * u64::from(h)
+                <= photonic_core::timeline::native_balance::NATIVE_BALANCE_MAX_PIXELS
+        })
+    {
+        let mut frame = render_tap_pixels_mode(
+            state,
+            sequence_id,
+            Tick(time),
+            Some(format_index),
+            ScopeTapPoint::NativeSceneProgram,
+            ScopeReadbackMode::ProgramOutput,
+        )
+        .await?;
+        if frame.revision != revision
+            || frame.tap != ScopeTapPoint::NativeSceneProgram
+            || frame.encoding != photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg
+            || native_size != Some((frame.width, frame.height))
+        {
+            return Err(err_code(
+                "ReferenceFrameInvalid",
+                "native reference scene frame changed",
+            ));
+        }
+        let scene = std::mem::take(&mut frame.pixels);
+        let display = frame.display_pixels.take().ok_or_else(|| {
+            err_code(
+                "ReferenceFrameInvalid",
+                "paired reference display is absent",
+            )
+        })?;
+        let (width, height) = (frame.width, frame.height);
+        let (png, balance) = match tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let measured =
+                photonic_render::scene_measurement::measure_pair(&scene, &display, width, height)
+                    .map_err(str::to_string)?;
+            let balance =
+                photonic_video::native_shot_match::measure_native_balance(&scene, width, height)
+                    .ok();
+            let image = image::RgbaImage::from_raw(width, height, measured.display_rgba)
+                .ok_or("invalid reference dimensions")?;
+            let mut png = Vec::new();
+            image
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .map_err(|e| e.to_string())?;
+            Ok((png, balance))
+        })
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => return Err(err_code("ReferenceFrameInvalid", e)),
+            Err(e) => return Err(err_code("ReferenceFrameInvalid", e.to_string())),
+        };
+        if state.document.lock().await.id != document_id
+            || state.history.lock().await.revision() != revision
+        {
+            return Err(err_code(
+                "RevisionConflict",
+                "document changed during native reference rendering",
+            ));
+        }
+        return Ok((png, frame.time, balance));
+    }
+
     let rendered = render_frame_at(
         state,
         RenderFrameAtArgs {
@@ -8149,7 +8536,15 @@ async fn render_reference_png(
     let bytes = general_purpose::STANDARD
         .decode(encoded)
         .map_err(|error| ToolResult::error(format!("invalid rendered PNG: {error}")))?;
-    Ok((bytes, Tick(time)))
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return Err(err_code(
+            "RevisionConflict",
+            "document changed during reference rendering",
+        ));
+    }
+    Ok((bytes, Tick(time), None))
 }
 
 pub async fn capture_reference_still(
@@ -8160,7 +8555,7 @@ pub async fn capture_reference_still(
     let Some(project_path) = state.document_path.lock().unwrap().clone() else {
         return ToolResult::error("save the project before capturing a reference still");
     };
-    let (sequence_id, format_index, color, default_name) = {
+    let (sequence_id, format_index, color, default_name, document_id) = {
         let doc = state.document.lock().await;
         let Some(project) = doc.timeline.as_ref() else {
             return ToolResult::error("no timeline project");
@@ -8187,15 +8582,17 @@ pub async fn capture_reference_still(
             sequence.active_format,
             sequence.color.clone(),
             format!("Still {}", sequence.reference_stills.len() + 1),
+            doc.id,
         )
     };
     let revision = state.history.lock().await.revision();
-    let (bytes, rendered_time) = match render_reference_png(
+    let (bytes, rendered_time, native_balance) = match render_reference_frame(
         state,
         sequence_id,
         format_index,
         args.at_ticks,
         revision,
+        document_id,
         if color.is_legacy() {
             photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709
         } else {
@@ -8207,6 +8604,7 @@ pub async fn capture_reference_still(
         Ok(frame) => frame,
         Err(error) => return error,
     };
+    let native_balance_available = native_balance.is_some();
     let id = uuid::Uuid::new_v4();
     let relative = std::path::PathBuf::from("reference-stills").join(format!("{id}.png"));
     let path = project_path
@@ -8229,7 +8627,8 @@ pub async fn capture_reference_still(
         let mut doc = state.document.lock().await;
         let mut history = state.history.lock().await;
         (|| -> Result<_, String> {
-            if history.revision() != revision
+            if doc.id != document_id
+                || history.revision() != revision
                 || *state.document_path.lock().unwrap() != Some(project_path.clone())
             {
                 return Err("project changed during capture".into());
@@ -8271,16 +8670,25 @@ pub async fn capture_reference_still(
             );
             asset.content_hash =
                 Some(photonic_video::media::content_hash(&path).map_err(|e| e.to_string())?);
+            let image_hash =
+                photonic_video::media::full_content_hash(&path).map_err(|e| e.to_string())?;
+            let native_balance = native_balance.map(|summary| {
+                photonic_core::timeline::native_balance::NativeReferenceBalance {
+                    summary,
+                    image_hash: image_hash.clone(),
+                }
+            });
             let still = ReferenceStill {
+                copied_from: None,
                 id,
                 name: args.name.unwrap_or(default_name),
                 image_asset: asset.id,
-                image_hash: photonic_video::media::full_content_hash(&path)
-                    .map_err(|e| e.to_string())?,
+                image_hash,
                 source_clip,
                 source_time: rendered_time,
                 grade_revision: revision,
                 color,
+                native_balance,
                 format_index,
             };
             let mut projected = project.clone();
@@ -8308,6 +8716,7 @@ pub async fn capture_reference_still(
         "still_id": id,
         "time_ticks": rendered_time.0,
         "revision": revision,
+        "native_balance_available": native_balance_available,
     }))
 }
 
@@ -8365,7 +8774,7 @@ pub async fn compare_reference_still(
     args: CompareReferenceStillArgs,
 ) -> ToolResult {
     use photonic_core::timeline::AssetSource;
-    let (sequence_id, format_index, width, height, still, source) = {
+    let (sequence_id, format_index, width, height, still, source, document_id) = {
         let doc = state.document.lock().await;
         let Some(project) = doc.timeline.as_ref() else {
             return ToolResult::error("no timeline project");
@@ -8412,6 +8821,7 @@ pub async fn compare_reference_still(
             sequence.format().height,
             still.clone(),
             source,
+            doc.id,
         )
     };
     let Some(AssetSource::File { path, rel_path }) = source else {
@@ -8451,12 +8861,13 @@ pub async fn compare_reference_still(
         );
     }
     let revision = state.history.lock().await.revision();
-    let (current_bytes, current_time) = match render_reference_png(
+    let (current_bytes, current_time, current_balance) = match render_reference_frame(
         state,
         sequence_id,
         format_index,
         args.at_ticks.unwrap_or(still.source_time.0),
         revision,
+        document_id,
         if still.color.is_legacy() {
             photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709
         } else {
@@ -8481,10 +8892,33 @@ pub async fn compare_reference_still(
     let Some(metrics) = reference_rgb_metrics(&reference.pixels, &current.pixels) else {
         return ToolResult::error("reference and current pixels cannot be compared");
     };
-    let match_suggestion = if still.color.is_legacy() {
-        photonic_video::shot_match::suggest_printer_lights(&reference.pixels, &current.pixels)
+    let (match_suggestion, match_unavailable_reason) = if still.color.is_legacy() {
+        let suggestion =
+            photonic_video::shot_match::suggest_printer_lights(&reference.pixels, &current.pixels);
+        let reason = suggestion
+            .is_none()
+            .then(|| "too few opaque, non-clipped Legacy SDR samples".to_string());
+        (suggestion, reason)
     } else {
-        None
+        let result = (|| -> Result<_, String> {
+            let reference = still
+                .native_balance
+                .as_ref()
+                .ok_or("reference has no scene-linear balance measurement; capture it again")?;
+            reference
+                .validate_for_image(&still.image_hash, width, height)
+                .map_err(str::to_string)?;
+            let current=current_balance.as_ref().ok_or("current frame has too few eligible scene-linear samples or exceeds the analysis bound")?;
+            photonic_video::native_shot_match::suggest_native_printer_lights(
+                &reference.summary,
+                current,
+            )
+            .map_err(str::to_string)
+        })();
+        match result {
+            Ok(suggestion) => (Some(suggestion), None),
+            Err(reason) => (None, Some(reason)),
+        }
     };
     {
         let doc = state.document.lock().await;
@@ -8499,7 +8933,8 @@ pub async fn compare_reference_still(
                     .iter()
                     .find(|item| item.id == still.id)
             });
-        if history.revision() != revision
+        if doc.id != document_id
+            || history.revision() != revision
             || still_current != Some(&still)
             || *state.document_path.lock().unwrap() != project_path
         {
@@ -8528,6 +8963,7 @@ pub async fn compare_reference_still(
         "interpretation": if still.color.is_legacy() { "legacy_sdr_srgb_rgba8_over_black" } else { "native_managed_srgb_rgba8_over_black" },
         "metrics": metrics,
         "shot_match_suggestion": match_suggestion,
+        "shot_match_unavailable_reason": match_unavailable_reason,
     }))
 }
 
@@ -8558,7 +8994,9 @@ pub async fn apply_shot_match(state: &AppState, args: ApplyShotMatchArgs) -> Too
     let Some(suggestion) = data["shot_match_suggestion"].as_object() else {
         return err_code(
             "MatchUnavailable",
-            "the frame has too few opaque, non-clipped pixels for a global match",
+            data["shot_match_unavailable_reason"]
+                .as_str()
+                .unwrap_or("the frame has too few usable pixels for a global match"),
         );
     };
     let points: [f32; 3] =
@@ -8970,12 +9408,15 @@ async fn correction_input_location(
     clip_id: ClipId,
     op_id: photonic_core::timeline::GradeOpId,
     graph_node_id: Option<u32>,
+    stage: photonic_core::timeline::GradeInspectionStage,
 ) -> Result<
     (
         SequenceId,
         FrameRate,
         bool,
         photonic_core::timeline::GradeOpKind,
+        u64,
+        uuid::Uuid,
     ),
     ToolResult,
 > {
@@ -8994,13 +9435,27 @@ async fn correction_input_location(
         .iter()
         .find(|clip| clip.id == clip_id)
         .unwrap();
-    let Some(grade) = clip.grade.as_ref().filter(|grade| !grade.bypass) else {
+    let Some(grade) = stage
+        .resolve_grade(project, clip)
+        .filter(|grade| !grade.bypass)
+    else {
         return Err(err_code(
             "QualifierInputUnavailable",
-            "inspection requires an enabled clip grade",
+            "inspection requires an enabled selected grade stage",
         ));
     };
     let native = !sequence_data.color.is_legacy();
+    if stage != photonic_core::timeline::GradeInspectionStage::Clip
+        && !matches!(
+            sequence_data.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        )
+    {
+        return Err(err_code(
+            "GradeInputUnavailable",
+            "non-clip stage input inspection requires Native Managed color",
+        ));
+    }
     let graph_input_valid = if graph_node_id.is_some() || grade.graph.is_some() {
         native && grade.has_grade_input(op_id, graph_node_id)
     } else {
@@ -9020,6 +9475,8 @@ async fn correction_input_location(
         sequence_data.frame_rate,
         !sequence_data.color.is_legacy(),
         op.kind,
+        state.history.lock().await.revision(),
+        doc.id,
     ))
 }
 
@@ -9033,24 +9490,39 @@ pub async fn sample_grade_input(state: &AppState, args: SampleGradeInputArgs) ->
             "x/y must be finite normalized coordinates in [0,1]",
         );
     }
-    let (sequence, frame_rate, native, kind) = match correction_input_location(
-        state,
-        args.clip_id,
-        args.op_id,
-        args.graph_node_id,
-    )
-    .await
-    {
-        Ok(location) => location,
-        Err(error) => return error,
-    };
+    let stage = args.stage.unwrap_or_default();
+    let (sequence, frame_rate, native, kind, revision, document_id) =
+        match correction_input_location(state, args.clip_id, args.op_id, args.graph_node_id, stage)
+            .await
+        {
+            Ok(location) => location,
+            Err(error) => return error,
+        };
     if !native {
         return err_code(
             "GradeInputUnavailable",
             "this sampler requires Native Managed input coordinates",
         );
     }
-    let point = match (kind, args.graph_node_id) {
+    let point = if stage != photonic_core::timeline::GradeInspectionStage::Clip {
+        if !matches!(
+            kind,
+            photonic_core::timeline::GradeOpKind::Curves
+                | photonic_core::timeline::GradeOpKind::HslQualifier
+        ) {
+            return err_code(
+                "GradeInputUnavailable",
+                "sampling supports curve and qualifier inputs",
+            );
+        }
+        ScopeTapPoint::GradeStageInput {
+            clip: args.clip_id,
+            stage,
+            node: args.graph_node_id,
+            op: args.op_id,
+        }
+    } else {
+        match (kind, args.graph_node_id) {
         (photonic_core::timeline::GradeOpKind::Curves, Some(node)) => ScopeTapPoint::NativeGraphCurveInput { clip: args.clip_id, node, op: args.op_id },
         (photonic_core::timeline::GradeOpKind::HslQualifier, Some(node)) => ScopeTapPoint::NativeGraphQualifierInput { clip: args.clip_id, node, op: args.op_id },
         (photonic_core::timeline::GradeOpKind::Curves, None) => ScopeTapPoint::NativeCurveInput {
@@ -9067,6 +9539,7 @@ pub async fn sample_grade_input(state: &AppState, args: SampleGradeInputArgs) ->
                 "sampling supports native clip curves and qualifiers with an unambiguous corrector input",
             )
         }
+    }
     };
     let time = match resolve_tick(
         args.at_ticks,
@@ -9090,6 +9563,15 @@ pub async fn sample_grade_input(state: &AppState, args: SampleGradeInputArgs) ->
         Ok(value) => value,
         Err(error) => return error,
     };
+    if measurement.revision != revision
+        || state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed during selected-stage input inspection",
+        );
+    }
     let x = ((args.x * f64::from(measurement.width)).floor() as u32).min(measurement.width - 1);
     let y = ((args.y * f64::from(measurement.height)).floor() as u32).min(measurement.height - 1);
     let Some(pixel) = measurement
@@ -9107,24 +9589,367 @@ pub async fn sample_grade_input(state: &AppState, args: SampleGradeInputArgs) ->
     let rgb = export_convert::unpremultiply([pixel[0], pixel[1], pixel[2]], pixel[3])
         .map(|v| v.clamp(0.0, 1.0));
     let luma = rgb[0] * 0.27222872 + rgb[1] * 0.67408174 + rgb[2] * 0.053689517;
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed while presenting selected-stage input",
+        );
+    }
     ToolResult::text("Native correction input sample").with_data(json!({
-        "clip_id":args.clip_id,"op_id":args.op_id,"graph_node_id":args.graph_node_id,"tick":measurement.time.0,"revision":measurement.revision,"snapshot_generation":measurement.generation,
+        "stage":stage,"clip_id":args.clip_id,"op_id":args.op_id,"graph_node_id":args.graph_node_id,"tick":measurement.time.0,"revision":measurement.revision,"snapshot_generation":measurement.generation,
         "width":measurement.width,"height":measurement.height,"pixel":{"x":x,"y":y},"coordinates":"acescct_ap1_bounded","rgb":rgb,"ap1_log_luma":luma,"alpha":pixel[3]
     }))
 }
 
-pub async fn inspect_qualifier(state: &AppState, args: InspectQualifierArgs) -> ToolResult {
-    let (sequence, frame_rate, native, kind) = match correction_input_location(
+/// Inspect a mixed/refined matte without grading, alpha division or display conversion.
+pub async fn inspect_grade_matte(state: &AppState, args: InspectGradeMatteArgs) -> ToolResult {
+    let stage = args.stage.unwrap_or_default();
+    let (sequence, frame_rate, revision, document_id) = {
+        let doc = state.document.lock().await;
+        let Some(project) = doc.timeline.as_ref() else {
+            return err_code("GradeMatteUnavailable", "no timeline project");
+        };
+        let Some((sequence, track)) = locate_clip(project, args.clip_id) else {
+            return err_code("GradeMatteUnavailable", "clip not found");
+        };
+        let seq = &project.sequences[&sequence];
+        if !matches!(
+            seq.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        ) {
+            return err_code(
+                "GradeMatteUnavailable",
+                "matte graph inspection requires Native Managed color",
+            );
+        }
+        let valid = find_clip(project, sequence, track, args.clip_id)
+            .and_then(|clip| stage.resolve_grade(project, clip))
+            .is_some_and(|grade| grade.has_matte_output(args.graph_node_id));
+        if !valid {
+            return err_code(
+                "GradeMatteUnavailable",
+                "select a matte node in an enabled selected grade stage",
+            );
+        }
+        (
+            sequence,
+            seq.frame_rate,
+            state.history.lock().await.revision(),
+            doc.id,
+        )
+    };
+    let time = match resolve_tick(
+        args.at_ticks,
+        args.at_tc.as_deref(),
+        args.at_seconds,
+        Some(frame_rate),
+    ) {
+        Ok(time) => time,
+        Err(error) => return error,
+    };
+    let measurement = match render_tap_pixels_mode(
         state,
-        args.clip_id,
-        args.op_id,
-        args.graph_node_id,
+        sequence,
+        time,
+        args.format_index,
+        if stage == photonic_core::timeline::GradeInspectionStage::Clip {
+            ScopeTapPoint::GradeGraphMatteOutput {
+                clip: args.clip_id,
+                node: args.graph_node_id,
+            }
+        } else {
+            ScopeTapPoint::GradeStageGraphMatteOutput {
+                clip: args.clip_id,
+                stage,
+                node: args.graph_node_id,
+            }
+        },
+        ScopeReadbackMode::MatteOutput,
     )
     .await
     {
-        Ok(location) => location,
+        Ok(value) => value,
         Err(error) => return error,
     };
+    if measurement.revision != revision
+        || state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed during matte inspection",
+        );
+    }
+    let inspection = match photonic_render::matte_inspection::inspect_weights(
+        &measurement.pixels,
+        measurement.width,
+        measurement.height,
+    ) {
+        Ok(value) => value,
+        Err(error) => return err_code("GradeMatteReadbackFailed", error),
+    };
+    let image = image::RgbaImage::from_raw(measurement.width, measurement.height, inspection.rgba)
+        .expect("validated matte dimensions");
+    let mut png = Vec::new();
+    if let Err(error) = image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    {
+        return ToolResult::error(error.to_string());
+    }
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed while presenting matte output",
+        );
+    }
+    ToolResult::text("Grading graph matte output")
+        .with_image(general_purpose::STANDARD.encode(png))
+        .with_data(json!({"stage":stage,"clip_id":args.clip_id,"graph_node_id":args.graph_node_id,
+            "tick":measurement.time.0,"revision":measurement.revision,
+            "snapshot_generation":measurement.generation,"width":measurement.width,"height":measurement.height,
+            "matte_encoding":"unassociated_weight",
+            "coverage":{"min":inspection.minimum,"max":inspection.maximum,"mean":inspection.mean}}))
+}
+
+/// Measure unclipped AP1 working values and actual SDR output from one frame.
+pub async fn measure_native_output(state: &AppState, args: MeasureNativeOutputArgs) -> ToolResult {
+    let (frame_rate, revision, document_id) = {
+        let doc = state.document.lock().await;
+        let Some(seq) = doc
+            .timeline
+            .as_ref()
+            .and_then(|p| p.sequences.get(&args.sequence_id))
+        else {
+            return err_code("NativeOutputUnavailable", "sequence not found");
+        };
+        if !matches!(
+            seq.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        ) {
+            return err_code(
+                "NativeOutputUnavailable",
+                "paired output measurement requires Native Managed color",
+            );
+        }
+        let Some(format) = seq
+            .formats
+            .get(args.format_index.unwrap_or(seq.active_format))
+        else {
+            return err_code(
+                "FormatOutOfRange",
+                "selected sequence format does not exist",
+            );
+        };
+        if u64::from(format.width) * u64::from(format.height)
+            > photonic_render::scene_measurement::MAX_PAIRED_PIXELS as u64
+        {
+            return err_code("NativeOutputTooLarge","paired output measurement supports at most 16777216 pixels; choose a smaller authored format explicitly");
+        }
+        (
+            seq.frame_rate,
+            state.history.lock().await.revision(),
+            doc.id,
+        )
+    };
+    let time = match resolve_tick(
+        args.at_ticks,
+        args.at_tc.as_deref(),
+        args.at_seconds,
+        Some(frame_rate),
+    ) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let mut measurement = match render_tap_pixels_mode(
+        state,
+        args.sequence_id,
+        time,
+        args.format_index,
+        ScopeTapPoint::NativeSceneProgram,
+        ScopeReadbackMode::ProgramOutput,
+    )
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => return e,
+    };
+    if measurement.revision != revision
+        || state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed during paired output measurement",
+        );
+    }
+    let scene = std::mem::take(&mut measurement.pixels);
+    let Some(display) = measurement.display_pixels.take() else {
+        return err_code(
+            "NativeOutputUnavailable",
+            "paired display readback is absent",
+        );
+    };
+    let (width, height) = (measurement.width, measurement.height);
+    let mut measured = match tokio::task::spawn_blocking(move || {
+        photonic_render::scene_measurement::measure_pair(&scene, &display, width, height)
+    })
+    .await
+    {
+        Ok(Ok(m)) => m,
+        Ok(Err(e)) => return err_code("NativeOutputReadbackFailed", e),
+        Err(e) => return err_code("NativeOutputReadbackFailed", e.to_string()),
+    };
+    let image =
+        image::RgbaImage::from_raw(width, height, std::mem::take(&mut measured.display_rgba))
+            .expect("validated paired image dimensions");
+    let mut png = Vec::new();
+    if let Err(e) = image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png) {
+        return ToolResult::error(e.to_string());
+    }
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed during paired output measurement",
+        );
+    }
+    ToolResult::text("Native scene and SDR output measurements").with_image(general_purpose::STANDARD.encode(png)).with_data(json!({
+        "document_id":document_id,"sequence_id":args.sequence_id,"tick":measurement.time.0,"revision":measurement.revision,"snapshot_generation":measurement.generation,"content_hash":format!("{:032x}",measurement.content_hash),"width":width,"height":height,
+        "scene_encoding":"scene_linear_acescg","display_encoding":"srgb_display","measurements":measured,
+        "note":"Same Full/original frame before and after the SDR transform. Straight covered pixels are equally weighted; no signal extrema or means exist when fully transparent. Relative stops describe working values, not reconstructed scene light. Luminance uses AP1 Y and stops relative to 0.18, range [-12,12); no absolute nits, HDR delivery, video IRE or calibrated-monitor claim. PNG alone is quantized and clamped for display; statistics retain readback values."
+    }))
+}
+
+/// Inspect an exact scene image node through the qualified SDR display transform.
+pub async fn inspect_grade_image(state: &AppState, args: InspectGradeImageArgs) -> ToolResult {
+    let stage = args.stage.unwrap_or_default();
+    let (sequence, frame_rate, revision, document_id) = {
+        let doc = state.document.lock().await;
+        let Some(project) = doc.timeline.as_ref() else {
+            return err_code("GradeImageUnavailable", "no timeline project");
+        };
+        let Some((sequence, track)) = locate_clip(project, args.clip_id) else {
+            return err_code("GradeImageUnavailable", "clip not found");
+        };
+        let seq = &project.sequences[&sequence];
+        if !matches!(
+            seq.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        ) {
+            return err_code(
+                "GradeImageUnavailable",
+                "image graph inspection requires Native Managed color",
+            );
+        }
+        let valid = find_clip(project, sequence, track, args.clip_id)
+            .and_then(|clip| stage.resolve_grade(project, clip))
+            .is_some_and(|grade| grade.has_image_output(args.graph_node_id));
+        if !valid {
+            return err_code(
+                "GradeImageUnavailable",
+                "select an image node in an enabled selected grade stage",
+            );
+        }
+        (
+            sequence,
+            seq.frame_rate,
+            state.history.lock().await.revision(),
+            doc.id,
+        )
+    };
+    let time = match resolve_tick(
+        args.at_ticks,
+        args.at_tc.as_deref(),
+        args.at_seconds,
+        Some(frame_rate),
+    ) {
+        Ok(time) => time,
+        Err(error) => return error,
+    };
+    let mut measurement = match render_tap_pixels_mode(
+        state,
+        sequence,
+        time,
+        args.format_index,
+        if stage == photonic_core::timeline::GradeInspectionStage::Clip {
+            ScopeTapPoint::GradeGraphImageOutput {
+                clip: args.clip_id,
+                node: args.graph_node_id,
+            }
+        } else {
+            ScopeTapPoint::GradeStageGraphImageOutput {
+                clip: args.clip_id,
+                stage,
+                node: args.graph_node_id,
+            }
+        },
+        ScopeReadbackMode::ImageOutput,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    if measurement.revision != revision
+        || state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed during image inspection",
+        );
+    }
+    let pixels = std::mem::take(&mut measurement.pixels);
+    let (width, height) = (measurement.width, measurement.height);
+    let inspection = match tokio::task::spawn_blocking(move || {
+        photonic_video::color::native_output::inspection::inspect_scene_image(
+            &pixels, width, height,
+        )
+    })
+    .await
+    {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => return err_code("GradeImageReadbackFailed", error),
+        Err(error) => return err_code("GradeImageReadbackFailed", error.to_string()),
+    };
+    let image = image::RgbaImage::from_raw(measurement.width, measurement.height, inspection.rgba)
+        .expect("validated image dimensions");
+    let mut png = Vec::new();
+    if let Err(error) = image.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+    {
+        return ToolResult::error(error.to_string());
+    }
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed while presenting the image output",
+        );
+    }
+    ToolResult::text("Grading graph image output")
+        .with_image(general_purpose::STANDARD.encode(png))
+        .with_data(json!({"stage":stage,"clip_id":args.clip_id,"graph_node_id":args.graph_node_id,
+            "tick":measurement.time.0,"revision":measurement.revision,
+            "snapshot_generation":measurement.generation,"width":measurement.width,"height":measurement.height,
+            "image_encoding":"srgb_display","scene_encoding":"scene_linear_acescg",
+            "scene_rgb":{"min":inspection.scene_min,"max":inspection.scene_max},
+            "coverage":{"min":inspection.alpha_min,"max":inspection.alpha_max}}))
+}
+
+pub async fn inspect_qualifier(state: &AppState, args: InspectQualifierArgs) -> ToolResult {
+    let stage = args.stage.unwrap_or_default();
+    let (sequence, frame_rate, native, kind, revision, document_id) =
+        match correction_input_location(state, args.clip_id, args.op_id, args.graph_node_id, stage)
+            .await
+        {
+            Ok(location) => location,
+            Err(error) => return error,
+        };
     if kind != photonic_core::timeline::GradeOpKind::HslQualifier {
         return err_code(
             "QualifierInputUnavailable",
@@ -9140,7 +9965,14 @@ pub async fn inspect_qualifier(state: &AppState, args: InspectQualifierArgs) -> 
         Ok(time) => time,
         Err(error) => return error,
     };
-    let point = if let Some(node) = args.graph_node_id {
+    let point = if stage != photonic_core::timeline::GradeInspectionStage::Clip {
+        ScopeTapPoint::GradeStageInput {
+            clip: args.clip_id,
+            stage,
+            node: args.graph_node_id,
+            op: args.op_id,
+        }
+    } else if let Some(node) = args.graph_node_id {
         ScopeTapPoint::NativeGraphQualifierInput {
             clip: args.clip_id,
             node,
@@ -9167,6 +9999,15 @@ pub async fn inspect_qualifier(state: &AppState, args: InspectQualifierArgs) -> 
         Ok(result) => result,
         Err(error) => return error,
     };
+    if measurement.revision != revision
+        || state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed during selected-stage input inspection",
+        );
+    }
     if measurement.pixels.len() != measurement.width as usize * measurement.height as usize
         || measurement.pixels.is_empty()
     {
@@ -9194,8 +10035,16 @@ pub async fn inspect_qualifier(state: &AppState, args: InspectQualifierArgs) -> 
     {
         return ToolResult::error(error.to_string());
     }
+    if state.document.lock().await.id != document_id
+        || state.history.lock().await.revision() != revision
+    {
+        return err_code(
+            "RevisionConflict",
+            "document changed while presenting selected-stage input",
+        );
+    }
     ToolResult::text("Qualifier isolation matte").with_image(general_purpose::STANDARD.encode(png)).with_data(json!({
-        "clip_id": args.clip_id, "op_id": args.op_id, "graph_node_id": args.graph_node_id, "tick": measurement.time.0,
+        "stage": stage,"clip_id": args.clip_id, "op_id": args.op_id, "graph_node_id": args.graph_node_id, "tick": measurement.time.0,
         "revision": measurement.revision, "snapshot_generation": measurement.generation,
         "width": measurement.width, "height": measurement.height,
         "key_coordinates": if measurement.encoding == photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg { "acescct_ap1_hsl" } else { "linear_rec709_hsl" },
@@ -9249,7 +10098,28 @@ pub async fn get_scopes(state: &AppState, args: GetScopesArgs) -> ToolResult {
         generation,
         diagnostics,
         encoding,
+        ..
     } = measurement;
+    if encoding == photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg {
+        let scene = match photonic_render::scene_scopes::measure(&pixels, w, h) {
+            Ok(scene) => scene,
+            Err(error) => return err_code("SceneScopeUnavailable", error),
+        };
+        let histogram = &scene.histogram;
+        return ToolResult::text(format!("AP1 scene-relative scopes for {w}x{h} at tick {}", measured_time.0))
+            .with_data(json!({
+                "tick": measured_time.0, "requested_tick": t.0,
+                "revision": revision, "snapshot_generation": generation, "sequence": seq_id,
+                "width": w, "height": h, "tap": if matches!(got, ScopeTapPoint::Clip(_)) { "clip" } else { "program" },
+                "color_interpretation": {"mode":"native_scene_linear", "primaries":"acescg_ap1", "scale":"relative_stops", "reference_gray":0.18, "minimum_stop":-12.0, "maximum_stop":12.0, "upper_exclusive":true},
+                "histogram":{"bins":256,"luma":histogram[0],"red":histogram[1],"green":histogram[2],"blue":histogram[3]},
+                "waveform":compact_waveform(&scene.waveform[0]),
+                "rgb_parade":{"red":compact_waveform(&scene.waveform[1]),"green":compact_waveform(&scene.waveform[2]),"blue":compact_waveform(&scene.waveform[3])},
+                "excluded":{"channel_order":["Y","R","G","B"],"transparent":scene.transparent,"invalid":scene.invalid,"nonpositive":scene.nonpositive,"below_range":scene.below,"above_range":scene.above},
+                "vectorscope":null,"video_legal":null,"grading_diagnostics":diagnostics,
+                "note":"Straight AP1 luminance/channels in log2(value/0.18), not nits or IRE. Positive in-range samples only; other values counted separately. Equal covered-pixel weight; spatial bins include every logical column, with at most256 measured columns. AP1 chroma vectorscope is not qualified."
+            }));
+    }
     let flat: Vec<f32> = pixels.iter().flat_map(|p| p.iter().copied()).collect();
     let matrix = match args.vectorscope_matrix {
         VectorscopeMatrix::Bt709 => photonic_render::color::Matrix::Bt709,
@@ -9270,7 +10140,12 @@ pub async fn get_scopes(state: &AppState, args: GetScopesArgs) -> ToolResult {
         ScopeTapPoint::NativeGraphQualifierInput { .. } => "graph_qualifier_input",
         ScopeTapPoint::NativeGraphCurveInput { .. } => "graph_curve_input",
         ScopeTapPoint::GradeGraphMatteOutput { .. } => "graph_matte_output",
+        ScopeTapPoint::GradeStageGraphMatteOutput { .. } => "stage_graph_matte_output",
+        ScopeTapPoint::GradeGraphImageOutput { .. } => "graph_image_output",
+        ScopeTapPoint::GradeStageGraphImageOutput { .. } => "stage_graph_image_output",
         ScopeTapPoint::Program => "program",
+        ScopeTapPoint::NativeSceneProgram => "native_scene_program",
+        ScopeTapPoint::GradeStageInput { .. } => "grade_stage_input",
     };
     let fell_back = want != got;
     let mut data = scopes_json(&scopes, measured_time);
@@ -9410,6 +10285,8 @@ fn compact_waveform(waveform: &photonic_render::scopes::Waveform) -> serde_json:
 }
 
 struct ScopeMeasurement {
+    display_pixels: Option<Vec<[f32; 4]>>,
+    content_hash: u128,
     pixels: Vec<[f32; 4]>,
     width: u32,
     height: u32,
@@ -9455,6 +10332,9 @@ enum ScopeReadbackMode {
     Signal,
     Qualifier(ClipId, photonic_core::timeline::GradeOpId),
     NativeLogInput,
+    MatteOutput,
+    ImageOutput,
+    ProgramOutput,
 }
 
 async fn render_tap_pixels_mode(
@@ -9545,16 +10425,126 @@ async fn render_tap_pixels_mode(
     if matches!(mode, ScopeReadbackMode::Signal) {
         validate_scope_tap_encoding(frame.scope_tap_encoding)?;
     } else if frame.scope_tap_point != want || !frame.grading_errors.is_empty() {
-        return Err(err_code(
-            "QualifierInputUnavailable",
-            "the requested key input is inactive or has unresolved grading dependencies",
-        ));
+        return Err(if matches!(mode, ScopeReadbackMode::MatteOutput) {
+            err_code(
+                "GradeMatteUnavailable",
+                "the requested matte output is inactive or has unresolved grading dependencies",
+            )
+        } else if matches!(mode, ScopeReadbackMode::ProgramOutput) {
+            err_code(
+                "NativeOutputUnavailable",
+                "requested scene output is missing or has unresolved grading dependencies",
+            )
+        } else if matches!(mode, ScopeReadbackMode::ImageOutput) {
+            err_code(
+                "GradeImageUnavailable",
+                "the requested image output is inactive or has unresolved grading dependencies",
+            )
+        } else {
+            err_code(
+                "QualifierInputUnavailable",
+                "the requested key input is inactive or has unresolved grading dependencies",
+            )
+        });
+    }
+
+    if matches!(mode, ScopeReadbackMode::MatteOutput) {
+        let valid = frame.scope_tap_encoding
+            == Some(photonic_video::graph::ir::FrameColorEncoding::MatteWeight)
+            && match want {
+                ScopeTapPoint::GradeGraphMatteOutput { clip, node } => frame
+                    .native_graph_mattes
+                    .iter()
+                    .any(|(c, n, _)| *c == clip && *n == node),
+                ScopeTapPoint::GradeStageGraphMatteOutput { clip, stage, node } => {
+                    photonic_video::graph::compile::GradeGraphStageOutput::find(
+                        &frame.native_stage_graph_outputs,
+                        clip,
+                        stage,
+                        node,
+                        false,
+                    )
+                    .is_some()
+                }
+                _ => false,
+            };
+        if !valid {
+            return Err(err_code(
+                "GradeMatteUnavailable",
+                "requested matte output is inactive, unreachable or unqualified",
+            ));
+        }
+    }
+
+    if matches!(mode, ScopeReadbackMode::ProgramOutput) {
+        use photonic_video::graph::ir::FrameColorEncoding;
+        if u64::from(tap.width) * u64::from(tap.height)
+            > photonic_render::scene_measurement::MAX_PAIRED_PIXELS as u64
+        {
+            return Err(err_code(
+                "NativeOutputTooLarge",
+                "rendered paired output exceeds the readback pixel bound",
+            ));
+        }
+        if want != ScopeTapPoint::NativeSceneProgram
+            || frame.scope_tap_encoding != Some(FrameColorEncoding::SceneLinearAcescg)
+            || frame.output_encoding != FrameColorEncoding::SrgbDisplay
+            || frame.preview_asset.is_some()
+            || frame.cached_preview
+            || frame.logical_size != (tap.width, tap.height)
+        {
+            return Err(err_code(
+                "NativeOutputUnavailable",
+                "paired native scene and SDR output require one qualified full program frame",
+            ));
+        }
+    }
+
+    if matches!(mode, ScopeReadbackMode::ImageOutput) {
+        let valid = frame.scope_tap_encoding
+            == Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+            && match want {
+                ScopeTapPoint::GradeGraphImageOutput { clip, node } => frame
+                    .native_graph_images
+                    .iter()
+                    .any(|(c, n, _)| *c == clip && *n == node),
+                ScopeTapPoint::GradeStageGraphImageOutput { clip, stage, node } => {
+                    photonic_video::graph::compile::GradeGraphStageOutput::find(
+                        &frame.native_stage_graph_outputs,
+                        clip,
+                        stage,
+                        node,
+                        true,
+                    )
+                    .is_some()
+                }
+                _ => false,
+            };
+        if !valid {
+            return Err(err_code(
+                "GradeImageUnavailable",
+                "requested image output is inactive, unreachable or unqualified",
+            ));
+        }
     }
 
     if matches!(mode, ScopeReadbackMode::NativeLogInput) {
         let valid = frame.scope_tap_encoding
             == Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
             && match want {
+                ScopeTapPoint::GradeStageInput {
+                    clip,
+                    stage,
+                    node,
+                    op,
+                } => photonic_video::graph::compile::NativeStageGradeInput::find(
+                    &frame.native_stage_grade_inputs,
+                    clip,
+                    stage,
+                    node,
+                    op,
+                )
+                .is_some(),
                 ScopeTapPoint::NativeGraphCurveInput { clip, node, op } => frame
                     .native_graph_curve_inputs
                     .iter()
@@ -9584,6 +10574,16 @@ async fn render_tap_pixels_mode(
     let texture = std::sync::Arc::clone(&tap.texture);
     let (width, height) = (tap.width, tap.height);
     let native_key = qualifier.and_then(|(clip, op)| {
+        if let ScopeTapPoint::GradeStageInput { stage, node, .. } = want {
+            return photonic_video::graph::compile::NativeStageGradeInput::find(
+                &frame.native_stage_grade_inputs,
+                clip,
+                stage,
+                node,
+                op,
+            )
+            .and_then(|input| input.qualifier.clone());
+        }
         if let ScopeTapPoint::NativeGraphQualifierInput { node, .. } = want {
             return frame
                 .native_graph_qualifier_inspections
@@ -9636,13 +10636,14 @@ async fn render_tap_pixels_mode(
                 );
             Ok(read_texture_rgba16f(&gpu, &encoded, width, height))
         } else if let Some(key) = native_key {
-            let matte = photonic_render::grade_gpu::native_qualifier_matte_gpu(
+            let matte = photonic_render::grade_gpu::native_qualifier_matte_with_spatial_gpu(
                 gpu.device(),
                 gpu.queue(),
                 &texture,
                 &key.qualifier,
                 key.mask.as_ref(),
                 (width, height),
+                key.spatial,
             )
             .map_err(str::to_owned)?;
             Ok(read_texture_rgba16f(&gpu, &matte, width, height))
@@ -9664,7 +10665,20 @@ async fn render_tap_pixels_mode(
     .await
     .map_err(|error| ToolResult::error(format!("inspection readback failed: {error}")))?
     .map_err(|error| err_code("QualifierReadbackFailed", error))?;
+    let display_pixels = if matches!(mode, ScopeReadbackMode::ProgramOutput) {
+        let gpu = bridge.engine().gpu().clone();
+        let output = frame.texture.clone();
+        Some(
+            tokio::task::spawn_blocking(move || read_texture_rgba16f(&gpu, &output, width, height))
+                .await
+                .map_err(|e| err_code("NativeOutputReadbackFailed", e.to_string()))?,
+        )
+    } else {
+        None
+    };
     Ok(ScopeMeasurement {
+        display_pixels,
+        content_hash: frame.content_hash.0,
         pixels,
         width,
         height,
@@ -9682,7 +10696,11 @@ fn validate_scope_tap_encoding(
 ) -> Result<(), ToolResult> {
     use photonic_video::graph::ir::FrameColorEncoding;
     match encoding {
-        Some(FrameColorEncoding::LegacyLinearRec709 | FrameColorEncoding::SrgbDisplay) => Ok(()),
+        Some(
+            FrameColorEncoding::LegacyLinearRec709
+            | FrameColorEncoding::SrgbDisplay
+            | FrameColorEncoding::SceneLinearAcescg,
+        ) => Ok(()),
         Some(other) => Err(err_code(
             "ScopeColorInterpretationUnavailable",
             format!("the {other:?} tap needs a qualified color-specific scope scale"),
@@ -9758,6 +10776,7 @@ pub async fn create_clip_composition(
 
 fn map_graph_error(e: EditError) -> ToolResult {
     match e {
+        EditError::InvalidGraphConnection(reason) => err_code("GraphTypeMismatch", reason),
         EditError::WouldCreateCycle => err_code(
             "CycleDetected",
             "edge would create a cycle in the node graph",
@@ -9797,9 +10816,64 @@ pub async fn add_graph_node(state: &AppState, args: AddGraphNodeArgs) -> ToolRes
         .pos
         .map(|[x, y]| NodePos { x, y })
         .unwrap_or(NodePos { x: 0.0, y: 0.0 });
-    let cmd = graph_ops::add_node(args.graph_id, node, pos);
+    let cmd = match graph_ops::add_node(p, args.graph_id, node, pos) {
+        Ok(cmd) => cmd,
+        Err(error) => return map_graph_error(error),
+    };
     history.execute_discrete(Command::Timeline(cmd), &mut doc);
     ToolResult::text("Added graph node").with_data(json!({ "node_id": node_id }))
+}
+
+pub async fn set_graph_time_offset(state: &AppState, args: SetGraphTimeOffsetArgs) -> ToolResult {
+    let mut doc = state.document.lock().await;
+    let mut history = state.history.lock().await;
+    let Some(p) = doc.timeline.as_ref() else {
+        return ToolResult::error("no timeline project");
+    };
+    match graph_ops::set_time_offset(p, args.graph_id, args.node_id, args.offset_ticks) {
+        Ok(Some(cmd)) => {
+            history.execute_discrete(Command::Timeline(cmd), &mut doc);
+            ToolResult::text("Updated graph time offset").with_data(json!({"changed":true}))
+        }
+        Ok(None) => {
+            ToolResult::text("Graph time offset unchanged").with_data(json!({"changed":false}))
+        }
+        Err(error) => map_graph_error(error),
+    }
+}
+
+pub async fn set_graph_mask_shape(state: &AppState, args: SetGraphMaskShapeArgs) -> ToolResult {
+    let mut doc = state.document.lock().await;
+    let mut history = state.history.lock().await;
+    let Some(p) = doc.timeline.as_ref() else {
+        return ToolResult::error("no timeline project");
+    };
+    match graph_ops::set_mask_shape(p, args.graph_id, args.node_id, args.shape) {
+        Ok(Some(cmd)) => {
+            history.execute_discrete(Command::Timeline(cmd), &mut doc);
+            ToolResult::text("Updated graph mask shape").with_data(json!({"changed":true}))
+        }
+        Ok(None) => {
+            ToolResult::text("Graph mask shape unchanged").with_data(json!({"changed":false}))
+        }
+        Err(error) => map_graph_error(error),
+    }
+}
+
+pub async fn set_graph_text(state: &AppState, args: SetGraphTextArgs) -> ToolResult {
+    let mut doc = state.document.lock().await;
+    let mut history = state.history.lock().await;
+    let Some(p) = doc.timeline.as_ref() else {
+        return ToolResult::error("no timeline project");
+    };
+    match graph_ops::set_text(p, args.graph_id, args.node_id, args.text) {
+        Ok(Some(cmd)) => {
+            history.execute_discrete(Command::Timeline(cmd), &mut doc);
+            ToolResult::text("Updated graph text").with_data(json!({"changed":true}))
+        }
+        Ok(None) => ToolResult::text("Graph text unchanged").with_data(json!({"changed":false})),
+        Err(error) => map_graph_error(error),
+    }
 }
 
 pub async fn remove_graph_node(state: &AppState, args: RemoveGraphNodeArgs) -> ToolResult {
@@ -9827,11 +10901,12 @@ pub async fn add_graph_edge(state: &AppState, args: AddGraphEdgeArgs) -> ToolRes
     };
     let from = (args.from.node_id, OutPort(args.from.port.unwrap_or(0)));
     let to = (args.to.node_id, InPort(args.to.port.unwrap_or(0)));
-    match graph_ops::add_edge(p, args.graph_id, from, to) {
-        Ok(cmd) => {
+    match graph_ops::connect_edge(p, args.graph_id, from, to) {
+        Ok(Some(cmd)) => {
             history.execute_discrete(Command::Timeline(cmd), &mut doc);
-            ToolResult::text("Added graph edge")
+            ToolResult::text("Connected graph input")
         }
+        Ok(None) => ToolResult::text("Graph input is already connected"),
         Err(e) => map_graph_error(e),
     }
 }
@@ -9856,7 +10931,10 @@ pub async fn remove_graph_edge(state: &AppState, args: RemoveGraphEdgeArgs) -> T
             g.edges.len()
         ));
     };
-    let cmd = graph_ops::remove_edge(args.graph_id, edge);
+    let cmd = match graph_ops::remove_edge(p, args.graph_id, edge) {
+        Ok(cmd) => cmd,
+        Err(error) => return map_graph_error(error),
+    };
     history.execute_discrete(Command::Timeline(cmd), &mut doc);
     ToolResult::text("Removed graph edge")
 }
@@ -10937,6 +12015,349 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bezier_matte_mcp_authoring_history_inspection_and_native_delivery() {
+        Box::pin(bezier_matte_delivery_case(false)).await;
+    }
+    #[tokio::test]
+    async fn animated_bezier_mcp_authoring_history_inspection_and_native_delivery() {
+        Box::pin(bezier_matte_delivery_case(true)).await;
+    }
+
+    async fn bezier_matte_delivery_case(animated: bool) {
+        use photonic_core::timeline::{
+            BezierWindow, BezierWindowInterpolation, BezierWindowKey, BezierWindowTrack,
+            GradeGraphNode,
+        };
+        let mut animation = BezierWindowTrack::new(Tick::ZERO, BezierWindow::default()).unwrap();
+        let mut end = BezierWindow::default();
+        for knot in &mut end.knots {
+            for point in [&mut knot.anchor, &mut knot.incoming, &mut knot.outgoing] {
+                point[0] += 0.2;
+            }
+        }
+        animation.keys.push(BezierWindowKey {
+            at: Tick(2 * TICKS_PER_SECOND / 30),
+            window: end,
+            interpolation: BezierWindowInterpolation::Linear,
+        });
+        let source_node = if animated {
+            GradeGraphNode::AnimatedBezierMatte {
+                input: 0,
+                track: animation.clone(),
+                label: "Animated cubic".into(),
+            }
+        } else {
+            GradeGraphNode::BezierMatte {
+                input: 0,
+                window: BezierWindow::default(),
+                label: "Editable cubic".into(),
+            }
+        };
+        let state = test_state();
+        assert!(engine_available(&state).await, "Native engine required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Bezier grading", FrameRate::FPS_30, 32, 32);
+        sequence.color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+            Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+        );
+        let sid = sequence.id;
+        let mut track = Track::new(photonic_core::timeline::TrackKind::Video, "V1");
+        let tid = track.id;
+        let source = Clip::new(
+            ClipSource::SolidColor {
+                color: Color {
+                    r: 0.1,
+                    g: 0.1,
+                    b: 0.1,
+                    a: 1.0,
+                },
+            },
+            Tick::ZERO,
+            Tick(TICKS_PER_SECOND / 10),
+        );
+        let clip = source.id;
+        track.clips.push(source);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        project.active_sequence = Some(sid);
+        state.document.lock().await.timeline = Some(project);
+        state.history.lock().await.reset();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 2.0 },
+        ));
+        grade.convert_to_graph();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_grade",
+            json!({"clip_id":clip,"grade":grade}),
+        ))
+        .await;
+        let key = grade.graph.as_ref().unwrap().next_id;
+        Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",json!({"scope":"clip","clip_id":clip,"op":"add_grade_graph_utility","grade_graph_node":source_node.clone()}))).await;
+        Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",json!({"scope":"clip","clip_id":clip,"op":"add_grade_graph_utility","grade_graph_node":GradeGraphNode::MatteApply{original:0,corrected:1,matte:key,label:"Isolate correction".into()}}))).await;
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let inspected = call(
+            &state,
+            "inspect_grade_matte",
+            json!({"clip_id":clip,"graph_node_id":key,"at_ticks":0}),
+        )
+        .await;
+        assert_ne!(inspected.is_error, Some(true), "{inspected:?}");
+        let encoded = inspected
+            .content
+            .iter()
+            .find_map(|v| match v {
+                ContentItem::Image { data, .. } => Some(data),
+                _ => None,
+            })
+            .unwrap();
+        let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(png.get_pixel(16, 16).0, [255; 4]);
+        assert_eq!(png.get_pixel(1, 1).0, [0, 0, 0, 255]);
+        assert_eq!(revision, state.history.lock().await.revision());
+        assert_eq!(
+            before,
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        if animated {
+            let mut invalid = animation.clone();
+            invalid.keys[1].at = invalid.keys[0].at;
+            let refused=call(&state,"effect_stack",json!({"scope":"clip","clip_id":clip,"op":"add_grade_graph_utility","grade_graph_node":GradeGraphNode::AnimatedBezierMatte{input:0,track:invalid,label:"duplicate keys".into()}})).await;
+            assert_eq!(refused.is_error, Some(true));
+            assert_eq!(revision, state.history.lock().await.revision());
+            assert_eq!(
+                before,
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+        }
+        let mut bad = serde_json::to_value(BezierWindow::default()).unwrap();
+        bad["knots"][0]["incoming"][0] = json!(5.0);
+        let refused=call(&state,"effect_stack",json!({"scope":"clip","clip_id":clip,"op":"add_grade_graph_utility","grade_graph_node":{"kind":"bezier_matte","input":0,"window":bad,"label":"bad"}})).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(revision, state.history.lock().await.revision());
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .track_mut(tid)
+            .unwrap()
+            .locked = true;
+        let refused=call(&state,"effect_stack",json!({"scope":"clip","clip_id":clip,"op":"add_grade_graph_utility","grade_graph_node":source_node.clone()})).await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(revision, state.history.lock().await.revision());
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&sid)
+            .unwrap()
+            .track_mut(tid)
+            .unwrap()
+            .locked = false;
+        assert_eq!(
+            before,
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let snapshot = state.history.lock().await.snapshot_state();
+        let file =
+            photonic_core::photon_file::save_photon(&*state.document.lock().await, Some(&snapshot))
+                .unwrap();
+        let (mut reloaded, loaded) = photonic_core::photon_file::load_photon(&file).unwrap();
+        let mut history = photonic_core::CommandHistory::new(200);
+        history.restore_state(loaded.unwrap());
+        assert!(history.undo(&mut reloaded));
+        assert!(history.redo(&mut reloaded));
+        assert_eq!(before, serde_json::to_value(&reloaded).unwrap());
+        let mut previews = Vec::new();
+        for frame in 0..3 {
+            let result=call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*TICKS_PER_SECOND/30,"quality":"full","output_format":"png"})).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|v| match v {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert!(png.get_pixel(16, 16)[0] > png.get_pixel(1, 1)[0] + 20);
+            previews.push(png);
+        }
+        if animated {
+            assert_ne!(previews[0], previews[1]);
+            assert_ne!(previews[1], previews[2]);
+        } else {
+            assert_eq!(previews[0], previews[1]);
+            assert_eq!(previews[1], previews[2]);
+        }
+        let dir = std::env::temp_dir().join(format!("photonic-bezier-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("bezier.mov");
+        let queued = call(
+            &state,
+            "export_sequence",
+            json!({"sequence_id":sid,"out_path":output,"preset":"ProRes Mezzanine","write_manifest":true}),
+        )
+        .await;
+        assert_ne!(queued.is_error, Some(true), "{queued:?}");
+        assert_eq!(data(&queued)["total_frames"], 3);
+        let finished = poll_job(&state, &data(&queued)["job_id"]).await;
+        assert_eq!(finished["status"]["state"], "done", "{finished}");
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 32 * 32 * 8 * 3);
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&output),
+        )
+        .unwrap();
+        let base = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([0.1; 3]);
+        let transform = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        for (ordinal, frame) in decoded.stdout.chunks_exact(32 * 32 * 8).enumerate() {
+            let window = if animated {
+                animation
+                    .sample(Tick(ordinal as i64 * TICKS_PER_SECOND / 30))
+                    .unwrap()
+            } else {
+                BezierWindow::default()
+            };
+            let matte = photonic_video::graph::ops::bezier_matte(32, 32, &window);
+            for (i, pixel) in frame.chunks_exact(8).enumerate() {
+                let weight = matte.pixels[i][0] as f64;
+                // Graph corrector edges are scene-linear AP1, so the explicit
+                // matte application interpolates light rather than ACEScct.
+                let expected = transform
+                    .map_straight_video(base.map(|v| v * (1.0 + 3.0 * weight)))
+                    .unwrap();
+                for c in 0..3 {
+                    let value = u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]]);
+                    assert!(
+                        value.abs_diff((expected[c] * 65535.0).round() as u16) < 500,
+                        "export pixel {i} channel {c}: {value} vs {expected:?}"
+                    );
+                }
+                assert!(u16::from_le_bytes([pixel[6], pixel[7]]) >= 65000);
+            }
+        }
+        if animated {
+            assert_ne!(
+                &decoded.stdout[..32 * 32 * 8],
+                &decoded.stdout[32 * 32 * 8..32 * 32 * 16]
+            );
+        } else {
+            assert_eq!(
+                &decoded.stdout[..32 * 32 * 8],
+                &decoded.stdout[32 * 32 * 8..32 * 32 * 16]
+            );
+        }
+        if let Ok(destination) = std::env::var(if animated {
+            "PHOTONIC_ANIMATED_BEZIER_QUALIFICATION_DIR"
+        } else {
+            "PHOTONIC_BEZIER_QUALIFICATION_DIR"
+        }) {
+            let destination = std::path::PathBuf::from(destination);
+            std::fs::create_dir_all(&destination).unwrap();
+            for (i, png) in previews.iter().enumerate() {
+                png.save(destination.join(format!("preview-{i}.png")))
+                    .unwrap();
+            }
+            std::fs::copy(&output, destination.join("bezier.mov")).unwrap();
+            std::fs::write(destination.join("input.photon"), file).unwrap();
+            std::fs::write(destination.join("checks.json"),serde_json::to_vec_pretty(&json!({"animated":animated,"frames":3,"pixels_per_frame":1024,"channels_checked":4,"rgb16_tolerance":500,"alpha_min":65000,"cpu_matte_and_explicit_ap1_interpolation_reference":true,"undo_redo_and_reload":true,"locked_track_refused":true,"invalid_geometry_refused":true,"matte_inspection_readonly":true,"manifest_verified":true})).unwrap()).unwrap();
+        }
+        if animated {
+            let mut invalid_grade = state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_ref()
+                .unwrap()
+                .sequences[&sid]
+                .track(tid)
+                .unwrap()
+                .clips[0]
+                .grade
+                .clone()
+                .unwrap();
+            for node in invalid_grade.graph.as_mut().unwrap().nodes.values_mut() {
+                if let GradeGraphNode::AnimatedBezierMatte { track, .. } = node {
+                    let mut end = track.keys[0].window.clone();
+                    for knot in &mut end.knots {
+                        for point in [&mut knot.anchor, &mut knot.incoming, &mut knot.outgoing] {
+                            point[0] = 1.0 - point[0];
+                            point[1] = 1.0 - point[1];
+                        }
+                    }
+                    track.keys[1].window = end;
+                }
+            }
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "set_grade",
+                json!({"clip_id":clip,"grade":invalid_grade}),
+            ))
+            .await;
+            let invalid_output = dir.join("invalid-interpolation.mov");
+            let rejected=call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":invalid_output,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+            let rejection = if rejected.is_error == Some(true) {
+                json!({"preflight_error":true})
+            } else {
+                let terminal = poll_job(&state, &data(&rejected)["job_id"]).await;
+                assert_eq!(
+                    terminal["status"]["state"], "failed",
+                    "degenerate animation export must fail: {terminal}"
+                );
+                terminal
+            };
+            assert!(
+                !invalid_output.exists(),
+                "failed animated export must not publish a partial movie"
+            );
+            if let Ok(destination) = std::env::var("PHOTONIC_ANIMATED_BEZIER_QUALIFICATION_DIR") {
+                std::fs::write(
+                    std::path::Path::new(&destination).join("degenerate-export-rejection.json"),
+                    serde_json::to_vec_pretty(&rejection).unwrap(),
+                )
+                .unwrap();
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn typed_grade_graph_utility_edits_round_trip_and_reject_invalid_ports() {
         use photonic_core::timeline::{GradeGraphNode, GradeOp, GradeOpKind, GradeOpParams};
         let state = test_state();
@@ -11661,8 +13082,8 @@ mod tests {
         use photonic_video::graph::ir::FrameColorEncoding;
         assert!(validate_scope_tap_encoding(Some(FrameColorEncoding::LegacyLinearRec709)).is_ok());
         assert!(validate_scope_tap_encoding(Some(FrameColorEncoding::SrgbDisplay)).is_ok());
+        assert!(validate_scope_tap_encoding(Some(FrameColorEncoding::SceneLinearAcescg)).is_ok());
         for encoding in [
-            Some(FrameColorEncoding::SceneLinearAcescg),
             Some(FrameColorEncoding::Acescct),
             Some(FrameColorEncoding::Bt709Video),
             None,
@@ -11782,7 +13203,9 @@ mod tests {
     /// `dispatch_tool_inner` match arm + handler + audit log) — the closest
     /// in-process equivalent to an agent's `tools/call`.
     async fn call(state: &AppState, name: &str, args: Value) -> ToolResult {
-        crate::dispatch::dispatch_tool(state, name, args)
+        // Keep the large dispatcher future off the test thread's stack. Longer
+        // author/undo/export scenarios must use the normal stack limit too.
+        Box::pin(crate::dispatch::dispatch_tool(state, name, args))
             .await
             .unwrap_or_else(|e| panic!("dispatch({name}) failed: {e}"))
     }
@@ -13318,6 +14741,92 @@ mod tests {
         assert_ne!(r.is_error, Some(true), "remove_track: {r:?}");
     }
 
+    #[tokio::test]
+    async fn track_composite_mcp_edits_are_atomic_locked_and_serializable() {
+        let state = test_state();
+        let (seq, track) = create_seq_and_track(&state, "video").await;
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_track_prop",
+            json!({"track_id":track,"blend":"soft_light","opacity":0.375}),
+        ))
+        .await;
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        assert_ne!(
+            call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":track,"blend":"soft_light","opacity":0.375})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        for value in [-0.01, 1.01] {
+            assert_eq!(
+                call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":track,"name":"must not change","opacity":value})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+        assert_ne!(
+            call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":track,"locked":true})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        let locked = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        assert_eq!(
+            call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":track,"locked":false,"blend":"screen"})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            locked
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        let audio = create_track(&state, &seq, "audio").await;
+        assert_eq!(
+            call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":audio,"opacity":1.0})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        let doc = state.document.lock().await;
+        let reloaded: photonic_core::Document =
+            serde_json::from_str(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.timeline).unwrap(),
+            serde_json::to_value(&doc.timeline).unwrap()
+        );
+    }
+
     // ── Tool family: clip edit ops ────────────────────────────────────────────
 
     #[tokio::test]
@@ -14487,6 +15996,442 @@ mod tests {
     // ── Tool family: keyframes ─────────────────────────────────────────────
 
     #[tokio::test]
+    async fn stage_animation_mcp_native_render_export_and_history() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            ClipLook, GradeGraphNode, GradeInspectionStage as S, GradeMask, GroupKind, GroupNode,
+            SharedLook, SharedLookId, WindowShape,
+        };
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_STAGE_ANIMATION_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-stage-animation-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        for graph in [false, true] {
+            for which in 0..4 {
+                let state = test_state();
+                let mut project = TimelineProject::new();
+                let mut sequence = Sequence::new("Stage animation", FrameRate::FPS_30, 16, 16);
+                sequence.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                let sid = sequence.id;
+                let tpf = sequence.frame_rate.ticks_per_frame().0;
+                let mut grade = Grade::new();
+                let exposure = GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: 0.0 },
+                );
+                let op = exposure.id;
+                grade.ops.push(exposure);
+                let mut window = GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: 0.0 },
+                );
+                let window_op = window.id;
+                window.mask = Some(GradeMask::PowerWindow {
+                    shape: WindowShape::Rectangle,
+                    center: [0.25, 0.5],
+                    size: [0.15, 0.2],
+                    rotation: 0.0,
+                    softness: 0.0,
+                    invert: false,
+                });
+                grade.ops.push(window);
+                let raw = if graph {
+                    grade.convert_to_graph();
+                    let output = match grade.graph.as_ref().unwrap().nodes
+                        [&grade.graph.as_ref().unwrap().output]
+                    {
+                        GradeGraphNode::Output { input } => input,
+                        _ => unreachable!(),
+                    };
+                    let node = grade
+                        .add_graph_utility(GradeGraphNode::WindowMatte {
+                            input: 0,
+                            op: window_op,
+                            label: "Animated window".into(),
+                        })
+                        .unwrap();
+                    grade
+                        .add_graph_utility(GradeGraphNode::MatteApply {
+                            original: output,
+                            corrected: output,
+                            matte: node,
+                            label: "Keep scene".into(),
+                        })
+                        .unwrap();
+                    Some(node)
+                } else {
+                    None
+                };
+                let mut group = GroupNode::new(GroupKind::Normal);
+                let gid = group.id;
+                group.pre_grade = Some(grade.clone());
+                group.post_grade = Some(grade.clone());
+                sequence.groups.insert(gid, group);
+                let look = SharedLookId::new();
+                project.shared_looks.insert(
+                    look,
+                    SharedLook {
+                        versions: Vec::new(),
+                        active_version: None,
+                        id: look,
+                        name: "Animated look".into(),
+                        grade: grade.clone(),
+                    },
+                );
+                let stage = [
+                    S::LocalLook,
+                    S::SharedLook { id: look },
+                    S::GroupPre { id: gid },
+                    S::GroupPost { id: gid },
+                ][which];
+                let mut ids = Vec::new();
+                let mut tracks = Vec::new();
+                for member in 0..2 {
+                    let mut c = Clip::new(
+                        ClipSource::SolidColor {
+                            color: photonic_core::Color {
+                                r: 0.2,
+                                g: 0.1,
+                                b: 0.05,
+                                a: 0.5,
+                            },
+                        },
+                        Tick(member * 3 * tpf),
+                        Tick(3 * tpf),
+                    );
+                    c.name = format!("Member {}", member + 1);
+                    c.grade = Some(grade.clone());
+                    c.group = Some(gid);
+                    c.look = Some(if which == 0 {
+                        ClipLook::Local(Box::new(grade.clone()))
+                    } else {
+                        ClipLook::Shared(look)
+                    });
+                    ids.push(c.id);
+                    let mut track = photonic_core::timeline::Track::new(
+                        photonic_core::timeline::TrackKind::Video,
+                        format!("V{}", member + 1),
+                    );
+                    tracks.push(track.id);
+                    track.clips.push(c);
+                    sequence.video_tracks.push(track);
+                }
+                project.insert_sequence(sequence);
+                project.active_sequence = Some(sid);
+                state.document.lock().await.timeline = Some(project);
+                assert!(engine_available(&state).await, "GPU required");
+                let address =
+                    json!({"target":"grade_stage_op","clip_id":ids[0],"stage":stage,"op_id":op});
+                let key = |at: i64, value: f64, corrector, path: &str| json!({"target":"grade_stage_op","clip_id":ids[0],"stage":stage,"op_id":corrector,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                let authored = json!({"ops":[key(0,0.0,op,"params.stops"),key(2*tpf,2.0,op,"params.stops"),key(0,0.25,window_op,"mask.center[0]"),key(2*tpf,0.75,window_op,"mask.center[0]")]});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    authored,
+                ))
+                .await;
+                let read = Box::pin(call(&state, "get_keyframes", address.clone())).await;
+                assert_ne!(read.is_error, Some(true), "{read:?}");
+                assert_eq!(
+                    data(&read)["tracks"][0]["keyframes"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    2
+                );
+                let copied = Box::pin(call(&state, "copy_keyframes", address.clone())).await;
+                assert_ne!(copied.is_error, Some(true));
+                let clipboard = data(&copied)["clipboard"].clone();
+                let mut paste = address.clone();
+                paste["clipboard"] = clipboard.clone();
+                paste["offset_ticks"] = json!(10 * tpf);
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "paste_keyframes",
+                    paste,
+                ))
+                .await;
+                // Remove the pasted keys, preserving the original linear range.
+                for at in [10 * tpf, 12 * tpf] {
+                    let mut remove = address.clone();
+                    remove["path"] = json!("params.stops");
+                    remove["at_ticks"] = json!(at);
+                    Box::pin(graph_authoring_edit_roundtrip(
+                        &state,
+                        "remove_keyframe",
+                        remove,
+                    ))
+                    .await;
+                }
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let rev = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"batch_set_keyframes",json!({"ops":[key(0,1.0,op,"params.stops"),key(0,-1.0,window_op,"mask.size[0]")]}))).await;
+                assert_eq!(invalid.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), rev);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+                let base = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    0.2, 0.1, 0.05,
+                ]);
+                let mut receipts = Vec::new();
+                for member in 0..2 {
+                    for frame in 0..3 {
+                        let at = (member * 3 + frame) * tpf;
+                        let stops = if member == 1 && which == 0 {
+                            0.0
+                        } else {
+                            frame as f64
+                        };
+                        let result = Box::pin(call(
+                            &state,
+                            "measure_native_output",
+                            json!({"sequence_id":sid,"at_ticks":at}),
+                        ))
+                        .await;
+                        assert_ne!(result.is_error, Some(true), "{result:?}");
+                        let d = &result.structured_content.as_ref().unwrap()["measurements"];
+                        assert!((d["alpha_min"].as_f64().unwrap() - 0.5).abs() < 0.002);
+                        for c in 0..3 {
+                            assert!(
+                                (d["scene_rgb"]["mean"][c].as_f64().unwrap()
+                                    - base[c] * 2.0f64.powf(stops))
+                                .abs()
+                                    < 0.003,
+                                "{d}"
+                            );
+                        }
+                        if let Some(raw) = raw {
+                            let matte=Box::pin(call(&state,"inspect_grade_matte",json!({"clip_id":ids[member as usize],"stage":stage,"graph_node_id":raw,"at_ticks":at}))).await;
+                            assert_ne!(matte.is_error, Some(true), "{matte:?}");
+                            let bytes = matte
+                                .content
+                                .iter()
+                                .find_map(|c| match c {
+                                    ContentItem::Image { data, .. } => {
+                                        Some(general_purpose::STANDARD.decode(data).unwrap())
+                                    }
+                                    _ => None,
+                                })
+                                .unwrap();
+                            let png = image::load_from_memory(&bytes).unwrap().to_rgba8();
+                            let center = if member == 1 && which == 0 {
+                                4
+                            } else {
+                                4 + frame as u32 * 4
+                            };
+                            assert!(png.get_pixel(center, 8)[0] > 250);
+                            assert!(png.get_pixel(if center == 4 { 12 } else { 2 }, 8)[0] < 5);
+                        }
+                        receipts.push(
+                            json!({"member":member,"frame":frame,"stops":stops,"measurements":d}),
+                        );
+                    }
+                }
+                let dir = root.join(format!(
+                    "{}-{}",
+                    which,
+                    if graph { "graph" } else { "stack" }
+                ));
+                std::fs::create_dir_all(&dir).unwrap();
+                let movie = dir.join("animation.mov");
+                let started=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+                assert_ne!(started.is_error, Some(true), "{started:?}");
+                let done = poll_job(&state, &data(&started)["job_id"]).await;
+                assert_eq!(done["status"]["state"], "done", "{done}");
+                photonic_video::export::manifest::verify_manifest(
+                    &photonic_video::export::manifest::manifest_path(&movie),
+                )
+                .unwrap();
+                let decoded = std::process::Command::new(&tools.ffmpeg)
+                    .args(["-v", "error", "-i"])
+                    .arg(&movie)
+                    .args([
+                        "-frames:v",
+                        "6",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgba64le",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(decoded.status.success());
+                assert_eq!(decoded.stdout.len(), 6 * 16 * 16 * 8);
+                // Independent numerical output reference is the qualified output map;
+                // animated gains above are calculated analytically, never read back from IR.
+                let output_map =
+                    photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+                for (index, frame_bytes) in decoded.stdout.chunks_exact(16 * 16 * 8).enumerate() {
+                    let stops = if index >= 3 && which == 0 {
+                        0.0
+                    } else {
+                        (index % 3) as f64
+                    };
+                    let expected = output_map
+                        .map_straight_video(base.map(|v| v * 2.0f64.powf(stops)))
+                        .unwrap();
+                    let pixel = &frame_bytes[(8 * 16 + 8) * 8..];
+                    for c in 0..3 {
+                        let got = u16::from_le_bytes([pixel[2 * c], pixel[2 * c + 1]]);
+                        assert!(
+                            got.abs_diff((expected[c] * 65535.0).round() as u16) < 1400,
+                            "{which} {graph} {index} {c}: {got} vs {expected:?}"
+                        );
+                    }
+                    assert!(u16::from_le_bytes([pixel[6], pixel[7]]).abs_diff(32768) < 512);
+                }
+                std::fs::write(
+                    dir.join("input.photon"),
+                    state.document.lock().await.to_json().unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    dir.join("checks.json"),
+                    serde_json::to_vec_pretty(
+                        &json!({"stage":stage,"graph":graph,"checks":receipts,"export_frames":6}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                // The other member's lock protects shared/group edits, while local
+                // look edits remain specific to their own unlocked track.
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tracks[1],"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true));
+                let changed = Box::pin(call(
+                    &state,
+                    "set_keyframe",
+                    key(0, 0.25, op, "params.stops"),
+                ))
+                .await;
+                assert_eq!(changed.is_error == Some(true), which != 0, "{changed:?}");
+                assert_ne!(
+                    Box::pin(call(&state, "get_keyframes", address.clone()))
+                        .await
+                        .is_error,
+                    Some(true)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn grade_keyframe_tools_roundtrip_copy_paste_and_reject_bad_batches() {
+        let state = test_state();
+        let (_, track) = create_seq_and_track(&state, "video").await;
+        let clip = insert_solid_clip(&state, &track, 0, 1000).await;
+        let op = GradeOp::new(
+            GradeOpKind::WhiteBalanceCct,
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin: 6500.0,
+                target_kelvin: 6500.0,
+            },
+        );
+        let op_id = op.id;
+        let mut grade = Grade::new();
+        grade.ops.push(op);
+        let result = Box::pin(call(
+            &state,
+            "set_grade",
+            json!({"clip_id":clip,"grade":grade}),
+        ))
+        .await;
+        assert_ne!(result.is_error, Some(true));
+        let key = |value: f64| json!({"target":"grade_op","clip_id":clip,"op_id":op_id,"path":"params.source_kelvin","at_ticks":0,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_keyframe",
+            key(3200.0),
+        ))
+        .await;
+        let listed = Box::pin(call(
+            &state,
+            "get_keyframes",
+            json!({"target":"grade_op","clip_id":clip,"op_id":op_id}),
+        ))
+        .await;
+        assert_eq!(
+            data(&listed)["tracks"][0]["keyframes"][0]["value"]["v"],
+            3200.0
+        );
+        let copied = Box::pin(call(
+            &state,
+            "copy_keyframes",
+            json!({"target":"grade_op","clip_id":clip,"op_id":op_id}),
+        ))
+        .await;
+        assert_ne!(copied.is_error, Some(true));
+        let clipboard = data(&copied)["clipboard"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(&state,"paste_keyframes",json!({"target":"grade_op","clip_id":clip,"op_id":op_id,"clipboard":clipboard,"offset_ticks":100}))).await;
+        Box::pin(graph_authoring_edit_roundtrip(&state,"remove_keyframe",json!({"target":"grade_op","clip_id":clip,"op_id":op_id,"path":"params.source_kelvin","at_ticks":100}))).await;
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let bad = Box::pin(call(
+            &state,
+            "batch_set_keyframes",
+            json!({"ops":[key(4000.0),key(1000.0)]}),
+        ))
+        .await;
+        assert_eq!(data(&bad)["error_code"], "InvalidGradeParameters");
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        {
+            let mut d = state.document.lock().await;
+            let p = d.timeline.as_mut().unwrap();
+            let track_id: TrackId = serde_json::from_value(track.clone()).unwrap();
+            for sequence in p.sequences.values_mut() {
+                if let Some(t) = sequence.track_mut(track_id) {
+                    t.locked = true;
+                }
+            }
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for (tool, args) in [
+            ("set_keyframe", key(4000.0)),
+            (
+                "remove_keyframe",
+                json!({"target":"grade_op","clip_id":clip,"op_id":op_id,"path":"params.source_kelvin","at_ticks":0}),
+            ),
+            (
+                "paste_keyframes",
+                json!({"target":"grade_op","clip_id":clip,"op_id":op_id,"clipboard":clipboard}),
+            ),
+        ] {
+            let result = Box::pin(call(&state, tool, args)).await;
+            assert_eq!(data(&result)["error_code"], "TrackLocked", "{result:?}");
+        }
+        let read = Box::pin(call(
+            &state,
+            "get_keyframes",
+            json!({"target":"grade_op","clip_id":clip,"op_id":op_id}),
+        ))
+        .await;
+        assert_ne!(read.is_error, Some(true));
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
     async fn family_keyframes() {
         let state = test_state();
         let (_, track_id) = create_seq_and_track(&state, "video").await;
@@ -14926,6 +16871,7 @@ mod tests {
     // ── Schema/args/dispatch consistency (10 §9.3) ───────────────────────────
 
     const VIDEO_TOOL_NAMES: &[&str] = &[
+        "measure_native_output",
         "create_sequence",
         "delete_sequence",
         "list_sequences",
@@ -15588,72 +17534,1305 @@ mod tests {
 
     #[tokio::test]
     async fn export_sequence_native_managed_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::Standard,
-        )
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_nested_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             true,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::Standard,
-        )
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_pq_source_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Pq,
             NativeGradeFixture::Standard,
-        )
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_cdl_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::Cdl,
-        )
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_curves_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::Curves,
-        )
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_hlg_source_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Hlg,
             NativeGradeFixture::Standard,
-        )
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn kelvin_legacy_animation_authors_undoes_previews_and_exports() {
+        use photonic_core::timeline::{
+            GradeOp, GradeOpKind, GradeOpParams, Interp, Keyframe, PropValue, PropertyTrack,
+        };
+        let state = test_state();
+        if !engine_available(&state).await {
+            return;
+        }
+        let Some(tools) = photonic_video::media::ffmpeg_locate::locate_for_test() else {
+            return;
+        };
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Kelvin animation","frame_rate":{"num":30,"den":1},"formats":[{"name":"square","width":32,"height":32}]}))).await;
+        assert_ne!(created.is_error, Some(true));
+        let sequence = data(&created)["sequence_id"].clone();
+        let track = create_track(&state, &sequence, "video").await;
+        let frame_ticks = TICKS_PER_SECOND / 30;
+        let inserted=Box::pin(call(&state,"insert_clip",json!({"track_id":track,"start_ticks":0,"duration_ticks":frame_ticks*3,"source":{"kind":"solid_color","color":"#808080"}}))).await;
+        assert_ne!(inserted.is_error, Some(true));
+        let clip = data(&inserted)["clip_id"].clone();
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::WhiteBalanceCct,
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin: 6500.0,
+                target_kelvin: 6500.0,
+            },
+        );
+        let mut lane = PropertyTrack::new("params.source_kelvin");
+        for (i, temperature) in [6500.0, 3200.0, 6500.0].into_iter().enumerate() {
+            lane.insert_keyframe(Keyframe::new(
+                Tick(frame_ticks * i as i64),
+                PropValue::Float(temperature),
+                Interp::Linear,
+            ));
+        }
+        op.params.tracks.push(lane);
+        grade.ops.push(op);
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let mut invalid = serde_json::to_value(&grade).unwrap();
+        invalid["ops"][0]["params"]["base"]["source_kelvin"] = json!(1000.0);
+        let rejected = Box::pin(call(
+            &state,
+            "set_grade",
+            json!({"clip_id":clip,"grade":invalid}),
+        ))
+        .await;
+        assert_eq!(data(&rejected)["error_code"], "InvalidGradeParameters");
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_grade",
+            json!({"clip_id":clip,"grade":grade}),
+        ))
+        .await;
+        let encoded = serde_json::to_string(&*state.document.lock().await).unwrap();
+        let reloaded: Box<photonic_core::document::Document> =
+            serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let mut previews = Vec::new();
+        for frame in 0..3 {
+            let result=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":frame_ticks*frame,"quality":"full","output_format":"png"}))).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            previews.push(png.get_pixel(16, 16).0);
+        }
+        assert_eq!(previews[0], previews[2]);
+        assert!(previews[0][0].abs_diff(previews[0][2]) <= 2);
+        assert!(
+            previews[1][2] > previews[1][0].saturating_add(20),
+            "{previews:?}"
+        );
+        let dir = std::env::temp_dir().join(format!("photonic-kelvin-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("animated.mov");
+        let queued = Box::pin(call(
+            &state,
+            "export_sequence",
+            json!({"sequence_id":sequence,"out_path":output,"preset":"ProRes Mezzanine"}),
+        ))
+        .await;
+        assert_ne!(queued.is_error, Some(true), "{queued:?}");
+        assert_eq!(data(&queued)["total_frames"], 3);
+        let finished = poll_job(&state, &data(&queued)["job_id"]).await;
+        assert_eq!(finished["status"]["state"], "done", "{finished}");
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 32 * 32 * 3 * 3);
+        let pixels: Vec<_> = (0..3)
+            .map(|i| {
+                let offset = i * 32 * 32 * 3 + (16 * 32 + 16) * 3;
+                decoded.stdout[offset..offset + 3].to_vec()
+            })
+            .collect();
+        for c in 0..3 {
+            assert!(pixels[0][c].abs_diff(pixels[2][c]) <= 2);
+        }
+        assert!(pixels[0][0].abs_diff(pixels[0][2]) <= 3);
+        assert!(pixels[1][2] > pixels[1][0].saturating_add(20), "{pixels:?}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn tonal_legacy_animation_authors_undoes_previews_and_exports() {
+        Box::pin(check_tonal_animation(false)).await;
+    }
+
+    #[tokio::test]
+    async fn tonal_native_animation_authors_undoes_previews_and_exports() {
+        Box::pin(check_tonal_animation(true)).await;
+    }
+
+    #[tokio::test]
+    async fn window_animation_legacy_mcp_preview_and_prores() {
+        Box::pin(check_primary_animation(false, true)).await;
+    }
+    #[tokio::test]
+    async fn window_animation_native_mcp_preview_and_prores() {
+        Box::pin(check_primary_animation(true, true)).await;
+    }
+    async fn check_tonal_animation(native: bool) {
+        Box::pin(check_primary_animation(native, false)).await;
+    }
+    #[tokio::test]
+    async fn boolean_window_legacy_mcp_authoring_preview_and_prores() {
+        for mode in [
+            photonic_core::timeline::GradeKeyMixMode::Union,
+            photonic_core::timeline::GradeKeyMixMode::Intersect,
+            photonic_core::timeline::GradeKeyMixMode::Subtract,
+            photonic_core::timeline::GradeKeyMixMode::Multiply,
+        ] {
+            Box::pin(check_primary_animation_with_boolean(
+                false,
+                true,
+                Some(mode),
+            ))
+            .await;
+        }
+    }
+    #[tokio::test]
+    async fn boolean_window_native_mcp_authoring_preview_and_prores() {
+        for mode in [
+            photonic_core::timeline::GradeKeyMixMode::Union,
+            photonic_core::timeline::GradeKeyMixMode::Intersect,
+            photonic_core::timeline::GradeKeyMixMode::Subtract,
+            photonic_core::timeline::GradeKeyMixMode::Multiply,
+        ] {
+            Box::pin(check_primary_animation_with_boolean(true, true, Some(mode))).await;
+        }
+    }
+    async fn check_primary_animation(native: bool, window: bool) {
+        Box::pin(check_primary_animation_with_boolean(native, window, None)).await;
+    }
+    async fn check_primary_animation_with_boolean(
+        native: bool,
+        window: bool,
+        boolean: Option<photonic_core::timeline::GradeKeyMixMode>,
+    ) {
+        use photonic_core::timeline::{
+            GradeOp, GradeOpKind, GradeOpParams, Interp, Keyframe, PropValue, PropertyTrack,
+        };
+        let state = test_state();
+        assert!(
+            engine_available(&state).await,
+            "engine required for animation qualification"
+        );
+        let tools = photonic_video::media::ffmpeg_locate::locate_for_test()
+            .expect("FFmpeg required for animation qualification");
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Tonal animation","frame_rate":{"num":30,"den":1},"formats":[{"name":"square","width":32,"height":32}]}))).await;
+        assert_ne!(created.is_error, Some(true));
+        let sequence = data(&created)["sequence_id"].clone();
+        let sequence = if native {
+            let converted = Box::pin(call(
+                &state,
+                "create_native_color_draft",
+                json!({"sequence_id":sequence}),
+            ))
+            .await;
+            assert_ne!(converted.is_error, Some(true), "{converted:?}");
+            data(&converted)["sequence_id"].clone()
+        } else {
+            sequence
+        };
+        let track = create_track(&state, &sequence, "video").await;
+        let frame_ticks = TICKS_PER_SECOND / 30;
+        let inserted=Box::pin(call(&state,"insert_clip",json!({"track_id":track,"start_ticks":0,"duration_ticks":frame_ticks*3,"source":{"kind":"solid_color","color":"#808080"}}))).await;
+        assert_ne!(inserted.is_error, Some(true));
+        let clip = data(&inserted)["clip_id"].clone();
+        let mut grade = Grade::new();
+        let mut op = if window {
+            GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure {
+                    stops: if boolean.is_some() { 0.0 } else { 3.0 },
+                },
+            )
+        } else {
+            GradeOp::new(
+                GradeOpKind::TonalExposure,
+                GradeOpParams::TonalExposure {
+                    stops: [0.0; 3],
+                    boundaries: [-2.0, 2.0],
+                    softness: 1.0,
+                },
+            )
+        };
+        if window {
+            op.mask = Some(photonic_core::timeline::GradeMask::PowerWindow {
+                shape: photonic_core::timeline::WindowShape::Rectangle,
+                center: [0.5; 2],
+                size: [0.1, 0.25],
+                rotation: 0.0,
+                softness: 0.0,
+                invert: false,
+            });
+        }
+        let animation_path = if window {
+            "mask.softness"
+        } else {
+            "params.stops[1]"
+        };
+        let mut lane = PropertyTrack::new(animation_path);
+        for (i, temperature) in [0.0, 1.0, 0.0].into_iter().enumerate() {
+            lane.insert_keyframe(Keyframe::new(
+                Tick(frame_ticks * i as i64),
+                PropValue::Float(temperature),
+                Interp::Linear,
+            ));
+        }
+        let animation = lane.keyframes;
+        let op_id = op.id;
+        grade.ops.push(op);
+        let boolean_route = boolean.map(|mode| {
+            use photonic_core::timeline::{
+                GradeGraphNode, GradeKeyMixMode, GradeMask, WindowShape,
+            };
+            let on = matches!(mode, GradeKeyMixMode::Intersect | GradeKeyMixMode::Multiply);
+            let mut other = GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 0.0 },
+            );
+            other.mask = Some(GradeMask::PowerWindow {
+                shape: WindowShape::Rectangle,
+                center: if on { [0.5; 2] } else { [0.1; 2] },
+                size: if on { [0.5; 2] } else { [0.1; 2] },
+                rotation: 0.0,
+                softness: 0.1,
+                invert: false,
+            });
+            let other_id = other.id;
+            grade.ops.push(other);
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 3.0 },
+            ));
+            grade.convert_to_graph();
+            let g = grade.graph.as_ref().unwrap();
+            let corrected = match g.nodes[&g.output] {
+                GradeGraphNode::Output { input } => input,
+                _ => unreachable!(),
+            };
+            let first = g.next_id;
+            [
+                GradeGraphNode::WindowMatte {
+                    input: 0,
+                    op: op_id,
+                    label: "Animated window".into(),
+                },
+                GradeGraphNode::WindowMatte {
+                    input: 0,
+                    op: other_id,
+                    label: "Second window".into(),
+                },
+                GradeGraphNode::KeyMixer {
+                    top: first,
+                    bottom: first + 1,
+                    mode,
+                    label: "Boolean windows".into(),
+                },
+                GradeGraphNode::MatteApply {
+                    original: 0,
+                    corrected,
+                    matte: first + 2,
+                    label: "Apply windows".into(),
+                },
+            ]
+        });
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        if !window {
+            let mut invalid = serde_json::to_value(&grade).unwrap();
+            invalid["ops"][0]["params"]["base"]["boundaries"] = json!([2.0, -2.0]);
+            let rejected = Box::pin(call(
+                &state,
+                "set_grade",
+                json!({"clip_id":clip,"grade":invalid}),
+            ))
+            .await;
+            assert_eq!(data(&rejected)["error_code"], "InvalidGradeParameters");
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_grade",
+            json!({"clip_id":clip,"grade":grade}),
+        ))
+        .await;
+        if let Some(nodes) = boolean_route {
+            for node in nodes {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",json!({"scope":"clip","clip_id":clip,"op":"add_grade_graph_utility","grade_graph_node":node}))).await;
+            }
+        }
+        let keys:Vec<_>=animation.iter().map(|key|json!({"target":"grade_op","clip_id":clip,"op_id":op_id,"path":animation_path,"at_ticks":key.at.0,"value":key.value,"interp":key.interp})).collect();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "batch_set_keyframes",
+            json!({"ops":keys}),
+        ))
+        .await;
+        let encoded = serde_json::to_string(&*state.document.lock().await).unwrap();
+        let reloaded: Box<photonic_core::document::Document> =
+            serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        if boolean.is_some() {
+            let snapshot = state.history.lock().await.snapshot_state();
+            let file = photonic_core::photon_file::save_photon(&reloaded, Some(&snapshot)).unwrap();
+            let (mut document, loaded_history) =
+                photonic_core::photon_file::load_photon(&file).unwrap();
+            let mut history = photonic_core::CommandHistory::new(200);
+            history.restore_state(
+                loaded_history.expect("Boolean graph history must survive a .photon reload"),
+            );
+            assert!(history.undo(&mut document));
+            assert!(history.redo(&mut document));
+            assert_eq!(
+                serde_json::to_value(&document.timeline).unwrap(),
+                serde_json::to_value(&reloaded.timeline).unwrap()
+            );
+        }
+        let mut previews = Vec::new();
+        for frame in 0..3 {
+            let result=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":frame_ticks*frame,"quality":"full","output_format":"png"}))).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            previews.push(png.get_pixel(if window { 20 } else { 16 }, 16).0);
+        }
+        if native && boolean.is_some() {
+            let before_inspection = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            let mut weights = Vec::new();
+            for frame in 0..3 {
+                let result = Box::pin(call(
+                    &state,
+                    "inspect_grade_matte",
+                    json!({"clip_id":clip,"graph_node_id":7,"at_ticks":frame_ticks*frame}),
+                ))
+                .await;
+                assert_ne!(result.is_error, Some(true), "{result:?}");
+                let encoded = result
+                    .content
+                    .iter()
+                    .find_map(|item| match item {
+                        ContentItem::Image { data, .. } => Some(data),
+                        _ => None,
+                    })
+                    .unwrap();
+                let png =
+                    image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                        .unwrap()
+                        .to_rgba8();
+                let p = png.get_pixel(20, 16).0;
+                assert_eq!(p[3], 255);
+                assert_eq!(p[0], p[1]);
+                assert_eq!(p[1], p[2]);
+                weights.push(p[0]);
+            }
+            assert_eq!(weights[0], weights[2]);
+            assert!(weights[1] > weights[0].saturating_add(8), "{weights:?}");
+            assert_eq!(revision, state.history.lock().await.revision());
+            assert_eq!(
+                before_inspection,
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+        }
+        assert_eq!(previews[0], previews[2]);
+        assert!(previews[0][0].abs_diff(previews[0][2]) <= 2);
+        assert!(
+            previews[1][0] > previews[0][0].saturating_add(if window { 8 } else { 20 }),
+            "{previews:?}"
+        );
+        let dir = std::env::temp_dir().join(format!("photonic-tonal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("animated.mov");
+        let queued = Box::pin(call(
+            &state,
+            "export_sequence",
+            json!({"sequence_id":sequence,"out_path":output,"preset":"ProRes Mezzanine"}),
+        ))
+        .await;
+        assert_ne!(queued.is_error, Some(true), "{queued:?}");
+        assert_eq!(data(&queued)["total_frames"], 3);
+        let finished = poll_job(&state, &data(&queued)["job_id"]).await;
+        assert_eq!(finished["status"]["state"], "done", "{finished}");
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgb24",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 32 * 32 * 3 * 3);
+        let pixels: Vec<_> = (0..3)
+            .map(|i| {
+                let offset = i * 32 * 32 * 3 + (16 * 32 + if window { 20 } else { 16 }) * 3;
+                decoded.stdout[offset..offset + 3].to_vec()
+            })
+            .collect();
+        for c in 0..3 {
+            assert!(pixels[0][c].abs_diff(pixels[2][c]) <= 2);
+        }
+        assert!(pixels[0][0].abs_diff(pixels[0][2]) <= 3);
+        assert!(
+            pixels[1][0] > pixels[0][0].saturating_add(if window { 8 } else { 20 }),
+            "{pixels:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_tonal_exposure_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::TonalExposure,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_kelvin_white_balance_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::KelvinWhiteBalance,
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_white_balance_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::WhiteBalance,
-        )
+        ))
         .await;
+    }
+
+    #[tokio::test]
+    async fn group_member_and_compound_inspection_are_exact_readonly_and_alpha_aware() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            GradeGraphNode, GradeMask, GradeOp, GradeOpKind, GradeOpParams, GroupKind, GroupNode,
+            Track, TrackKind, WindowShape,
+        };
+        let native =
+            || SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        for compound in [false, true] {
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut sequence = Sequence::new("Selected group members", FrameRate::FPS_30, 16, 16);
+            sequence.color = native();
+            let sequence_id = sequence.id;
+            let exposure = |stops| {
+                let mut g = Grade::new();
+                g.ops.push(GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops },
+                ));
+                g
+            };
+            let mut template = exposure(0.0);
+            let curve = GradeOp::new(
+                GradeOpKind::Curves,
+                GradeOpParams::Curves {
+                    master: vec![],
+                    red: vec![],
+                    green: vec![],
+                    blue: vec![],
+                    hue_vs_hue: vec![],
+                    hue_vs_sat: vec![],
+                    hue_vs_luma: vec![],
+                    luma_vs_sat: vec![],
+                    sat_vs_sat: vec![],
+                },
+            );
+            let curve_id = curve.id;
+            template.ops.push(curve);
+            let mut key = GradeOp::new(
+                GradeOpKind::HslQualifier,
+                GradeOpParams::HslQualifier {
+                    hue: [0., 1.],
+                    sat: [0., 1.],
+                    lum: [0., 1.],
+                    softness: 0.,
+                    correction: photonic_core::timeline::CdlParams::identity(),
+                    keys: vec![],
+                    matte_levels: [0., 0.],
+                },
+            );
+            key.mask = Some(GradeMask::PowerWindow {
+                shape: WindowShape::Rectangle,
+                center: [0.5; 2],
+                size: [0.2; 2],
+                rotation: 0.,
+                softness: 0.,
+                invert: true,
+            });
+            let key_id = key.id;
+            template.ops.push(key);
+            template.convert_to_graph();
+            let curve_node = template
+                .graph
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(id, n)| {
+                    matches!(n,GradeGraphNode::Corrector{op,..} if *op==curve_id).then_some(*id)
+                })
+                .unwrap();
+            let key_node = template
+                .graph
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find_map(|(id, n)| {
+                    matches!(n,GradeGraphNode::Corrector{op,..} if *op==key_id).then_some(*id)
+                })
+                .unwrap();
+            let output = match template.graph.as_ref().unwrap().nodes
+                [&template.graph.as_ref().unwrap().output]
+            {
+                GradeGraphNode::Output { input } => input,
+                _ => unreachable!(),
+            };
+            let raw = template
+                .add_graph_utility(GradeGraphNode::WindowMatte {
+                    input: 0,
+                    op: key_id,
+                    label: "Member window".into(),
+                })
+                .unwrap();
+            template
+                .add_graph_utility(GradeGraphNode::MatteApply {
+                    original: output,
+                    corrected: output,
+                    matte: raw,
+                    label: "Retain scene image".into(),
+                })
+                .unwrap();
+            let image_node = template.graph.as_ref().unwrap().output;
+            let grade = |stops| {
+                let mut g = template.clone();
+                g.ops[0].params.base = GradeOpParams::Exposure { stops };
+                g
+            };
+            let mut parent = GroupNode::new(GroupKind::Normal);
+            let parent_id = parent.id;
+            parent.pre_grade = Some(grade(0.125));
+            parent.post_grade = Some(grade(1.25));
+            let mut leaf = GroupNode::new(GroupKind::Normal);
+            let leaf_id = leaf.id;
+            leaf.parent = Some(parent_id);
+            leaf.pre_grade = Some(grade(0.25));
+            leaf.post_grade = Some(grade(1.0));
+            sequence.groups.insert(parent_id, parent);
+            sequence.groups.insert(leaf_id, leaf);
+            let mut members = Vec::new();
+            for (index, rgb) in [[0.2, 0.1, 0.05], [0.05, 0.1, 0.2]].into_iter().enumerate() {
+                let solid = ClipSource::SolidColor {
+                    color: photonic_core::Color {
+                        r: rgb[0],
+                        g: rgb[1],
+                        b: rgb[2],
+                        a: 0.5,
+                    },
+                };
+                let source = if compound {
+                    let mut inner = Sequence::new("Compound source", FrameRate::FPS_30, 16, 16);
+                    inner.color = native();
+                    let mut inner_track = Track::new(TrackKind::Video, "Inner");
+                    let mut inner_clip = Clip::new(solid, Tick::ZERO, Tick::from_seconds(1));
+                    inner_clip.grade = Some(exposure(0.125));
+                    inner_track.clips.push(inner_clip);
+                    inner.video_tracks.push(inner_track);
+                    let inner_id = inner.id;
+                    project.insert_sequence(inner);
+                    ClipSource::NestedSequence { sequence: inner_id }
+                } else {
+                    solid
+                };
+                let mut clip = Clip::new(source, Tick::ZERO, Tick::from_seconds(1));
+                clip.name = format!("Member {}", index + 1);
+                clip.group = Some(leaf_id);
+                clip.grade = Some(grade(0.5));
+                clip.look = Some(photonic_core::timeline::ClipLook::Local(Box::new(grade(
+                    0.75,
+                ))));
+                let mut track = Track::new(TrackKind::Video, format!("V{}", index + 1));
+                track.locked = true;
+                track.grade = Some(exposure(3.0));
+                members.push((clip.id, track.id, rgb));
+                track.clips.push(clip);
+                sequence.video_tracks.push(track);
+            }
+            // Keep a third, non-active member so detaching one selected shot
+            // does not create a forbidden singleton Normal group.
+            let mut standby = sequence.video_tracks[0].clips[0].clone();
+            standby.id = ClipId::new();
+            standby.start = Tick::from_seconds(1);
+            standby.name = "Standby group member".into();
+            sequence.video_tracks[0].clips.push(standby);
+            sequence.master_grade = Some(exposure(4.0));
+            project.insert_sequence(sequence);
+            project.active_sequence = Some(sequence_id);
+            state.document.lock().await.timeline = Some(project);
+            assert!(engine_available(&state).await, "GPU required");
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            let encode = |x: f64| {
+                if x <= 0.0078125 {
+                    10.5402377416545 * x + 0.0729055341958355
+                } else {
+                    (x.log2() + 9.72) / 17.52
+                }
+            };
+            let stages = [
+                (json!({"kind":"group_pre","id":parent_id}), 0.125),
+                (json!({"kind":"group_pre","id":leaf_id}), 0.375),
+                (json!({"kind":"clip"}), 0.875),
+                (json!({"kind":"local_look"}), 1.625),
+                (json!({"kind":"group_post","id":leaf_id}), 2.625),
+                (json!({"kind":"group_post","id":parent_id}), 3.875),
+            ];
+            let mut receipts = Vec::new();
+            for (clip_id, _, rgb) in &members {
+                let base = photonic_video::color::native::encoded_srgb_to_linear_ap1_display(
+                    rgb.map(f64::from),
+                );
+                for (stage, stops) in &stages {
+                    let gain = 2.0_f64.powf(stops + if compound { 0.125 } else { 0.0 });
+                    for (op, node) in [(curve_id, curve_node), (key_id, key_node)] {
+                        for node in [None, Some(node)] {
+                            let result=call(&state,"sample_grade_input",json!({"clip_id":clip_id,"stage":stage,"op_id":op,"graph_node_id":node,"at_ticks":0,"x":0.5,"y":0.5})).await;
+                            assert_ne!(result.is_error, Some(true), "{result:?}");
+                            let d = result.structured_content.as_ref().unwrap();
+                            assert_eq!(d["stage"], *stage);
+                            assert_eq!(d["alpha"], 0.5);
+                            for c in 0..3 {
+                                assert!(
+                                    (d["rgb"][c].as_f64().unwrap() - encode(base[c] * gain)).abs()
+                                        < 0.002,
+                                    "{d}"
+                                );
+                            }
+                        }
+                    }
+                    let image=call(&state,"inspect_grade_image",json!({"clip_id":clip_id,"stage":stage,"graph_node_id":image_node,"at_ticks":0})).await;
+                    assert_ne!(image.is_error, Some(true), "{image:?}");
+                    let d = image.structured_content.as_ref().unwrap();
+                    assert_eq!(d["coverage"]["min"], 0.5);
+                    for c in 0..3 {
+                        assert!(
+                            (d["scene_rgb"]["min"][c].as_f64().unwrap() - base[c] * gain).abs()
+                                < 0.002,
+                            "{d}"
+                        );
+                    }
+                    for (tool, node, white) in [
+                        ("inspect_grade_matte", raw, 255u8),
+                        ("inspect_qualifier", key_node, 128u8),
+                    ] {
+                        let result=call(&state,tool,json!({"clip_id":clip_id,"stage":stage,"op_id":key_id,"graph_node_id":node,"at_ticks":0})).await;
+                        assert_ne!(result.is_error, Some(true), "{result:?}");
+                        let encoded = result
+                            .content
+                            .iter()
+                            .find_map(|item| match item {
+                                ContentItem::Image { data, .. } => Some(data),
+                                _ => None,
+                            })
+                            .unwrap();
+                        let png = image::load_from_memory(
+                            &general_purpose::STANDARD.decode(encoded).unwrap(),
+                        )
+                        .unwrap()
+                        .to_rgba8();
+                        assert_eq!(png.get_pixel(8, 8)[0], 0);
+                        assert_eq!(png.get_pixel(0, 0)[0], white);
+                    }
+                    receipts.push(json!({"clip":clip_id,"stage":stage,"gain":gain,"source_rgb":rgb,"alpha":0.5}));
+                }
+            }
+            for stage in [
+                json!({"kind":"group_pre","id":uuid::Uuid::new_v4()}),
+                json!({"kind":"group_post","id":uuid::Uuid::new_v4()}),
+            ] {
+                assert_eq!(call(&state,"inspect_grade_image",json!({"clip_id":members[0].0,"stage":stage,"graph_node_id":image_node,"at_ticks":0})).await.is_error,Some(true));
+            }
+            let locked = call(
+                &state,
+                "group_grade",
+                json!({"group_id":parent_id,"stage":"pre","op":"set","grade":grade(2.0)}),
+            )
+            .await;
+            assert_eq!(locked.is_error, Some(true));
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            if let Ok(root) = std::env::var("PHOTONIC_GROUP_INSPECTION_QUALIFICATION_DIR") {
+                let dir = std::path::PathBuf::from(root).join(if compound {
+                    "compound"
+                } else {
+                    "solid"
+                });
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(
+                    dir.join("input.photon"),
+                    state.document.lock().await.to_json().unwrap(),
+                )
+                .unwrap();
+                std::fs::write(dir.join("checks.json"),serde_json::to_vec_pretty(&json!({"members":receipts,"image_node":image_node,"raw_matte":raw,"curve_id":curve_id,"key_id":key_id,"history_unchanged":true,"locked_readonly":true})).unwrap()).unwrap();
+            }
+            assert_ne!(
+                call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":members[0].1,"locked":false})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            let still_locked = call(
+                &state,
+                "group_grade",
+                json!({"group_id":parent_id,"stage":"pre","op":"set","grade":grade(2.0)}),
+            )
+            .await;
+            assert_eq!(
+                still_locked.is_error,
+                Some(true),
+                "another locked group member must protect the shared grade"
+            );
+            for (_, track, _) in &members {
+                assert_ne!(
+                    call(
+                        &state,
+                        "set_track_prop",
+                        json!({"track_id":track,"locked":false})
+                    )
+                    .await
+                    .is_error,
+                    Some(true)
+                );
+            }
+            let (clip_id, track_id, _) = members[0];
+            {
+                let mut doc = state.document.lock().await;
+                let project = doc.timeline.as_ref().unwrap();
+                let mut clip = find_clip(project, sequence_id, track_id, clip_id)
+                    .unwrap()
+                    .clone();
+                clip.group = None;
+                let command = ops::set_clip_prop(project, sequence_id, track_id, clip).unwrap();
+                state
+                    .history
+                    .lock()
+                    .await
+                    .execute_discrete(Command::Timeline(command), &mut doc);
+            }
+            let request = json!({"clip_id":clip_id,"stage":stages[0].0,"graph_node_id":image_node,"at_ticks":0});
+            assert_eq!(
+                call(&state, "inspect_grade_image", request.clone())
+                    .await
+                    .is_error,
+                Some(true)
+            );
+            assert_ne!(call(&state, "undo", json!({})).await.is_error, Some(true));
+            assert_ne!(
+                call(&state, "inspect_grade_image", request).await.is_error,
+                Some(true)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn look_stage_curve_and_qualifier_inputs_are_exact_readonly_and_alpha_aware() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            ClipLook, Grade, GradeGraphNode, GradeMask, GradeOp, GradeOpKind, GradeOpParams,
+            SharedLook, SharedLookId, Track, TrackKind, WindowShape,
+        };
+        for shared in [false, true] {
+            for graph in [false, true] {
+                let state = test_state();
+                let mut project = TimelineProject::new();
+                let mut sequence = Sequence::new("Look input", FrameRate::FPS_30, 16, 16);
+                sequence.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                let mut clip = Clip::new(
+                    ClipSource::SolidColor {
+                        color: photonic_core::Color {
+                            r: 0.2,
+                            g: 0.1,
+                            b: 0.05,
+                            a: 0.5,
+                        },
+                    },
+                    Tick::ZERO,
+                    Tick::from_seconds(1),
+                );
+                let clip_id = clip.id;
+                let mut grade = Grade::new();
+                grade.ops.push(GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: 1.0 },
+                ));
+                let curve = GradeOp::new(
+                    GradeOpKind::Curves,
+                    GradeOpParams::Curves {
+                        master: vec![],
+                        red: vec![],
+                        green: vec![],
+                        blue: vec![],
+                        hue_vs_hue: vec![],
+                        hue_vs_sat: vec![],
+                        hue_vs_luma: vec![],
+                        luma_vs_sat: vec![],
+                        sat_vs_sat: vec![],
+                    },
+                );
+                let curve_id = curve.id;
+                grade.ops.push(curve);
+                let key = GradeOp::new(
+                    GradeOpKind::HslQualifier,
+                    GradeOpParams::HslQualifier {
+                        hue: [0.0, 1.0],
+                        sat: [0.0, 1.0],
+                        lum: [0.0, 1.0],
+                        softness: 0.0,
+                        correction: photonic_core::timeline::CdlParams::identity(),
+                        keys: vec![],
+                        matte_levels: [0.0, 0.0],
+                    },
+                );
+                let key_id = key.id;
+                grade.ops.push(key);
+                grade.ops.push(GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: 2.0 },
+                ));
+                if graph {
+                    grade.convert_to_graph();
+                }
+                let mut look = grade.clone();
+                look.ops[0].params.base = GradeOpParams::Exposure { stops: 0.5 };
+                look.ops[2].mask = Some(GradeMask::PowerWindow {
+                    shape: WindowShape::Rectangle,
+                    center: [0.5; 2],
+                    size: [0.2; 2],
+                    rotation: 0.0,
+                    softness: 0.0,
+                    invert: true,
+                });
+                let node_for = |grade: &Grade, op| {
+                    grade.graph.as_ref().and_then(|g| {
+                        g.nodes.iter().find_map(|(id, n)| {
+                            matches!(n,GradeGraphNode::Corrector {op:o,..} if *o==op).then_some(*id)
+                        })
+                    })
+                };
+                let curve_node = node_for(&look, curve_id);
+                let key_node = node_for(&look, key_id);
+                let utility = if graph {
+                    let g = look.graph.as_ref().unwrap();
+                    let input = *g
+                        .nodes
+                        .iter()
+                        .find(|(_, n)| matches!(n, GradeGraphNode::Input))
+                        .unwrap()
+                        .0;
+                    let output = match g.nodes[&g.output] {
+                        GradeGraphNode::Output { input } => input,
+                        _ => unreachable!(),
+                    };
+                    let utility = look
+                        .add_graph_utility(GradeGraphNode::QualifierMatte {
+                            input,
+                            op: key_id,
+                            label: "Look key source".into(),
+                        })
+                        .unwrap();
+                    look.add_graph_utility(GradeGraphNode::MatteApply {
+                        original: input,
+                        corrected: output,
+                        matte: utility,
+                        label: String::new(),
+                    })
+                    .unwrap();
+                    Some(utility)
+                } else {
+                    None
+                };
+                let look_id = SharedLookId::new();
+                let stage = if shared {
+                    json!({"kind":"shared_look","id":look_id})
+                } else {
+                    json!({"kind":"local_look"})
+                };
+                clip.grade = Some(grade);
+                clip.look = Some(if shared {
+                    ClipLook::Shared(look_id)
+                } else {
+                    ClipLook::Local(Box::new(look.clone()))
+                });
+                if shared {
+                    project.shared_looks.insert(
+                        look_id,
+                        SharedLook {
+                            versions: Vec::new(),
+                            active_version: None,
+                            id: look_id,
+                            name: "Input inspection look".into(),
+                            grade: look,
+                        },
+                    );
+                }
+                let mut track = Track::new(TrackKind::Video, "V1");
+                let track_id = track.id;
+                track.locked = true;
+                track.clips.push(clip);
+                let mut later = Grade::new();
+                later.ops.push(GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: 3.0 },
+                ));
+                track.grade = Some(later.clone());
+                sequence.master_grade = Some(later);
+                sequence.video_tracks.push(track);
+                project.insert_sequence(sequence);
+                state.document.lock().await.timeline = Some(project);
+                assert!(engine_available(&state).await, "GPU required");
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let base = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    0.2, 0.1, 0.05,
+                ]);
+                // Independent published ACEScct equation: stage input gains are
+                // clip +1 stop, or complete clip +3 then look +0.5 stops.
+                let encode = |x: f64| {
+                    if x <= 0.0078125 {
+                        10.5402377416545 * x + 0.0729055341958355
+                    } else {
+                        (x.log2() + 9.72) / 17.52
+                    }
+                };
+                for (wanted, gain) in [
+                    (json!({"kind":"clip"}), 2.0),
+                    (stage.clone(), 8.0 * 2.0_f64.sqrt()),
+                ] {
+                    for (op, node) in [(curve_id, curve_node), (key_id, key_node)] {
+                        for exact in [false, true] {
+                            let mut request = json!({"clip_id":clip_id,"stage":wanted,"op_id":op,"x":0.5,"y":0.5,"at_ticks":0});
+                            if exact {
+                                if let Some(node) = node {
+                                    request["graph_node_id"] = json!(node);
+                                }
+                            }
+                            let result = call(&state, "sample_grade_input", request).await;
+                            assert_ne!(result.is_error, Some(true), "{result:?}");
+                            let d = result.structured_content.as_ref().unwrap();
+                            assert_eq!(d["stage"], wanted);
+                            assert_eq!(d["alpha"], 0.5);
+                            for c in 0..3 {
+                                assert!(
+                                    (d["rgb"][c].as_f64().unwrap() - encode(base[c] * gain)).abs()
+                                        < 0.002,
+                                    "{d}"
+                                );
+                            }
+                        }
+                    }
+                    let result=call(&state,"inspect_qualifier",json!({"clip_id":clip_id,"stage":wanted,"op_id":key_id,"graph_node_id":key_node,"at_ticks":0})).await;
+                    assert_ne!(result.is_error, Some(true), "{result:?}");
+                    let d = result.structured_content.as_ref().unwrap();
+                    assert_eq!(d["stage"], wanted);
+                    assert_eq!(d["coverage"]["max"], 0.5);
+                    let encoded = result
+                        .content
+                        .iter()
+                        .find_map(|c| match c {
+                            ContentItem::Image { data, .. } => Some(data),
+                            _ => None,
+                        })
+                        .unwrap();
+                    let png = image::load_from_memory(
+                        &general_purpose::STANDARD.decode(encoded).unwrap(),
+                    )
+                    .unwrap()
+                    .to_rgba8();
+                    let center = png.get_pixel(8, 8).0;
+                    assert_eq!(center[3], 255);
+                    assert_eq!(center[0], if wanted == stage { 0 } else { 128 });
+                    assert_eq!(png.get_pixel(0, 0)[0], 128);
+                }
+                if let Some(node) = utility {
+                    let result=call(&state,"sample_grade_input",json!({"clip_id":clip_id,"stage":stage,"op_id":key_id,"graph_node_id":node,"x":0.5,"y":0.5,"at_ticks":0})).await;
+                    assert_ne!(result.is_error, Some(true), "{result:?}");
+                    let d = result.structured_content.as_ref().unwrap();
+                    for c in 0..3 {
+                        assert!(
+                            (d["rgb"][c].as_f64().unwrap() - encode(base[c] * 8.0)).abs() < 0.002
+                        );
+                    }
+                }
+                for wrong in [
+                    json!({"kind":"shared_look","id":SharedLookId::new()}),
+                    if shared {
+                        json!({"kind":"local_look"})
+                    } else {
+                        json!({"kind":"shared_look","id":look_id})
+                    },
+                ] {
+                    for tool in ["sample_grade_input", "inspect_qualifier"] {
+                        assert_eq!(call(&state,tool,json!({"clip_id":clip_id,"stage":wrong,"op_id":key_id,"x":0.5,"y":0.5,"at_ticks":0})).await.is_error,Some(true));
+                    }
+                }
+                assert_eq!(
+                    before,
+                    serde_json::to_value(&*state.document.lock().await).unwrap()
+                );
+                assert_eq!(revision, state.history.lock().await.revision());
+                let mut interrupted_tools = vec!["sample_grade_input", "inspect_qualifier"];
+                if graph {
+                    interrupted_tools.extend(["inspect_grade_image", "inspect_grade_matte"]);
+                }
+                for tool in interrupted_tools {
+                    let bridge = engine_bridge(&state).unwrap();
+                    let transport = bridge.lock_transport().await;
+                    let old_id = state.document.lock().await.id;
+                    let node = match tool {
+                        "inspect_grade_image" => curve_node,
+                        "inspect_grade_matte" => utility,
+                        _ => key_node,
+                    };
+                    let request = json!({"clip_id":clip_id,"stage":stage,"op_id":key_id,"graph_node_id":node,"at_ticks":0,"x":0.5,"y":0.5});
+                    let mut pending = Box::pin(call(&state, tool, request));
+                    std::future::poll_fn(|cx| {
+                        use std::future::Future;
+                        match pending.as_mut().poll(cx) {
+                            std::task::Poll::Pending => std::task::Poll::Ready(()),
+                            std::task::Poll::Ready(_) => {
+                                panic!("input inspection should wait for held transport")
+                            }
+                        }
+                    })
+                    .await;
+                    state.document.lock().await.id = uuid::Uuid::new_v4();
+                    drop(transport);
+                    let stale = pending.await;
+                    assert_eq!(
+                        data(&stale)["error_code"],
+                        "RevisionConflict",
+                        "{tool} must reject document replacement"
+                    );
+                    state.document.lock().await.id = old_id;
+                }
+                assert_eq!(
+                    before,
+                    serde_json::to_value(&*state.document.lock().await).unwrap()
+                );
+                assert_eq!(revision, state.history.lock().await.revision());
+                if let Ok(root) = std::env::var("PHOTONIC_LOOK_INPUT_QUALIFICATION_DIR") {
+                    let folder = std::path::PathBuf::from(root).join(format!(
+                        "{}-{}",
+                        if shared { "shared" } else { "local" },
+                        if graph { "graph" } else { "stack" }
+                    ));
+                    std::fs::create_dir_all(&folder).unwrap();
+                    std::fs::write(
+                        folder.join("input.photon"),
+                        state.document.lock().await.to_json().unwrap(),
+                    )
+                    .unwrap();
+                    std::fs::write(folder.join("checks.json"),serde_json::to_vec_pretty(&json!({"clip_id":clip_id,"stage":stage,"curve_id":curve_id,"key_id":key_id,"curve_node":curve_node,"key_node":key_node,"utility":utility,"history_unchanged":true,"locked_readonly":true,"look_gain":8.0*2.0_f64.sqrt(),"clip_gain":2.0,"source_alpha":0.5})).unwrap()).unwrap();
+                }
+                if shared {
+                    assert_ne!(
+                        call(
+                            &state,
+                            "set_track_prop",
+                            json!({"track_id":track_id,"locked":false})
+                        )
+                        .await
+                        .is_error,
+                        Some(true)
+                    );
+                    assert_ne!(
+                        call(
+                            &state,
+                            "shared_look",
+                            json!({"op":"make_independent","clip_id":clip_id})
+                        )
+                        .await
+                        .is_error,
+                        Some(true)
+                    );
+                    let sample = |stage: serde_json::Value| json!({"clip_id":clip_id,"stage":stage,"op_id":curve_id,"graph_node_id":curve_node,"at_ticks":0,"x":0.5,"y":0.5});
+                    assert_eq!(
+                        call(&state, "sample_grade_input", sample(stage.clone()))
+                            .await
+                            .is_error,
+                        Some(true)
+                    );
+                    assert_ne!(
+                        call(
+                            &state,
+                            "sample_grade_input",
+                            sample(json!({"kind":"local_look"}))
+                        )
+                        .await
+                        .is_error,
+                        Some(true)
+                    );
+                    assert_ne!(call(&state, "undo", json!({})).await.is_error, Some(true));
+                    assert_eq!(
+                        call(
+                            &state,
+                            "sample_grade_input",
+                            sample(json!({"kind":"local_look"}))
+                        )
+                        .await
+                        .is_error,
+                        Some(true)
+                    );
+                    let restored = call(&state, "sample_grade_input", sample(stage.clone())).await;
+                    assert_ne!(restored.is_error, Some(true), "{restored:?}");
+                    let mut bypassed = {
+                        let doc = state.document.lock().await;
+                        doc.timeline.as_ref().unwrap().shared_looks[&look_id]
+                            .grade
+                            .clone()
+                    };
+                    bypassed.bypass = true;
+                    assert_ne!(
+                        call(
+                            &state,
+                            "shared_look",
+                            json!({"op":"update","look_id":look_id,"grade":bypassed})
+                        )
+                        .await
+                        .is_error,
+                        Some(true)
+                    );
+                    assert_eq!(
+                        call(&state, "sample_grade_input", sample(stage.clone()))
+                            .await
+                            .is_error,
+                        Some(true)
+                    );
+                    assert_ne!(
+                        call(&state, "sample_grade_input", sample(json!({"kind":"clip"})))
+                            .await
+                            .is_error,
+                        Some(true)
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -16000,55 +19179,324 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn export_sequence_native_spatial_qualifier_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::QualifierSpatial,
+        ))
+        .await;
+    }
+    #[tokio::test]
+    async fn export_sequence_native_spatial_graph_qualifier_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::QualifierGraphSpatial,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
     async fn export_sequence_native_qualifier_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::Qualifier,
-        )
+        ))
         .await;
     }
 
     #[tokio::test]
     async fn export_sequence_native_secondary_curves_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
             NativeGradeFixture::SecondaryCurves,
-        )
+        ))
         .await;
     }
 
+    #[tokio::test]
+    async fn export_sequence_native_glow_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Glow,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_chroma_key_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::ChromaKey,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_luma_key_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::LumaKey,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_invert_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Invert,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_unsharp_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Unsharp,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_gaussian_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Gaussian,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_screen_blend_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::ScreenBlend,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_soft_light_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::PiecewiseBlend(photonic_core::layer::BlendMode::SoftLight),
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_nonseparable_blends_prores_mcp_parity() {
+        for mode in [
+            photonic_core::layer::BlendMode::Hue,
+            photonic_core::layer::BlendMode::Saturation,
+            photonic_core::layer::BlendMode::Color,
+            photonic_core::layer::BlendMode::Luminosity,
+        ] {
+            Box::pin(check_native_managed_prores_mcp_parity(
+                false,
+                NativeSourceFixture::Bt709,
+                NativeGradeFixture::PiecewiseBlend(mode),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_bounded_blends_prores_mcp_parity() {
+        for mode in [
+            photonic_core::layer::BlendMode::ColorDodge,
+            photonic_core::layer::BlendMode::ColorBurn,
+            photonic_core::layer::BlendMode::Divide,
+            photonic_core::layer::BlendMode::VividLight,
+            photonic_core::layer::BlendMode::HardMix,
+        ] {
+            Box::pin(check_native_managed_prores_mcp_parity(
+                false,
+                NativeSourceFixture::Bt709,
+                NativeGradeFixture::PiecewiseBlend(mode),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_arithmetic_blends_prores_mcp_parity() {
+        for mode in [
+            photonic_core::layer::BlendMode::LinearDodge,
+            photonic_core::layer::BlendMode::LinearBurn,
+            photonic_core::layer::BlendMode::Subtract,
+            photonic_core::layer::BlendMode::LinearLight,
+        ] {
+            Box::pin(check_native_managed_prores_mcp_parity(
+                false,
+                NativeSourceFixture::Bt709,
+                NativeGradeFixture::PiecewiseBlend(mode),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_luminance_blends_prores_mcp_parity() {
+        for mode in [
+            photonic_core::layer::BlendMode::DarkerColor,
+            photonic_core::layer::BlendMode::LighterColor,
+        ] {
+            Box::pin(check_native_managed_prores_mcp_parity(
+                false,
+                NativeSourceFixture::Bt709,
+                NativeGradeFixture::PiecewiseBlend(mode),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_piecewise_blends_prores_mcp_parity() {
+        for mode in [
+            photonic_core::layer::BlendMode::Overlay,
+            photonic_core::layer::BlendMode::HardLight,
+            photonic_core::layer::BlendMode::PinLight,
+        ] {
+            Box::pin(check_native_managed_prores_mcp_parity(
+                false,
+                NativeSourceFixture::Bt709,
+                NativeGradeFixture::PiecewiseBlend(mode),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_composition_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Composition,
+        ))
+        .await;
+    }
+
+    #[derive(Debug)]
     enum NativeSourceFixture {
         Bt709,
         Pq,
         Hlg,
     }
+    #[derive(Debug)]
     enum NativeGradeFixture {
         Standard,
+        Resize,
+        Vignette,
+        Grain,
+        Denoise,
+        Gaussian,
+        Unsharp,
+        Invert,
+        LumaKey,
+        ChromaKey,
+        Glow,
+        ScreenBlend,
+        PiecewiseBlend(photonic_core::layer::BlendMode),
+        Composition,
         Cdl,
         Curves,
         WhiteBalance,
+        KelvinWhiteBalance,
+        TonalExposure,
         Qualifier,
+        QualifierSpatial,
+        QualifierGraphSpatial,
         QualifierGraph,
         SecondaryCurves,
     }
 
     #[tokio::test]
-    async fn export_sequence_native_graph_qualifier_prores_mcp_parity() {
-        check_native_managed_prores_mcp_parity(
+    async fn export_sequence_native_denoise_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
             false,
             NativeSourceFixture::Bt709,
-            NativeGradeFixture::QualifierGraph,
-        )
+            NativeGradeFixture::Denoise,
+        ))
         .await;
     }
 
+    #[tokio::test]
+    async fn export_sequence_native_grain_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Grain,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_vignette_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Vignette,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_resize_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::Resize,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn export_sequence_native_graph_qualifier_prores_mcp_parity() {
+        Box::pin(check_native_managed_prores_mcp_parity(
+            false,
+            NativeSourceFixture::Bt709,
+            NativeGradeFixture::QualifierGraph,
+        ))
+        .await;
+    }
+
+    // Callers box this broad async fixture so native export qualification fits
+    // the default Rust test-thread stack as additional authoring paths are added.
     async fn check_native_managed_prores_mcp_parity(
         nested: bool,
         source_mode: NativeSourceFixture,
         grade_mode: NativeGradeFixture,
     ) {
+        let composition = matches!(grade_mode, NativeGradeFixture::Composition);
+        let blend_mode = match grade_mode {
+            NativeGradeFixture::ScreenBlend => Some(photonic_core::layer::BlendMode::Screen),
+            NativeGradeFixture::PiecewiseBlend(mode) => Some(mode),
+            _ => None,
+        };
+        let piecewise_blend = matches!(grade_mode, NativeGradeFixture::PiecewiseBlend(_));
+        let gaussian = matches!(grade_mode, NativeGradeFixture::Gaussian);
+        let unsharp = matches!(grade_mode, NativeGradeFixture::Unsharp);
+        let invert = matches!(grade_mode, NativeGradeFixture::Invert);
+        let luma_key = matches!(grade_mode, NativeGradeFixture::LumaKey);
+        let chroma_key = matches!(grade_mode, NativeGradeFixture::ChromaKey);
+        let glow = matches!(grade_mode, NativeGradeFixture::Glow);
+        let vignette = matches!(grade_mode, NativeGradeFixture::Vignette);
+        let grain = matches!(grade_mode, NativeGradeFixture::Grain);
+        let denoise = matches!(grade_mode, NativeGradeFixture::Denoise);
         let pq = matches!(source_mode, NativeSourceFixture::Pq);
         let hlg = matches!(source_mode, NativeSourceFixture::Hlg);
         let cdl = matches!(grade_mode, NativeGradeFixture::Cdl);
@@ -16058,11 +19506,23 @@ mod tests {
         );
         let secondary_curves = matches!(grade_mode, NativeGradeFixture::SecondaryCurves);
         let white_balance = matches!(grade_mode, NativeGradeFixture::WhiteBalance);
+        let kelvin_white_balance = matches!(grade_mode, NativeGradeFixture::KelvinWhiteBalance);
+        let tonal_exposure = matches!(grade_mode, NativeGradeFixture::TonalExposure);
         let qualifier = matches!(
             grade_mode,
-            NativeGradeFixture::Qualifier | NativeGradeFixture::QualifierGraph
+            NativeGradeFixture::Qualifier
+                | NativeGradeFixture::QualifierGraph
+                | NativeGradeFixture::QualifierSpatial
+                | NativeGradeFixture::QualifierGraphSpatial
         );
-        let graph_grade = matches!(grade_mode, NativeGradeFixture::QualifierGraph);
+        let spatial_qualifier = matches!(
+            grade_mode,
+            NativeGradeFixture::QualifierSpatial | NativeGradeFixture::QualifierGraphSpatial
+        );
+        let graph_grade = matches!(
+            grade_mode,
+            NativeGradeFixture::QualifierGraph | NativeGradeFixture::QualifierGraphSpatial
+        );
         use photonic_core::timeline::color::{
             InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
             NativeManagedColorConfig, SequenceColorConfig,
@@ -16071,10 +19531,27 @@ mod tests {
             AssetKind, Clip, ClipSource, MediaAsset, Tick, Track, TrackKind,
         };
         let state = test_state();
-        if !engine_available(&state).await {
+        let required = matches!(
+            grade_mode,
+            NativeGradeFixture::Resize
+                | NativeGradeFixture::Vignette
+                | NativeGradeFixture::Grain
+                | NativeGradeFixture::Denoise
+        );
+        let available = engine_available(&state).await;
+        assert!(
+            !required || available,
+            "GPU required for new managed-effect qualification"
+        );
+        if !available {
             return;
         }
-        let Some(tools) = photonic_video::media::ffmpeg_locate::locate_for_test() else {
+        let tools = photonic_video::media::ffmpeg_locate::locate_for_test();
+        assert!(
+            !required || tools.is_some(),
+            "FFmpeg required for new managed-effect export qualification"
+        );
+        let Some(tools) = tools else {
             return;
         };
         let dir = std::env::temp_dir().join(format!(
@@ -16105,18 +19582,18 @@ mod tests {
             .status()
             .unwrap();
         assert!(generated.success());
-        let created = call(
+        let created = Box::pin(call(
             &state,
             "create_sequence",
             json!({
                 "name": "MCP Native", "frame_rate": {"num": 30, "den": 1},
                 "formats": [{"name": "1:1", "width": 32, "height": 32}]
             }),
-        )
+        ))
         .await;
         let seq_json = data(&created)["sequence_id"].clone();
         let seq_id: SequenceId = serde_json::from_value(seq_json.clone()).unwrap();
-        let clip_id = {
+        let (clip_id, asset_id, track_id) = {
             let mut doc = state.document.lock().await;
             let project = doc.timeline.as_mut().unwrap();
             let mut asset = MediaAsset::from_file(AssetKind::Video, &source);
@@ -16152,17 +19629,127 @@ mod tests {
             );
             let clip_id = clip.id;
             track.clips.push(clip);
+            let track_id = track.id;
             seq.video_tracks.push(track);
-            clip_id
+            (clip_id, asset_id, track_id)
         };
+        if gaussian
+            || unsharp
+            || invert
+            || luma_key
+            || chroma_key
+            || glow
+            || vignette
+            || grain
+            || denoise
+        {
+            for scope in [
+                json!({"scope":"asset","asset_id":asset_id}),
+                json!({"scope":"clip","clip_id":clip_id}),
+                json!({"scope":"track","track_id":track_id}),
+                json!({"scope":"master","sequence_id":seq_id}),
+            ] {
+                let with = |extra: Value| {
+                    let mut args = scope.clone();
+                    args.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    args
+                };
+                let added=Box::pin(call(&state,"effect_stack",with(json!({"op":"add","effect_id":if denoise {"noise.reduce"} else if grain {"stylize.grain"} else if vignette {"stylize.vignette"} else if glow {"stylize.glow"} else if chroma_key {"key.chroma"} else if luma_key {"key.luma"} else if invert {"color.invert"} else if unsharp {"sharpen.unsharp"} else {"blur.gaussian"}})))).await;
+                assert_ne!(added.is_error, Some(true), "{added:?}");
+                if !invert && !luma_key && !chroma_key && !vignette && !grain && !denoise {
+                    let radius=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":0.8}})))).await;
+                    assert_ne!(radius.is_error, Some(true), "{radius:?}");
+                }
+                if grain {
+                    for (path, value) in [
+                        ("params.amount", 0.025),
+                        ("params.seed", 16777217.0),
+                        ("params.monochrome", 1.0),
+                    ] {
+                        let result=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":value}})))).await;
+                        assert_ne!(result.is_error, Some(true), "{result:?}");
+                    }
+                }
+                if glow {
+                    let result=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.tint","value":{"t":"color","v":{"r":1.0,"g":1.0,"b":1.0,"a":1.0}}})))).await;
+                    assert_ne!(result.is_error, Some(true), "{result:?}");
+                    for (path, value) in [("params.threshold", 0.1), ("params.intensity", 0.1)] {
+                        let result=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":value}})))).await;
+                        assert_ne!(result.is_error, Some(true), "{result:?}");
+                    }
+                }
+                if chroma_key {
+                    let result=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.key_color","value":{"t":"color","v":{"r":0.0,"g":1.0,"b":0.0,"a":1.0}}})))).await;
+                    assert_ne!(result.is_error, Some(true), "{result:?}");
+                    for (path, value) in [
+                        ("params.tolerance", 0.125),
+                        ("params.edge_softness", 0.25),
+                        ("params.spill_suppress", 0.25),
+                    ] {
+                        let result=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":value}})))).await;
+                        assert_ne!(result.is_error, Some(true), "{result:?}");
+                    }
+                }
+                if luma_key {
+                    for (path, value) in [("params.threshold", 0.0), ("params.softness", 0.25)] {
+                        let result = Box::pin(call(&state, "effect_stack", with(json!({"op":"set_param", "index":0, "path":path, "value":{"t":"float","v":value}})))).await;
+                        assert_ne!(result.is_error, Some(true), "{result:?}");
+                    }
+                }
+                if unsharp {
+                    let amount=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.amount","value":{"t":"float","v":0.2}})))).await;
+                    assert_ne!(amount.is_error, Some(true), "{amount:?}");
+                }
+            }
+        }
+        if luma_key || chroma_key || glow {
+            // Qualify command-authored routing before the later LUT grade needs
+            // its runtime dependency provider. Raw alpha has independent GPU tests.
+            let document = state.document.lock().await;
+            let compiled = photonic_video::graph::compile::compile_native_preview(
+                document.timeline.as_ref().unwrap(),
+                seq_id,
+                0,
+                Tick::ZERO,
+                photonic_video::graph::compile::Quality::FULL,
+            );
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+            if glow {
+                assert_eq!(
+                    compiled
+                        .graph
+                        .nodes
+                        .iter()
+                        .filter(|node| matches!(node.op,
+                    photonic_video::graph::ir::IrOp::NativeGlow {sigma,threshold,intensity,tint}
+                    if sigma==0.8 && threshold==0.1 && intensity==0.1 && (tint[0]-1.0).abs()<0.001))
+                        .count(),
+                    4
+                );
+            } else if chroma_key {
+                assert_eq!(compiled.graph.nodes.iter().filter(|node| matches!(node.op,
+                    photonic_video::graph::ir::IrOp::NativeChromaKey {key,tolerance,softness,spill}
+                    if (key[0]-0.3395).abs()<0.001 && tolerance==0.125 && softness==0.25 && spill==0.25)).count(),4);
+            } else {
+                assert_eq!(compiled.graph.nodes.iter().filter(|node| matches!(node.op,
+                photonic_video::graph::ir::IrOp::NativeLumaKey { threshold, softness, invert: false }
+                if threshold == 0.0 && softness == 0.25)).count(), 4);
+            }
+        }
         if pq || hlg {
             let revision = state.history.lock().await.revision();
             let mut interpretation = json!({"version":1,"standard":if pq {"bt2100_pq_display"}else{"bt2100_hlg_scene"},"range":"limited","matrix":"bt2020_non_constant"});
-            let rejected = call(
+            let rejected = Box::pin(call(
                 &state,
                 "set_native_input_color",
                 json!({"scope":"clip","clip_id":clip_id,"interpretation":interpretation}),
-            )
+            ))
             .await;
             assert_eq!(rejected.is_error, Some(true));
             assert_eq!(state.history.lock().await.revision(), revision);
@@ -16170,11 +19757,11 @@ mod tests {
             if hlg {
                 interpretation["hlg_peak_nits"] = json!(1000);
             }
-            let authored = call(
+            let authored = Box::pin(call(
                 &state,
                 "set_native_input_color",
                 json!({"scope":"clip","clip_id":clip_id,"interpretation":interpretation}),
-            )
+            ))
             .await;
             assert_ne!(authored.is_error, Some(true), "{authored:?}");
             assert_eq!(state.history.lock().await.revision(), revision + 1);
@@ -16212,7 +19799,7 @@ mod tests {
                 .media
                 .insert(asset)
         };
-        let declared = call(
+        let declared = Box::pin(call(
             &state,
             "set_lut_interpretation",
             json!({
@@ -16222,7 +19809,7 @@ mod tests {
                     "output": { "kind": "native", "transform_revision": 1, "space": "acescct" }
                 }
             }),
-        )
+        ))
         .await;
         assert_ne!(declared.is_error, Some(true), "{declared:?}");
         let mut grade = photonic_core::timeline::Grade::new();
@@ -16233,24 +19820,24 @@ mod tests {
                 vibrance: 0.0,
             },
         ));
-        let baseline_authored = call(
+        let baseline_authored = Box::pin(call(
             &state,
             "set_grade",
             json!({ "clip_id": clip_id, "grade": grade }),
-        )
+        ))
         .await;
         assert_ne!(
             baseline_authored.is_error,
             Some(true),
             "{baseline_authored:?}"
         );
-        let baseline_preview = call(
+        let baseline_preview = Box::pin(call(
             &state,
             "render_frame_at",
             json!({
                 "sequence_id": seq_json, "at_ticks": 0, "quality": "full", "output_format": "png"
             }),
-        )
+        ))
         .await;
         assert_ne!(
             baseline_preview.is_error,
@@ -16369,7 +19956,33 @@ mod tests {
                 softness: 0.1,
                 invert: false,
             });
+            if spatial_qualifier {
+                key.qualifier_spatial = Some(photonic_core::timeline::GradeQualifierSpatial {
+                    denoise: true,
+                    grow: 0.02,
+                    blur: 0.02,
+                });
+            }
             grade.ops.push(key);
+        }
+        if tonal_exposure {
+            grade.ops.push(photonic_core::timeline::GradeOp::new(
+                photonic_core::timeline::GradeOpKind::TonalExposure,
+                photonic_core::timeline::GradeOpParams::TonalExposure {
+                    stops: [0.4, 0.2, 0.1],
+                    boundaries: [-2.0, 2.0],
+                    softness: 1.0,
+                },
+            ));
+        }
+        if kelvin_white_balance {
+            grade.ops.push(photonic_core::timeline::GradeOp::new(
+                photonic_core::timeline::GradeOpKind::WhiteBalanceCct,
+                photonic_core::timeline::GradeOpParams::WhiteBalanceCct {
+                    source_kelvin: 3200.0,
+                    target_kelvin: 6500.0,
+                },
+            ));
         }
         if white_balance {
             grade.ops.push(photonic_core::timeline::GradeOp::new(
@@ -16429,14 +20042,140 @@ mod tests {
             .iter()
             .find(|op| op.kind == photonic_core::timeline::GradeOpKind::HslQualifier)
             .map(|op| op.id);
-        let authored = call(
-            &state,
-            "set_grade",
-            json!({ "clip_id": clip_id, "grade": grade }),
-        )
-        .await;
+        let authored = if spatial_qualifier || kelvin_white_balance || tonal_exposure {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "set_grade",
+                json!({"clip_id":clip_id,"grade":grade}),
+            ))
+            .await
+        } else {
+            Box::pin(call(
+                &state,
+                "set_grade",
+                json!({"clip_id":clip_id,"grade":grade}),
+            ))
+            .await
+        };
         assert_ne!(authored.is_error, Some(true), "{authored:?}");
-        let preview = call(
+        if spatial_qualifier || kelvin_white_balance || tonal_exposure {
+            let encoded = serde_json::to_string(&*state.document.lock().await).unwrap();
+            let reloaded: Box<photonic_core::document::Document> =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(
+                serde_json::to_value(&reloaded).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+        }
+        if composition {
+            use photonic_core::timeline::{
+                Grade, GradeOp, GradeOpKind, GradeOpParams, GraphEdge, GraphNode, GraphOp, InPort,
+                NodeGraph, OutPort, PropValue,
+            };
+            let mut document = state.document.lock().await;
+            let project = document.timeline.as_mut().unwrap();
+            let (mut graph, source) = NodeGraph::new_clip_composition("Native clip graph");
+            let mut grade = Grade::new();
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 0.125 },
+            ));
+            let node = GraphNode::new(GraphOp::Grade { grade });
+            let id = node.id;
+            graph.nodes.insert(id, node);
+            let lut = GraphNode::new(GraphOp::Lut { asset: lut_id });
+            let graph_lut_id = lut.id;
+            graph.nodes.insert(graph_lut_id, lut);
+            graph.edges = vec![
+                GraphEdge {
+                    from: (source, OutPort::PRIMARY),
+                    to: (id, InPort::PRIMARY),
+                },
+                GraphEdge {
+                    from: (id, OutPort::PRIMARY),
+                    to: (graph_lut_id, InPort::PRIMARY),
+                },
+                GraphEdge {
+                    from: (graph_lut_id, OutPort::PRIMARY),
+                    to: (graph.output, InPort::PRIMARY),
+                },
+            ];
+            project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0].composition =
+                Some(graph.id);
+            project.graphs.insert(graph.id, graph);
+            let mut graph = NodeGraph::new_project_graph("Native program graph");
+            let mut node = GraphNode::new(GraphOp::Blur);
+            let id = node.id;
+            node.params
+                .base
+                .0
+                .set("params.radius", PropValue::Float(0.8));
+            graph.nodes.insert(id, node);
+            graph.edges.push(GraphEdge {
+                from: (id, OutPort::PRIMARY),
+                to: (graph.output, InPort::PRIMARY),
+            });
+            project.project_graph = Some(graph.id);
+            project.graphs.insert(graph.id, graph);
+        }
+        if matches!(grade_mode, NativeGradeFixture::Resize) {
+            use photonic_core::timeline::{
+                FitMode, GraphEdge, GraphNode, GraphOp, InPort, NodeGraph, OutPort, PropValue,
+            };
+            let mut document = state.document.lock().await;
+            let project = document.timeline.as_mut().unwrap();
+            let (mut graph, source) = NodeGraph::new_clip_composition("Native resize export");
+            let mut node = GraphNode::new(GraphOp::Resize {
+                fit: FitMode::Stretch,
+            });
+            node.params
+                .base
+                .0
+                .set("params.width", PropValue::Float(24.0));
+            node.params
+                .base
+                .0
+                .set("params.height", PropValue::Float(16.0));
+            let id = node.id;
+            graph.nodes.insert(id, node);
+            graph.edges = vec![
+                GraphEdge {
+                    from: (source, OutPort::PRIMARY),
+                    to: (id, InPort::PRIMARY),
+                },
+                GraphEdge {
+                    from: (id, OutPort::PRIMARY),
+                    to: (graph.output, InPort::PRIMARY),
+                },
+            ];
+            project.sequences.get_mut(&seq_id).unwrap().video_tracks[0].clips[0].composition =
+                Some(graph.id);
+            project.graphs.insert(graph.id, graph);
+        }
+        if let Some(mode) = blend_mode {
+            let mut document = state.document.lock().await;
+            let sequence = document
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&seq_id)
+                .unwrap();
+            let mut copy = sequence.video_tracks[0].clips[0].clone();
+            copy.id = photonic_core::timeline::ClipId::new();
+            let mut upper = Track::new(TrackKind::Video, "Native qualified blend");
+            let upper_id = upper.id;
+            upper.clips.push(copy);
+            sequence.video_tracks.push(upper);
+            drop(document);
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "set_track_prop",
+                json!({"track_id":upper_id,"blend":mode,"opacity":0.5}),
+            ))
+            .await;
+        }
+        let preview = Box::pin(call(
             &state,
             "render_frame_at",
             json!({
@@ -16445,7 +20184,7 @@ mod tests {
                 "quality": "full",
                 "output_format": "png"
             }),
-        )
+        ))
         .await;
         assert_ne!(preview.is_error, Some(true), "{preview:?}");
         assert_eq!(
@@ -16470,20 +20209,20 @@ mod tests {
         if let Some(op_id) = qualifier_id {
             let before = serde_json::to_value(&*state.document.lock().await).unwrap();
             let revision = state.history.lock().await.revision();
-            let key = call(
+            let key = Box::pin(call(
                 &state,
                 "inspect_qualifier",
                 json!({ "clip_id": clip_id, "op_id": op_id, "at_ticks": 0 }),
-            )
+            ))
             .await;
             assert_ne!(key.is_error, Some(true), "{key:?}");
             let data = key.structured_content.as_ref().unwrap();
             assert_eq!(data["key_coordinates"], "acescct_ap1_hsl");
-            let sampled = call(
+            let sampled = Box::pin(call(
                 &state,
                 "sample_grade_input",
                 json!({"clip_id":clip_id,"op_id":op_id,"x":0.5,"y":0.5,"at_ticks":0}),
-            )
+            ))
             .await;
             assert_ne!(sampled.is_error, Some(true), "{sampled:?}");
             assert_eq!(
@@ -16496,17 +20235,17 @@ mod tests {
             );
 
             if let Some(node) = graph_source_node {
-                let source = call(
+                let source = Box::pin(call(
                     &state,
                     "inspect_qualifier",
                     json!({"clip_id":clip_id,"op_id":op_id,"graph_node_id":node,"at_ticks":0}),
-                )
+                ))
                 .await;
                 assert_ne!(source.is_error, Some(true), "{source:?}");
                 let source_data = source.structured_content.as_ref().unwrap();
                 assert_eq!(source_data["graph_node_id"], node);
                 assert_eq!(source_data["coverage"], data["coverage"]);
-                let source_sample=call(&state,"sample_grade_input",json!({"clip_id":clip_id,"op_id":op_id,"graph_node_id":node,"at_ticks":0,"x":0.5,"y":0.5})).await;
+                let source_sample=Box::pin(call(&state,"sample_grade_input",json!({"clip_id":clip_id,"op_id":op_id,"graph_node_id":node,"at_ticks":0,"x":0.5,"y":0.5}))).await;
                 assert_ne!(source_sample.is_error, Some(true), "{source_sample:?}");
                 assert_eq!(
                     source_sample.structured_content.as_ref().unwrap()["rgb"],
@@ -16540,7 +20279,7 @@ mod tests {
                 json!({ "clip_id": clip_id, "op_id": photonic_core::timeline::GradeOpId::new(), "at_ticks": 0 }),
                 json!({ "clip_id": clip_id, "op_id": op_id, "at_seconds": 3.0 }),
             ] {
-                let rejected = call(&state, "inspect_qualifier", request).await;
+                let rejected = Box::pin(call(&state, "inspect_qualifier", request)).await;
                 assert_eq!(rejected.is_error, Some(true));
             }
             assert_eq!(
@@ -16552,20 +20291,24 @@ mod tests {
         let gray = pixels.get_pixel(16, 16).0;
         assert!(
             gray[0] > 20
-                && if white_balance {
+                && if kelvin_white_balance {
+                    gray[2] > gray[0].saturating_add(3)
+                } else if white_balance {
                     gray[0] > gray[1].saturating_add(2) && gray[2] > gray[1].saturating_add(2)
                 } else {
                     gray[0].abs_diff(gray[1]) <= 2 && gray[1].abs_diff(gray[2]) <= 2
                 },
-            "native saturation PNG should be gray: {gray:?}"
+            "native PNG should match the selected correction: {gray:?}"
         );
-        assert!(gray[0] > baseline_gray[0].saturating_add(3), "declared ACEScct LUT must visibly lift the neutral signal: {baseline_gray:?} -> {gray:?}");
+        if !piecewise_blend && !kelvin_white_balance {
+            assert!(gray[0] > baseline_gray[0].saturating_add(3), "declared ACEScct LUT must visibly lift the neutral signal: {baseline_gray:?} -> {gray:?}");
+        }
         let corner = pixels.get_pixel(1, 1).0;
         assert!(
             gray[0] > corner[0].saturating_add(5),
             "native window must isolate exposure: center {gray:?}, corner {corner:?}"
         );
-        let scopes = call(
+        let scopes = Box::pin(call(
             &state,
             "get_scopes",
             json!({
@@ -16573,7 +20316,7 @@ mod tests {
                 "at_ticks": 0,
                 "tap": "program"
             }),
-        )
+        ))
         .await;
         assert_ne!(scopes.is_error, Some(true), "{scopes:?}");
         assert_eq!(
@@ -16582,11 +20325,11 @@ mod tests {
         );
         assert!(data(&scopes)["video_legal"].is_null());
         let scope_revision = state.history.lock().await.revision();
-        let queued = call(
+        let queued = Box::pin(call(
             &state,
             "measure_scopes",
             json!({"clip_id": clip_id, "at_ticks": 0, "tap": "program"}),
-        )
+        ))
         .await;
         assert_ne!(queued.is_error, Some(true), "{queued:?}");
         let measured = poll_job(&state, &data(&queued)["job_id"]).await;
@@ -16606,53 +20349,102 @@ mod tests {
         }
         assert_eq!(state.history.lock().await.revision(), scope_revision);
 
-        let scene_tap = call(
+        let scene_before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let scene_tap = Box::pin(call(
             &state,
             "get_scopes",
             json!({
                 "clip_id": clip_id, "at_ticks": 0, "tap": "clip"
             }),
-        )
+        ))
         .await;
-        assert_eq!(scene_tap.is_error, Some(true));
+        assert_ne!(scene_tap.is_error, Some(true), "{scene_tap:?}");
         assert_eq!(
-            data(&scene_tap)["error_code"],
-            "ScopeColorInterpretationUnavailable"
+            data(&scene_tap)["color_interpretation"]["mode"],
+            "native_scene_linear"
         );
+        assert!(data(&scene_tap)["vectorscope"].is_null());
+        assert!(data(&scene_tap)["video_legal"].is_null());
+        let queued_scene = Box::pin(call(
+            &state,
+            "measure_scopes",
+            json!({"clip_id":clip_id,"at_ticks":0,"tap":"clip"}),
+        ))
+        .await;
+        assert_ne!(queued_scene.is_error, Some(true));
+        let scene_job = poll_job(&state, &data(&queued_scene)["job_id"]).await;
+        assert_eq!(scene_job["status"]["state"], "done");
+        for key in [
+            "histogram",
+            "waveform",
+            "rgb_parade",
+            "excluded",
+            "color_interpretation",
+            "tick",
+            "revision",
+        ] {
+            assert_eq!(
+                scene_job["status"]["result"][key],
+                data(&scene_tap)[key],
+                "scene scope parity {key}"
+            );
+        }
+        assert_eq!(state.history.lock().await.revision(), scope_revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            scene_before
+        );
+        if let Ok(root) = std::env::var("PHOTONIC_SCENE_SCOPES_QUALIFICATION_DIR") {
+            let root = std::path::PathBuf::from(root);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join(format!("{source_mode:?}-{grade_mode:?}-{nested}.json")),serde_json::to_vec_pretty(&json!({"scene":data(&scene_tap),"program":data(&scopes),"async_job_parity":true,"document_unchanged":true,"revision_unchanged":true})).unwrap()).unwrap();
+        }
         *state.document_path.lock().unwrap() = Some(dir.join("native.photon"));
-        let captured = call(
+        let captured = Box::pin(call(
             &state,
             "capture_reference_still",
             json!({
                 "sequence_id": seq_json, "at_ticks": 0, "name": "Native frame"
             }),
-        )
+        ))
         .await;
         assert_ne!(captured.is_error, Some(true), "{captured:?}");
         let still_id = data(&captured)["still_id"].clone();
-        let listed = call(
+        let listed = Box::pin(call(
             &state,
             "list_reference_stills",
             json!({"sequence_id": seq_json}),
-        )
+        ))
         .await;
         assert_eq!(data(&listed)["stills"][0]["comparable"], true);
-        let compared = call(
+        let compared = Box::pin(call(
             &state,
             "compare_reference_still",
             json!({
                 "sequence_id": seq_json, "still_id": still_id, "at_ticks": 0
             }),
-        )
+        ))
         .await;
         assert_ne!(compared.is_error, Some(true), "{compared:?}");
         assert_eq!(
             data(&compared)["interpretation"],
             "native_managed_srgb_rgba8_over_black"
         );
-        assert!(data(&compared)["shot_match_suggestion"].is_null());
+        if !data(&compared)["shot_match_suggestion"].is_null() {
+            assert_eq!(
+                data(&compared)["shot_match_suggestion"]["method"],
+                "per_channel_10_percent_trimmed_log2_opaque_positive_scene_linear_ap1_v1"
+            );
+            assert!(data(&compared)["shot_match_suggestion"]["points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|v| v.as_f64().unwrap().abs() < 0.01));
+        } else {
+            assert!(data(&compared)["shot_match_unavailable_reason"].is_string());
+        }
         let output = dir.join("mcp-graded.mov");
-        let started = call(
+        let started = Box::pin(call(
             &state,
             "export_sequence",
             json!({
@@ -16661,13 +20453,13 @@ mod tests {
                 "preset": "ProRes Mezzanine",
                 "write_manifest": true
             }),
-        )
+        ))
         .await;
         assert_ne!(started.is_error, Some(true), "{started:?}");
         let job_id = data(&started)["job_id"].clone();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
-            let status = call(&state, "get_job_status", json!({"job_id": job_id})).await;
+            let status = Box::pin(call(&state, "get_job_status", json!({"job_id": job_id}))).await;
             let value = data(&status);
             let phase = value["status"]["state"].as_str().unwrap();
             if phase != "queued" && phase != "running" {
@@ -16682,11 +20474,11 @@ mod tests {
         }
         let manifest_path = photonic_video::export::manifest::manifest_path(&output);
         let manifest = photonic_video::export::manifest::verify_manifest(&manifest_path).unwrap();
-        let inspected = call(
+        let inspected = Box::pin(call(
             &state,
             "inspect_render_manifest",
             json!({"path":manifest_path}),
-        )
+        ))
         .await;
         assert_ne!(inspected.is_error, Some(true), "{inspected:?}");
         assert_eq!(data(&inspected)["verified"], true);
@@ -16739,12 +20531,14 @@ mod tests {
         let gray = &decoded.stdout[(16 * 32 + 16) * 3..][..3];
         assert!(
             gray[0] > 20
-                && if white_balance {
+                && if kelvin_white_balance {
+                    gray[2] > gray[0].saturating_add(3)
+                } else if white_balance {
                     gray[0] > gray[1].saturating_add(2) && gray[2] > gray[1].saturating_add(2)
                 } else {
                     gray[0].abs_diff(gray[1]) <= 3 && gray[1].abs_diff(gray[2]) <= 3
                 },
-            "native saturation ProRes round trip should be gray: {gray:?}"
+            "native ProRes should match the selected correction: {gray:?}"
         );
         let corner = &decoded.stdout[(32 + 1) * 3..][..3];
         assert!(
@@ -16752,6 +20546,14606 @@ mod tests {
             "native window must survive ProRes: center {gray:?}, corner {corner:?}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn paired_native_output_rejects_oversized_authored_formats_before_readback() {
+        let state = test_state();
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Large measurement","frame_rate":{"num":30,"den":1},"formats":[{"name":"large","width":8192,"height":4096}]}))).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let converted = Box::pin(call(
+            &state,
+            "create_native_color_draft",
+            json!({"sequence_id":data(&created)["sequence_id"]}),
+        ))
+        .await;
+        assert_ne!(converted.is_error, Some(true), "{converted:?}");
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let rejected = Box::pin(call(
+            &state,
+            "measure_native_output",
+            json!({"sequence_id":data(&converted)["sequence_id"],"at_ticks":0}),
+        ))
+        .await;
+        assert_eq!(data(&rejected)["error_code"], "NativeOutputTooLarge");
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn paired_native_output_measurement_reads_actual_pre_and_post_transform_without_edits() {
+        use photonic_core::timeline::{GradeOp, GradeOpKind, GradeOpParams};
+        let state = test_state();
+        assert!(
+            engine_available(&state).await,
+            "GPU required for paired output qualification"
+        );
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Paired output","frame_rate":{"num":30,"den":1},"formats":[{"name":"square","width":32,"height":32}]}))).await;
+        assert_ne!(created.is_error, Some(true));
+        let legacy = data(&created)["sequence_id"].clone();
+        let refused = Box::pin(call(
+            &state,
+            "measure_native_output",
+            json!({"sequence_id":legacy,"at_ticks":0}),
+        ))
+        .await;
+        assert_eq!(data(&refused)["error_code"], "NativeOutputUnavailable");
+        let converted = Box::pin(call(
+            &state,
+            "create_native_color_draft",
+            json!({"sequence_id":legacy}),
+        ))
+        .await;
+        assert_ne!(converted.is_error, Some(true));
+        let sequence = data(&converted)["sequence_id"].clone();
+        let track = create_track(&state, &sequence, "video").await;
+        let inserted=Box::pin(call(&state,"insert_clip",json!({"track_id":track,"start_ticks":0,"duration_ticks":TICKS_PER_SECOND,"source":{"kind":"solid_color","color":"#808080"}}))).await;
+        assert_ne!(inserted.is_error, Some(true));
+        let clip = data(&inserted)["clip_id"].clone();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 3.0 },
+        ));
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::LinearOffset,
+            GradeOpParams::LinearOffset {
+                rgb: [-2.0, 0.0, 0.0],
+            },
+        ));
+        assert_ne!(
+            Box::pin(call(
+                &state,
+                "set_grade",
+                json!({"clip_id":clip,"grade":grade})
+            ))
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_ne!(
+            Box::pin(call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":track,"opacity":0.5,"locked":true})
+            ))
+            .await
+            .is_error,
+            Some(true)
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let measured = Box::pin(call(
+            &state,
+            "measure_native_output",
+            json!({"sequence_id":sequence,"at_ticks":0}),
+        ))
+        .await;
+        assert_ne!(measured.is_error, Some(true), "{measured:?}");
+        let result = measured.structured_content.as_ref().unwrap();
+        let stats = &result["measurements"];
+        assert_eq!(result["revision"], revision);
+        assert_eq!(result["scene_encoding"], "scene_linear_acescg");
+        assert_eq!(result["display_encoding"], "srgb_display");
+        assert_eq!(stats["covered_pixels"], 1024);
+        assert_eq!(stats["transparent_pixels"], 0);
+        assert_eq!(stats["alpha_min"], 0.5);
+        assert_eq!(stats["alpha_max"], 0.5);
+        assert_eq!(stats["scene_rgb"]["below_zero"], json!([1024, 0, 0]));
+        assert_eq!(stats["scene_rgb"]["above_one"], json!([0, 1024, 1024]));
+        let neutral =
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([128.0 / 255.0; 3]);
+        for c in 0..3 {
+            let expected = neutral[c] * 8.0 - if c == 0 { 2.0 } else { 0.0 };
+            assert!((stats["scene_rgb"]["mean"][c].as_f64().unwrap() - expected).abs() < 0.003);
+        }
+        assert_eq!(
+            stats["scene_luminance_stops"]["counts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .sum::<u64>(),
+            1024
+        );
+        let png_of = |result: &ToolResult| {
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8()
+        };
+        let actual = png_of(&measured);
+        let rendered = Box::pin(call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        ))
+        .await;
+        assert_ne!(rendered.is_error, Some(true), "{rendered:?}");
+        let preview = png_of(&rendered);
+        for (a, b) in actual.pixels().zip(preview.pixels()) {
+            assert_eq!(a[3], 128);
+            for c in 0..4 {
+                assert!(a[c].abs_diff(b[c]) <= 1, "{:?} {:?}", a, b);
+            }
+        }
+        for bad in [
+            json!({"sequence_id":sequence,"at_ticks":-1}),
+            json!({"sequence_id":sequence,"at_ticks":0,"format_index":99}),
+            json!({"sequence_id":SequenceId::new(),"at_ticks":0}),
+        ] {
+            assert_eq!(
+                Box::pin(call(&state, "measure_native_output", bad))
+                    .await
+                    .is_error,
+                Some(true)
+            );
+        }
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+
+        // Hold transport so the handler captures its original document identity,
+        // then simulate a file replacement whose fresh history has the same revision.
+        let bridge = engine_bridge(&state).unwrap();
+        let transport = bridge.lock_transport().await;
+        let old_id = state.document.lock().await.id;
+        let mut pending = Box::pin(measure_native_output(
+            &state,
+            serde_json::from_value(json!({"sequence_id":sequence,"at_ticks":0})).unwrap(),
+        ));
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            match pending.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(()),
+                std::task::Poll::Ready(_) => panic!("inspection should wait for transport"),
+            }
+        })
+        .await;
+        state.document.lock().await.id = uuid::Uuid::new_v4();
+        drop(transport);
+        let stale = pending.await;
+        assert_eq!(data(&stale)["error_code"], "RevisionConflict");
+        state.document.lock().await.id = old_id;
+        assert_eq!(state.history.lock().await.revision(), revision);
+    }
+
+    #[tokio::test]
+    async fn inspect_grade_image_exact_node_excludes_later_grades_and_look() {
+        check_grade_image_stage(false).await;
+    }
+
+    #[tokio::test]
+    async fn inspect_grade_image_shared_look_stage_is_exact_and_readonly() {
+        check_grade_image_stage(true).await;
+    }
+
+    async fn check_grade_image_stage(shared: bool) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            Clip, ClipLook, ClipSource, Grade, GradeGraphNode, GradeOp, GradeOpKind, GradeOpParams,
+            Track, TrackKind,
+        };
+        let state = test_state();
+        assert!(
+            engine_available(&state).await,
+            "GPU required for image-output qualification"
+        );
+        let created=call(&state,"create_sequence",json!({"name":"Image output","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":16,"height":8}]})).await;
+        let sequence: SequenceId =
+            serde_json::from_value(data(&created)["sequence_id"].clone()).unwrap();
+        let look_id = photonic_core::timeline::SharedLookId::new();
+        let look_stage = if shared {
+            json!({"kind":"shared_look","id":look_id})
+        } else {
+            json!({"kind":"local_look"})
+        };
+        let (clip_id, node, output) = {
+            let mut doc = state.document.lock().await;
+            let project = doc.timeline.as_mut().unwrap();
+            let seq = project.sequences.get_mut(&sequence).unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let mut clip = Clip::new(
+                ClipSource::SolidColor {
+                    color: photonic_core::Color {
+                        r: 0.2,
+                        g: 0.1,
+                        b: 0.05,
+                        a: 0.5,
+                    },
+                },
+                Tick::ZERO,
+                Tick::from_seconds(1),
+            );
+            let mut grade = Grade::new();
+            let first = GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 1.0 },
+            );
+            let first_id = first.id;
+            grade.ops.push(first);
+            grade.ops.push(GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 2.0 },
+            ));
+            grade.convert_to_graph();
+            let graph = grade.graph.as_ref().unwrap();
+            let node = *graph
+                .nodes
+                .iter()
+                .find(
+                    |(_, value)| matches!(value,GradeGraphNode::Corrector {op,..} if *op==first_id),
+                )
+                .unwrap()
+                .0;
+            let output = graph.output;
+            // Deliberately colliding graph node IDs in a separate local look.
+            let mut look = grade.clone();
+            look.ops[0].params.base = GradeOpParams::Exposure { stops: 4.0 };
+            clip.look = Some(if shared {
+                ClipLook::Shared(look_id)
+            } else {
+                ClipLook::Local(Box::new(look.clone()))
+            });
+            clip.grade = Some(grade);
+            let id = clip.id;
+            let mut track = Track::new(TrackKind::Video, "V1");
+            track.locked = true;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            if shared {
+                project.shared_looks.insert(
+                    look_id,
+                    photonic_core::timeline::SharedLook {
+                        versions: Vec::new(),
+                        active_version: None,
+                        id: look_id,
+                        name: "Shared exposure".into(),
+                        grade: look,
+                    },
+                );
+            }
+            (id, node, output)
+        };
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let base =
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([0.2, 0.1, 0.05]);
+        for (node, gain) in [(node, 2.0), (output, 8.0)] {
+            let result = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let payload = result
+                .structured_content
+                .as_ref()
+                .expect("image output metadata");
+            assert_eq!(payload["image_encoding"], "srgb_display");
+            assert_eq!(payload["scene_encoding"], "scene_linear_acescg");
+            assert_eq!(payload["coverage"]["min"], 0.5);
+            for c in 0..3 {
+                assert!(
+                    (payload["scene_rgb"]["min"][c].as_f64().unwrap() - base[c] * gain).abs()
+                        < 0.001
+                );
+            }
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|item| match item {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            let expected = photonic_video::color::native_output::Aces2SdrOutput::shared()
+                .unwrap()
+                .map_straight(base.map(|v| v * gain))
+                .unwrap();
+            for pixel in png.pixels() {
+                assert_eq!(pixel[3], 128);
+                for c in 0..3 {
+                    assert!(pixel[c].abs_diff((expected[c] * 255.0).round() as u8) <= 2);
+                }
+            }
+        }
+        // Look node IDs deliberately collide with the clip nodes. Its first
+        // correction sees the complete clip grade (8x), then applies 16x.
+        for (stage, node, gain) in [
+            (look_stage.clone(), node, 128.0),
+            (look_stage.clone(), output, 512.0),
+            (json!({"kind":"clip"}), output, 8.0),
+            (serde_json::Value::Null, output, 8.0),
+        ] {
+            let result = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"stage":stage,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let payload = result.structured_content.as_ref().unwrap();
+            assert_eq!(
+                payload["stage"],
+                if stage.is_null() {
+                    json!({"kind":"clip"})
+                } else {
+                    stage
+                }
+            );
+            for c in 0..3 {
+                assert!(
+                    (payload["scene_rgb"]["min"][c].as_f64().unwrap() - base[c] * gain).abs()
+                        < 0.025,
+                    "{payload}"
+                );
+            }
+        }
+        let wrong = call(&state, "inspect_grade_image", json!({"clip_id":clip_id,"stage":{"kind":"shared_look","id":uuid::Uuid::new_v4()},"graph_node_id":node,"at_ticks":0})).await;
+        assert_eq!(wrong.is_error, Some(true));
+        for request in [
+            json!({"clip_id":clip_id,"graph_node_id":999999,"at_ticks":0}),
+            json!({"clip_id":clip_id,"graph_node_id":node,"at_seconds":2.0}),
+        ] {
+            assert_eq!(
+                call(&state, "inspect_grade_image", request).await.is_error,
+                Some(true)
+            );
+        }
+        assert_eq!(
+            call(
+                &state,
+                "inspect_grade_matte",
+                json!({"clip_id":clip_id,"graph_node_id":node,"at_ticks":0})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if let Ok(root) = std::env::var("PHOTONIC_LOOK_QUALIFICATION_DIR") {
+            let folder = std::path::PathBuf::from(root).join(if shared {
+                "shared-image"
+            } else {
+                "local-image"
+            });
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(
+                folder.join("look.photon"),
+                state.document.lock().await.to_json().unwrap(),
+            )
+            .unwrap();
+            std::fs::write(folder.join("checks.json"), serde_json::to_vec_pretty(&json!({"clip_id":clip_id,"stage":look_stage,"node":node,"output":output,"clip_gain":8,"look_first_gain":128,"look_output_gain":512,"locked_readonly":true,"history_unchanged":true,"wrong_shared_link_refused":true})).unwrap()).unwrap();
+        }
+        if shared {
+            let track = {
+                let doc = state.document.lock().await;
+                locate_clip(doc.timeline.as_ref().unwrap(), clip_id)
+                    .unwrap()
+                    .1
+            };
+            let unlocked = call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":track,"locked":false}),
+            )
+            .await;
+            assert_ne!(unlocked.is_error, Some(true), "{unlocked:?}");
+            let detached = call(
+                &state,
+                "shared_look",
+                json!({"op":"make_independent","clip_id":clip_id}),
+            )
+            .await;
+            assert_ne!(detached.is_error, Some(true), "{detached:?}");
+            let stale = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"stage":look_stage,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_eq!(stale.is_error, Some(true));
+            let local = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"stage":{"kind":"local_look"},"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(local.is_error, Some(true), "{local:?}");
+            for c in 0..3 {
+                assert!(
+                    (local.structured_content.as_ref().unwrap()["scene_rgb"]["min"][c]
+                        .as_f64()
+                        .unwrap()
+                        - base[c] * 128.0)
+                        .abs()
+                        < 0.025
+                );
+            }
+            let undone = call(&state, "undo", json!({})).await;
+            assert_ne!(undone.is_error, Some(true), "{undone:?}");
+            let stale_local = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"stage":{"kind":"local_look"},"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_eq!(stale_local.is_error, Some(true));
+            let restored = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"stage":look_stage,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(restored.is_error, Some(true), "{restored:?}");
+            let mut bypassed = {
+                let doc = state.document.lock().await;
+                doc.timeline.as_ref().unwrap().shared_looks[&look_id]
+                    .grade
+                    .clone()
+            };
+            bypassed.bypass = true;
+            let updated = call(
+                &state,
+                "shared_look",
+                json!({"op":"update","look_id":look_id,"grade":bypassed}),
+            )
+            .await;
+            assert_ne!(updated.is_error, Some(true), "{updated:?}");
+            assert_eq!(
+                call(
+                    &state,
+                    "inspect_grade_image",
+                    json!({"clip_id":clip_id,"stage":look_stage,"graph_node_id":node,"at_ticks":0})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            let ordinary = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":clip_id,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(ordinary.is_error, Some(true), "{ordinary:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_grade_matte_mixed_refined_output_is_readonly_and_unassociated() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            AssetKind, CdlParams, Clip, ClipSource, Grade, GradeGraphNode, GradeKeyMixMode,
+            GradeMask, GradeOp, GradeOpKind, GradeOpParams, MediaAsset, Track, TrackKind,
+            WindowShape,
+        };
+        let state = test_state();
+        assert!(
+            engine_available(&state).await,
+            "GPU required for matte-output qualification"
+        );
+        let path = std::env::temp_dir().join(format!(
+            "photonic-matte-output-{}.png",
+            uuid::Uuid::new_v4()
+        ));
+        image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::from_pixel(
+            16,
+            16,
+            image::Rgba([32768, 16384, 8192, 32768]),
+        )
+        .save(&path)
+        .unwrap();
+        let created = call(&state,"create_sequence",json!({"name":"Matte output","frame_rate":{"num":30,"den":1},"formats":[{"name":"square","width":16,"height":16}]})).await;
+        let seq_id: SequenceId =
+            serde_json::from_value(data(&created)["sequence_id"].clone()).unwrap();
+        let look_id = photonic_core::timeline::SharedLookId::new();
+        let (asset, clip_id, key_node, refined, mixed) = {
+            let mut doc = state.document.lock().await;
+            let project = doc.timeline.as_mut().unwrap();
+            let asset = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &path));
+            let seq = project.sequences.get_mut(&seq_id).unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let mut clip = Clip::new(
+                ClipSource::Asset { asset },
+                Tick::ZERO,
+                Tick::from_seconds(1),
+            );
+            let mut grade = Grade::new();
+            let mut op = GradeOp::new(
+                GradeOpKind::HslQualifier,
+                GradeOpParams::HslQualifier {
+                    hue: [0.0, 1.0],
+                    sat: [0.0, 1.0],
+                    lum: [0.0, 1.0],
+                    softness: 0.0,
+                    correction: CdlParams::identity(),
+                    keys: vec![],
+                    matte_levels: [0.0, 0.0],
+                },
+            );
+            op.mask = Some(GradeMask::PowerWindow {
+                shape: WindowShape::Rectangle,
+                center: [0.5; 2],
+                size: [0.2; 2],
+                rotation: 0.0,
+                softness: 0.0,
+                invert: false,
+            });
+            let op_id = op.id;
+            grade.ops.push(op);
+            grade.convert_to_graph();
+            let graph = grade.graph.as_ref().unwrap();
+            let input = *graph
+                .nodes
+                .iter()
+                .find(|(_, n)| matches!(n, GradeGraphNode::Input))
+                .unwrap()
+                .0;
+            let corrected = match graph.nodes[&graph.output] {
+                GradeGraphNode::Output { input } => input,
+                _ => unreachable!(),
+            };
+            let key = grade
+                .add_graph_utility(GradeGraphNode::QualifierMatte {
+                    input,
+                    op: op_id,
+                    label: String::new(),
+                })
+                .unwrap();
+            let refined = grade
+                .add_graph_utility(GradeGraphNode::MatteRefine {
+                    input: key,
+                    refinement: Default::default(),
+                    label: String::new(),
+                })
+                .unwrap();
+            let mixed = grade
+                .add_graph_utility(GradeGraphNode::KeyMixer {
+                    top: key,
+                    bottom: refined,
+                    mode: GradeKeyMixMode::Multiply,
+                    label: String::new(),
+                })
+                .unwrap();
+            grade
+                .add_graph_utility(GradeGraphNode::MatteApply {
+                    original: input,
+                    corrected,
+                    matte: mixed,
+                    label: String::new(),
+                })
+                .unwrap();
+            let mut look = grade.clone();
+            if let Some(GradeMask::PowerWindow { invert, .. }) = look.ops[0].mask.as_mut() {
+                *invert = true;
+            }
+            clip.look = Some(photonic_core::timeline::ClipLook::Shared(look_id));
+            clip.grade = Some(grade);
+            let clip_id = clip.id;
+            let mut track = Track::new(TrackKind::Video, "V1");
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.shared_looks.insert(
+                look_id,
+                photonic_core::timeline::SharedLook {
+                    versions: Vec::new(),
+                    active_version: None,
+                    id: look_id,
+                    name: "Inverted window look".into(),
+                    grade: look,
+                },
+            );
+            (asset, clip_id, key, refined, mixed)
+        };
+        let authored=call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":asset,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}})).await;
+        assert_ne!(authored.is_error, Some(true), "{authored:?}");
+        // Read-only output inspection remains available when editing is locked.
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .video_tracks[0]
+            .locked = true;
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for node in [key_node, refined, mixed] {
+            let result = call(
+                &state,
+                "inspect_grade_matte",
+                json!({"clip_id":clip_id,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let d = result
+                .structured_content
+                .as_ref()
+                .expect("matte output metadata");
+            assert_eq!(d["matte_encoding"], "unassociated_weight");
+            assert_eq!(d["coverage"]["min"], 0.0);
+            assert_eq!(d["coverage"]["max"], 1.0);
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|item| match item {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(png.get_pixel(8, 8).0, [255; 4]);
+            assert_eq!(png.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        }
+        for node in [key_node, refined, mixed] {
+            let stage = json!({"kind":"shared_look","id":look_id});
+            let result = call(
+                &state,
+                "inspect_grade_matte",
+                json!({"clip_id":clip_id,"stage":stage,"graph_node_id":node,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(result.structured_content.as_ref().unwrap()["stage"], stage);
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["coverage"]["min"],
+                0.0
+            );
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["coverage"]["max"],
+                1.0
+            );
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|item| match item {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(png.get_pixel(8, 8).0, [0, 0, 0, 255]);
+            assert_eq!(png.get_pixel(0, 0).0, [255; 4]);
+        }
+        for stage in [
+            json!({"kind":"local_look"}),
+            json!({"kind":"shared_look","id":uuid::Uuid::new_v4()}),
+        ] {
+            assert_eq!(
+                call(
+                    &state,
+                    "inspect_grade_matte",
+                    json!({"clip_id":clip_id,"stage":stage,"graph_node_id":mixed,"at_ticks":0})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+        }
+        for request in [
+            json!({"clip_id":clip_id,"graph_node_id":999}),
+            json!({"clip_id":clip_id,"graph_node_id":0}),
+            json!({"clip_id":clip_id,"graph_node_id":mixed,"at_seconds":2.0}),
+        ] {
+            assert_eq!(
+                call(&state, "inspect_grade_matte", request).await.is_error,
+                Some(true)
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if let Ok(output) = std::env::var("PHOTONIC_MATTE_QUALIFICATION_DIR") {
+            let output = std::path::PathBuf::from(output);
+            std::fs::create_dir_all(&output).unwrap();
+            std::fs::write(
+                output.join("matte-output.photon"),
+                state.document.lock().await.to_json().unwrap(),
+            )
+            .unwrap();
+            std::fs::write(output.join("fixture.json"), serde_json::to_vec_pretty(&json!({"clip_id":clip_id,"nodes":[key_node,refined,mixed],"shared_look_id":look_id,"source":path,"source_is_temporary":true})).unwrap()).unwrap();
+        } else {
+            std::fs::remove_file(path).unwrap();
+        }
+        drop(state);
+    }
+
+    #[tokio::test]
+    async fn native_title_slide_mcp_whole_paint_preview_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let created=call(&state,"create_sequence",json!({"name":"Native title SlideUp","frame_rate":{"num":30,"den":1},"formats":[{"name":"test","width":128,"height":80}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut d = state.document.lock().await;
+            let seq = d.timeline.as_mut().unwrap().sequences.get_mut(&id).unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_text_clip",json!({"track_id":track,"text":"HI","start_ticks":0,"duration_ticks":ticks*7,"style":{"animation":"slide_up","fill":"#ff000000","font_size":32,"position":[0.5,0.2],"stroke":{"color":"#00ff00","width":3},"background":{"color":"#0000ff80","padding":5,"corner_radius":3}}}))).await;
+        assert_ne!(inserted.is_error, Some(true), "{inserted:?}");
+        let saved = state.document.lock().await.to_json().unwrap();
+        let restored = photonic_core::Document::from_json(&saved).unwrap();
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), before);
+        let revision = state.history.lock().await.revision();
+        let retained = std::env::var_os("PHOTONIC_TITLE_SLIDE_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-title-slide-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut images = Vec::new();
+        for frame in 0..7 {
+            let result=call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":ticks*frame,"quality":"full","output_format":"png"})).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let bytes = general_purpose::STANDARD
+                .decode(
+                    result
+                        .content
+                        .iter()
+                        .find_map(|c| {
+                            if let ContentItem::Image { data, .. } = c {
+                                Some(data)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap(),
+                )
+                .unwrap();
+            let png = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert_eq!(png.dimensions(), (128, 80));
+            std::fs::write(dir.join(format!("preview-{frame}.png")), bytes).unwrap();
+            images.push(png);
+        }
+        assert!(
+            images[0].pixels().all(|p| p[3] == 0),
+            "all paint invisible at start"
+        );
+        let mut visible = 0;
+        for y in 0..80 {
+            for x in 0..128 {
+                let target = images[3].get_pixel(x, y);
+                let source = if y >= 2 {
+                    images[6].get_pixel(x, y - 2).0
+                } else {
+                    [0; 4]
+                };
+                assert!(
+                    target[3].abs_diff(((source[3] as f32) * 0.5).round() as u8) <= 2,
+                    "whole paint fade mismatch at{x},{y}: {target:?}/{source:?}"
+                );
+                if source[3] > 20 {
+                    visible += 1;
+                    for c in 0..3 {
+                        assert!(
+                            target[c].abs_diff(source[c]) <= 6,
+                            "straight color should survive whole paint fade"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(visible > 50);
+        let mut draft_images = Vec::new();
+        for frame in [0, 3, 6] {
+            let result=call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":ticks*frame,"quality":"preview","scale":0.5,"output_format":"png"})).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let bytes = general_purpose::STANDARD
+                .decode(
+                    result
+                        .content
+                        .iter()
+                        .find_map(|c| {
+                            if let ContentItem::Image { data, .. } = c {
+                                Some(data)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap(),
+                )
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            assert_eq!(image.dimensions(), (64, 40));
+            std::fs::write(dir.join(format!("draft-{frame}.png")), bytes).unwrap();
+            draft_images.push(image);
+        }
+        assert!(draft_images[0].pixels().all(|p| p[3] == 0));
+        for y in 0..40 {
+            for x in 0..64 {
+                let target = draft_images[1].get_pixel(x, y);
+                let source = if y >= 1 {
+                    draft_images[2].get_pixel(x, y - 1).0
+                } else {
+                    [0; 4]
+                };
+                assert!(
+                    target[3].abs_diff((source[3] as f32 * 0.5).round() as u8) <= 2,
+                    "Draft whole paint alpha"
+                );
+            }
+        }
+        // Use the test policy's permitted temporary export root; retention is
+        // copied separately, exactly like the other native qualification tests.
+        let export_dir = std::env::temp_dir().join(format!(
+            "photonic-title-slide-export-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&export_dir).unwrap();
+        let out = export_dir.join("title-slide.mov");
+        let started=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let raw = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "7",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(raw.status.success());
+        assert_eq!(raw.stdout.len(), 7 * 128 * 80 * 8);
+        for (index, pixel) in raw.stdout.chunks_exact(8).enumerate() {
+            let f = index / (128 * 80);
+            let i = index % (128 * 80);
+            let expected = images[f].get_pixel((i % 128) as u32, (i / 128) as u32)[3] as u16 * 257;
+            assert!(
+                u16::from_le_bytes([pixel[6], pixel[7]]).abs_diff(expected) <= 700,
+                "ProRes alpha frame{f} pixel{i}"
+            );
+        }
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        std::fs::write(dir.join("input.photon"), saved).unwrap();
+        std::fs::write(dir.join("checks.json"),serde_json::to_vec_pretty(&json!({"frames":7,"size":[128,80],"draft_size":[64,40],"draft_midpoint_offset_pixels":1,"whole_paint_midpoint_offset_pixels":2,"whole_paint_midpoint_opacity":0.5,"png_alpha_tolerance":2,"png_straight_rgb_tolerance":6,"prores_alpha16_tolerance":700,"history_document_unchanged":true,"save_roundtrip":true})).unwrap()).unwrap();
+        std::fs::copy(&out, dir.join("title-slide.mov")).unwrap();
+        std::fs::remove_dir_all(export_dir).unwrap();
+        if retained.is_none() {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_decorated_title_mcp_author_preview_save_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let ffmpeg =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let created=call(&state,"create_sequence",json!({"name":"Decorated managed title","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":128,"height":64}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_text_clip",json!({"track_id":track,"text":"HI","start_ticks":0,"duration_ticks":ticks*3,"style":{"fill":"#ff000000","font_size":40,"position":[0.5,0.2],"stroke":{"color":"#00ff00","width":4},"background":{"color":"#0000ff80","padding":6,"corner_radius":5}}}))).await;
+        let clip = data(&inserted)["clip_id"].clone();
+        let saved = state.document.lock().await.to_json().unwrap();
+        let restored = photonic_core::Document::from_json(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let frame = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_ne!(frame.is_error, Some(true), "{frame:?}");
+        let bytes = general_purpose::STANDARD
+            .decode(
+                frame
+                    .content
+                    .iter()
+                    .find_map(|c| {
+                        if let ContentItem::Image { data, .. } = c {
+                            Some(data)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap(),
+            )
+            .unwrap();
+        let png = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let refs: Value = serde_json::from_str(include_str!(
+            "../../../photonic-video/tests/fixtures/native_title_reference.json"
+        ))
+        .unwrap();
+        let palette: [[f64; 3]; 2] = std::array::from_fn(|i| {
+            std::array::from_fn(|c| refs["matrix"][c][i + 1].as_f64().unwrap())
+        });
+        let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        let expected = palette.map(|p| output.map_straight(p).unwrap());
+        let video = palette.map(|p| output.map_straight_video(p).unwrap());
+        let mut selected = Vec::new();
+        let mut counts = [0usize; 2];
+        for y in 1..63 {
+            for x in 1..127 {
+                let p = png.get_pixel(x, y);
+                let region = if p[3] == 255 {
+                    Some(0)
+                } else if p[3] == 128 {
+                    Some(1)
+                } else {
+                    None
+                };
+                if let Some(region) = region {
+                    if (y - 1..=y + 1)
+                        .all(|ny| (x - 1..=x + 1).all(|nx| png.get_pixel(nx, ny)[3] == p[3]))
+                    {
+                        for c in 0..3 {
+                            assert!(
+                                p[c].abs_diff((expected[region][c] * 255.0).round() as u8) <= 6,
+                                "region{region} {p:?} vs {:?}",
+                                expected[region]
+                            );
+                        }
+                        selected.push(((y * 128 + x) as usize, region));
+                        counts[region] += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            counts[0] > 5 && counts[1] > 20,
+            "outline and box must both be visible with transparent fill: {counts:?}"
+        );
+        let retained = std::env::var_os("PHOTONIC_DECORATED_TITLE_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-decorated-title-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("decorated-title.mov");
+        let start=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(start.is_error, Some(true), "{start:?}");
+        let done = poll_job(&state, &data(&start)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&ffmpeg.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 3 * 128 * 64 * 8);
+        for (index, raw) in decoded.stdout.chunks_exact(8).enumerate() {
+            let px = index % (128 * 64);
+            let p = png.get_pixel((px % 128) as u32, (px / 128) as u32);
+            assert!(u16::from_le_bytes([raw[6], raw[7]]).abs_diff(u16::from(p[3]) * 257) <= 700);
+        }
+        for frame in 0..3 {
+            for (pixel, region) in &selected {
+                let raw = &decoded.stdout[(frame * 128 * 64 + pixel) * 8..][..8];
+                for c in 0..3 {
+                    let v = u16::from_le_bytes([raw[c * 2], raw[c * 2 + 1]]);
+                    assert!(
+                        v.abs_diff((video[*region][c] * 65535.0).round() as u16) <= 1800,
+                        "region{region} video channel{c}: {v}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if retained.is_some() {
+            std::fs::write(dir.join("decorated-title.photon"), saved).unwrap();
+            std::fs::write(dir.join("decorated-title.png"), bytes).unwrap();
+            std::fs::write(
+                dir.join("fixture.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"sequence_id":sequence,"clip_id":clip,"track_id":track}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicitly provisioned pinned local subject model"]
+    async fn native_subject_matte_mcp_preview_export_history_and_model_receipt() {
+        for case in 0..2 {
+            Box::pin(check_native_subject_matte(case)).await;
+        }
+    }
+    async fn check_native_subject_matte(case: u8) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{GraphOp, TimeSource};
+        let retained = std::env::var_os("PHOTONIC_SUBJECT_MATTE_DIR").map(std::path::PathBuf::from);
+        let dir = retained
+            .clone()
+            .unwrap_or_else(|| {
+                std::env::temp_dir()
+                    .join(format!("photonic-subject-matte-{}", uuid::Uuid::new_v4()))
+            })
+            .join(format!("case-{case}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let alpha = if case == 0 { 255 } else { 128 };
+        let mut input = photonic_core::raster::image::RasterImage::filled(96, 96, [0, 0, 0, alpha]);
+        for y in 30..66 {
+            for x in 30..66 {
+                input.set_pixel(x, y, [255, 255, 0, alpha]);
+            }
+        }
+        let model = photonic_matte::CachedMatteModel::load_cached().unwrap();
+        let mask = model.matte(&input).unwrap();
+        assert!(
+            mask.get(48, 48) as u32 > mask.get(3, 3) as u32 + 40,
+            "synthetic subject was not detected"
+        );
+        let source = dir.join("subject.png");
+        image::RgbaImage::from_raw(96, 96, input.pixels)
+            .unwrap()
+            .save(&source)
+            .unwrap();
+        image::GrayImage::from_raw(96, 96, mask.data.clone())
+            .unwrap()
+            .save(dir.join("reference-mask.png"))
+            .unwrap();
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Native subject mask","frame_rate":{"num":30,"den":1},"formats":[{"name":"square","width":96,"height":96}]}))).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let seq_id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let ticks = photonic_core::timeline::FrameRate::FPS_30
+            .ticks_per_frame()
+            .0;
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let imported = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "import_media",
+            json!({"paths":[source]}),
+        ))
+        .await;
+        let asset = data(&imported)["assets"][0]["asset_id"].clone();
+        let asset_id: AssetId = serde_json::from_value(asset.clone()).unwrap();
+        let probe = Box::pin(call(&state, "probe_media", json!({"asset_id":asset}))).await;
+        assert_ne!(probe.is_error, Some(true), "{probe:?}");
+        let probed = poll_job(&state, &data(&probe)["job_id"]).await;
+        assert_eq!(probed["status"]["state"], "done");
+        Box::pin(graph_authoring_edit_roundtrip(&state,"set_native_input_color",json!({"scope":"asset","asset_id":asset,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+        let track = create_track(&state, &sequence, "video").await;
+        let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_clip",json!({"track_id":track,"start_ticks":0,"duration_ticks":ticks*3,"source":{"kind":"asset","asset_id":asset}}))).await;
+        let clip = data(&inserted)["clip_id"].clone();
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            if case == 0 {
+                "create_clip_composition"
+            } else {
+                "set_project_graph"
+            },
+            if case == 0 {
+                json!({"clip_id":clip})
+            } else {
+                json!({})
+            },
+        ))
+        .await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = Box::pin(call(&state, "get_graph", json!({"graph_id":graph_id}))).await;
+        let graph = data(&read)["graph"].clone();
+        let output = graph["output"].clone();
+        for index in (0..graph["edges"].as_array().unwrap().len()).rev() {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "remove_graph_edge",
+                json!({"graph_id":graph_id,"edge_index":index}),
+            ))
+            .await;
+        }
+        let source_node = if case == 0 {
+            graph["nodes"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find(|n| n["op"]["op"] == "clip_in")
+                .unwrap()["id"]
+                .clone()
+        } else {
+            let added=Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_node",json!({"graph_id":graph_id,"op":GraphOp::MediaIn{asset:asset_id,time_source:TimeSource::Sequence}}))).await;
+            data(&added)["node_id"].clone()
+        };
+        let added = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":GraphOp::MaskFromMatte}),
+        ))
+        .await;
+        let matte = data(&added)["node_id"].clone();
+        for (from, to) in [(source_node, matte.clone()), (matte.clone(), output)] {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":from},"to":{"node_id":to}}),
+            ))
+            .await;
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let saved = state.document.lock().await.to_json().unwrap();
+        assert_eq!(
+            serde_json::to_value(photonic_core::Document::from_json(&saved).unwrap()).unwrap(),
+            before
+        );
+        let transform = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        for frame in [0, 2] {
+            let result=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":ticks*frame,"quality":"full","output_format":"png"}))).await;
+            assert_ne!(result.is_error, Some(true), "case{case}: {result:?}");
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|c| {
+                    if let ContentItem::Image { data, .. } = c {
+                        Some(data)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+            std::fs::write(dir.join(format!("preview-{frame}.png")), &bytes).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            for (pixel, weight) in image.pixels().zip(&mask.data) {
+                let value = *weight as f64 / 255.0;
+                let expected = transform
+                    .map_premultiplied([value, value, value, 1.0])
+                    .unwrap();
+                for c in 0..4 {
+                    assert!(
+                        pixel[c].abs_diff((expected[c] * 255.0).round() as u8) <= 4,
+                        "case{case} preview{frame} {pixel:?} vs {expected:?}"
+                    );
+                }
+            }
+            let bridge = engine_bridge(&state).unwrap();
+            let actual = bridge.session().latest_frame().unwrap();
+            assert_eq!(actual.pending_computations, 0);
+            assert!(actual.subject_matte_used);
+        }
+        let out = dir.join("subject-mask.mov");
+        let started=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        let manifest_path = photonic_video::export::manifest::manifest_path(&out);
+        photonic_video::export::manifest::verify_manifest(&manifest_path).unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest["toolchain"]["subject_matte_used"]["sha256"],
+            photonic_matte::PINNED_MODEL_SHA256
+        );
+        let tools = photonic_video::media::ffmpeg_locate::locate_for_test().unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba64le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 3 * 96 * 96 * 8);
+        for frame in 0..3 {
+            for (pixel, weight) in decoded.stdout[frame * 96 * 96 * 8..(frame + 1) * 96 * 96 * 8]
+                .chunks_exact(8)
+                .zip(&mask.data)
+            {
+                let expected = transform
+                    .map_straight_video([*weight as f64 / 255.0; 3])
+                    .unwrap();
+                for c in 0..3 {
+                    let actual = u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]]) as f64;
+                    assert!(
+                        (actual - expected[c] * 65535.0).abs() <= 1024.0,
+                        "case{case} export {actual} vs {expected:?}"
+                    );
+                }
+                // ProRes decodes to yuva444p12le: opaque 4095 expands to 65520.
+                assert!(65535 - u16::from_le_bytes([pixel[6], pixel[7]]) <= 15);
+            }
+        }
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        let mut changed =
+            photonic_core::raster::image::RasterImage::filled(96, 96, [0, 0, 0, alpha]);
+        for y in 30..66 {
+            for x in 5..25 {
+                changed.set_pixel(x, y, [255, 255, 0, alpha]);
+            }
+        }
+        let changed_mask = model.matte(&changed).unwrap();
+        let changed_path = dir.join("changed-subject.png");
+        image::RgbaImage::from_raw(96, 96, changed.pixels)
+            .unwrap()
+            .save(&changed_path)
+            .unwrap();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "relink_media",
+            json!({"asset_id":asset,"new_path":changed_path,"allow_hash_mismatch":true}),
+        ))
+        .await;
+        for (phase, reference) in [("relinked", &changed_mask), ("restored", &mask)] {
+            if phase == "restored" {
+                let undone = Box::pin(call(&state, "undo", json!({}))).await;
+                assert_ne!(undone.is_error, Some(true), "{undone:?}");
+            }
+            let result = Box::pin(call(
+                &state,
+                "render_frame_at",
+                json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+            ))
+            .await;
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "case{case} {phase}: {result:?}"
+            );
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|c| {
+                    if let ContentItem::Image { data, .. } = c {
+                        Some(data)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+            std::fs::write(dir.join(format!("preview-{phase}.png")), &bytes).unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            for (pixel, weight) in image.pixels().zip(&reference.data) {
+                let value = *weight as f64 / 255.0;
+                let expected = transform
+                    .map_premultiplied([value, value, value, 1.0])
+                    .unwrap();
+                for c in 0..4 {
+                    assert!(
+                        pixel[c].abs_diff((expected[c] * 255.0).round() as u8) <= 4,
+                        "case{case} {phase}: stale mask {pixel:?} vs {expected:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        let revision = state.history.lock().await.revision();
+        if case == 0 {
+            let track_id: TrackId = serde_json::from_value(track).unwrap();
+            state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&seq_id)
+                .unwrap()
+                .track_mut(track_id)
+                .unwrap()
+                .locked = true;
+            assert_eq!(
+                Box::pin(call(
+                    &state,
+                    "remove_graph_node",
+                    json!({"graph_id":graph_id,"node_id":matte})
+                ))
+                .await
+                .is_error,
+                Some(true)
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+        }
+        std::fs::write(dir.join("subject-matte.photon"), saved).unwrap();
+        std::fs::write(dir.join("checks.json"),serde_json::to_vec_pretty(&json!({"case":case,"source_alpha":alpha,"preview_frames":[0,2],"export_frames":3,"exact_frames_not_provisional":true,"pinned_model_receipt":true,"relink_and_undo_pixels":true,"reference":"separate direct pinned-model raw-weight inference and output transform; source coverage is not folded into weights","history_save_locks":true})).unwrap()).unwrap();
+        if retained.is_none() {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires generated native_source_end integration fixture via PHOTONIC_SOURCE_END_DOCUMENT"]
+    async fn native_source_end_exact_preview_export_refusal_and_recovery() {
+        let file = std::path::PathBuf::from(
+            std::env::var_os("PHOTONIC_SOURCE_END_DOCUMENT")
+                .expect("generated source-end document"),
+        );
+        let document =
+            photonic_core::Document::from_json(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        let sequence = document.timeline.as_ref().unwrap().active_sequence.unwrap();
+        let before = serde_json::to_value(&document).unwrap();
+        let ticks = photonic_core::timeline::FrameRate::FPS_30
+            .ticks_per_frame()
+            .0;
+        let state = test_state();
+        *state.document.lock().await = document;
+        assert!(engine_available(&state).await, "GPU required");
+        let mut checks = Vec::new();
+        for (frame, rejected) in [(0, false), (2, true), (1, false), (60, true), (0, false)] {
+            let start = std::time::Instant::now();
+            let result = Box::pin(call(&state, "render_frame_at", json!({"sequence_id":sequence,"at_ticks":frame*ticks,"quality":"full","output_format":"png"}))).await;
+            assert_eq!(result.is_error == Some(true), rejected, "{result:?}");
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(8),
+                "EOF fell through to timeout"
+            );
+            if rejected {
+                assert!(
+                    format!("{result:?}").contains("last decoded frame"),
+                    "{result:?}"
+                );
+                assert!(!result
+                    .content
+                    .iter()
+                    .any(|c| matches!(c, ContentItem::Image { .. })));
+            }
+            checks.push(
+                json!({"frame":frame,"rejected":rejected,"elapsed_ms":start.elapsed().as_millis()}),
+            );
+        }
+        let out =
+            std::env::temp_dir().join(format!("must-not-publish-{}.mov", uuid::Uuid::new_v4()));
+        let start = std::time::Instant::now();
+        let started = Box::pin(call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "failed", "{done}");
+        assert!(done.to_string().contains("last decoded frame"), "{done}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        assert!(!out.exists(), "failed export published an output");
+        assert!(!photonic_video::export::manifest::manifest_path(&out).exists());
+        let recovered = Box::pin(call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full"}),
+        ))
+        .await;
+        assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        std::fs::write(file.parent().unwrap().join("mcp-checks.json"), serde_json::to_vec_pretty(&json!({"previews":checks,"export_failed_without_output_or_manifest":true,"document_unchanged":true})).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "run with an intentionally missing PHOTONIC_RMBG_MODEL_PATH"]
+    async fn native_subject_model_missing_refuses_exact_preview_and_export() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        assert!(
+            photonic_matte::CachedMatteModel::load_cached().is_err(),
+            "negative fixture requires missing model"
+        );
+        let state = test_state();
+        assert!(engine_available(&state).await);
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Missing subject model","frame_rate":{"num":30,"den":1},"formats":[{"name":"tiny","width":32,"height":16}]}))).await;
+        let sequence = data(&created)["sequence_id"].clone();
+        let seq_id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let track = create_track(&state, &sequence, "video").await;
+        let clip = insert_solid_clip(
+            &state,
+            &track,
+            0,
+            photonic_core::timeline::FrameRate::FPS_30
+                .ticks_per_frame()
+                .0
+                * 2,
+        )
+        .await;
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "create_clip_composition",
+            json!({"clip_id":clip}),
+        ))
+        .await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = Box::pin(call(&state, "get_graph", json!({"graph_id":graph_id}))).await;
+        let graph = data(&read)["graph"].clone();
+        let output = graph["output"].clone();
+        let source = graph["nodes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|n| n["op"]["op"] == "clip_in")
+            .unwrap()["id"]
+            .clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "remove_graph_edge",
+            json!({"graph_id":graph_id,"edge_index":0}),
+        ))
+        .await;
+        let added = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":photonic_core::timeline::GraphOp::MaskFromMatte}),
+        ))
+        .await;
+        let matte = data(&added)["node_id"].clone();
+        for (from, to) in [(source, matte.clone()), (matte, output)] {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":from},"to":{"node_id":to}}),
+            ))
+            .await;
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let started = Instant::now();
+        let result = Box::pin(call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        ))
+        .await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(data(&result)["error_code"], "ColorPipelineUnavailable");
+        assert!(data(&result)["message"]
+            .as_str()
+            .unwrap()
+            .contains("Native subject matte"));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "failure was hidden behind a render timeout"
+        );
+        let dir =
+            std::env::temp_dir().join(format!("photonic-missing-subject-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("must-not-publish.mov");
+        let started=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "failed", "{done}");
+        assert!(!out.exists(), "failed export published an output");
+        assert!(!photonic_video::export::manifest::manifest_path(&out).exists());
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_title_mcp_author_undo_save_preview_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let created=call(&state,"create_sequence",json!({"name":"Managed title","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":128,"height":64}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_text_clip",json!({"track_id":track,"text":"HI","start_ticks":0,"duration_ticks":ticks*3,"style":{"font_size":40,"fill":"#ff000080","position":[0.5,0.2],"max_width":0.9,"clear_stroke":true}}))).await;
+        let clip = data(&inserted)["clip_id"].clone();
+        let saved = state.document.lock().await.to_json().unwrap();
+        let reloaded = photonic_core::Document::from_json(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let frame = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_ne!(frame.is_error, Some(true), "{frame:?}");
+        let encoded = frame
+            .content
+            .iter()
+            .find_map(|c| {
+                if let ContentItem::Image { data, .. } = c {
+                    Some(data)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let png_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let png = image::load_from_memory(&png_bytes).unwrap().to_rgba8();
+        assert!(png.pixels().filter(|p| p[3] > 100).count() > 20);
+        let ap1 =
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([1.0, 0.0, 0.0]);
+        let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        let expected = output
+            .map_premultiplied([ap1[0], ap1[1], ap1[2], 1.0])
+            .unwrap();
+        for p in png.pixels().filter(|p| p[3] > 100) {
+            for c in 0..3 {
+                assert!(
+                    p[c].abs_diff((expected[c] * 255.0).round() as u8) <= 4,
+                    "{p:?} vs {expected:?}"
+                );
+            }
+        }
+        let retained =
+            std::env::var_os("PHOTONIC_TITLE_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-title-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("title.mov");
+        let started=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 3 * 128 * 64 * 8);
+        let expected_video = output.map_straight_video(ap1).unwrap();
+        let mut opaque_checked = 0;
+        for (index, raw) in decoded.stdout.chunks_exact(8).enumerate() {
+            let px = index % (128 * 64);
+            let (x, y) = ((px % 128) as u32, (px / 128) as u32);
+            let alpha = png.get_pixel(x, y)[3];
+            let actual = u16::from_le_bytes([raw[6], raw[7]]);
+            assert!(actual.abs_diff(u16::from(alpha) * 257) <= 700);
+            if x > 0
+                && x < 127
+                && y > 0
+                && y < 63
+                && (y - 1..=y + 1)
+                    .all(|ny| (x - 1..=x + 1).all(|nx| png.get_pixel(nx, ny)[3] >= 127))
+            {
+                opaque_checked += 1;
+                for c in 0..3 {
+                    let value = u16::from_le_bytes([raw[c * 2], raw[c * 2 + 1]]);
+                    assert!(value.abs_diff((expected_video[c] * 65535.0).round() as u16) <= 1800);
+                }
+            }
+        }
+        assert!(opaque_checked > 10);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if retained.is_some() {
+            std::fs::write(dir.join("title.photon"), saved).unwrap();
+            std::fs::write(dir.join("title.png"), png_bytes).unwrap();
+            std::fs::write(
+                dir.join("fixture.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"clip_id":clip,"sequence_id":sequence,"track_id":track}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_vector_mcp_graph_author_undo_save_preview_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        {
+            let mut d = state.document.lock().await;
+            d.width = 128.0;
+            d.height = 64.0;
+        }
+        let shape=Box::pin(graph_authoring_edit_roundtrip(&state,"create_path",json!({"name":"Native logo","path_data":"M 8 8 L 120 8 L 120 56 L 8 56 Z","fill":{"type":"solid","color":"#8033cc80"}}))).await;
+        assert_ne!(shape.is_error, Some(true));
+        let created=call(&state,"create_sequence",json!({"name":"Managed vector","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":128,"height":64}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let seq: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut d = state.document.lock().await;
+            let s = d
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&seq)
+                .unwrap();
+            s.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            s.frame_rate.ticks_per_frame().0
+        };
+        Box::pin(graph_authoring_edit_roundtrip(&state,"insert_text_clip",json!({"track_id":track,"text":"SOURCE","start_ticks":0,"duration_ticks":ticks*3,"style":{"font_size":24,"fill":"#ffffff","clear_stroke":true}}))).await;
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_project_graph",
+            json!({}),
+        ))
+        .await;
+        let graph = data(&created)["graph_id"].clone();
+        let read = call(&state, "get_graph", json!({"graph_id":graph})).await;
+        let output = data(&read)["graph"]["output"].clone();
+        let added = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph,"op":{"op":"vector_in","vref":{"vref":"whole_document"}}}),
+        ))
+        .await;
+        let node = data(&added)["node_id"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_edge",
+            json!({"graph_id":graph,"from":{"node_id":node},"to":{"node_id":output}}),
+        ))
+        .await;
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let saved = state.document.lock().await.to_json().unwrap();
+        assert_eq!(
+            serde_json::to_value(Document::from_json(&saved).unwrap()).unwrap(),
+            before
+        );
+        let frame = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_ne!(frame.is_error, Some(true), "{frame:?}");
+        let encoded = frame
+            .content
+            .iter()
+            .find_map(|c| {
+                if let ContentItem::Image { data, .. } = c {
+                    Some(data)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let png = image::load_from_memory(&bytes).unwrap().to_rgba8();
+        let output_map = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        let ap1 = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+            128.0 / 255.0,
+            51.0 / 255.0,
+            204.0 / 255.0,
+        ]);
+        let expected = output_map
+            .map_premultiplied([ap1[0], ap1[1], ap1[2], 1.0])
+            .unwrap();
+        for (x, y) in [(16, 16), (64, 32), (112, 48)] {
+            let p = png.get_pixel(x, y);
+            assert!(p[3].abs_diff(128) <= 2, "{p:?}");
+            for c in 0..3 {
+                assert!(
+                    p[c].abs_diff((expected[c] * 255.0).round() as u8) <= 5,
+                    "{p:?} vs {expected:?}"
+                );
+            }
+        }
+        assert_eq!(png.get_pixel(0, 0).0, [0; 4]);
+        assert!(
+            png.get_pixel(9, 32)[3] > 100,
+            "must use exact authored canvas without preview margin"
+        );
+        let retained =
+            std::env::var_os("PHOTONIC_VECTOR_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-vector-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("vector.mov");
+        let started=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 3 * 128 * 64 * 8);
+        let video = output_map.map_straight_video(ap1).unwrap();
+        for frame in decoded.stdout.chunks_exact(128 * 64 * 8) {
+            let i = (32 * 128 + 64) * 8;
+            let p = &frame[i..i + 8];
+            for c in 0..3 {
+                let a = u16::from_le_bytes([p[c * 2], p[c * 2 + 1]]);
+                assert!(
+                    a.abs_diff((video[c] * 65535.0).round() as u16) <= 1800,
+                    "{a} vs {}",
+                    video[c]
+                );
+            }
+            assert!(u16::from_le_bytes([p[6], p[7]]).abs_diff(128 * 257) < 800);
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        // Invalid source must replace the prior successful frame with an error.
+        let invalid=call(&state,"create_path",json!({"name":"Unqualified gradient","path_data":"M 0 0 L 8 0 L 8 8 Z","fill":{"type":"gradient","gradient_type":"linear","colors":["#ff0000","#0000ff"],"coords":[0,0,8,0]}})).await;
+        assert_ne!(invalid.is_error, Some(true));
+        let bad = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_eq!(bad.is_error, Some(true), "{bad:?}");
+        if retained.is_some() {
+            std::fs::write(dir.join("vector.photon"), saved).unwrap();
+            std::fs::write(dir.join("vector.png"), bytes).unwrap();
+            std::fs::write(dir.join("fixture.json"),serde_json::to_vec_pretty(&json!({"sequence":sequence,"graph":graph,"vector_node":node,"frames":3,"native_vector":"whole_document solid paths","source_color":"#8033cc80","invalid_gradient_refused":true})).unwrap()).unwrap();
+        } else {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_graph_text_mcp_clip_and_project_author_save_preview_prores() {
+        Box::pin(check_native_graph_text_export(false)).await;
+        Box::pin(check_native_graph_text_export(true)).await;
+    }
+    async fn check_native_graph_text_export(project_scope: bool) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let created=call(&state,"create_sequence",json!({"name":"Managed title","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":128,"height":64}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_text_clip",json!({"track_id":track,"text":"SOURCE","start_ticks":0,"duration_ticks":ticks*3,"style":{"font_size":40,"fill":"#00ff00ff","position":[0.5,0.2],"max_width":0.9,"clear_stroke":true}}))).await;
+        let clip = data(&inserted)["clip_id"].clone();
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            if project_scope {
+                "set_project_graph"
+            } else {
+                "create_clip_composition"
+            },
+            if project_scope {
+                json!({})
+            } else {
+                json!({"clip_id":clip})
+            },
+        ))
+        .await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+        let graph = data(&read)["graph"].clone();
+        let output = graph["output"].clone();
+        for index in (0..graph["edges"].as_array().unwrap().len()).rev() {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "remove_graph_edge",
+                json!({"graph_id":graph_id,"edge_index":index}),
+            ))
+            .await;
+        }
+        let initial = photonic_core::timeline::TextGen::default();
+        let added = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":{"op":"text","text":initial}}),
+        ))
+        .await;
+        let text_node = data(&added)["node_id"].clone();
+        let payload = json!({"text":"HI","font_family":"sans-serif","font_size":40.0,"fill":{"r":1.0,"g":0.0,"b":0.0,"a":128.0/255.0},"position":[0.5,0.2]});
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_graph_text",
+            json!({"graph_id":graph_id,"node_id":text_node,"text":payload}),
+        ))
+        .await;
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_edge",
+            json!({"graph_id":graph_id,"from":{"node_id":text_node},"to":{"node_id":output}}),
+        ))
+        .await;
+        let revision = state.history.lock().await.revision();
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let repeated = call(
+            &state,
+            "set_graph_text",
+            json!({"graph_id":graph_id,"node_id":text_node,"text":payload}),
+        )
+        .await;
+        assert_ne!(repeated.is_error, Some(true));
+        assert_eq!(data(&repeated)["changed"], false);
+        let mut bad = payload.clone();
+        bad["font_size"] = json!(0);
+        assert_eq!(
+            call(
+                &state,
+                "set_graph_text",
+                json!({"graph_id":graph_id,"node_id":text_node,"text":bad})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(
+            call(
+                &state,
+                "set_graph_text",
+                json!({"graph_id":graph_id,"node_id":output,"text":payload})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        let saved = state.document.lock().await.to_json().unwrap();
+        let reloaded = photonic_core::Document::from_json(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let frame = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_ne!(frame.is_error, Some(true), "{frame:?}");
+        let encoded = frame
+            .content
+            .iter()
+            .find_map(|c| {
+                if let ContentItem::Image { data, .. } = c {
+                    Some(data)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let png_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let png = image::load_from_memory(&png_bytes).unwrap().to_rgba8();
+        assert!(png.pixels().filter(|p| p[3] > 100).count() > 20);
+        let ap1 =
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([1.0, 0.0, 0.0]);
+        let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        let expected = output
+            .map_premultiplied([ap1[0], ap1[1], ap1[2], 1.0])
+            .unwrap();
+        for p in png.pixels().filter(|p| p[3] > 100) {
+            for c in 0..3 {
+                assert!(
+                    p[c].abs_diff((expected[c] * 255.0).round() as u8) <= 4,
+                    "{p:?} vs {expected:?}"
+                );
+            }
+        }
+        let retained = std::env::var_os("PHOTONIC_GRAPH_TEXT_QUALIFICATION_DIR").map(|p| {
+            std::path::PathBuf::from(p).join(if project_scope { "project" } else { "clip" })
+        });
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-graph-text-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("title.mov");
+        let started=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 3 * 128 * 64 * 8);
+        let expected_video = output.map_straight_video(ap1).unwrap();
+        let mut opaque_checked = 0;
+        for (index, raw) in decoded.stdout.chunks_exact(8).enumerate() {
+            let px = index % (128 * 64);
+            let (x, y) = ((px % 128) as u32, (px / 128) as u32);
+            let alpha = png.get_pixel(x, y)[3];
+            let actual = u16::from_le_bytes([raw[6], raw[7]]);
+            assert!(actual.abs_diff(u16::from(alpha) * 257) <= 700);
+            if x > 0
+                && x < 127
+                && y > 0
+                && y < 63
+                && (y - 1..=y + 1)
+                    .all(|ny| (x - 1..=x + 1).all(|nx| png.get_pixel(nx, ny)[3] >= 127))
+            {
+                opaque_checked += 1;
+                for c in 0..3 {
+                    let value = u16::from_le_bytes([raw[c * 2], raw[c * 2 + 1]]);
+                    assert!(value.abs_diff((expected_video[c] * 65535.0).round() as u16) <= 1800);
+                }
+            }
+        }
+        assert!(opaque_checked > 10);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if !project_scope {
+            state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap()
+                .video_tracks[0]
+                .locked = true;
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            let mut changed = payload.clone();
+            changed["text"] = json!("Forbidden");
+            assert_eq!(
+                call(
+                    &state,
+                    "set_graph_text",
+                    json!({"graph_id":graph_id,"node_id":text_node,"text":changed})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+        }
+        if retained.is_some() {
+            std::fs::write(dir.join("title.photon"), saved).unwrap();
+            std::fs::write(dir.join("title.png"), png_bytes).unwrap();
+            std::fs::write(
+                dir.join("fixture.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"clip_id":clip,"sequence_id":sequence,"track_id":track,"graph_id":graph_id,"text_node_id":text_node}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_caption_animation_mcp_author_save_preview_and_prores() {
+        Box::pin(check_native_caption_animation(
+            false,
+            photonic_core::timeline::TextDirection::Auto,
+        ))
+        .await;
+    }
+    #[tokio::test]
+    async fn native_decorated_caption_animation_mcp_author_save_preview_and_prores() {
+        Box::pin(check_native_caption_animation(
+            true,
+            photonic_core::timeline::TextDirection::Auto,
+        ))
+        .await;
+    }
+    #[tokio::test]
+    async fn native_caption_direction_mcp_author_save_preview_and_prores() {
+        for decorated in [false, true] {
+            Box::pin(check_native_caption_animation(
+                decorated,
+                photonic_core::timeline::TextDirection::Rtl,
+            ))
+            .await;
+        }
+    }
+    async fn check_native_caption_animation(
+        decorated: bool,
+        direction: photonic_core::timeline::TextDirection,
+    ) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let created=call(&state,"create_sequence",json!({"name":"Animated managed captions","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":192,"height":96}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        assert_ne!(call(&state,"insert_text_clip",json!({"track_id":track,"text":"","start_ticks":0,"duration_ticks":ticks*18,"style":{"clear_stroke":true}})).await.is_error,Some(true));
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_caption_track",
+            json!({"sequence_id":sequence,"name":"Animated"}),
+        ))
+        .await;
+        let captions = data(&created)["track_id"].clone();
+        let inserted = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_caption_cue",
+            json!({"track_id":captions,"text":if direction==photonic_core::timeline::TextDirection::Rtl{"Brand שלום"}else{"HI OK"},"start_ticks":0,"end_ticks":ticks*18}),
+        ))
+        .await;
+        let cue = data(&inserted)["cue_id"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_caption_word",
+            json!({"cue_id":cue,"word_index":0,"start_ticks":0,"end_ticks":ticks*6}),
+        ))
+        .await;
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_caption_word",
+            json!({"cue_id":cue,"word_index":1,"start_ticks":ticks*6,"end_ticks":ticks*12}),
+        ))
+        .await;
+        for mode in [
+            "slide_up",
+            "fade_words",
+            "typewriter",
+            "word_pop",
+            "underline",
+            "fill_sweep",
+            "sweep_slide_up",
+            "sweep_fade_words",
+            "sweep_typewriter",
+        ] {
+            let sweeping = mode == "fill_sweep" || mode.starts_with("sweep_");
+            let animation = mode.strip_prefix("sweep_").unwrap_or(mode);
+            let mut style = json!({"clear_stroke":true,"clear_highlight":true,"fill":"#ffffff","font_size":28,"position":[0.5,0.2],"max_width":0.9,"animation":if mode=="word_pop"||mode=="underline"||mode=="fill_sweep"{"none"}else{animation}});
+            style["direction"] = serde_json::to_value(direction).unwrap();
+            if mode == "word_pop" {
+                style.as_object_mut().unwrap().remove("clear_highlight");
+                style["word_pop"] = json!({"active_color":"#ff0000","inactive_color":"#0000ff"});
+            }
+            if sweeping {
+                style.as_object_mut().unwrap().remove("clear_highlight");
+                style["fill_sweep"] =
+                    json!({"active_color":"#ff000080","inactive_color":"#0000ffb0"});
+            }
+            if mode == "underline" {
+                style.as_object_mut().unwrap().remove("clear_highlight");
+                style["underline"] = json!({"active_color":"#ff0000"});
+            }
+            let frame_samples = if mode == "underline" {
+                [0, 6, 12]
+            } else {
+                [0, 3, 12]
+            };
+            if decorated {
+                style.as_object_mut().unwrap().remove("clear_stroke");
+                style["stroke"] = json!({"color":"#00ff00","width":2});
+                style["background"] = json!({"color":"#0000ff80","padding":4,"corner_radius":6});
+            }
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "set_caption_style",
+                json!({"track_id":captions,"style":style}),
+            ))
+            .await;
+            let saved = state.document.lock().await.to_json().unwrap();
+            let reloaded = photonic_core::Document::from_json(&saved).unwrap();
+            assert_eq!(
+                serde_json::to_value(&reloaded).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            let mut previews = Vec::new();
+            for frame in frame_samples {
+                let result=call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":ticks*frame,"quality":"full","output_format":"png"})).await;
+                assert_ne!(result.is_error, Some(true), "{mode}: {result:?}");
+                assert_eq!(
+                    result.structured_content.as_ref().unwrap()["caption_notes"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    usize::from(
+                        sweeping && direction == photonic_core::timeline::TextDirection::Rtl
+                    )
+                );
+                let data = result
+                    .content
+                    .iter()
+                    .find_map(|c| {
+                        if let ContentItem::Image { data, .. } = c {
+                            Some(data)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                let bytes = general_purpose::STANDARD.decode(data).unwrap();
+                previews.push(image::load_from_memory(&bytes).unwrap().to_rgba8());
+            }
+            assert_ne!(
+                previews[0].as_raw(),
+                previews[2].as_raw(),
+                "{mode} actually changes"
+            );
+            if mode == "underline" && !decorated {
+                for image in &previews[..2] {
+                    assert!(
+                        image
+                            .pixels()
+                            .filter(|p| p[0] > 200 && p[1] < 30 && p[2] < 30 && p[3] > 50)
+                            .count()
+                            > 10,
+                        "active underline appears"
+                    );
+                }
+                assert_eq!(
+                    previews[2]
+                        .pixels()
+                        .filter(|p| p[0] > 200 && p[1] < 30 && p[2] < 30 && p[3] > 50)
+                        .count(),
+                    0,
+                    "underline ends at word end"
+                );
+                assert_ne!(
+                    previews[0].as_raw(),
+                    previews[1].as_raw(),
+                    "underline moves to the second word"
+                );
+            }
+            if ["slide_up", "typewriter"].contains(&animation) {
+                assert!(previews[0].pixels().all(|p| p[3] == 0));
+            }
+            if mode == "fill_sweep"
+                && direction != photonic_core::timeline::TextDirection::Rtl
+                && !decorated
+            {
+                assert!(
+                    previews[1]
+                        .pixels()
+                        .filter(|p| p[0] > 200 && p[2] < 30 && p[3] > 50)
+                        .count()
+                        > 4,
+                    "spatially active red glyph pixels, not whole-word purple lerp"
+                );
+                assert!(
+                    previews[1]
+                        .pixels()
+                        .filter(|p| p[2] > 200 && p[0] < 30 && p[3] > 50)
+                        .count()
+                        > 4,
+                    "spatially inactive blue glyph pixels"
+                );
+            }
+            assert!(
+                previews[2]
+                    .pixels()
+                    .filter(|p| p[3] > if sweeping { 100 } else { 250 })
+                    .count()
+                    > 30,
+                "{mode} reaches visible full text"
+            );
+            if animation == "slide_up" {
+                assert!(previews[1]
+                    .pixels()
+                    .filter(|p| p[3] > 0)
+                    .all(|p| p[3] <= 128));
+            }
+            if decorated {
+                assert!(
+                    previews[2]
+                        .pixels()
+                        .filter(|p| p[1] > 200 && p[0] < 30 && p[2] < 30 && p[3] > 200)
+                        .count()
+                        > 5,
+                    "visible outline {mode}"
+                );
+                assert!(
+                    previews[2]
+                        .pixels()
+                        .filter(|p| p[2] > 200
+                            && p[0] < 30
+                            && p[1] < 30
+                            && (110..=140).contains(&p[3]))
+                        .count()
+                        > 20,
+                    "visible box {mode}"
+                );
+            }
+            let retained = std::env::var_os("PHOTONIC_CAPTION_ANIMATION_QUALIFICATION_DIR")
+                .map(std::path::PathBuf::from);
+            let dir = retained
+                .as_ref()
+                .map(|p| {
+                    let p = if direction == photonic_core::timeline::TextDirection::Rtl {
+                        p.join("rtl")
+                    } else {
+                        p.clone()
+                    };
+                    if decorated {
+                        p.join("decorated").join(mode)
+                    } else {
+                        p.join(mode)
+                    }
+                })
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!(
+                        "photonic-native-caption-{mode}-{}",
+                        uuid::Uuid::new_v4()
+                    ))
+                });
+            std::fs::create_dir_all(&dir).unwrap();
+            let out = dir.join("animation.mov");
+            let start=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+            assert_ne!(start.is_error, Some(true), "{mode}: {start:?}");
+            let done = poll_job(&state, &data(&start)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&out),
+            )
+            .unwrap();
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(photonic_video::export::manifest::manifest_path(&out)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                manifest["request"]["caption_notes"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                usize::from(sweeping && direction == photonic_core::timeline::TextDirection::Rtl)
+            );
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&out)
+                .args([
+                    "-frames:v",
+                    "18",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 18 * 192 * 96 * 8);
+            for (sample, frame) in frame_samples.into_iter().map(|v| v as usize).enumerate() {
+                let png = &previews[sample];
+                let frame_bytes = &decoded.stdout[frame * 192 * 96 * 8..(frame + 1) * 192 * 96 * 8];
+                for (index, raw) in frame_bytes.chunks_exact(8).enumerate() {
+                    let x = (index % 192) as u32;
+                    let y = (index / 192) as u32;
+                    let p = png.get_pixel(x, y);
+                    let a = u16::from_le_bytes([raw[6], raw[7]]);
+                    assert!(
+                        a.abs_diff(u16::from(p[3]) * 257) <= 700,
+                        "{mode} alpha frame{frame} ({x},{y})"
+                    );
+                    if x > 0
+                        && x < 191
+                        && y > 0
+                        && y < 95
+                        && (y - 1..=y + 1).all(|ny| {
+                            (x - 1..=x + 1).all(|nx| {
+                                let q = png.get_pixel(nx, ny);
+                                q[3] >= 100 && (0..3).all(|c| q[c].abs_diff(p[c]) <= 4)
+                            })
+                        })
+                    {
+                        for c in 0..3 {
+                            let v = u16::from_le_bytes([raw[c * 2], raw[c * 2 + 1]]);
+                            let s = p[c] as f64 / 255.0;
+                            let l = if s <= 0.04045 {
+                                s / 12.92
+                            } else {
+                                ((s + 0.055) / 1.055).powf(2.4)
+                            };
+                            let encoded = if l < 0.018 {
+                                4.5 * l
+                            } else {
+                                1.099 * l.powf(0.45) - 0.099
+                            };
+                            assert!(
+                                v.abs_diff((encoded * 65535.0).round() as u16) <= 1800,
+                                "{mode} color frame{frame} ({x},{y}) {v} vs {encoded}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+            if retained.is_some() {
+                std::fs::write(dir.join("animation.photon"), saved).unwrap();
+                for (index, png) in previews.iter().enumerate() {
+                    png.save(dir.join(format!("frame-{}.png", frame_samples[index])))
+                        .unwrap();
+                }
+            } else {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let invalid_word = call(
+            &state,
+            "set_caption_style",
+            json!({"cue_id":cue,"word_index":0,"style":{"direction":"rtl"}}),
+        )
+        .await;
+        assert_eq!(invalid_word.is_error, Some(true));
+        if direction != photonic_core::timeline::TextDirection::Auto {
+            let dir = std::env::temp_dir().join(format!(
+                "photonic-direction-subtitles-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            for format in ["srt", "vtt", "ass"] {
+                let path = dir.join(format!("captions.{format}"));
+                let result = call(
+                    &state,
+                    "export_captions",
+                    json!({"track_id":captions,"path":path,"format":format}),
+                )
+                .await;
+                assert_ne!(result.is_error, Some(true), "{result:?}");
+                assert!(data(&result)["notes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n.as_str().unwrap().contains("paragraph direction")));
+                assert!(std::fs::read_to_string(path).unwrap().contains("שלום"));
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        for style in [
+            json!({"animation":"not_an_animation"}),
+            json!({"direction":"sideways"}),
+            json!({"underline":{"active_color":"bad"}}),
+            json!({"clear_highlight":true,"underline":{"active_color":"#ffffff"}}),
+            json!({"underline":{"active_color":"#ffffff"},"word_pop":{"active_color":"#ffffff","inactive_color":"#000000"}}),
+            json!({"stroke":{"color":"#ffffff","width":9}}),
+            json!({"clear_stroke":true,"stroke":{"color":"#ffffff","width":2}}),
+            json!({"clear_background":true,"background":{"color":"#ffffff","padding":4,"corner_radius":2}}),
+            json!({"background":{"color":"#ffffff","padding":129,"corner_radius":2}}),
+            json!({"unsupported_style_knob":true}),
+            json!({"word_pop":{"active_color":"bad","inactive_color":"#ffffff"}}),
+            json!({"clear_highlight":true,"word_pop":{"active_color":"#ffffff","inactive_color":"#000000"}}),
+        ] {
+            assert_eq!(
+                call(
+                    &state,
+                    "set_caption_style",
+                    json!({"track_id":captions,"style":style})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_caption_mcp_author_undo_save_preview_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let created=call(&state,"create_sequence",json!({"name":"Managed caption","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":128,"height":64}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let extent=call(&state,"insert_text_clip",json!({"track_id":track,"text":"","start_ticks":0,"duration_ticks":ticks*3,"style":{"clear_stroke":true}})).await;
+        assert_ne!(extent.is_error, Some(true), "{extent:?}");
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_caption_track",
+            json!({"sequence_id":sequence,"name":"Display captions"}),
+        ))
+        .await;
+        let captions = data(&created)["track_id"].clone();
+        let inserted = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_caption_cue",
+            json!({"track_id":captions,"text":"HI","start_ticks":0,"end_ticks":ticks*3}),
+        ))
+        .await;
+        let clip = data(&inserted)["cue_id"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(&state,"set_caption_style",json!({"track_id":captions,"style":{"font_size":40,"fill":"#ff000080","position":[0.5,0.2],"max_width":0.9,"clear_stroke":true}}))).await;
+        let saved = state.document.lock().await.to_json().unwrap();
+        let reloaded = photonic_core::Document::from_json(&saved).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let frame = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":0,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_ne!(frame.is_error, Some(true), "{frame:?}");
+        let encoded = frame
+            .content
+            .iter()
+            .find_map(|c| {
+                if let ContentItem::Image { data, .. } = c {
+                    Some(data)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let png_bytes = general_purpose::STANDARD.decode(encoded).unwrap();
+        let png = image::load_from_memory(&png_bytes).unwrap().to_rgba8();
+        assert!(png.pixels().filter(|p| p[3] > 100).count() > 20);
+        // Caption red is display-authored and must bypass scene tone/gamut mapping.
+        let expected = [1.0f64, 0.0, 0.0];
+        for p in png.pixels().filter(|p| p[3] > 100) {
+            for c in 0..3 {
+                assert!(
+                    p[c].abs_diff((expected[c] * 255.0).round() as u8) <= 4,
+                    "{p:?} vs {expected:?}"
+                );
+            }
+        }
+        let retained =
+            std::env::var_os("PHOTONIC_CAPTION_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-caption-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("caption.mov");
+        let started=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let done = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 3 * 128 * 64 * 8);
+        let expected_video = [1.0f64, 0.0, 0.0];
+        let mut opaque_checked = 0;
+        for (index, raw) in decoded.stdout.chunks_exact(8).enumerate() {
+            let px = index % (128 * 64);
+            let (x, y) = ((px % 128) as u32, (px / 128) as u32);
+            let alpha = png.get_pixel(x, y)[3];
+            let actual = u16::from_le_bytes([raw[6], raw[7]]);
+            assert!(actual.abs_diff(u16::from(alpha) * 257) <= 700);
+            if x > 0
+                && x < 127
+                && y > 0
+                && y < 63
+                && (y - 1..=y + 1)
+                    .all(|ny| (x - 1..=x + 1).all(|nx| png.get_pixel(nx, ny)[3] >= 127))
+            {
+                opaque_checked += 1;
+                for c in 0..3 {
+                    let value = u16::from_le_bytes([raw[c * 2], raw[c * 2 + 1]]);
+                    assert!(value.abs_diff((expected_video[c] * 65535.0).round() as u16) <= 1800);
+                }
+            }
+        }
+        assert!(opaque_checked > 10);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if retained.is_some() {
+            std::fs::write(dir.join("caption.photon"), saved).unwrap();
+            std::fs::write(dir.join("caption.png"), png_bytes).unwrap();
+            std::fs::write(
+                dir.join("fixture.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"clip_id":clip,"sequence_id":sequence,"track_id":track}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        } else {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_solid_mcp_author_preview_and_prores_preserve_srgb_swatch_alpha() {
+        Box::pin(check_native_solid_export_fixture(0)).await;
+    }
+
+    #[tokio::test]
+    async fn native_graph_solid_clip_and_project_prores_preserve_srgb_swatch_alpha() {
+        Box::pin(check_native_solid_export_fixture(1)).await;
+        Box::pin(check_native_solid_export_fixture(2)).await;
+    }
+
+    #[tokio::test]
+    async fn native_shape_clip_ellipse_and_project_rect_prores() {
+        Box::pin(check_native_solid_export_fixture(3)).await;
+        Box::pin(check_native_solid_export_fixture(4)).await;
+    }
+
+    #[tokio::test]
+    async fn native_retimed_clip_ramps_mcp_history_preview_and_prores() {
+        for case in 0..4 {
+            Box::pin(check_native_clip_ramp(case)).await;
+        }
+    }
+
+    async fn check_native_clip_ramp(case: u8) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{GraphOp, Interp, Tick};
+        use photonic_video::color::native::{decode_video_sample_to_ap1, NativeVideoInput};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_RAMP_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let dir = retained
+            .as_ref()
+            .map(|p| p.join(format!("case-{case}")))
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("photonic-ramp-{}", uuid::Uuid::new_v4()))
+            });
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = std::fs::canonicalize(dir).unwrap();
+        let raw_path = dir.join("source.yuv");
+        let source = dir.join("source.mkv");
+        let codes = |frame: usize| {
+            [
+                32 + (frame * 3) as u16,
+                120 + ((frame % 4) * 5) as u16,
+                105 + ((frame % 7) * 6) as u16,
+            ]
+        };
+        let mut raw = Vec::new();
+        for frame in 0..64 {
+            for code in codes(frame) {
+                raw.extend(vec![code as u8; 32 * 16]);
+            }
+        }
+        std::fs::write(&raw_path, &raw).unwrap();
+        let encoded = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "yuv444p",
+                "-video_size",
+                "32x16",
+                "-framerate",
+                "30",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+                "-color_range",
+                "tv",
+                "-i",
+            ])
+            .arg(&raw_path)
+            .args([
+                "-c:v",
+                "ffv1",
+                "-g",
+                "1",
+                "-pix_fmt",
+                "yuv444p",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-colorspace",
+                "bt709",
+                "-color_range",
+                "tv",
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            encoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&encoded.stderr)
+        );
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&source)
+            .args(["-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout, raw, "independent fixture codes");
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let created=Box::pin(call(&state,"create_sequence",json!({"name":"Native clip ramp","frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":32,"height":16}]}))).await;
+        assert_ne!(created.is_error, Some(true));
+        let sequence = data(&created)["sequence_id"].clone();
+        let seq_id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let ticks = photonic_core::timeline::FrameRate::FPS_30
+            .ticks_per_frame()
+            .0;
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let imported = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "import_media",
+            json!({"paths":[source]}),
+        ))
+        .await;
+        let asset = data(&imported)["assets"][0]["asset_id"].clone();
+        let probe = Box::pin(call(&state, "probe_media", json!({"asset_id":asset}))).await;
+        assert_ne!(probe.is_error, Some(true), "{probe:?}");
+        let done = poll_job(&state, &data(&probe)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        Box::pin(graph_authoring_edit_roundtrip(&state,"set_native_input_color",json!({"scope":"asset","asset_id":asset,"interpretation":{"version":1,"standard":"bt709_scene","range":"limited","matrix":"bt709"}}))).await;
+        let track = create_track(&state, &sequence, "video").await;
+        let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_clip",json!({"track_id":track,"start_ticks":ticks*3,"source_in_ticks":ticks*8,"duration_ticks":ticks*6,"source":{"kind":"asset","asset_id":asset}}))).await;
+        let clip = data(&inserted)["clip_id"].clone();
+        let (first, last, interp) = match case {
+            0 => (1, 2, Interp::Hold),
+            1 => (1, 3, Interp::Linear),
+            2 => (
+                1,
+                3,
+                Interp::Bezier {
+                    out_handle: [1.0 / 3.0, 0.0],
+                    in_handle: [2.0 / 3.0, 0.0],
+                },
+            ),
+            _ => (2, -1, Interp::Linear),
+        };
+        Box::pin(graph_authoring_edit_roundtrip(&state,"set_clip_speed",json!({"clip_id":clip,"keys":[{"at_ticks":0,"ratio":{"num":first,"den":1},"interp":interp},{"at_ticks":ticks*4,"ratio":{"num":last,"den":1},"interp":Interp::Hold}]}))).await;
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "create_clip_composition",
+            json!({"clip_id":clip}),
+        ))
+        .await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = Box::pin(call(&state, "get_graph", json!({"graph_id":graph_id}))).await;
+        let graph = data(&read)["graph"].clone();
+        let output = graph["output"].clone();
+        let source_node = graph["nodes"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|n| n["op"]["op"] == "clip_in")
+            .unwrap()["id"]
+            .clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "remove_graph_edge",
+            json!({"graph_id":graph_id,"edge_index":0}),
+        ))
+        .await;
+        let added=Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_node",json!({"graph_id":graph_id,"op":GraphOp::TimeOffset{offset:Tick::ZERO},"pos":[20.0,150.0]}))).await;
+        let offset = data(&added)["node_id"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "set_graph_time_offset",
+            json!({"graph_id":graph_id,"node_id":offset,"offset_ticks":-ticks/2}),
+        ))
+        .await;
+        for (from, to) in [(&source_node, &offset), (&offset, &output)] {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":from},"to":{"node_id":to}}),
+            ))
+            .await;
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let saved = state.document.lock().await.to_json().unwrap();
+        assert_eq!(
+            serde_json::to_value(photonic_core::Document::from_json(&saved).unwrap()).unwrap(),
+            before
+        );
+        let source_frame = |frame: usize| {
+            let d = (frame - 3) as f64 + 0.5;
+            let delta = match case {
+                0 => {
+                    if d <= 4. {
+                        d
+                    } else {
+                        4. + 2. * (d - 4.)
+                    }
+                }
+                1 => {
+                    if d <= 4. {
+                        d + d * d / 4.
+                    } else {
+                        8. + 3. * (d - 4.)
+                    }
+                }
+                2 => {
+                    // x(u)=u and y(u)=u^3: analytic integral of 1+2u^3.
+                    if d <= 4. {
+                        d + d.powi(4) / 128.
+                    } else {
+                        6. + 3. * (d - 4.)
+                    }
+                }
+                _ => {
+                    if d <= 4. {
+                        2. * d - 3. * d * d / 8.
+                    } else {
+                        2. - (d - 4.)
+                    }
+                }
+            };
+            (8. + delta).floor() as usize
+        };
+        let transform = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+        for frame in [3, 5, 8] {
+            let result=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":ticks*frame,"quality":"full","output_format":"png"}))).await;
+            assert_ne!(
+                result.is_error,
+                Some(true),
+                "case{case} frame{frame}: {result:?}"
+            );
+            let encoded = result
+                .content
+                .iter()
+                .find_map(|content| {
+                    if let ContentItem::Image { data, .. } = content {
+                        Some(data)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            let ap1 = decode_video_sample_to_ap1(
+                codes(source_frame(frame as usize)),
+                8,
+                true,
+                NativeVideoInput::Bt709,
+            )
+            .unwrap();
+            let expected = transform
+                .map_premultiplied([ap1[0], ap1[1], ap1[2], 1.])
+                .unwrap();
+            for pixel in png.pixels() {
+                for c in 0..4 {
+                    assert!(
+                        (pixel[c] as f64 - expected[c] * 255.).abs() <= 4.,
+                        "case{case} frame{frame} source{}: {pixel:?} vs {expected:?}",
+                        source_frame(frame as usize)
+                    );
+                }
+            }
+            png.save(dir.join(format!("frame-{frame}.png"))).unwrap();
+        }
+        let movie = dir.join("ramp.mov");
+        let exported=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(exported.is_error, Some(true));
+        let done = poll_job(&state, &data(&exported)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&movie),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&movie)
+            .args([
+                "-frames:v",
+                "9",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 9 * 32 * 16 * 8);
+        for frame in 0..9 {
+            let expected = if frame < 3 {
+                [0.; 4]
+            } else {
+                let ap1 = decode_video_sample_to_ap1(
+                    codes(source_frame(frame)),
+                    8,
+                    true,
+                    NativeVideoInput::Bt709,
+                )
+                .unwrap();
+                let rgb = transform.map_straight_video(ap1).unwrap();
+                [rgb[0], rgb[1], rgb[2], 1.]
+            };
+            for pixel in
+                decoded.stdout[frame * 32 * 16 * 8..(frame + 1) * 32 * 16 * 8].chunks_exact(8)
+            {
+                for c in 0..4 {
+                    let value = u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]]) as f64;
+                    assert!(
+                        (value - expected[c] * 65535.).abs() <= 1024.,
+                        "case{case} export frame{frame} c{c}: {value} vs {expected:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        let track_id: TrackId = serde_json::from_value(track).unwrap();
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq_id)
+            .unwrap()
+            .track_mut(track_id)
+            .unwrap()
+            .locked = true;
+        assert_eq!(
+            Box::pin(call(
+                &state,
+                "set_clip_speed",
+                json!({"clip_id":clip,"ratio":{"num":1,"den":1}})
+            ))
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(
+            Box::pin(call(
+                &state,
+                "set_graph_time_offset",
+                json!({"graph_id":graph_id,"node_id":offset,"offset_ticks":0})
+            ))
+            .await
+            .is_error,
+            Some(true)
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        std::fs::write(dir.join("ramp.photon"), saved).unwrap();
+        std::fs::write(dir.join("checks.json"),serde_json::to_vec_pretty(&json!({"case":case,"preview_frames":[3,5,8],"reference_source_frames":[source_frame(3),source_frame(5),source_frame(8)],"export_frames":9,"half_frame_offset":true,"independent_integral_and_color_reference":true,"history_save_and_locks":true,"manifest_verified":true})).unwrap()).unwrap();
+        if retained.is_none() {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_media_in_import_timing_preview_prores_and_refusal_recovery() {
+        Box::pin(check_native_media_in_import(NativeMediaFixtureMode::Plain)).await;
+    }
+
+    #[tokio::test]
+    async fn native_time_offset_media_in_author_preview_prores_and_recovery() {
+        Box::pin(check_native_media_in_import(NativeMediaFixtureMode::Offset)).await;
+    }
+
+    #[tokio::test]
+    async fn native_four_offset_media_sources_preview_prores_and_recovery() {
+        Box::pin(check_native_media_in_import(
+            NativeMediaFixtureMode::FourOffsets,
+        ))
+        .await;
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum NativeMediaFixtureMode {
+        Plain,
+        Offset,
+        FourOffsets,
+    }
+
+    async fn author_native_echo_sources(
+        state: &AppState,
+        graph_id: &Value,
+        node: &Value,
+        mut output_source: Value,
+        ticks: i64,
+    ) -> Value {
+        for (index, frames) in [-31i64, -61, -91].into_iter().enumerate() {
+            let added=Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_node",json!({
+                        "graph_id":graph_id,"op":GraphOp::TimeOffset{offset:Tick(frames*ticks)},"pos":[270.0,200.0+index as f32*100.0]
+                    }))).await;
+            let shifted = data(&added)["node_id"].clone();
+            Box::pin(graph_authoring_edit_roundtrip(
+                state,
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":node},"to":{"node_id":shifted}}),
+            ))
+            .await;
+            let added=Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_node",json!({
+                        "graph_id":graph_id,"op":GraphOp::Merge{mode:photonic_core::layer::BlendMode::Normal},"pos":[510.0+index as f32*210.0,200.0]
+                    }))).await;
+            let merged = data(&added)["node_id"].clone();
+            Box::pin(graph_authoring_edit_roundtrip(state,"set_graph_node_param",json!({"graph_id":graph_id,"node_id":merged,"path":"params.opacity","value":photonic_core::timeline::PropValue::Float(1.0/(index+2) as f64)}))).await;
+            Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":shifted},"to":{"node_id":merged,"port":0}}))).await;
+            Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":merged,"port":1}}))).await;
+            output_source = merged;
+        }
+        output_source
+    }
+
+    async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
+        Box::pin(check_native_media_in_import_sized(mode, None, None)).await;
+    }
+
+    #[tokio::test]
+    async fn native_mixed_resolution_media_in_mcp_preview_prores_and_relink() {
+        for fit in [
+            photonic_core::timeline::FitMode::Contain,
+            photonic_core::timeline::FitMode::Cover,
+            photonic_core::timeline::FitMode::Stretch,
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                None,
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_mixed_intermediate_resize_mcp_preview_prores_and_relink() {
+        for (fit, dimensions) in [
+            (photonic_core::timeline::FitMode::Contain, [9, 13]),
+            (photonic_core::timeline::FitMode::Cover, [21, 7]),
+            (photonic_core::timeline::FitMode::Stretch, [1, 1]),
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                Some(dimensions),
+            ))
+            .await;
+        }
+    }
+
+    async fn check_native_media_in_import_sized(
+        mode: NativeMediaFixtureMode,
+        resize_fit: Option<photonic_core::timeline::FitMode>,
+        intermediate_dimensions: Option<[usize; 2]>,
+    ) {
+        let output_width = if resize_fit.is_some() { 16_usize } else { 32 };
+        let output_height = 16_usize;
+        let temporal_echo = mode == NativeMediaFixtureMode::FourOffsets;
+        let offset_frames = (mode != NativeMediaFixtureMode::Plain).then_some(-1i64);
+        let source_frames = if temporal_echo { 120usize } else { 12 };
+
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{GraphOp, Ratio, SpeedMap, Tick, TimeSource};
+        use photonic_video::color::native::{decode_video_sample_to_ap1, NativeVideoInput};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        for case in (if temporal_echo { 2 } else { 0 })..6 {
+            let still = case < 2;
+            let project_scope = case == 1 || case >= 4;
+            let time_source = if case == 2 || case == 5 {
+                TimeSource::Local
+            } else {
+                TimeSource::Sequence
+            };
+            let retained = std::env::var_os(if intermediate_dimensions.is_some() {
+                "PHOTONIC_INTERMEDIATE_RESIZE_QUALIFICATION_DIR"
+            } else if resize_fit.is_some() {
+                "PHOTONIC_MIXED_MEDIA_QUALIFICATION_DIR"
+            } else if temporal_echo {
+                "PHOTONIC_ECHO_QUALIFICATION_DIR"
+            } else if offset_frames.is_some() {
+                "PHOTONIC_TIME_QUALIFICATION_DIR"
+            } else {
+                "PHOTONIC_MEDIAIN_QUALIFICATION_DIR"
+            })
+            .map(std::path::PathBuf::from);
+            let dir = retained
+                .as_ref()
+                .map(|p| {
+                    p.join(resize_fit.map(|fit| format!("{fit:?}")).unwrap_or_default())
+                        .join(format!("case-{case}"))
+                })
+                .unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("photonic-mediain-{}", uuid::Uuid::new_v4()))
+                });
+            std::fs::create_dir_all(&dir).unwrap();
+            let dir = std::fs::canonicalize(dir).unwrap();
+            let source = dir.join(if still { "source.png" } else { "source.mkv" });
+            let wrong = dir.join(if still {
+                "wrong-size.png"
+            } else {
+                "wrong-size.mkv"
+            });
+            let still_pixels = image::RgbaImage::from_fn(32, 16, |x, y| {
+                let first = (x / 8 + y / 4) % 2 == 0;
+                image::Rgba([
+                    if first { 30 } else { 180 },
+                    if first { 110 } else { 60 },
+                    if first { 220 } else { 90 },
+                    if x < 2 || x >= 30 || y < 2 || y >= 14 {
+                        0
+                    } else if first {
+                        128
+                    } else {
+                        192
+                    },
+                ])
+            });
+            let mut source_codes = Vec::new();
+            if still {
+                still_pixels.save(&source).unwrap();
+                image::RgbaImage::from_pixel(16, 16, image::Rgba([30, 110, 220, 255]))
+                    .save(&wrong)
+                    .unwrap();
+            } else {
+                for frame in 0..source_frames {
+                    let color_frame = (frame % 12) as u8;
+                    image::RgbaImage::from_pixel(
+                        32,
+                        16,
+                        image::Rgba([
+                            30 + color_frame * 17,
+                            40 + color_frame * 5,
+                            210 - color_frame * 11,
+                            255,
+                        ]),
+                    )
+                    .save(dir.join(format!("input-{frame:02}.png")))
+                    .unwrap();
+                }
+                let result = std::process::Command::new(&tools.ffmpeg)
+                    .args(["-v", "error", "-framerate", "30", "-i"])
+                    .arg(dir.join("input-%02d.png"))
+                    .args([
+                        "-frames:v",
+                        &source_frames.to_string(),
+                        "-vf",
+                        "scale=out_color_matrix=bt709:out_range=tv",
+                        "-c:v",
+                        "ffv1",
+                        "-pix_fmt",
+                        "yuv444p10le",
+                        "-color_primaries",
+                        "bt709",
+                        "-color_trc",
+                        "bt709",
+                        "-colorspace",
+                        "bt709",
+                        "-color_range",
+                        "tv",
+                        "-y",
+                    ])
+                    .arg(&source)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                let raw = std::process::Command::new(&tools.ffmpeg)
+                    .args(["-v", "error", "-i"])
+                    .arg(&source)
+                    .args([
+                        "-frames:v",
+                        &source_frames.to_string(),
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "yuv444p10le",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(raw.status.success());
+                assert_eq!(raw.stdout.len(), source_frames * 32 * 16 * 3 * 2);
+                for frame in 0..source_frames {
+                    let codes = std::array::from_fn(|c| {
+                        let i = (frame * 32 * 16 * 3 + c * 32 * 16) * 2;
+                        u16::from_le_bytes([raw.stdout[i], raw.stdout[i + 1]])
+                    });
+                    source_codes.push(
+                        decode_video_sample_to_ap1(codes, 10, true, NativeVideoInput::Bt709)
+                            .unwrap(),
+                    );
+                }
+                let result = std::process::Command::new(&tools.ffmpeg)
+                    .args(["-v", "error", "-i"])
+                    .arg(&source)
+                    .args([
+                        "-vf",
+                        "scale=16:16",
+                        "-c:v",
+                        "ffv1",
+                        "-pix_fmt",
+                        "yuv444p10le",
+                        "-y",
+                    ])
+                    .arg(&wrong)
+                    .output()
+                    .unwrap();
+                assert!(result.status.success());
+            }
+            let state = test_state();
+            assert!(engine_available(&state).await, "GPU required");
+            let created=call(&state,"create_sequence",json!({"name":"Native MediaIn","frame_rate":{"num":30,"den":1},"formats":[{"name":"qualified format","width":output_width,"height":output_height}]})).await;
+            assert_ne!(created.is_error, Some(true));
+            let sequence = data(&created)["sequence_id"].clone();
+            let seq_id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+            let ticks = {
+                let mut doc = state.document.lock().await;
+                let seq = doc
+                    .timeline
+                    .as_mut()
+                    .unwrap()
+                    .sequences
+                    .get_mut(&seq_id)
+                    .unwrap();
+                seq.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                seq.frame_rate.ticks_per_frame().0
+            };
+            let imported = Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "import_media",
+                json!({"paths":[source]}),
+            ))
+            .await;
+            let asset = data(&imported)["assets"][0]["asset_id"].clone();
+            let asset_id: AssetId = serde_json::from_value(asset.clone()).unwrap();
+            let probe = call(&state, "probe_media", json!({"asset_id":asset})).await;
+            assert_ne!(probe.is_error, Some(true));
+            let done = poll_job(&state, &data(&probe)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            let interpretation = if still {
+                json!({"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"})
+            } else {
+                json!({"version":1,"standard":"bt709_scene","range":"limited","matrix":"bt709"})
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "set_native_input_color",
+                json!({"scope":"asset","asset_id":asset,"interpretation":interpretation}),
+            ))
+            .await;
+            let track = create_track(&state, &sequence, "video").await;
+            let track_id: TrackId = serde_json::from_value(track.clone()).unwrap();
+            let inserted=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_clip",json!({"track_id":track,"start_ticks":ticks*3,"duration_ticks":ticks*3,"source":{"kind":"solid_color","color":"#ff0000ff"}}))).await;
+            let clip = data(&inserted)["clip_id"].clone();
+            {
+                let mut doc = state.document.lock().await;
+                let host = &mut doc
+                    .timeline
+                    .as_mut()
+                    .unwrap()
+                    .sequences
+                    .get_mut(&seq_id)
+                    .unwrap()
+                    .video_tracks[0]
+                    .clips[0];
+                host.source_in = Tick(ticks * 7);
+                host.speed = SpeedMap::Constant(Ratio { num: 2, den: 1 });
+            }
+            let created = Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                if project_scope {
+                    "set_project_graph"
+                } else {
+                    "create_clip_composition"
+                },
+                if project_scope {
+                    json!({})
+                } else {
+                    json!({"clip_id":clip})
+                },
+            ))
+            .await;
+            let graph_id = data(&created)["graph_id"].clone();
+            let read = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+            let graph = data(&read)["graph"].clone();
+            let output = graph["output"].clone();
+            for index in (0..graph["edges"].as_array().unwrap().len()).rev() {
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "remove_graph_edge",
+                    json!({"graph_id":graph_id,"edge_index":index}),
+                ))
+                .await;
+            }
+            let added=Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_node",json!({"graph_id":graph_id,"op":GraphOp::MediaIn{asset:asset_id,time_source},"pos":[40.0,100.0]}))).await;
+            let node = data(&added)["node_id"].clone();
+            let offset_node = if let Some(frames) = offset_frames {
+                let added = Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_node",json!({
+                    "graph_id":graph_id,"op":GraphOp::TimeOffset{offset:Tick::ZERO},"pos":[270.0,100.0]
+                }))).await;
+                let offset_node = data(&added)["node_id"].clone();
+                let payload =
+                    json!({"graph_id":graph_id,"node_id":offset_node,"offset_ticks":frames*ticks});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "set_graph_time_offset",
+                    payload.clone(),
+                ))
+                .await;
+                let rev = state.history.lock().await.revision();
+                let repeated = call(&state, "set_graph_time_offset", payload).await;
+                assert_eq!(data(&repeated)["changed"], false);
+                assert_eq!(
+                    call(
+                        &state,
+                        "set_graph_time_offset",
+                        json!({"graph_id":graph_id,"node_id":node,"offset_ticks":0})
+                    )
+                    .await
+                    .is_error,
+                    Some(true)
+                );
+                assert_eq!(state.history.lock().await.revision(), rev);
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_edge",
+                    json!({
+                        "graph_id":graph_id,"from":{"node_id":node},"to":{"node_id":offset_node}
+                    }),
+                ))
+                .await;
+                Some(offset_node)
+            } else {
+                None
+            };
+            let mut output_source = offset_node.as_ref().unwrap_or(&node).clone();
+            if temporal_echo {
+                output_source = Box::pin(author_native_echo_sources(
+                    &state,
+                    &graph_id,
+                    &node,
+                    output_source,
+                    ticks,
+                ))
+                .await;
+            }
+            if let Some(fit) = resize_fit {
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":GraphOp::Resize{fit}}),
+                ))
+                .await;
+                let resized = data(&added)["node_id"].clone();
+                for (path, value) in [
+                    (
+                        "params.width",
+                        intermediate_dimensions.map_or(output_width, |v| v[0]) as f64,
+                    ),
+                    (
+                        "params.height",
+                        intermediate_dimensions.map_or(output_height, |v| v[1]) as f64,
+                    ),
+                ] {
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"set_graph_node_param",json!({"graph_id":graph_id,"node_id":resized,"path":path,"value":photonic_core::timeline::PropValue::Float(value)}))).await;
+                }
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":resized}}))).await;
+                output_source = resized;
+            }
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":output}}),
+            ))
+            .await;
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            let saved = state.document.lock().await.to_json().unwrap();
+            let reload = photonic_core::Document::from_json(&saved).unwrap();
+            assert_eq!(serde_json::to_value(reload).unwrap(), before);
+            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                if still {
+                    let p = still_pixels.as_raw()[index * 4..index * 4 + 4]
+                        .try_into()
+                        .unwrap();
+                    let p: [u8; 4] = p;
+                    (
+                        photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                            p[0] as f64 / 255.,
+                            p[1] as f64 / 255.,
+                            p[2] as f64 / 255.,
+                        ]),
+                        p[3] as f64 / 255.,
+                    )
+                } else {
+                    let base = if !project_scope && time_source == TimeSource::Local {
+                        frame - 3
+                    } else {
+                        frame
+                    };
+                    let offsets: &[i64] = if temporal_echo {
+                        &[-1, -31, -61, -91]
+                    } else if offset_frames.is_some() {
+                        &[-1]
+                    } else {
+                        &[0]
+                    };
+                    let mut average = [0f64; 3];
+                    for offset in offsets {
+                        let sample = source_codes[(base as i64 - offset) as usize];
+                        for channel in 0..3 {
+                            average[channel] += sample[channel] / offsets.len() as f64;
+                        }
+                    }
+                    (average, 1.)
+                }
+            };
+            // Independent f64 premultiplied bilinear reference for both
+            // authored Resize and its fixed-canvas normalization. Sampling
+            // uses logical extents, never allocation/bucket padding.
+            let resize_pixel = |width: usize,
+                                height: usize,
+                                sw: usize,
+                                sh: usize,
+                                fit: photonic_core::timeline::FitMode,
+                                index: usize,
+                                sample: &dyn Fn(usize) -> ([f64; 3], f64)|
+             -> ([f64; 3], f64) {
+                let sx = width as f64 / sw as f64;
+                let sy = height as f64 / sh as f64;
+                let (sx, sy) = match fit {
+                    photonic_core::timeline::FitMode::Contain => (sx.min(sy), sx.min(sy)),
+                    photonic_core::timeline::FitMode::Cover => (sx.max(sy), sx.max(sy)),
+                    photonic_core::timeline::FitMode::Stretch => (sx, sy),
+                };
+                let ox = (width as f64 - sw as f64 * sx) / 2.;
+                let oy = (height as f64 - sh as f64 * sy) / 2.;
+                let px = (index % width) as f64 + 0.5;
+                let py = (index / width) as f64 + 0.5;
+                if px < ox || py < oy || px >= ox + sw as f64 * sx || py >= oy + sh as f64 * sy {
+                    return ([0.; 3], 0.);
+                }
+                let x = ((px - ox) / sx - 0.5).clamp(0., (sw - 1) as f64);
+                let y = ((py - oy) / sy - 0.5).clamp(0., (sh - 1) as f64);
+                let x0 = x.floor() as usize;
+                let y0 = y.floor() as usize;
+                let tx = x - x0 as f64;
+                let ty = y - y0 as f64;
+                let mut premult = [0.; 3];
+                let mut a = 0.;
+                for (xx, wx) in [(x0, 1. - tx), ((x0 + 1).min(sw - 1), tx)] {
+                    for (yy, wy) in [(y0, 1. - ty), ((y0 + 1).min(sh - 1), ty)] {
+                        let (rgb, alpha) = sample(yy * sw + xx);
+                        let weight = wx * wy;
+                        a += alpha * weight;
+                        for c in 0..3 {
+                            premult[c] += rgb[c] * alpha * weight;
+                        }
+                    }
+                }
+                if a > 0. {
+                    for c in &mut premult {
+                        *c /= a;
+                    }
+                }
+                (premult, a)
+            };
+            let scene_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                let Some(fit) = resize_fit else {
+                    return source_pixel(frame, index);
+                };
+                let [iw, ih] = intermediate_dimensions.unwrap_or([output_width, output_height]);
+                resize_pixel(
+                    output_width,
+                    output_height,
+                    iw,
+                    ih,
+                    photonic_core::timeline::FitMode::Stretch,
+                    index,
+                    &|i| resize_pixel(iw, ih, 32, 16, fit, i, &|j| source_pixel(frame, j)),
+                )
+            };
+            let transform = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            let mut previews = Vec::new();
+            for frame in [3, 4, 5] {
+                let rendered=call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":ticks*frame,"quality":"full","output_format":"png"})).await;
+                assert_ne!(rendered.is_error, Some(true), "case{case}: {rendered:?}");
+                let encoded = rendered
+                    .content
+                    .iter()
+                    .find_map(|c| {
+                        if let ContentItem::Image { data, .. } = c {
+                            Some(data)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap();
+                let png =
+                    image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                        .unwrap()
+                        .to_rgba8();
+                for (index, pixel) in png.pixels().enumerate() {
+                    let (rgb, a) = scene_pixel(frame as usize, index);
+                    let expected = transform
+                        .map_premultiplied([rgb[0] * a, rgb[1] * a, rgb[2] * a, a])
+                        .unwrap();
+                    assert!(pixel[3].abs_diff((a * 255.).round() as u8) <= 1);
+                    if a > 0.05 {
+                        for c in 0..3 {
+                            assert!(
+                                pixel[c].abs_diff((expected[c] / a * 255.).round() as u8) <= 4,
+                                "case{case} frame{frame} c{c}: {pixel:?} vs{expected:?}"
+                            );
+                        }
+                    }
+                }
+                png.save(dir.join(format!("frame-{frame}.png"))).unwrap();
+                previews.push(png);
+            }
+            if !still {
+                assert_ne!(
+                    previews[0].as_raw(),
+                    previews[2].as_raw(),
+                    "source time actually advances"
+                );
+            }
+            let output_path = dir.join("media-in.mov");
+            let start=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":output_path,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+            assert_ne!(start.is_error, Some(true), "{start:?}");
+            let done = poll_job(&state, &data(&start)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&output_path),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&output_path)
+                .args([
+                    "-frames:v",
+                    "6",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 6 * output_width * output_height * 8);
+            for frame in 3..6 {
+                for (index, pixel) in decoded.stdout[frame * output_width * output_height * 8
+                    ..(frame + 1) * output_width * output_height * 8]
+                    .chunks_exact(8)
+                    .enumerate()
+                {
+                    let (rgb, a) = scene_pixel(frame, index);
+                    assert!(
+                        u16::from_le_bytes([pixel[6], pixel[7]])
+                            .abs_diff((a * 65535.).round() as u16)
+                            <= 700
+                    );
+                    if a > 0.05 {
+                        let expected = transform.map_straight_video(rgb).unwrap();
+                        for c in 0..3 {
+                            assert!(
+                                u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]])
+                                    .abs_diff((expected[c] * 65535.).round() as u16)
+                                    <= 1600,
+                                "case{case} frame{frame} pixel{index} channel{c}"
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+            // Missing interpretation is a real refusal, and Undo recovers the
+            // exact authored source without accepting a stale rendered picture.
+            assert_ne!(
+                call(
+                    &state,
+                    "set_native_input_color",
+                    json!({"scope":"asset","asset_id":asset,"interpretation":null})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            let rejected = call(
+                &state,
+                "render_frame_at",
+                json!({"sequence_id":sequence,"at_ticks":ticks*3,"quality":"full"}),
+            )
+            .await;
+            assert_eq!(rejected.is_error, Some(true), "{rejected:?}");
+            assert!(format!("{rejected:?}").contains("interpretation"));
+            assert_ne!(call(&state, "undo", json!({})).await.is_error, Some(true));
+            let good_probe = state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_ref()
+                .unwrap()
+                .media
+                .assets[&asset_id]
+                .probe
+                .clone();
+            assert_ne!(
+                call(
+                    &state,
+                    "relink_media",
+                    json!({"asset_id":asset,"new_path":wrong,"allow_hash_mismatch":true})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+            if !still {
+                state
+                    .document
+                    .lock()
+                    .await
+                    .timeline
+                    .as_mut()
+                    .unwrap()
+                    .media
+                    .assets
+                    .get_mut(&asset_id)
+                    .unwrap()
+                    .probe = good_probe;
+                let rejected = call(
+                    &state,
+                    "render_frame_at",
+                    json!({"sequence_id":sequence,"at_ticks":ticks*3,"quality":"full"}),
+                )
+                .await;
+                assert_eq!(rejected.is_error, Some(true));
+                assert!(
+                    format!("{rejected:?}").contains("geometry changed"),
+                    "{rejected:?}"
+                );
+            }
+            let probe = call(&state, "probe_media", json!({"asset_id":asset})).await;
+            let done = poll_job(&state, &data(&probe)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done");
+            let rejected = call(
+                &state,
+                "render_frame_at",
+                json!({"sequence_id":sequence,"at_ticks":ticks*3,"quality":"full"}),
+            )
+            .await;
+            if resize_fit.is_some() {
+                assert_ne!(
+                    rejected.is_error,
+                    Some(true),
+                    "re-probed replacement is now canvas-sized: {rejected:?}"
+                );
+            } else {
+                assert_eq!(rejected.is_error, Some(true));
+                assert!(
+                    format!("{rejected:?}").contains("explicit Resize"),
+                    "{rejected:?}"
+                );
+            }
+            for _ in 0..2 {
+                assert_ne!(call(&state, "undo", json!({})).await.is_error, Some(true));
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            let recovered = call(
+                &state,
+                "render_frame_at",
+                json!({"sequence_id":sequence,"at_ticks":ticks*3,"quality":"full"}),
+            )
+            .await;
+            assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+            if !project_scope {
+                {
+                    let mut doc = state.document.lock().await;
+                    doc.timeline
+                        .as_mut()
+                        .unwrap()
+                        .sequences
+                        .get_mut(&seq_id)
+                        .unwrap()
+                        .track_mut(track_id)
+                        .unwrap()
+                        .locked = true;
+                }
+                let locked = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let rev = state.history.lock().await.revision();
+                if let Some(node) = &offset_node {
+                    assert_eq!(
+                        call(
+                            &state,
+                            "set_graph_time_offset",
+                            json!({"graph_id":graph_id,"node_id":node,"offset_ticks":0})
+                        )
+                        .await
+                        .is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    call(
+                        &state,
+                        "set_native_input_color",
+                        json!({"scope":"asset","asset_id":asset,"interpretation":null})
+                    )
+                    .await
+                    .is_error,
+                    Some(true)
+                );
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    locked
+                );
+                assert_eq!(state.history.lock().await.revision(), rev);
+                state
+                    .document
+                    .lock()
+                    .await
+                    .timeline
+                    .as_mut()
+                    .unwrap()
+                    .sequences
+                    .get_mut(&seq_id)
+                    .unwrap()
+                    .track_mut(track_id)
+                    .unwrap()
+                    .locked = false;
+            }
+            std::fs::write(dir.join("media-in.photon"), saved).unwrap();
+            std::fs::write(dir.join("checks.json"),serde_json::to_vec_pretty(&json!({"case":case,"offset_frames":offset_frames,"temporal_echo":temporal_echo,"still":still,"project_scope":project_scope,"time_source":time_source,"source_dimensions":[32,16],"resize_fit":resize_fit,"intermediate_dimensions":intermediate_dimensions,"output_dimensions":[output_width,output_height],"preview_frames":[3,4,5],"export_frames":6,"scalar_reference":true,"input_interpretation_refusal":true,"unresized_geometry_refusal":resize_fit.is_none(),"stale_video_geometry_refusal":!still,"reprobed_canvas_replacement_accepted":resize_fit.is_some(),"undo_recovery":true,"authoring_history":true,"manifest_verified":true})).unwrap()).unwrap();
+            if retained.is_none() {
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_channels_clip_and_project_mcp_author_preview_prores() {
+        Box::pin(check_native_solid_export_fixture(9)).await;
+        Box::pin(check_native_solid_export_fixture(10)).await;
+        Box::pin(check_native_solid_export_fixture(11)).await;
+        Box::pin(check_native_solid_export_fixture(12)).await;
+        Box::pin(check_native_solid_export_fixture(13)).await;
+        Box::pin(check_native_solid_export_fixture(14)).await;
+    }
+
+    async fn author_native_channel_graph(state: &AppState, clip: Value, scope: u8) {
+        use photonic_core::timeline::GraphOp;
+        Box::pin(author_native_generator_graph(
+            state,
+            clip.clone(),
+            if scope % 2 == 1 { 1 } else { 2 },
+        ))
+        .await;
+        let graph_id = {
+            let document = state.document.lock().await;
+            let project = document.timeline.as_ref().unwrap();
+            if scope % 2 == 0 {
+                serde_json::to_value(project.project_graph.unwrap()).unwrap()
+            } else {
+                let cid: ClipId = serde_json::from_value(clip).unwrap();
+                serde_json::to_value(
+                    project
+                        .sequences
+                        .values()
+                        .flat_map(|s| &s.video_tracks)
+                        .flat_map(|t| &t.clips)
+                        .find(|c| c.id == cid)
+                        .unwrap()
+                        .composition
+                        .unwrap(),
+                )
+                .unwrap()
+            }
+        };
+        let read = call(state, "get_graph", json!({"graph_id":graph_id})).await;
+        let graph = data(&read)["graph"].clone();
+        let source = graph["edges"][0]["from"][0].clone();
+        let output = graph["output"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            state,
+            "remove_graph_edge",
+            json!({"graph_id":graph_id,"edge_index":0}),
+        ))
+        .await;
+        let split = Box::pin(graph_authoring_edit_roundtrip(
+            state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":GraphOp::ChannelSplit}),
+        ))
+        .await;
+        let split = data(&split)["node_id"].clone();
+        let combine = Box::pin(graph_authoring_edit_roundtrip(
+            state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":GraphOp::ChannelCombine}),
+        ))
+        .await;
+        let combine = data(&combine)["node_id"].clone();
+        for (from, to) in [(source.clone(), split.clone()), (combine.clone(), output)] {
+            Box::pin(graph_authoring_edit_roundtrip(
+                state,
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":from},"to":{"node_id":to}}),
+            ))
+            .await;
+        }
+        if (11..=12).contains(&scope) {
+            let shape=Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_node",json!({"graph_id":graph_id,"op":GraphOp::MaskShape{shape:photonic_core::timeline::MaskShapeKind::Rect}}))).await;
+            let shape = data(&shape)["node_id"].clone();
+            for (path, value) in [
+                ("params.center_x", 0.5),
+                ("params.center_y", 0.5),
+                ("params.size_x", 0.35),
+                ("params.size_y", 0.35),
+                ("params.feather", 0.25),
+            ] {
+                Box::pin(graph_authoring_edit_roundtrip(state,"set_graph_node_param",json!({"graph_id":graph_id,"node_id":shape,"path":path,"value":photonic_core::timeline::PropValue::Float(value)}))).await;
+            }
+            Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":shape},"to":{"node_id":combine,"port":3}}))).await;
+        }
+        if scope >= 13 {
+            Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":source},"to":{"node_id":combine,"port":3}}))).await;
+        }
+        for port in 0..4 {
+            if scope >= 11 && port == 3 {
+                continue;
+            }
+            let source_port = if scope == 10 && port == 0 {
+                2
+            } else if scope == 10 && port == 2 {
+                0
+            } else {
+                port
+            };
+            Box::pin(graph_authoring_edit_roundtrip(state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":split,"port":source_port},"to":{"node_id":combine,"port":port}}))).await;
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let bad=call(state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":split,"port":4},"to":{"node_id":combine,"port":0}})).await;
+        assert_eq!(bad.is_error, Some(true));
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn native_polygon_clip_and_project_mcp_author_save_preview_prores() {
+        Box::pin(check_native_solid_export_fixture(7)).await;
+        Box::pin(check_native_solid_export_fixture(8)).await;
+    }
+
+    #[tokio::test]
+    async fn native_switch_clip_and_project_prores_preserve_animated_color_and_alpha() {
+        Box::pin(check_native_solid_export_fixture(5)).await;
+        Box::pin(check_native_solid_export_fixture(6)).await;
+    }
+
+    async fn graph_authoring_edit_roundtrip(
+        state: &AppState,
+        tool: &str,
+        args: Value,
+    ) -> ToolResult {
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let result = call(state, tool, args).await;
+        assert_ne!(result.is_error, Some(true), "{tool}: {result:?}");
+        let after = serde_json::to_value(&*state.document.lock().await).unwrap();
+        assert_ne!(before, after, "{tool} must perform the fixture edit");
+        assert_ne!(call(state, "undo", json!({})).await.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before,
+            "{tool} undo"
+        );
+        assert_ne!(call(state, "redo", json!({})).await.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            after,
+            "{tool} redo"
+        );
+        result
+    }
+
+    async fn author_native_generator_graph(state: &AppState, clip: Value, scope: u8) {
+        use photonic_core::timeline::{GraphOp, MaskShapeKind, PropValue};
+        assert!((1..=4).contains(&scope) || (7..=8).contains(&scope));
+        let created = Box::pin(graph_authoring_edit_roundtrip(
+            state,
+            if scope % 2 == 1 {
+                "create_clip_composition"
+            } else {
+                "set_project_graph"
+            },
+            if scope % 2 == 1 {
+                json!({"clip_id":clip})
+            } else {
+                json!({})
+            },
+        ))
+        .await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = call(state, "get_graph", json!({"graph_id":graph_id})).await;
+        assert_ne!(read.is_error, Some(true));
+        let graph = data(&read)["graph"].clone();
+        let output = graph["output"].clone();
+        for index in (0..graph["edges"].as_array().unwrap().len()).rev() {
+            Box::pin(graph_authoring_edit_roundtrip(
+                state,
+                "remove_graph_edge",
+                json!({"graph_id":graph_id,"edge_index":index}),
+            ))
+            .await;
+        }
+        let shape = scope >= 3;
+        let op = if shape {
+            GraphOp::MaskShape {
+                shape: if scope >= 7 || scope == 3 {
+                    MaskShapeKind::Ellipse
+                } else {
+                    MaskShapeKind::Rect
+                },
+            }
+        } else {
+            GraphOp::SolidColor
+        };
+        let added = Box::pin(graph_authoring_edit_roundtrip(
+            state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":op}),
+        ))
+        .await;
+        let node_id = data(&added)["node_id"].clone();
+        if scope >= 7 {
+            let payload = json!({"graph_id":graph_id,"node_id":node_id,"shape":{"shape":"polygon","vertices":[[0.0,0.0],[1.0,0.0],[0.5,1.0]]}});
+            Box::pin(graph_authoring_edit_roundtrip(
+                state,
+                "set_graph_mask_shape",
+                payload.clone(),
+            ))
+            .await;
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            let repeated = call(state, "set_graph_mask_shape", payload).await;
+            assert_eq!(data(&repeated)["changed"], false);
+            for vertices in [json!([]), json!([[0.0, 0.0], [1.1, 0.0], [0.5, 1.0]])] {
+                let rejected=call(state,"set_graph_mask_shape",json!({"graph_id":graph_id,"node_id":node_id,"shape":{"shape":"polygon","vertices":vertices}})).await;
+                assert_eq!(rejected.is_error, Some(true));
+            }
+            let rejected = call(
+                state,
+                "set_graph_mask_shape",
+                json!({"graph_id":graph_id,"node_id":output,"shape":{"shape":"rect"}}),
+            )
+            .await;
+            assert_eq!(rejected.is_error, Some(true));
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+        let params = if shape {
+            vec![
+                ("params.center_x", PropValue::Float(0.5)),
+                ("params.center_y", PropValue::Float(0.5)),
+                ("params.size_x", PropValue::Float(0.35)),
+                ("params.size_y", PropValue::Float(0.35)),
+                ("params.feather", PropValue::Float(0.25)),
+            ]
+        } else {
+            vec![(
+                "params.color",
+                PropValue::Color(photonic_core::Color {
+                    r: 51.0 / 255.0,
+                    g: 128.0 / 255.0,
+                    b: 204.0 / 255.0,
+                    a: 128.0 / 255.0,
+                }),
+            )]
+        };
+        for (path, value) in params {
+            Box::pin(graph_authoring_edit_roundtrip(
+                state,
+                "set_graph_node_param",
+                json!({"graph_id":graph_id,"node_id":node_id,"path":path,"value":value}),
+            ))
+            .await;
+        }
+        Box::pin(graph_authoring_edit_roundtrip(
+            state,
+            "add_graph_edge",
+            json!({"graph_id":graph_id,"from":{"node_id":node_id},"to":{"node_id":output}}),
+        ))
+        .await;
+        let read = call(state, "get_graph", json!({"graph_id":graph_id})).await;
+        assert_eq!(data(&read)["compiles"], true);
+        // Verify the same graph survives the document's serialization boundary.
+        let document = state.document.lock().await;
+        let roundtrip: photonic_core::Document =
+            serde_json::from_str(&document.to_json().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(roundtrip.timeline).unwrap(),
+            serde_json::to_value(&document.timeline).unwrap()
+        );
+    }
+
+    // 0: source solid; 1/2: clip/project solid; 3/4: clip ellipse/project rect;
+    // 5/6: clip/project animated Switch with an unsupported dormant branch.
+    async fn check_native_solid_export_fixture(graph_scope: u8) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(
+            engine_available(&state).await,
+            "GPU required for native solid qualification"
+        );
+        let tools = photonic_video::media::ffmpeg_locate::locate_for_test()
+            .expect("FFmpeg required for native solid qualification");
+        let created = call(&state, "create_sequence", json!({"name":"Native solid", "frame_rate":{"num":30,"den":1}, "formats":[{"name":"2:1","width":16,"height":8}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let ticks = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&id)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let inserted = call(&state, "insert_clip", json!({"track_id":track,"start_ticks":0,"duration_ticks":ticks*3,"source":{"kind":"solid_color","color":if graph_scope == 0 { "#3380cc80" } else { "#ff0000ff" }}})).await;
+        assert_ne!(inserted.is_error, Some(true), "{inserted:?}");
+        let after = serde_json::to_value(&*state.document.lock().await).unwrap();
+        assert_ne!(call(&state, "undo", json!({})).await.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_ne!(call(&state, "redo", json!({})).await.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            after
+        );
+        if (9..=14).contains(&graph_scope) {
+            Box::pin(author_native_channel_graph(
+                &state,
+                data(&inserted)["clip_id"].clone(),
+                graph_scope,
+            ))
+            .await;
+        } else if (1..=4).contains(&graph_scope) || (7..=8).contains(&graph_scope) {
+            Box::pin(author_native_generator_graph(
+                &state,
+                data(&inserted)["clip_id"].clone(),
+                graph_scope,
+            ))
+            .await;
+        } else if (5..=6).contains(&graph_scope) {
+            use photonic_core::timeline::{
+                ClipSource, GraphEdge, GraphNode, GraphOp, InPort, NodeGraph, OutPort, PropValue,
+            };
+            let mut document = state.document.lock().await;
+            let project = document.timeline.as_mut().unwrap();
+            // Deliberately different underlying source proves the graph generator
+            // supplies the rendered pixels. Graph construction is direct fixture setup.
+            project.sequences.get_mut(&id).unwrap().video_tracks[0].clips[0].source =
+                ClipSource::SolidColor {
+                    color: photonic_core::Color::RED,
+                };
+            let mut graph = if graph_scope % 2 == 1 {
+                NodeGraph::new_clip_composition("Native graph solid").0
+            } else {
+                NodeGraph::new_project_graph("Native graph solid")
+            };
+            let mut node = GraphNode::new(
+                if (3..=4).contains(&graph_scope) || (7..=8).contains(&graph_scope) {
+                    GraphOp::MaskShape {
+                        shape: if graph_scope == 3 {
+                            photonic_core::timeline::MaskShapeKind::Ellipse
+                        } else {
+                            photonic_core::timeline::MaskShapeKind::Rect
+                        },
+                    }
+                } else {
+                    GraphOp::SolidColor
+                },
+            );
+            if (3..=4).contains(&graph_scope) || (7..=8).contains(&graph_scope) {
+                for (path, value) in [
+                    ("params.center_x", 0.5),
+                    ("params.center_y", 0.5),
+                    ("params.size_x", 0.35),
+                    ("params.size_y", 0.35),
+                    ("params.feather", 0.25),
+                ] {
+                    node.params.base.0.set(path, PropValue::Float(value));
+                }
+            }
+            node.params.base.0.set(
+                "params.color",
+                PropValue::Color(photonic_core::Color {
+                    r: 51.0 / 255.0,
+                    g: 128.0 / 255.0,
+                    b: 204.0 / 255.0,
+                    a: 128.0 / 255.0,
+                }),
+            );
+            let solid = node.id;
+            graph.nodes.insert(solid, node);
+            graph.edges = vec![GraphEdge {
+                from: (solid, OutPort::PRIMARY),
+                to: (graph.output, InPort::PRIMARY),
+            }];
+            if (5..=6).contains(&graph_scope) {
+                use photonic_core::timeline::{Interp, Keyframe, PropPath, Tick};
+                let mut other = GraphNode::new(GraphOp::SolidColor);
+                other.params.base.0.set(
+                    "params.color",
+                    PropValue::Color(photonic_core::Color {
+                        r: 0.0,
+                        g: 1.0,
+                        b: 0.0,
+                        a: 0.25,
+                    }),
+                );
+                let other_id = other.id;
+                let dormant = GraphNode::new(GraphOp::MaskFromMatte);
+                let dormant_id = dormant.id;
+                let mut switch = GraphNode::new(GraphOp::Switch);
+                let switch_id = switch.id;
+                let lane = switch.params.track_mut(&PropPath::new("params.selected"));
+                for (at, index) in [(0, 1), (ticks, 2), (ticks * 2, 1)] {
+                    lane.insert_keyframe(Keyframe::new(
+                        Tick(at),
+                        PropValue::Enum(index),
+                        Interp::Linear,
+                    ));
+                }
+                for node in [other, dormant, switch] {
+                    graph.nodes.insert(node.id, node);
+                }
+                graph.edges = vec![
+                    GraphEdge {
+                        from: (dormant_id, OutPort::PRIMARY),
+                        to: (switch_id, InPort(0)),
+                    },
+                    GraphEdge {
+                        from: (solid, OutPort::PRIMARY),
+                        to: (switch_id, InPort(1)),
+                    },
+                    GraphEdge {
+                        from: (other_id, OutPort::PRIMARY),
+                        to: (switch_id, InPort(2)),
+                    },
+                    GraphEdge {
+                        from: (switch_id, OutPort::PRIMARY),
+                        to: (graph.output, InPort::PRIMARY),
+                    },
+                ];
+            }
+            if graph_scope % 2 == 1 {
+                project.sequences.get_mut(&id).unwrap().video_tracks[0].clips[0].composition =
+                    Some(graph.id);
+            } else {
+                project.project_graph = Some(graph.id);
+            }
+            project.graphs.insert(graph.id, graph);
+        }
+        let after = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let frame = call(
+            &state,
+            "render_frame_at",
+            json!({"sequence_id":sequence,"at_ticks":ticks,"quality":"full","output_format":"png"}),
+        )
+        .await;
+        assert_ne!(frame.is_error, Some(true), "{frame:?}");
+        let encoded = frame
+            .content
+            .iter()
+            .find_map(|item| match item {
+                ContentItem::Image { data, .. } => Some(data),
+                _ => None,
+            })
+            .unwrap();
+        let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+            .unwrap()
+            .to_rgba8();
+        let mask_image = (3..=4).contains(&graph_scope) || (7..=8).contains(&graph_scope);
+        let rgb = if (3..=4).contains(&graph_scope) || (7..=8).contains(&graph_scope) {
+            [1.0; 3]
+        } else {
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                51.0 / 255.0,
+                128.0 / 255.0,
+                204.0 / 255.0,
+            ])
+        };
+        let rgb = if graph_scope == 10 {
+            [rgb[2], rgb[1], rgb[0]]
+        } else {
+            rgb
+        };
+        let alpha = if (3..=4).contains(&graph_scope) || (7..=8).contains(&graph_scope) {
+            1.0
+        } else {
+            128.0 / 255.0
+        };
+        let alpha = if graph_scope >= 13 {
+            rgb[0] * 0.2722287168 + rgb[1] * 0.6740817658 + rgb[2] * 0.0536895174
+        } else {
+            alpha
+        };
+        let pixel_alpha = |index: usize| {
+            if (5..=6).contains(&graph_scope) && index / (16 * 8) == 1 {
+                return 0.25;
+            }
+            if !((3..=4).contains(&graph_scope)
+                || (7..=8).contains(&graph_scope)
+                || (11..=12).contains(&graph_scope))
+            {
+                return alpha;
+            }
+            let index = index % (16 * 8);
+            let dx = ((index % 16) as f64 + 0.5) / 16.0 - 0.5;
+            let dy = ((index / 16) as f64 + 0.5) / 8.0 - 0.5;
+            if (7..=8).contains(&graph_scope) {
+                // Independent normalized triangle half-plane and line-distance oracle.
+                let x = dx / 0.35;
+                let y = dy / 0.35;
+                if y < -1.0 || y > 1.0 || x < (y - 1.0) / 2.0 || x > (1.0 - y) / 2.0 {
+                    return 0.0;
+                }
+                let distance = (y + 1.0)
+                    .min((2.0 * x - y + 1.0) / 5.0_f64.sqrt())
+                    .min((-2.0 * x - y + 1.0) / 5.0_f64.sqrt());
+                let t = (distance / 0.25).clamp(0.0, 1.0);
+                return t * t * (3.0 - 2.0 * t);
+            }
+            let d = if graph_scope == 3 {
+                (dx / 0.35).hypot(dy / 0.35)
+            } else {
+                (dx / 0.35).abs().max((dy / 0.35).abs())
+            };
+            let t = ((d - 0.75) / 0.25).clamp(0.0, 1.0);
+            1.0 - t * t * (3.0 - 2.0 * t)
+        };
+        let preview_rgb = if (5..=6).contains(&graph_scope) {
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([0.0, 1.0, 0.0])
+        } else {
+            rgb
+        };
+        let preview_alpha = if (5..=6).contains(&graph_scope) {
+            0.25
+        } else {
+            alpha
+        };
+        let expected = photonic_video::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_premultiplied([
+                preview_rgb[0] * preview_alpha,
+                preview_rgb[1] * preview_alpha,
+                preview_rgb[2] * preview_alpha,
+                preview_alpha,
+            ])
+            .unwrap();
+        for (index, pixel) in png.pixels().enumerate() {
+            let coverage = if (5..=6).contains(&graph_scope) {
+                preview_alpha
+            } else {
+                pixel_alpha(index)
+            };
+            let (expected, coverage) = if mask_image {
+                let weight = pixel_alpha(index);
+                (
+                    photonic_video::color::native_output::Aces2SdrOutput::shared()
+                        .unwrap()
+                        .map_premultiplied([weight, weight, weight, 1.0])
+                        .unwrap(),
+                    1.0,
+                )
+            } else {
+                (expected, coverage)
+            };
+            for c in 0..3 {
+                if coverage < 0.01 {
+                    continue;
+                }
+                assert!(
+                    pixel[c].abs_diff((expected[c] / preview_alpha * 255.0).round() as u8) <= 3
+                );
+            }
+            assert!(pixel[3].abs_diff((coverage * 255.0).round() as u8) <= 1);
+        }
+        let dir =
+            std::env::temp_dir().join(format!("photonic-native-solid-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let output = dir.join("solid.mov");
+        if graph_scope >= 7 {
+            let document = state.document.lock().await;
+            std::fs::write(
+                dir.join(if graph_scope >= 9 {
+                    "channels.photon"
+                } else {
+                    "polygon.photon"
+                }),
+                document.to_json().unwrap(),
+            )
+            .unwrap();
+            let loaded: photonic_core::Document = serde_json::from_str(
+                &std::fs::read_to_string(dir.join(if graph_scope >= 9 {
+                    "channels.photon"
+                } else {
+                    "polygon.photon"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(loaded).unwrap(),
+                serde_json::to_value(&*document).unwrap()
+            );
+            png.save(dir.join("preview.png")).unwrap();
+        }
+        let started = call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":output,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let completed = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(completed["status"]["state"], "done", "{completed}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&output),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args([
+                "-frames:v",
+                "3",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert_eq!(decoded.stdout.len(), 3 * 16 * 8 * 8);
+        let video_rgb = photonic_video::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_straight_video(rgb)
+            .unwrap();
+        let green_rgb = photonic_video::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_straight_video(
+                photonic_video::color::native::encoded_srgb_to_linear_ap1_display([0.0, 1.0, 0.0]),
+            )
+            .unwrap();
+        for (index, pixel) in decoded.stdout.chunks_exact(8).enumerate() {
+            let coverage = if mask_image { 1.0 } else { pixel_alpha(index) };
+            let mask_rgb = if mask_image {
+                Some(
+                    photonic_video::color::native_output::Aces2SdrOutput::shared()
+                        .unwrap()
+                        .map_straight_video([pixel_alpha(index); 3])
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let actual = u16::from_le_bytes([pixel[6], pixel[7]]);
+            assert!(actual.abs_diff((coverage * 65535.0).round() as u16) <= 512);
+            for c in 0..3 {
+                if coverage < 0.05 {
+                    continue;
+                }
+                let actual = u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]]);
+                let channel = if let Some(rgb) = mask_rgb {
+                    rgb[c]
+                } else if (5..=6).contains(&graph_scope) && index / (16 * 8) == 1 {
+                    green_rgb[c]
+                } else {
+                    video_rgb[c]
+                };
+                let expected = (channel * 65535.0).round() as u16;
+                assert!(
+                    actual.abs_diff(expected) <= 1400,
+                    "channel {c}: {actual} vs {expected}"
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            after
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if graph_scope >= 7 {
+            if let Ok(root) = std::env::var(if graph_scope >= 9 {
+                "PHOTONIC_CHANNELS_QUALIFICATION_DIR"
+            } else {
+                "PHOTONIC_POLYGON_QUALIFICATION_DIR"
+            }) {
+                let target = std::path::Path::new(&root).join(format!("scope-{graph_scope}"));
+                std::fs::create_dir_all(&target).unwrap();
+                for entry in std::fs::read_dir(&dir).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_file() {
+                        std::fs::copy(&path, target.join(path.file_name().unwrap())).unwrap();
+                    }
+                }
+                std::fs::write(target.join("checks.json"),serde_json::to_vec_pretty(&json!({"scope":graph_scope,"frames":3,"preview_reference":if graph_scope>=9{"AP1 channel reconstruction/reorder with authored alpha"}else{"opaque grayscale mask-to-image; independent triangle weights"},"prores_redecode":true,"manifest_verified":true,"authoring_undo_redo":true,"save_roundtrip":true})).unwrap()).unwrap();
+            }
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_dissolve_preview_and_prores_redecode_preserve_changing_alpha() {
+        check_native_transition_preview_prores(
+            photonic_core::timeline::TransitionKind::CrossDissolve,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_spatial_transitions_preview_and_prores_redecode_preserve_alpha() {
+        use photonic_core::timeline::TransitionKind;
+        for kind in [
+            TransitionKind::DipToBlack,
+            TransitionKind::DipToColor,
+            TransitionKind::Wipe,
+            TransitionKind::Push,
+            TransitionKind::LumaWipe,
+        ] {
+            check_native_transition_preview_prores(kind).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_solid_end_fade_mcp_authoring_preview_and_prores_alpha() {
+        Box::pin(check_native_generator_end_fade(
+            NativeTransitionFixtureSource::Solid,
+        ))
+        .await;
+    }
+    #[tokio::test]
+    async fn native_extended_end_fade_mcp_authoring_preview_and_prores_alpha() {
+        for source in [
+            NativeTransitionFixtureSource::Title,
+            NativeTransitionFixtureSource::Vector,
+            NativeTransitionFixtureSource::Nested,
+        ] {
+            Box::pin(check_native_generator_end_fade(source)).await;
+        }
+    }
+    async fn check_native_generator_end_fade(fixture_source: NativeTransitionFixtureSource) {
+        Box::pin(check_native_generator_end_fade_kind(
+            fixture_source,
+            photonic_core::timeline::TransitionKind::CrossDissolve,
+        ))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn native_catalog_outgoing_fades_mcp_all_sources_and_delivery() {
+        use photonic_core::timeline::TransitionKind;
+        for source in [
+            NativeTransitionFixtureSource::Solid,
+            NativeTransitionFixtureSource::Title,
+            NativeTransitionFixtureSource::Vector,
+            NativeTransitionFixtureSource::Nested,
+        ] {
+            for kind in [
+                TransitionKind::DipToBlack,
+                TransitionKind::DipToColor,
+                TransitionKind::Wipe,
+                TransitionKind::Push,
+                TransitionKind::LumaWipe,
+            ] {
+                Box::pin(check_native_generator_end_fade_kind(source, kind)).await;
+            }
+        }
+    }
+
+    async fn check_native_generator_end_fade_kind(
+        fixture_source: NativeTransitionFixtureSource,
+        kind: photonic_core::timeline::TransitionKind,
+    ) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        let state = test_state();
+        assert!(engine_available(&state).await, "engine required");
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let dir = std::env::temp_dir().join(format!(
+            "photonic-native-solid-fade-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let created=call(&state,"create_sequence",json!({"name":"Solid fade", "frame_rate":{"num":30,"den":1},"formats":[{"name":"2:1","width":16,"height":8}]})).await;
+        assert_ne!(created.is_error, Some(true));
+        let sequence = data(&created)["sequence_id"].clone();
+        let sid: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let track = create_track(&state, &sequence, "video").await;
+        let frame = {
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            seq.frame_rate.ticks_per_frame().0
+        };
+        let added=Box::pin(graph_authoring_edit_roundtrip(&state,"insert_clip",json!({"track_id":track,"start_ticks":0,"duration_ticks":frame*5,"source":{"kind":"solid_color","color":"#cc803380"}}))).await;
+        let clip = data(&added)["clip_id"].clone();
+        if fixture_source != NativeTransitionFixtureSource::Solid {
+            let cid: ClipId = serde_json::from_value(clip.clone()).unwrap();
+            let mut doc = state.document.lock().await;
+            let color = photonic_core::Color::new(
+                204.0 / 255.0,
+                128.0 / 255.0,
+                51.0 / 255.0,
+                128.0 / 255.0,
+            );
+            if fixture_source == NativeTransitionFixtureSource::Vector {
+                doc.width = 16.0;
+                doc.height = 8.0;
+                let layer = doc.active_layer_id.unwrap();
+                doc.add_node(
+                    photonic_core::SceneNode::new(
+                        "fade logo",
+                        layer,
+                        photonic_core::SceneNodeKind::Path(
+                            photonic_core::node::PathNode::new(photonic_core::PathData::rect(
+                                0.0, 0.0, 16.0, 8.0,
+                            ))
+                            .with_fill(photonic_core::style::Fill::solid(color)),
+                        ),
+                    ),
+                    None,
+                );
+            }
+            let project = doc.timeline.as_mut().unwrap();
+            let rate = project.sequences[&sid].frame_rate;
+            let source = native_transition_fixture_source(project, rate, color, fixture_source);
+            let seq = project.sequences.get_mut(&sid).unwrap();
+            let target = seq
+                .video_tracks
+                .iter_mut()
+                .flat_map(|t| t.clips.iter_mut())
+                .find(|c| c.id == cid)
+                .unwrap();
+            target.source = source;
+        }
+        Box::pin(graph_authoring_edit_roundtrip(&state,"set_transition",json!({"clip_id":clip,"edge":"out","transition":{"kind":kind,"duration_ticks":frame*2,"params":{"curve":"linear"}}}))).await;
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        std::fs::write(
+            dir.join("document.photon"),
+            state.document.lock().await.to_json().unwrap(),
+        )
+        .unwrap();
+        for (at, alpha) in [(2, 128u8), (3, 128), (4, 64)] {
+            let rendered=call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":frame*at,"quality":"full","output_format":"png"})).await;
+            assert_ne!(rendered.is_error, Some(true), "{rendered:?}");
+            let encoded = rendered
+                .content
+                .iter()
+                .find_map(|c| match c {
+                    ContentItem::Image { data, .. } => Some(data),
+                    _ => None,
+                })
+                .unwrap();
+            let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+                .unwrap()
+                .to_rgba8();
+            png.save(dir.join(format!("preview-{at}.png"))).unwrap();
+            assert!(
+                png.get_pixel(8, 4).0[3].abs_diff(alpha) <= 1,
+                "frame{at}: {:?}",
+                png.get_pixel(8, 4)
+            );
+        }
+        let out = dir.join("solid-fade.mov");
+        let export=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(export.is_error, Some(true), "{export:?}");
+        let completed = poll_job(&state, &data(&export)["job_id"]).await;
+        assert_eq!(completed["status"]["state"], "done", "{completed}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&out),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out)
+            .args([
+                "-frames:v",
+                "5",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 5 * 16 * 8 * 8);
+        for at in 0..5 {
+            let offset = (at * 16 * 8 + 4 * 16 + 8) * 8 + 6;
+            let actual = u16::from_le_bytes([decoded.stdout[offset], decoded.stdout[offset + 1]]);
+            let expected =
+                ((128.0 / 255.0) * if at == 4 { 0.5 } else { 1.0 } * 65535.0_f64).round() as u16;
+            assert!(
+                actual.abs_diff(expected) <= 512,
+                "frame{at}: {actual} vs {expected}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if let Some(retained) = std::env::var_os("PHOTONIC_OUTGOING_FADE_QUALIFICATION_DIR") {
+            let target =
+                std::path::PathBuf::from(retained).join(format!("{fixture_source:?}-{kind:?}"));
+            std::fs::create_dir_all(&target).unwrap();
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    std::fs::copy(&path, target.join(path.file_name().unwrap())).unwrap();
+                }
+            }
+            std::fs::write(target.join("checks.json"),serde_json::to_vec_pretty(&json!({"source":format!("{fixture_source:?}"),"kind":kind,"contract":"Outgoing at gap/end is eased opacity fade to transparent; kind-specific geometry applies only at incoming cuts","preview_frames":[2,3,4],"preview_alpha":[128,128,64],"preview_alpha_tolerance":1,"prores_frames":5,"prores_alpha16_tolerance":512,"manifest_verified":true,"authoring_undo_redo_and_save":true,"render_document_history_unchanged":true})).unwrap()).unwrap();
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_solid_transition_partners_mcp_preview_prores_and_alpha() {
+        use photonic_core::timeline::TransitionKind;
+        for sources in 1..=3 {
+            for kind in [
+                TransitionKind::CrossDissolve,
+                TransitionKind::DipToBlack,
+                TransitionKind::DipToColor,
+                TransitionKind::Wipe,
+                TransitionKind::Push,
+                TransitionKind::LumaWipe,
+            ] {
+                Box::pin(check_native_transition_source_preview_prores(kind, sources)).await;
+            }
+        }
+    }
+
+    async fn check_native_transition_preview_prores(kind: photonic_core::timeline::TransitionKind) {
+        Box::pin(check_native_transition_source_preview_prores(kind, 0)).await;
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum NativeTransitionFixtureSource {
+        Solid,
+        Title,
+        Vector,
+        Nested,
+    }
+
+    fn native_transition_fixture_source(
+        project: &mut photonic_core::timeline::TimelineProject,
+        rate: photonic_core::timeline::FrameRate,
+        color: photonic_core::Color,
+        fixture_source: NativeTransitionFixtureSource,
+    ) -> photonic_core::timeline::ClipSource {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        match fixture_source {
+            NativeTransitionFixtureSource::Solid => ClipSource::SolidColor { color },
+            NativeTransitionFixtureSource::Title => {
+                let mut content = photonic_core::timeline::TextClipContent::new("X");
+                content.style.font_size = 8.0;
+                content.style.fill = photonic_core::Color::TRANSPARENT;
+                content.style.stroke = None;
+                content.style.position = [0.5, 0.5];
+                content.style.max_width = 1.0;
+                content.style.background = Some(photonic_core::timeline::CaptionBackground {
+                    color,
+                    padding: 128.0,
+                    corner_radius: 0.0,
+                });
+                ClipSource::Text { content }
+            }
+            NativeTransitionFixtureSource::Vector => {
+                let asset = project.media.insert(MediaAsset::new(
+                    AssetKind::VectorDoc,
+                    photonic_core::timeline::AssetSource::EmbeddedVector {
+                        root: photonic_core::timeline::VectorRef::WholeDocument,
+                    },
+                ));
+                ClipSource::Vector { asset }
+            }
+            NativeTransitionFixtureSource::Nested => {
+                let mut inner =
+                    photonic_core::timeline::Sequence::new("transition nest", rate, 16, 8);
+                inner.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                let mut track = Track::new(TrackKind::Video, "inner");
+                track.clips.push(Clip::new(
+                    ClipSource::SolidColor { color },
+                    Tick::ZERO,
+                    Tick(rate.ticks_per_frame().0 * 10),
+                ));
+                inner.video_tracks.push(track);
+                let sequence = inner.id;
+                project.sequences.insert(sequence, inner);
+                ClipSource::NestedSequence { sequence }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_extended_transition_sources_mcp_preview_prores_and_alpha() {
+        use photonic_core::timeline::TransitionKind;
+        for source in [
+            NativeTransitionFixtureSource::Title,
+            NativeTransitionFixtureSource::Vector,
+            NativeTransitionFixtureSource::Nested,
+        ] {
+            for mask in 1..=3 {
+                if source == NativeTransitionFixtureSource::Vector && mask == 3 {
+                    continue;
+                }
+                for kind in [
+                    TransitionKind::CrossDissolve,
+                    TransitionKind::DipToBlack,
+                    TransitionKind::DipToColor,
+                    TransitionKind::Wipe,
+                    TransitionKind::Push,
+                    TransitionKind::LumaWipe,
+                ] {
+                    Box::pin(check_native_transition_qualified_sources(
+                        kind, mask, source,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    async fn check_native_transition_source_preview_prores(
+        kind: photonic_core::timeline::TransitionKind,
+        source_mask: u8,
+    ) {
+        Box::pin(check_native_transition_qualified_sources(
+            kind,
+            source_mask,
+            NativeTransitionFixtureSource::Solid,
+        ))
+        .await;
+    }
+    async fn check_native_transition_qualified_sources(
+        kind: photonic_core::timeline::TransitionKind,
+        source_mask: u8,
+        fixture_source: NativeTransitionFixtureSource,
+    ) {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let state = test_state();
+        assert!(
+            engine_available(&state).await,
+            "engine required for transition qualification"
+        );
+        let tools = photonic_video::media::ffmpeg_locate::locate_for_test()
+            .expect("FFmpeg required for transition qualification");
+        let retained = std::env::var_os("PHOTONIC_TRANSITION_QUALIFICATION_DIR").map(|p| {
+            std::path::PathBuf::from(p)
+                .join(format!("{fixture_source:?}-mask{source_mask}-{kind:?}"))
+        });
+        let dir = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-dissolve-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&dir).unwrap();
+        let red = dir.join("red.png");
+        let blue = dir.join("blue.png");
+        image::RgbaImage::from_pixel(16, 8, image::Rgba([255, 0, 0, 64]))
+            .save(&red)
+            .unwrap();
+        image::RgbaImage::from_pixel(16, 8, image::Rgba([0, 0, 255, 192]))
+            .save(&blue)
+            .unwrap();
+        let created = call(&state,"create_sequence",json!({"name":"Native dissolve", "frame_rate":{"num":30,"den":1}, "formats":[{"name":"2:1","width":16,"height":8}]})).await;
+        assert_ne!(created.is_error, Some(true), "{created:?}");
+        let sequence = data(&created)["sequence_id"].clone();
+        let sequence_id: SequenceId = serde_json::from_value(sequence.clone()).unwrap();
+        let (assets, frame_ticks, incoming_id) = {
+            let mut doc = state.document.lock().await;
+            let colors = [
+                photonic_core::Color::new(1.0, 0.0, 0.0, 64.0 / 255.0),
+                photonic_core::Color::new(0.0, 0.0, 1.0, 192.0 / 255.0),
+            ];
+            if fixture_source == NativeTransitionFixtureSource::Vector {
+                doc.width = 16.0;
+                doc.height = 8.0;
+                let color = colors[if source_mask == 1 { 0 } else { 1 }];
+                let layer = doc.active_layer_id.unwrap();
+                doc.add_node(
+                    photonic_core::SceneNode::new(
+                        "transition logo",
+                        layer,
+                        photonic_core::SceneNodeKind::Path(
+                            photonic_core::node::PathNode::new(photonic_core::PathData::rect(
+                                0.0, 0.0, 16.0, 8.0,
+                            ))
+                            .with_fill(photonic_core::style::Fill::solid(color)),
+                        ),
+                    ),
+                    None,
+                );
+            }
+            let project = doc.timeline.as_mut().unwrap();
+            let rate = project.sequences[&sequence_id].frame_rate;
+            let mut special = Vec::new();
+            for color in colors {
+                special.push(native_transition_fixture_source(
+                    project,
+                    rate,
+                    color,
+                    fixture_source,
+                ));
+            }
+            let a = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &red));
+            let b = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &blue));
+            let seq = project.sequences.get_mut(&sequence_id).unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let frame = seq.frame_rate.ticks_per_frame();
+            let mut track = Track::new(TrackKind::Video, "V1");
+            track.clips.push(Clip::new(
+                if source_mask & 1 != 0 {
+                    special[0].clone()
+                } else {
+                    ClipSource::Asset { asset: a }
+                },
+                Tick::ZERO,
+                Tick(frame.0 * 2),
+            ));
+            let incoming = Clip::new(
+                if source_mask & 2 != 0 {
+                    special[1].clone()
+                } else {
+                    ClipSource::Asset { asset: b }
+                },
+                Tick(frame.0 * 2),
+                Tick(frame.0 * 3),
+            );
+            let incoming_id = incoming.id;
+            track.clips.push(incoming);
+            seq.video_tracks.push(track);
+            ([a, b], frame.0, incoming_id)
+        };
+        for asset in assets {
+            let result = call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":asset,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}})).await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let authored = call(&state,"set_transition",json!({"clip_id":incoming_id,"edge":"in","transition":{"kind":kind,"duration_ticks":frame_ticks*2,"params":{"curve":"linear","softness":0.2,"color":{"r":0.2,"g":0.8,"b":0.4,"a":0.6}}}})).await;
+        assert_ne!(authored.is_error, Some(true), "{authored:?}");
+        let after = serde_json::to_value(&*state.document.lock().await).unwrap();
+        assert_ne!(before, after);
+        assert_ne!(call(&state, "undo", json!({})).await.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        assert_ne!(call(&state, "redo", json!({})).await.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            after
+        );
+        let revision = state.history.lock().await.revision();
+        let preview = call(&state,"render_frame_at",json!({"sequence_id":sequence,"at_ticks":frame_ticks*3,"quality":"full","output_format":"png"})).await;
+        assert_ne!(
+            preview.is_error,
+            Some(true),
+            "{fixture_source:?} mask{source_mask} {kind:?}: {preview:?}"
+        );
+        let encoded = preview
+            .content
+            .iter()
+            .find_map(|item| match item {
+                ContentItem::Image { data, .. } => Some(data),
+                _ => None,
+            })
+            .unwrap();
+        let png = image::load_from_memory(&general_purpose::STANDARD.decode(encoded).unwrap())
+            .unwrap()
+            .to_rgba8();
+        let a = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([1.0, 0.0, 0.0]);
+        let b = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([0.0, 0.0, 1.0]);
+        let midpoint = |x: usize| {
+            use photonic_core::timeline::TransitionKind;
+            if kind == TransitionKind::DipToBlack {
+                return [0.0, 0.0, 0.0, 1.0];
+            }
+            if kind == TransitionKind::DipToColor {
+                let c = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    0.2, 0.8, 0.4,
+                ]);
+                return [c[0] * 0.6, c[1] * 0.6, c[2] * 0.6, 0.6];
+            }
+            let coordinate = (x as f64 + 0.5) / 16.0;
+            let weight = match kind {
+                TransitionKind::CrossDissolve => 0.5,
+                TransitionKind::Push => {
+                    if coordinate < 0.5 {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                }
+                TransitionKind::Wipe | TransitionKind::LumaWipe => {
+                    let t = ((0.5 - (coordinate - 0.2)) / 0.4).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                }
+                _ => unreachable!(),
+            };
+            let rgb = [0, 1, 2]
+                .map(|c| a[c] * (64.0 / 255.0) * (1.0 - weight) + b[c] * (192.0 / 255.0) * weight);
+            [
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                (64.0 * (1.0 - weight) + 192.0 * weight) / 255.0,
+            ]
+        };
+        for x in [4usize, 8, 12] {
+            let scene = midpoint(x);
+            let expected = photonic_video::color::native_output::Aces2SdrOutput::shared()
+                .unwrap()
+                .map_premultiplied(scene)
+                .unwrap();
+            let pixel = png.get_pixel(x as u32, 4).0;
+            for c in 0..3 {
+                assert!(
+                    pixel[c].abs_diff((expected[c] / scene[3] * 255.0).round() as u8) <= 3,
+                    "{kind:?}, x{x}: {pixel:?} vs {expected:?}"
+                );
+            }
+            assert!(
+                pixel[3].abs_diff((scene[3] * 255.0).round() as u8) <= 1,
+                "{kind:?}, x{x}: {pixel:?}"
+            );
+        }
+        let output = dir.join("dissolve.mov");
+        let started = call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":output,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+        let completed = poll_job(&state, &data(&started)["job_id"]).await;
+        assert_eq!(completed["status"]["state"], "done", "{completed}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&output),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args([
+                "-frames:v",
+                "5",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "rgba64le",
+                "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert_eq!(decoded.stdout.len(), 5 * 16 * 8 * 8);
+        for x in [4usize, 8, 12] {
+            for frame in 0..5 {
+                let alpha = match frame {
+                    0..=2 => 64.0 / 255.0,
+                    3 => midpoint(x)[3],
+                    _ => 192.0 / 255.0,
+                };
+                let offset = (frame * 16 * 8 + 4 * 16 + x) * 8 + 6;
+                let actual =
+                    u16::from_le_bytes([decoded.stdout[offset], decoded.stdout[offset + 1]]);
+                let expected = (alpha * 65535.0).round() as u16;
+                assert!(
+                    actual.abs_diff(expected) <= 512,
+                    "{kind:?} frame {frame}, x{x}: alpha {actual} vs {expected}"
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            after
+        );
+        assert_eq!(state.history.lock().await.revision(), revision);
+        if retained.is_some() {
+            std::fs::write(
+                dir.join("transition.photon"),
+                state.document.lock().await.to_json().unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("midpoint.png"),
+                general_purpose::STANDARD.decode(encoded).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(dir.join("checks.json"),serde_json::to_vec_pretty(&json!({"source":format!("{fixture_source:?}"),"source_mask":source_mask,"transition":kind,"frames":5,"preview_rgb_alpha_checked":true,"export_alpha_frames_checked":5,"undo_redo_preserves_document":true})).unwrap()).unwrap();
+        } else {
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_motion_blur_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_MOTION_BLUR_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-motion-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |angle: f64, distance: f64| {
+            let a = angle.to_radians();
+            let clean = |v: f64| {
+                if v.abs() < 1e-10 {
+                    0.0
+                } else {
+                    v as f32 as f64
+                }
+            };
+            let (dx, dy) = (clean(distance * a.cos()), clean(distance * a.sin()));
+            let steps = dx.hypot(dy).ceil().clamp(1.0, 128.0) as u32;
+            let mut out = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let mut p = [0.0f64; 4];
+                    for i in 0..=steps {
+                        let t = i as f64 / steps as f64 - 0.5;
+                        let sx = (x as f64 + dx * t).clamp(0.0, (w - 1) as f64);
+                        let sy = (y as f64 + dy * t).clamp(0.0, (h - 1) as f64);
+                        let x0 = sx.floor() as u32;
+                        let y0 = sy.floor() as u32;
+                        let fx = sx - x0 as f64;
+                        let fy = sy - y0 as f64;
+                        for (xx, yy, weight) in [
+                            (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                            ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                            (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                            ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+                        ] {
+                            for c in 0..4 {
+                                p[c] +=
+                                    input[(yy * w + xx) as usize][c] * weight / (steps + 1) as f64;
+                            }
+                        }
+                    }
+                    out.push(p);
+                }
+            }
+            out
+        };
+        for which in 0..4 {
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Directional blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(engine_available(&state).await, "GPU required");
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":"blur.motion"})),
+            ))
+            .await;
+            let (angle, distance) = [(0.0, 4.0), (37.0, 8.0), (90.0, 12.0), (225.0, 16.0)][which];
+            for (path, value) in [("params.angle", angle), ("params.distance", distance)] {
+                if (path == "params.angle" && value == 0.0)
+                    || (path == "params.distance" && value == 8.0)
+                {
+                    continue;
+                }
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":value}})))).await;
+            }
+            if which == 1 {
+                let key = |at, value, path| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(&state,"batch_set_keyframes",json!({"ops":[key(0,0.0,"params.distance"),key(2*tpf,8.0,"params.distance"),key(0,0.0,"params.angle"),key(2*tpf,90.0,"params.angle")]}))).await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let (a, d) = if which == 1 {
+                    (frame as f64 * 45.0, frame as f64 * 4.0)
+                } else {
+                    (angle, distance)
+                };
+                let expected = reference(a, d);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"angle":a,"distance":d,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.distance","value":{"t":"float","v":501.0}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.distance","value":{"t":"float","v":2.0}})))).await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_mosaic_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_MOSAIC_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-mosaic-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |block: f64| {
+            let size = block.round() as u32;
+            let stride = (w + 1) as usize;
+            let mut sum = vec![[0.0f64; 4]; stride * (h + 1) as usize];
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y + 1) as usize * stride + (x + 1) as usize;
+                    for c in 0..4 {
+                        sum[i][c] =
+                            input[(y * w + x) as usize][c] + sum[i - 1][c] + sum[i - stride][c]
+                                - sum[i - stride - 1][c];
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let (x0, y0) = (x / size * size, y / size * size);
+                    let (x1, y1) = ((x0 + size).min(w), (y0 + size).min(h));
+                    let mut pixel = [0.0; 4];
+                    for c in 0..4 {
+                        pixel[c] = (sum[y1 as usize * stride + x1 as usize][c]
+                            - sum[y0 as usize * stride + x1 as usize][c]
+                            - sum[y1 as usize * stride + x0 as usize][c]
+                            + sum[y0 as usize * stride + x0 as usize][c])
+                            / ((x1 - x0) * (y1 - y0)) as f64;
+                    }
+                    out.push(pixel);
+                }
+            }
+            out
+        };
+        for which in 0..4 {
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native mosaic", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native mosaic"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":"stylize.mosaic"})),
+            ))
+            .await;
+            let block = [1.0, 4.5, 8.0, 256.0][which];
+            if block != 8.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.block","value":{"t":"float","v":block}})))).await;
+            }
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":"params.block","at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,1.0),key(2*tpf,8.0)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let b = if which == 1 {
+                    1.0 + frame as f64 * 3.5
+                } else {
+                    block
+                };
+                let expected = reference(b);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"block":b,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.block","value":{"t":"float","v":257.0}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.block","value":{"t":"float","v":2.0}})))).await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_box_blur_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_BOX_BLUR_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-box-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |radius: f64| {
+            // Independent direct separable sums, not the sliding-window CPU implementation.
+            let radius = radius.round() as i64;
+            let mut source = input.clone();
+            for axis in 0..2 {
+                let mut out = vec![[0.0f64; 4]; (w * h) as usize];
+                for y in 0..h {
+                    for x in 0..w {
+                        let mut pixel = [0.0; 4];
+                        for offset in -radius..=radius {
+                            let sx = (x as i64 + if axis == 0 { offset } else { 0 })
+                                .clamp(0, w as i64 - 1) as u32;
+                            let sy = (y as i64 + if axis == 1 { offset } else { 0 })
+                                .clamp(0, h as i64 - 1) as u32;
+                            for c in 0..4 {
+                                pixel[c] +=
+                                    source[(sy * w + sx) as usize][c] / (2 * radius + 1) as f64;
+                            }
+                        }
+                        out[(y * w + x) as usize] = pixel;
+                    }
+                }
+                source = out;
+            }
+            source
+        };
+        for which in 0..4 {
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native box blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native box blur"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":"blur.box"})),
+            ))
+            .await;
+            let radius = [0.0, 4.5, 8.0, 500.0][which];
+            if radius != 0.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":radius}})))).await;
+            }
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":"params.radius","at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,1.0),key(2*tpf,8.0)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let b = if which == 1 {
+                    1.0 + frame as f64 * 3.5
+                } else {
+                    radius
+                };
+                let expected = reference(b);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"radius":b,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":501.0}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":2.0}})))).await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_detail_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_DETAIL_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-detail-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |kind: usize, amount: f64, sigma: f64, threshold: f64| {
+            let sigma = if kind == 2 {
+                (w.min(h) as f64 / 8.0).clamp(3.0, 60.0)
+            } else {
+                sigma
+            };
+            if kind != 1 && (amount == 0.0 || sigma < 0.5) {
+                return input.clone();
+            }
+            let mut low = input.clone();
+            if sigma >= 0.5 {
+                let n = if sigma <= 12.0 {
+                    1
+                } else {
+                    ((sigma / 12.0).powi(2).ceil() as usize).clamp(2, 16)
+                };
+                let sp = sigma / (n as f64).sqrt();
+                let step = ((sp * 3.0).ceil() / 128.0).ceil().clamp(1.0, 4.0);
+                let radius = (((sp * 3.0).ceil() / step).ceil() as i32).min(128);
+                let weights: Vec<_> = (-radius..=radius)
+                    .map(|k| (-((k as f64 * step).powi(2)) / (2.0 * sp * sp)).exp())
+                    .collect();
+                let total: f64 = weights.iter().sum();
+                for _ in 0..n {
+                    for axis in 0..2 {
+                        let mut next = vec![[0.0f64; 4]; (w * h) as usize];
+                        for y in 0..h {
+                            for x in 0..w {
+                                let mut pixel = [0.0; 4];
+                                for (i, weight) in weights.iter().enumerate() {
+                                    let offset = ((i as i32 - radius) as f64 * step).round() as i32;
+                                    let xx = (x as i32 + if axis == 0 { offset } else { 0 })
+                                        .clamp(0, w as i32 - 1)
+                                        as u32;
+                                    let yy = (y as i32 + if axis == 1 { offset } else { 0 })
+                                        .clamp(0, h as i32 - 1)
+                                        as u32;
+                                    for c in 0..4 {
+                                        pixel[c] += low[(yy * w + xx) as usize][c] * weight / total;
+                                    }
+                                }
+                                next[(y * w + x) as usize] = pixel;
+                            }
+                        }
+                        low = next;
+                    }
+                }
+            }
+            input
+                .iter()
+                .zip(&low)
+                .map(|(src, low)| {
+                    if src[3] <= 0.0 {
+                        return [0.0; 4];
+                    }
+                    let straight = [src[0] / src[3], src[1] / src[3], src[2] / src[3]];
+                    let luma = straight[0] * 0.2722287168
+                        + straight[1] * 0.6740817658
+                        + straight[2] * 0.0536895174;
+                    let bell = (1.0 - (luma - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+                    let mut out = *src;
+                    for c in 0..3 {
+                        let diff = if low[3] > 1e-8 {
+                            straight[c] - low[c] / low[3]
+                        } else {
+                            0.0
+                        };
+                        out[c] = src[3]
+                            * match kind {
+                                0 => {
+                                    straight[c]
+                                        + amount
+                                            * ((diff.abs() - threshold) / (32.0 / 255.0))
+                                                .clamp(0.0, 1.0)
+                                            * diff
+                                }
+                                1 => 128.0 / 255.0 + diff,
+                                2 => straight[c] + amount * bell * diff,
+                                _ => straight[c] + amount * diff,
+                            };
+                    }
+                    out
+                })
+                .collect::<Vec<_>>()
+        };
+        for case in 0..16 {
+            let which = case % 4;
+            let kind = case / 4;
+            let effect_id = [
+                "sharpen.smart",
+                "filter.high_pass",
+                "color.clarity",
+                "sharpen.unsharp_raster",
+            ][kind];
+            let path = if kind == 1 {
+                "params.radius"
+            } else {
+                "params.amount"
+            };
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native detail", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native detail"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let amount = if kind == 1 {
+                1.0
+            } else if kind == 2 {
+                [-1.0, -0.5, 0.5, 1.0][which]
+            } else {
+                [0.0, 1.5, 2.0, 3.0][which]
+            };
+            let sigma = if kind == 2 {
+                0.0
+            } else {
+                [0.0, 2.5, 12.0, 48.0][which]
+            };
+            let threshold = if kind == 0 {
+                [0.0, 0.1, 0.25, 1.0][which]
+            } else {
+                0.0
+            };
+            let mut params = Vec::new();
+            if kind != 1 {
+                params.push(("params.amount", amount, if kind == 0 { 1.0 } else { 0.0 }));
+            }
+            if kind != 2 {
+                params.push(("params.radius", sigma, if kind == 0 { 1.0 } else { 0.0 }));
+            }
+            if kind == 0 {
+                params.push(("params.threshold", threshold * 255.0, 0.0));
+            }
+            for (path, value, default) in params {
+                if value != default {
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":value}})))).await;
+                }
+            }
+            if which == 1 {
+                let (a, b) = if kind == 1 {
+                    (0.0, 5.0)
+                } else if kind == 2 {
+                    (-0.75, 0.75)
+                } else {
+                    (0.0, 2.0)
+                };
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,a),key(2*tpf,b)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("kind-{kind}-scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let (a, r) = if which == 1 {
+                    if kind == 1 {
+                        (amount, frame as f64 * 2.5)
+                    } else if kind == 2 {
+                        (-0.75 + frame as f64 * 0.75, sigma)
+                    } else {
+                        (frame as f64, sigma)
+                    }
+                } else {
+                    (amount, sigma)
+                };
+                let expected = reference(kind, a, r, threshold);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"effect":effect_id,"amount":a,"sigma":r,"threshold":threshold,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":match kind {1=>500.01,2=>1.01,_=>10.01}}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":0.2}})))).await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_geometric_warps_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_WARP_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-warp-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |kind: usize, amount: f64, wavelength: f64| {
+            // Independent binary64 inverse coordinates and four explicit sample weights.
+            let cx = w as f64 / 2.0;
+            let cy = h as f64 / 2.0;
+            let radius = w.min(h) as f64 / 2.0;
+            let mut out = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let px = x as f64 + 0.5;
+                    let py = y as f64 + 0.5;
+                    let (mut sx, mut sy) = (px, py);
+                    if kind == 2 {
+                        sx += amount * (std::f64::consts::TAU * py / wavelength).sin();
+                        sy += amount * (std::f64::consts::TAU * px / wavelength).sin();
+                    } else {
+                        let dx = px - cx;
+                        let dy = py - cy;
+                        let r = dx.hypot(dy);
+                        if r > 0.0 && r < radius {
+                            let n = r / radius;
+                            let mapped = if kind == 0 {
+                                r + amount * r * (1.0 - n).powi(2)
+                            } else {
+                                let curved = if amount >= 0.0 {
+                                    radius * n.asin() / std::f64::consts::FRAC_PI_2
+                                } else {
+                                    radius * (n * std::f64::consts::FRAC_PI_2).sin()
+                                };
+                                r * (1.0 - amount.abs()) + curved * amount.abs()
+                            };
+                            sx = cx + dx / r * mapped;
+                            sy = cy + dy / r * mapped;
+                        }
+                    }
+                    sx = (sx - 0.5).clamp(0.0, w as f64 - 1.0);
+                    sy = (sy - 0.5).clamp(0.0, h as f64 - 1.0);
+                    let x0 = sx.floor() as u32;
+                    let y0 = sy.floor() as u32;
+                    let fx = sx - x0 as f64;
+                    let fy = sy - y0 as f64;
+                    let mut pixel = [0.0; 4];
+                    for (xx, yy, weight) in [
+                        (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                        ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                        (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                        ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+                    ] {
+                        for c in 0..4 {
+                            pixel[c] += input[(yy * w + xx) as usize][c] * weight;
+                        }
+                    }
+                    out.push(pixel);
+                }
+            }
+            out
+        };
+        for case in 0..12 {
+            let which = case % 4;
+            let kind = case / 4;
+            let effect_id = ["geo.pinch", "geo.spherize", "geo.ripple"][kind];
+            let path = if kind == 2 {
+                "params.amplitude"
+            } else {
+                "params.amount"
+            };
+            let wavelength = [1.0, 7.5, 16.0, 512.0][which];
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native geometric warp", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native geometric warp"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let amount = if kind == 2 {
+                [0.0, -3.5, 5.0, 64.0][which]
+            } else {
+                [0.0, -0.35, 0.6, 1.0][which]
+            };
+            let default = if kind == 2 { 4.0 } else { 0.0 };
+            if amount != default {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":amount}})))).await;
+            }
+            if kind == 2 && wavelength != 16.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.wavelength","value":{"t":"float","v":wavelength}})))).await;
+            }
+            if which == 1 {
+                let endpoint = if kind == 2 { 6.0 } else { 0.75 };
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,-endpoint),key(2*tpf,endpoint)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("kind-{kind}-scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let a = if which == 1 {
+                    let endpoint = if kind == 2 { 6.0 } else { 0.75 };
+                    -endpoint + frame as f64 * endpoint
+                } else {
+                    amount
+                };
+                let expected = reference(kind, a, wavelength);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"effect":effect_id,"amount":a,"wavelength":wavelength,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":if kind==2 {64.01}else{1.01}}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":0.2}})))).await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn transfer_artistic_reference(p: [f32; 4], posterize: bool, parameter: f64) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        let to_srgb = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let to_ap1 = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let straight = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let linear = if straight[0] == straight[1] && straight[1] == straight[2] {
+            straight
+        } else {
+            to_srgb.map(|row| row[0] * straight[0] + row[1] * straight[1] + row[2] * straight[2])
+        };
+        let encoded = linear.map(|v| {
+            let v = v.clamp(0.0, 1.0);
+            if v == 1.0 {
+                1.0
+            } else if v <= 0.0031308 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
+        });
+        let encoded = if posterize {
+            encoded.map(|v| (v * (parameter - 1.0) + 0.5).floor() / (parameter - 1.0))
+        } else {
+            let y = if encoded[0] == encoded[1] && encoded[1] == encoded[2] {
+                encoded[0]
+            } else {
+                encoded[0] * 0.299 + encoded[1] * 0.587 + encoded[2] * 0.114
+            };
+            [if y >= parameter { 1.0 } else { 0.0 }; 3]
+        };
+        let decoded = encoded.map(|v| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        let rgb = to_ap1.map(|row| row[0] * decoded[0] + row[1] * decoded[1] + row[2] * decoded[2]);
+        [
+            rgb[0] * p[3] as f64,
+            rgb[1] * p[3] as f64,
+            rgb[2] * p[3] as f64,
+            p[3] as f64,
+        ]
+    }
+    fn desaturate_reference(p: [f32; 4]) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        if p[0] == p[1] && p[1] == p[2] {
+            return p.map(f64::from);
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let rgb = a
+            .map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+            .map(|v| {
+                let x = v.abs();
+                if x <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    v.signum() * (1.055 * x.powf(1.0 / 2.4) - 0.055)
+                }
+            });
+        let g = (rgb.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+            + rgb.iter().copied().fold(f64::INFINITY, f64::min))
+            / 2.0;
+        let light = if g.abs() <= 0.04045 {
+            g / 12.92
+        } else {
+            g.signum() * ((g.abs() + 0.055) / 1.055).powf(2.4)
+        };
+        let rgb = b.map(|r| (r[0] + r[1] + r[2]) * light * p[3] as f64);
+        [rgb[0], rgb[1], rgb[2], p[3] as f64]
+    }
+    fn transfer_invert_reference(p: [f32; 4]) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let linear = a.map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]);
+        let decoded = linear.map(|v| {
+            let s = if v.abs() <= 0.0031308 {
+                12.92 * v
+            } else {
+                v.signum() * (1.055 * v.abs().powf(1.0 / 2.4) - 0.055)
+            };
+            let n = 1.0 - s;
+            if n.abs() <= 0.04045 {
+                n / 12.92
+            } else {
+                n.signum() * ((n.abs() + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        let out = b.map(|r| {
+            ((r[0] * decoded[0] + r[1] * decoded[1] + r[2] * decoded[2]) * p[3] as f64)
+                .clamp(-65504.0, 65504.0)
+        });
+        [out[0], out[1], out[2], p[3] as f64]
+    }
+    /// Independent binary64 reference for the established diagnostic numeric effect.
+    fn unpremultiply_reference(p: [f32; 4]) -> [f64; 4] {
+        let a = (p[3] as f64).clamp(0.0, 1.0);
+        if a > 0.000001 {
+            [
+                (p[0] as f64 / a).clamp(-65504.0, 65504.0),
+                (p[1] as f64 / a).clamp(-65504.0, 65504.0),
+                (p[2] as f64 / a).clamp(-65504.0, 65504.0),
+                a,
+            ]
+        } else {
+            [0.0; 4]
+        }
+    }
+    #[tokio::test]
+    async fn native_deflicker_mcp_shared_owners_and_upstream_correction_exports() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        use std::io::Write;
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_DEFLICKER_OWNER_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-deflicker-owners-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mkv");
+        let mut child = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                "16x16",
+                "-framerate",
+                "30",
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+            ])
+            .arg(&source)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut input = child.stdin.take().unwrap();
+            for frame in 0..12 {
+                input
+                    .write_all(&vec![
+                        if (frame / 2) % 2 == 0 { 80 } else { 110 };
+                        16 * 16 * 3
+                    ])
+                    .unwrap();
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        let state = test_state();
+        let mut project = TimelineProject::new();
+        let mut seq = Sequence::new("Native Deflicker owners", FrameRate::FPS_30, 16, 16);
+        let sid = seq.id;
+        let tpf = seq.frame_rate.ticks_per_frame().0;
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut asset = MediaAsset::from_file(AssetKind::Video, &source);
+        asset.probe = Some(photonic_video::media::probe::probe_asset(&tools, &source).unwrap());
+        let aid = project.media.insert(asset);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let tid = track.id;
+        let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(12 * tpf));
+        let cid = clip.id;
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        project.active_sequence = Some(sid);
+        project.insert_sequence(seq);
+        state.document.lock().await.timeline = Some(project);
+        assert!(engine_available(&state).await, "GPU required");
+        let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"bt709_scene","range":"limited","matrix":"bt709"}}))).await;
+        assert_ne!(tag.is_error, Some(true));
+        let scopes = [
+            json!({"scope":"asset","asset_id":aid}),
+            json!({"scope":"clip","clip_id":cid}),
+            json!({"scope":"track","track_id":tid}),
+            json!({"scope":"master","sequence_id":sid}),
+        ];
+        let with = |scope: &Value, extra: Value| {
+            let mut v = scope.clone();
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            v
+        };
+        for scope in &scopes {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(scope, json!({"op":"add","effect_id":"color.deflicker"})),
+            ))
+            .await;
+        }
+        let mut receipts = Vec::new();
+        let mut baseline_spread = 0.0;
+        let mut single_spread = 0.0;
+        let spread = |v: &[f64]| {
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+        for (name, enabled) in [
+            ("baseline", [false; 4]),
+            ("asset", [true, false, false, false]),
+            ("clip", [false, true, false, false]),
+            ("track", [false, false, true, false]),
+            ("master", [false, false, false, true]),
+            ("stacked", [true; 4]),
+        ] {
+            for (i, scope) in scopes.iter().enumerate() {
+                let edit=Box::pin(call(&state,"effect_stack",with(scope,json!({"op":"set_param","index":0,"path":"enabled","value":{"t":"bool","v":enabled[i]}})))).await;
+                assert_ne!(edit.is_error, Some(true), "{edit:?}");
+            }
+            for frame in [0, 5, 11] {
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{name}:{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|c| match c {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (16, 16)
+                );
+                std::fs::write(root.join(format!("{name}-frame-{frame}.png")), bytes).unwrap();
+            }
+            let movie = root.join(format!("{name}.mov"));
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{name}:{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{name}:{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args(["-f", "rawvideo", "-pix_fmt", "gray16le", "pipe:1"])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 12 * 16 * 16 * 2);
+            let means: Vec<f64> = decoded
+                .stdout
+                .chunks_exact(16 * 16 * 2)
+                .map(|f| {
+                    f.chunks_exact(2)
+                        .map(|v| u16::from_le_bytes([v[0], v[1]]) as f64 / 65535.0)
+                        .sum::<f64>()
+                        / 256.0
+                })
+                .collect();
+            let sd = spread(&means);
+            if name == "baseline" {
+                assert!(sd > 0.01);
+                baseline_spread = sd;
+            } else {
+                assert!(
+                    sd < baseline_spread * 0.5,
+                    "{name}: {sd} vs {baseline_spread}, {means:?}"
+                );
+                if name == "asset" {
+                    single_spread = sd;
+                }
+                if name == "stacked" {
+                    assert!(sd<=single_spread+0.004,"upstream-corrected inputs must not be corrected as if still raw: {sd}/{single_spread}");
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":root.join(format!("{name}.photon"))}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true));
+            let restored = Document::from_json(
+                &std::fs::read_to_string(root.join(format!("{name}.photon"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            receipts.push(json!({"scope":name,"enabled":enabled,"mean_curve":means,"stddev":sd}));
+        }
+        // The second use starts at source frame six, the opposite flicker phase.
+        // Shared-asset gains must be keyed by each trimmed clip context.
+        for (i, scope) in scopes.iter().enumerate() {
+            let edit=Box::pin(call(&state,"effect_stack",with(scope,json!({"op":"set_param","index":0,"path":"enabled","value":{"t":"bool","v":i==0}})))).await;
+            assert_ne!(edit.is_error, Some(true), "{edit:?}");
+        }
+        let split = Box::pin(call(
+            &state,
+            "split_clip",
+            json!({"clip_id":cid,"at_ticks":6*tpf}),
+        ))
+        .await;
+        assert_ne!(split.is_error, Some(true), "{split:?}");
+        let reused_movie = root.join("asset-reused-trimmed.mov");
+        let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":reused_movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(export.is_error, Some(true), "{export:?}");
+        let result = poll_job(&state, &data(&export)["job_id"]).await;
+        assert_eq!(result["status"]["state"], "done", "{result}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&reused_movie),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&reused_movie)
+            .args(["-f", "rawvideo", "-pix_fmt", "gray16le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 12 * 16 * 16 * 2);
+        let reused_means: Vec<f64> = decoded
+            .stdout
+            .chunks_exact(16 * 16 * 2)
+            .map(|f| {
+                f.chunks_exact(2)
+                    .map(|v| u16::from_le_bytes([v[0], v[1]]) as f64 / 65535.0)
+                    .sum::<f64>()
+                    / 256.0
+            })
+            .collect();
+        let baseline_means: Vec<f64> = receipts[0]["mean_curve"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        for half in 0..2 {
+            let a = half * 6;
+            assert!(
+                spread(&reused_means[a..a + 6]) < spread(&baseline_means[a..a + 6]) * 0.5,
+                "trim context {half}: {reused_means:?}"
+            );
+        }
+        receipts.push(json!({"scope":"asset-reused-trimmed","mean_curve":reused_means,"independent_contexts":2}));
+        std::fs::write(root.join("checks.json"),serde_json::to_vec_pretty(&json!({"cases":receipts,"movies":7,"previews":18,"save_history":true,"upstream_inputs_measured":true})).unwrap()).unwrap();
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_deflicker_mcp_clip_animation_history_preview_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        use std::io::Write;
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_NATIVE_DEFLICKER_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-deflicker-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.mkv");
+        let mut child = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pixel_format",
+                "rgb24",
+                "-video_size",
+                "16x16",
+                "-framerate",
+                "30",
+                "-i",
+                "pipe:0",
+                "-an",
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv444p",
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709",
+                "-color_trc",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+            ])
+            .arg(&source)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            let mut input = child.stdin.take().unwrap();
+            for frame in 0..12 {
+                input
+                    .write_all(&vec![
+                        if (frame / 2) % 2 == 0 { 80 } else { 110 };
+                        16 * 16 * 3
+                    ])
+                    .unwrap();
+            }
+        }
+        assert!(child.wait().unwrap().success());
+        let state = test_state();
+        let mut project = TimelineProject::new();
+        let mut seq = Sequence::new("Native Deflicker", FrameRate::FPS_30, 16, 16);
+        let sid = seq.id;
+        let tpf = seq.frame_rate.ticks_per_frame().0;
+        seq.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut asset = MediaAsset::from_file(AssetKind::Video, &source);
+        asset.probe = Some(photonic_video::media::probe::probe_asset(&tools, &source).unwrap());
+        let aid = project.media.insert(asset);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let tid = track.id;
+        let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(12 * tpf));
+        let cid = clip.id;
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        project.active_sequence = Some(sid);
+        project.insert_sequence(seq);
+        state.document.lock().await.timeline = Some(project);
+        assert!(engine_available(&state).await, "GPU required");
+        let tagged=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"bt709_scene","range":"limited","matrix":"bt709"}}))).await;
+        assert_ne!(tagged.is_error, Some(true), "{tagged:?}");
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "effect_stack",
+            json!({"scope":"clip","clip_id":cid,"op":"add","effect_id":"color.deflicker"}),
+        ))
+        .await;
+        let keys:Vec<_>=[(0,0.7),(11*tpf,1.0)].into_iter().map(|(at,v)|json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":"params.amount","at_ticks":at,"value":{"t":"float","v":v},"interp":{"kind":"linear"}})).collect();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "batch_set_keyframes",
+            json!({"ops":keys}),
+        ))
+        .await;
+        let mut curves = Vec::new();
+        for enabled in [false, true] {
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",json!({"scope":"clip","clip_id":cid,"op":"set_param","index":0,"path":"enabled","value":{"t":"bool","v":enabled}}))).await;
+            if enabled {
+                for frame in [0, 5, 11] {
+                    let result=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                    assert_ne!(result.is_error, Some(true), "{result:?}");
+                    let bytes = result
+                        .content
+                        .iter()
+                        .find_map(|c| match c {
+                            ContentItem::Image { data, .. } => {
+                                Some(general_purpose::STANDARD.decode(data).unwrap())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        image::load_from_memory(&bytes)
+                            .unwrap()
+                            .to_rgba8()
+                            .dimensions(),
+                        (16, 16)
+                    );
+                    std::fs::write(root.join(format!("frame-{frame}.png")), bytes).unwrap();
+                }
+            }
+            let movie = root.join(if enabled {
+                "corrected.mov"
+            } else {
+                "baseline.mov"
+            });
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args(["-f", "rawvideo", "-pix_fmt", "gray16le", "pipe:1"])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 12 * 16 * 16 * 2);
+            let means: Vec<f64> = decoded
+                .stdout
+                .chunks_exact(16 * 16 * 2)
+                .map(|frame| {
+                    frame
+                        .chunks_exact(2)
+                        .map(|v| u16::from_le_bytes([v[0], v[1]]) as f64 / 65535.0)
+                        .sum::<f64>()
+                        / 256.0
+                })
+                .collect();
+            curves.push(means);
+        }
+        let spread = |v: &[f64]| {
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt()
+        };
+        assert!(spread(&curves[0]) > 0.01);
+        assert!(spread(&curves[1]) < spread(&curves[0]) * 0.5, "{curves:?}");
+        let saved = Box::pin(call(
+            &state,
+            "save_document",
+            json!({"path":root.join("input.photon")}),
+        ))
+        .await;
+        assert_ne!(saved.is_error, Some(true), "{saved:?}");
+        let restored =
+            Document::from_json(&std::fs::read_to_string(root.join("input.photon")).unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&*state.document.lock().await).unwrap()
+        );
+        let before_analysis_keys = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let keys:Vec<_>=[("params.window",0.2,0.4),("params.max_change",0.25,0.4)].into_iter().flat_map(|(path,a,b)|[(0,a),(11*tpf,b)].into_iter().map(move|(at,v)|json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":v},"interp":{"kind":"linear"}}))).collect();
+        let edit = Box::pin(call(&state, "batch_set_keyframes", json!({"ops":keys}))).await;
+        assert_ne!(edit.is_error, Some(true), "{edit:?}");
+        let movie = root.join("animated-analysis.mov");
+        let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(export.is_error, Some(true), "{export:?}");
+        let done = poll_job(&state, &data(&export)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&movie),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&movie)
+            .args(["-f", "rawvideo", "-pix_fmt", "gray16le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 12 * 16 * 16 * 2);
+        let means: Vec<f64> = decoded
+            .stdout
+            .chunks_exact(16 * 16 * 2)
+            .map(|frame| {
+                frame
+                    .chunks_exact(2)
+                    .map(|v| u16::from_le_bytes([v[0], v[1]]) as f64 / 65535.0)
+                    .sum::<f64>()
+                    / 256.0
+            })
+            .collect();
+        assert!(
+            spread(&means) < spread(&curves[0]) * 0.5,
+            "animated analysis {means:?}"
+        );
+        curves.push(means);
+        let undo = Box::pin(call(&state, "undo", json!({}))).await;
+        assert_ne!(undo.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before_analysis_keys
+        );
+        let duplicate = Box::pin(call(
+            &state,
+            "effect_stack",
+            json!({"scope":"clip","clip_id":cid,"op":"add","effect_id":"color.deflicker"}),
+        ))
+        .await;
+        assert_ne!(duplicate.is_error, Some(true));
+        let duplicate_movie = root.join("stacked-clip.mov");
+        let exported=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":duplicate_movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+        assert_ne!(exported.is_error, Some(true), "{exported:?}");
+        let done = poll_job(&state, &data(&exported)["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&duplicate_movie),
+        )
+        .unwrap();
+        let decoded = std::process::Command::new(&tools.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&duplicate_movie)
+            .args(["-f", "rawvideo", "-pix_fmt", "gray16le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(decoded.status.success());
+        assert_eq!(decoded.stdout.len(), 12 * 16 * 16 * 2);
+        let duplicate_means: Vec<f64> = decoded
+            .stdout
+            .chunks_exact(16 * 16 * 2)
+            .map(|f| {
+                f.chunks_exact(2)
+                    .map(|v| u16::from_le_bytes([v[0], v[1]]) as f64 / 65535.0)
+                    .sum::<f64>()
+                    / 256.0
+            })
+            .collect();
+        assert!(
+            spread(&duplicate_means) <= spread(&curves[1]) + 0.004,
+            "stacked clip must measure its corrected input: {duplicate_means:?}"
+        );
+        let undo = Box::pin(call(&state, "undo", json!({}))).await;
+        assert_ne!(undo.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before_analysis_keys
+        );
+        let lock = Box::pin(call(
+            &state,
+            "set_track_prop",
+            json!({"track_id":tid,"locked":true}),
+        ))
+        .await;
+        assert_ne!(lock.is_error, Some(true));
+        let rev = state.history.lock().await.revision();
+        let refused = Box::pin(call(
+            &state,
+            "effect_stack",
+            json!({"scope":"clip","clip_id":cid,"op":"remove","index":0}),
+        ))
+        .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(rev, state.history.lock().await.revision());
+        std::fs::write(root.join("checks.json"),serde_json::to_vec_pretty(&json!({"baseline":curves[0],"corrected":curves[1],"baseline_stddev":spread(&curves[0]),"corrected_stddev":spread(&curves[1]),"previews":3,"movies":4,"stacked_clip_curve":duplicate_means,"scope":"clip","animated":"amount0.7to1,window0.2to0.4,max_change0.25to0.4","animated_analysis":curves[2],"animated_analysis_stddev":spread(&curves[2]),"save_history_lock":true})).unwrap()).unwrap();
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_unpremultiply_mcp_all_owners_history_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_UNPREMULTIPLY_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-unpremultiply-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "util.unpremultiply";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Unpremultiply", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Unpremultiply"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            for enabled in [false, true] {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"enabled","value":{"t":"bool","v":enabled}})))).await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| unpremultiply_reference(p.map(|v| v as f32)))
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"effect":effect_id,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_transfer_invert_mcp_all_owners_history_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_TRANSFER_INVERT_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-transfer-invert-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "color.invert_raster";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Transfer Invert", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Transfer Invert"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            for enabled in [false, true] {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"enabled","value":{"t":"bool","v":enabled}})))).await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| transfer_invert_reference(p.map(|v| v as f32)))
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"effect":effect_id,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_desaturate_mcp_all_owners_history_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_DESATURATE_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-desaturate-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "color.desaturate";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Desaturate", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Desaturate"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            for enabled in [false, true] {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"enabled","value":{"t":"bool","v":enabled}})))).await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| desaturate_reference(p.map(|v| v as f32)))
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(json!({"frame":frame,"effect":effect_id,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn transfer_matrix_reference(p: [f32; 4], matrix: [[f32; 3]; 3]) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        if matrix == [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+            return p.map(f64::from);
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let rgb = a
+            .map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+            .map(|v| {
+                let x = v.abs();
+                if x <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    v.signum() * (1.055 * x.powf(1.0 / 2.4) - 0.055)
+                }
+            });
+        let rgb = matrix
+            .map(|r| r[0] as f64 * rgb[0] + r[1] as f64 * rgb[1] + r[2] as f64 * rgb[2])
+            .map(|v| {
+                if v.abs() <= 0.04045 {
+                    v / 12.92
+                } else {
+                    v.signum() * ((v.abs() + 0.055) / 1.055).powf(2.4)
+                }
+            });
+        let rgb = b.map(|r| (r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]) * p[3] as f64);
+        [rgb[0], rgb[1], rgb[2], p[3] as f64]
+    }
+    #[tokio::test]
+    async fn native_transfer_matrix_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_TRANSFER_MATRIX_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-transfer-matrix-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for case in 0..8 {
+            let which = case % 4;
+            let bw = case >= 4;
+            let effect_id = if bw {
+                "color.black_and_white"
+            } else {
+                "color.channel_mixer"
+            };
+            let path = if bw { "params.wr" } else { "params.rg" };
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native transfer matrix", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native transfer matrix"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = if bw {
+                [0.0, 0.2, 0.7, 1.0][which]
+            } else {
+                [-1.0, 0.25, 0.5, 1.5][which]
+            };
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            if which == 1 {
+                let values = if bw { [0.0, 1.0] } else { [-0.5, 0.5] };
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,values[0]),key(2*tpf,values[1])]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("case-{case}-scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 {
+                    if bw {
+                        frame as f64 * 0.5
+                    } else {
+                        -0.5 + frame as f64 * 0.5
+                    }
+                } else {
+                    parameter
+                };
+                let matrix = if bw {
+                    let sum = value + 0.587 + 0.114;
+                    [[
+                        (value / sum) as f32,
+                        (0.587 / sum) as f32,
+                        (0.114 / sum) as f32,
+                    ]; 3]
+                } else {
+                    [[1.0, value as f32, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+                };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| transfer_matrix_reference(p.map(|v| v as f32), matrix))
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":if bw{1.01}else{2.01}}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    fn photo_filter_reference(
+        p: [f32; 4],
+        color: [f32; 3],
+        density: f32,
+        preserve: bool,
+    ) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        if density == 0.0 || color == [1.0; 3] {
+            return p.map(f64::from);
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let rgb = a
+            .map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+            .map(|v| {
+                let x = v.abs();
+                if x <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    v.signum() * (1.055 * x.powf(1.0 / 2.4) - 0.055)
+                }
+            });
+        let mut filtered = [0.0; 3];
+        for i in 0..3 {
+            filtered[i] =
+                rgb[i] * (1.0 - density as f64) + rgb[i] * color[i] as f64 * density as f64;
+        }
+        if preserve {
+            let before = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+            let after = 0.299 * filtered[0] + 0.587 * filtered[1] + 0.114 * filtered[2];
+            if after > 0.0001 {
+                for c in &mut filtered {
+                    *c *= before / after;
+                }
+            }
+        }
+        let rgb = filtered.map(|v| {
+            if v.abs() <= 0.04045 {
+                v / 12.92
+            } else {
+                v.signum() * ((v.abs() + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        let rgb = b.map(|r| (r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]) * p[3] as f64);
+        [rgb[0], rgb[1], rgb[2], p[3] as f64]
+    }
+    fn color_balance_reference(p: [f32; 4], shifts: [[f32; 3]; 3], preserve: bool) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        if shifts == [[0.0; 3]; 3] {
+            return p.map(f64::from);
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let rgb = a
+            .map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+            .map(|v| {
+                let x = v.abs();
+                if x <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    v.signum() * (1.055 * x.powf(1.0 / 2.4) - 0.055)
+                }
+            });
+        let original = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+        let sw = (1.0 - 2.0 * original).clamp(0.0, 1.0);
+        let hw = (2.0 * original - 1.0).clamp(0.0, 1.0);
+        let mw = (1.0 - sw - hw).clamp(0.0, 1.0);
+        let mut filtered = [0.0; 3];
+        for i in 0..3 {
+            filtered[i] = rgb[i]
+                + 0.5
+                    * (shifts[0][i] as f64 * sw
+                        + shifts[1][i] as f64 * mw
+                        + shifts[2][i] as f64 * hw);
+        }
+        if preserve {
+            let after = 0.299 * filtered[0] + 0.587 * filtered[1] + 0.114 * filtered[2];
+            if after > 0.0001 {
+                for c in &mut filtered {
+                    *c *= original / after;
+                }
+            }
+        }
+        let rgb = filtered.map(|v| {
+            if v.abs() <= 0.04045 {
+                v / 12.92
+            } else {
+                v.signum() * ((v.abs() + 0.055) / 1.055).powf(2.4)
+            }
+        });
+        let rgb = b.map(|r| (r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]) * p[3] as f64);
+        [rgb[0], rgb[1], rgb[2], p[3] as f64]
+    }
+    fn catalog_curve_reference(p: [f32; 4], knots: [[f32; 2]; 5], contrast: f32) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        let mut points: Vec<_> = knots.map(|k| [k[0] as f64, k[1] as f64]).to_vec();
+        if contrast.abs() > 1e-6 {
+            points[2][1] = (0.5 + contrast as f64 * 0.25).clamp(0.05, 0.95);
+        }
+        points.sort_by(|a, b| a[0].total_cmp(&b[0]));
+        points.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6);
+        if points.len() < 2 || points.iter().all(|k| k[0] == k[1]) {
+            return p.map(f64::from);
+        }
+        let n = points.len();
+        let slopes: Vec<_> = points
+            .windows(2)
+            .map(|q| (q[1][1] - q[0][1]) / (q[1][0] - q[0][0]))
+            .collect();
+        let mut tangent = vec![0.0; n];
+        tangent[0] = slopes[0];
+        tangent[n - 1] = slopes[n - 2];
+        for i in 1..n - 1 {
+            if slopes[i - 1] * slopes[i] > 0.0 {
+                tangent[i] = (slopes[i - 1] + slopes[i]) * 0.5;
+            }
+        }
+        for i in 0..n - 1 {
+            if slopes[i].abs() < 1e-12 {
+                tangent[i] = 0.0;
+                tangent[i + 1] = 0.0;
+            } else {
+                let a = tangent[i] / slopes[i];
+                let b = tangent[i + 1] / slopes[i];
+                let norm = a * a + b * b;
+                if norm > 9.0 {
+                    let t = 3.0 / norm.sqrt();
+                    tangent[i] = t * a * slopes[i];
+                    tangent[i + 1] = t * b * slopes[i];
+                }
+            }
+        }
+        let sample = |x: f64| {
+            if x <= points[0][0] {
+                return points[0][1] + (x - points[0][0]) * tangent[0];
+            }
+            if x >= points[n - 1][0] {
+                return points[n - 1][1] + (x - points[n - 1][0]) * tangent[n - 1];
+            }
+            let i = points
+                .windows(2)
+                .position(|q| x >= q[0][0] && x <= q[1][0])
+                .unwrap();
+            let h = points[i + 1][0] - points[i][0];
+            let t = (x - points[i][0]) / h;
+            let t2 = t * t;
+            let t3 = t2 * t;
+            (2.0 * t3 - 3.0 * t2 + 1.0) * points[i][1]
+                + (t3 - 2.0 * t2 + t) * h * tangent[i]
+                + (-2.0 * t3 + 3.0 * t2) * points[i + 1][1]
+                + (t3 - t2) * h * tangent[i + 1]
+        };
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let rgb = a
+            .map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+            .map(|v| {
+                let x = v.abs();
+                if x <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    v.signum() * (1.055 * x.powf(1.0 / 2.4) - 0.055)
+                }
+            })
+            .map(sample)
+            .map(|v| {
+                if v.abs() <= 0.04045 {
+                    v / 12.92
+                } else {
+                    v.signum() * ((v.abs() + 0.055) / 1.055).powf(2.4)
+                }
+            });
+        let rgb = b.map(|r| {
+            ((r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]) * p[3] as f64).clamp(-65504.0, 65504.0)
+        });
+        [rgb[0], rgb[1], rgb[2], p[3] as f64]
+    }
+    fn levels_reference(
+        p: [f32; 4],
+        black_white: [f32; 2],
+        gamma: f32,
+        output: [f32; 2],
+    ) -> [f64; 4] {
+        if p[3] <= 0.0 {
+            return [0.0; 4];
+        }
+        if black_white == [0.0, 1.0] && gamma == 1.0 && output == [0.0, 1.0] {
+            return p.map(f64::from);
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let rgb = [
+            p[0] as f64 / p[3] as f64,
+            p[1] as f64 / p[3] as f64,
+            p[2] as f64 / p[3] as f64,
+        ];
+        let rgb = a
+            .map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+            .map(|v| {
+                let x = v.abs();
+                if x <= 0.0031308 {
+                    v * 12.92
+                } else {
+                    v.signum() * (1.055 * x.powf(1.0 / 2.4) - 0.055)
+                }
+            });
+        let span = (black_white[1] as f64 - black_white[0] as f64).max(0.0001);
+        let rgb = rgb
+            .map(|v| {
+                let n = (v - black_white[0] as f64) / span;
+                let bounded = n.clamp(0.0, 1.0);
+                output[0] as f64
+                    + (bounded.powf(1.0 / gamma as f64) + (n - bounded))
+                        * (output[1] as f64 - output[0] as f64)
+            })
+            .map(|v| {
+                if v.abs() <= 0.04045 {
+                    v / 12.92
+                } else {
+                    v.signum() * ((v.abs() + 0.055) / 1.055).powf(2.4)
+                }
+            });
+        let rgb = b.map(|r| {
+            ((r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]) * p[3] as f64).clamp(-65504.0, 65504.0)
+        });
+        [rgb[0], rgb[1], rgb[2], p[3] as f64]
+    }
+    fn alpha_view_reference(p: [f32; 4], mode: u8) -> [f64; 4] {
+        let a = (p[3] as f64).clamp(0.0, 1.0);
+        match mode {
+            1 => p.map(f64::from),
+            2 => {
+                if a > 0.000001 {
+                    [
+                        (p[0] as f64 / a).clamp(-65504.0, 65504.0),
+                        (p[1] as f64 / a).clamp(-65504.0, 65504.0),
+                        (p[2] as f64 / a).clamp(-65504.0, 65504.0),
+                        1.0,
+                    ]
+                } else {
+                    [0.0, 0.0, 0.0, 1.0]
+                }
+            }
+            _ => [a, a, a, 1.0],
+        }
+    }
+    #[tokio::test]
+    async fn native_alpha_view_mcp_authoring_modes_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_ALPHA_VIEW_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-alpha-view-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "util.alpha_view";
+            let path = "params.mode";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Alpha View", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Alpha View"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = [0.0, 1.0, 2.0, 0.0][which];
+            if parameter != 0.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            }
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,0.0),key(2*tpf,2.0)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 { frame as f64 } else { parameter };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| {
+                        alpha_view_reference(p.map(|v| v as f32), (value as f32).round() as u8)
+                    })
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":2.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_levels_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_LEVELS_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-levels-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "color.levels";
+            let path = "params.gamma";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Levels", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Levels"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = [0.5, 0.75, 2.0, 4.0][which];
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,0.5),key(2*tpf,2.0)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 {
+                    0.5 + frame as f64 * 0.75
+                } else {
+                    parameter
+                };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| {
+                        levels_reference(p.map(|v| v as f32), [0.0, 1.0], value as f32, [0.0, 1.0])
+                    })
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":10.0}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_catalog_curves_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_CATALOG_CURVES_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-catalog-curves-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "color.curves";
+            let path = "params.p2y";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Catalog Curves", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Catalog Curves"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = [0.25, 0.35, 0.75, 1.0][which];
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,0.2),key(2*tpf,0.8)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 {
+                    0.2 + frame as f64 * 0.3
+                } else {
+                    parameter
+                };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| {
+                        catalog_curve_reference(
+                            p.map(|v| v as f32),
+                            [
+                                [0.0, 0.0],
+                                [0.25, 0.25],
+                                [0.5, value as f32],
+                                [0.75, 0.75],
+                                [1.0, 1.0],
+                            ],
+                            0.0,
+                        )
+                    })
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":1.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_color_balance_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_COLOR_BALANCE_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-color-balance-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "color.color_balance";
+            let path = "params.midtones_r";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Color Balance", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Color Balance"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = [-0.5, 0.25, 0.5, 0.75][which];
+            let preserve_parameter = [0.0, 0.5, 0.5000000596046448, 1.0][which];
+            let preserve = preserve_parameter as f32 > 0.5;
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            if preserve_parameter != 1.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.preserve_luminosity","value":{"t":"float","v":preserve_parameter}})))).await;
+            }
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,-0.4),key(2*tpf,0.4)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 {
+                    -0.4 + frame as f64 * 0.4
+                } else {
+                    parameter
+                };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| {
+                        color_balance_reference(
+                            p.map(|v| v as f32),
+                            [[0.0; 3], [value as f32, 0.0, 0.0], [0.0; 3]],
+                            preserve,
+                        )
+                    })
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":1.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_photo_filter_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_PHOTO_FILTER_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-photo-filter-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "color.photo_filter";
+            let path = "params.density";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native Photo Filter", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native Photo Filter"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = [0.0, 0.4, 0.75, 1.0][which];
+            let preserve_parameter = [0.0, 0.5, 0.5000000596046448, 1.0][which];
+            let preserve = preserve_parameter as f32 > 0.5;
+            let color = [1.0, 0.5, 0.2];
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            if preserve_parameter != 1.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.preserve_luminosity","value":{"t":"float","v":preserve_parameter}})))).await;
+            }
+            if which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,0.0),key(2*tpf,1.0)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 {
+                    frame as f64 * 0.5
+                } else {
+                    parameter
+                };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| {
+                        photo_filter_reference(p.map(|v| v as f32), color, value as f32, preserve)
+                    })
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":1.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_transfer_artistic_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_TRANSFER_ARTISTIC_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-transfer-artistic-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for case in 0..8 {
+            let which = case % 4;
+            let posterize = case < 4;
+            let effect_id = if posterize {
+                "color.posterize"
+            } else {
+                "color.threshold"
+            };
+            let path = if posterize {
+                "params.levels"
+            } else {
+                "params.level"
+            };
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native transfer artistic", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native transfer artistic"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let parameter = if posterize {
+                [2.0, 5.0, 8.0, 255.0][which]
+            } else {
+                [0.0, 0.4, 0.6, 1.0][which]
+            };
+            Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":parameter}})))).await;
+            if which == 1 {
+                let values = if posterize { [2.0, 6.0] } else { [0.25, 0.5] };
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,values[0]),key(2*tpf,values[1])]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("case-{case}-scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let value = if which == 1 {
+                    if posterize {
+                        2.0 + frame as f64 * 2.0
+                    } else {
+                        0.25 + frame as f64 * 0.125
+                    }
+                } else {
+                    parameter
+                };
+                let expected: Vec<_> = input
+                    .iter()
+                    .map(|p| transfer_artistic_reference(p.map(|v| v as f32), posterize, value))
+                    .collect();
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameter":value,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":if posterize{255.01}else{1.01}}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_outline_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_OUTLINE_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-outline-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |values: [f64; 5]| {
+            let color = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                values[1], values[2], values[3],
+            ]);
+            let sites: Vec<_> = (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .filter(|&(x, y)| input[(y * w + x) as usize][3] >= 0.5)
+                .collect();
+            (0..h)
+                .flat_map(|y| (0..w).map(move |x| (x, y)))
+                .map(|(x, y)| {
+                    let src = input[(y * w + x) as usize];
+                    if values[0] == 0.0 || values[4] == 0.0 {
+                        return src;
+                    }
+                    let d = if src[3] >= 0.5 {
+                        -1.0
+                    } else {
+                        sites
+                            .iter()
+                            .map(|&(sx, sy)| (x as f64 - sx as f64).hypot(y as f64 - sy as f64))
+                            .fold(f64::INFINITY, f64::min)
+                    };
+                    let t = ((d - (values[0] - 1.0)) / 2.0).clamp(0.0, 1.0);
+                    let a = (1.0 - t * t * (3.0 - 2.0 * t)) * values[4] * (1.0 - src[3]);
+                    [
+                        src[0] + color[0] * a,
+                        src[1] + color[1] * a,
+                        src[2] + color[2] * a,
+                        src[3] + a,
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        for which in 0..4 {
+            let effect_id = "util.outline";
+            let paths = [
+                "params.thickness",
+                "params.r",
+                "params.g",
+                "params.b",
+                "params.opacity",
+            ];
+            let path = paths[0];
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native outline", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native outline"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let values = [1.25, 0.8, 0.1, 0.3, 0.7];
+            for (i, path) in paths.iter().enumerate() {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":values[i]}})))).await;
+            }
+            if which == 1 {
+                let target = [4.5, 0.2, 0.7, 0.9, 0.9];
+                let mut keys = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    for (at, value) in [(0, values[i]), (2 * tpf, target[i])] {
+                        keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                    }
+                }
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":keys}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let target = [4.5, 0.2, 0.7, 0.9, 0.9];
+                let c = if which == 1 {
+                    std::array::from_fn(|i| {
+                        values[i] + (target[i] - values[i]) * frame as f64 / 2.0
+                    })
+                } else {
+                    values
+                };
+                let expected = reference(c);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameters":c,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":64.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Independent binary64 piecewise HSL/envelope reference. Input/output are AP1.
+    fn linear_hsl_reference(pixel: [f32; 4], vibrance: bool, c: [f64; 3]) -> [f64; 4] {
+        let alpha = pixel[3] as f64;
+        if alpha <= 0.0 {
+            return [0.0; 4];
+        }
+        if c == [0.0; 3] {
+            return pixel.map(f64::from);
+        }
+        let rgb = photonic_video::color::native::ap1_to_linear_srgb().transform([
+            pixel[0] as f64 / alpha,
+            pixel[1] as f64 / alpha,
+            pixel[2] as f64 / alpha,
+        ]);
+        let lo = rgb.into_iter().fold(f64::INFINITY, f64::min);
+        let hi = rgb.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        let spread = (hi - lo) / lo.abs().max(hi.abs()).max(1.0);
+        if vibrance && spread <= 1e-6 {
+            return pixel.map(f64::from);
+        }
+        let low = 2.0 * lo.min(0.0);
+        let high = 1.0 + 2.0 * (hi - 1.0).max(0.0);
+        let u = rgb.map(|v| (v - low) / (high - low));
+        let min = u.into_iter().fold(f64::INFINITY, f64::min);
+        let max = u.into_iter().fold(f64::NEG_INFINITY, f64::max);
+        let d = max - min;
+        let l = (max + min) / 2.0;
+        let (mut hue, mut s) = if d.abs() < 1e-9 {
+            (0.0, 0.0)
+        } else {
+            let h = if max == u[0] {
+                ((u[1] - u[2]) / d).rem_euclid(6.0)
+            } else if max == u[1] {
+                (u[2] - u[0]) / d + 2.0
+            } else {
+                (u[0] - u[1]) / d + 4.0
+            };
+            (
+                h * 60.0,
+                (d / (1.0 - (2.0 * l - 1.0).abs()).max(1e-9)).clamp(0.0, 1.0),
+            )
+        };
+        let light = if vibrance {
+            let t = ((spread - 1e-6) / (1e-4 - 1e-6)).clamp(0.0, 1.0);
+            s = (s + c[0] * (1.0 - s) * t * t * (3.0 - 2.0 * t)).clamp(0.0, 1.0);
+            0.0
+        } else {
+            hue = (hue + c[0]).rem_euclid(360.0);
+            s = (s * (1.0 + c[1])).clamp(0.0, 1.0);
+            c[2]
+        };
+        let t = light.abs();
+        let keep = 1.0 - t;
+        let new_low = keep * low;
+        let new_high = 1.0 + keep * (high - 1.0);
+        let physical_l = keep * (hi + lo) * 0.5 + t * if light >= 0.0 { 1.0 } else { 0.0 };
+        let l = ((physical_l - new_low) / (new_high - new_low)).clamp(0.0, 1.0);
+        let chroma = (1.0 - (2.0 * l - 1.0).abs()) * s;
+        let hp = hue.rem_euclid(360.0) / 60.0;
+        let x = chroma * (1.0 - (hp.rem_euclid(2.0) - 1.0).abs());
+        let base = match hp.floor() as u8 {
+            0 => [chroma, x, 0.0],
+            1 => [x, chroma, 0.0],
+            2 => [0.0, chroma, x],
+            3 => [0.0, x, chroma],
+            4 => [x, 0.0, chroma],
+            _ => [chroma, 0.0, x],
+        };
+        let output = base.map(|v| new_low + (v + l - chroma / 2.0) * (new_high - new_low));
+        let ap1 = photonic_video::color::native::linear_srgb_to_ap1().transform(output);
+        [
+            (ap1[0] * alpha).clamp(-65504.0, 65504.0),
+            (ap1[1] * alpha).clamp(-65504.0, 65504.0),
+            (ap1[2] * alpha).clamp(-65504.0, 65504.0),
+            alpha,
+        ]
+    }
+    #[tokio::test]
+    async fn native_linear_hsl_mcp_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_LINEAR_HSL_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-linear-hsl-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 7 {
+                    [190u8, 50, 30, 128]
+                } else if x < 10 {
+                    [128, 128, 128, 192]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for vibrance in [false, true] {
+            for which in 0..4 {
+                let effect_id = if vibrance {
+                    "color.vibrance"
+                } else {
+                    "color.hue_saturation"
+                };
+                let paths = if vibrance {
+                    vec!["params.amount"]
+                } else {
+                    vec!["params.hue", "params.saturation", "params.lightness"]
+                };
+                let path = paths[0];
+                let state = test_state();
+                let mut project = TimelineProject::new();
+                let mut seq = Sequence::new("Native linear HSL", FrameRate::FPS_30, w, h);
+                let sid = seq.id;
+                let tpf = seq.frame_rate.ticks_per_frame().0;
+                seq.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                let aid = project
+                    .media
+                    .insert(MediaAsset::from_file(AssetKind::Image, &source));
+                let mut track = Track::new(TrackKind::Video, "V1");
+                let tid = track.id;
+                let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+                let cid = clip.id;
+                track.clips.push(clip);
+                seq.video_tracks.push(track);
+                project.active_sequence = Some(sid);
+                project.insert_sequence(seq);
+                state.document.lock().await.timeline = Some(project);
+                assert!(
+                    engine_available(&state).await,
+                    "GPU required for native linear HSL"
+                );
+                let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+                assert_ne!(tag.is_error, Some(true), "{tag:?}");
+                let scope = [
+                    json!({"scope":"asset","asset_id":aid}),
+                    json!({"scope":"clip","clip_id":cid}),
+                    json!({"scope":"track","track_id":tid}),
+                    json!({"scope":"master","sequence_id":sid}),
+                ][which]
+                    .clone();
+                let with = |extra: Value| {
+                    let mut v = scope.clone();
+                    v.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    v
+                };
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"add","effect_id":effect_id})),
+                ))
+                .await;
+                let values = if vibrance {
+                    [0.5, 0.0, 0.0]
+                } else {
+                    [60.0, 0.3, 0.2]
+                };
+                for (i, path) in paths.iter().enumerate() {
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":values[i]}})))).await;
+                }
+                if which == 1 {
+                    let target = if vibrance {
+                        [-0.5, 0.0, 0.0]
+                    } else {
+                        [-60.0, -0.4, -0.2]
+                    };
+                    let mut keys = Vec::new();
+                    for (i, path) in paths.iter().enumerate() {
+                        for (at, value) in [(0, values[i]), (2 * tpf, target[i])] {
+                            keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                        }
+                    }
+                    Box::pin(graph_authoring_edit_roundtrip(
+                        &state,
+                        "batch_set_keyframes",
+                        json!({"ops":keys}),
+                    ))
+                    .await;
+                }
+                let dir = root.join(format!("effect-{}/scope-{which}", vibrance as u8));
+                std::fs::create_dir_all(&dir).unwrap();
+                let mut references = Vec::new();
+                let mut receipts = Vec::new();
+                for frame in 0..3 {
+                    let target = if vibrance {
+                        [-0.5, 0.0, 0.0]
+                    } else {
+                        [-60.0, -0.4, -0.2]
+                    };
+                    let c = if which == 1 {
+                        std::array::from_fn(|i| {
+                            values[i] + (target[i] - values[i]) * frame as f64 / 2.0
+                        })
+                    } else {
+                        values
+                    };
+                    let expected = input
+                        .iter()
+                        .map(|p| linear_hsl_reference(p.map(|v| v as f32), vibrance, c))
+                        .collect::<Vec<_>>();
+                    let measured = Box::pin(call(
+                        &state,
+                        "measure_native_output",
+                        json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                    ))
+                    .await;
+                    assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                    let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                    // Scene means are straight-color statistics over covered pixels, so
+                    // spatial alpha/color parity is checked in the high-bit export below.
+                    assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                    let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                    assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                    let bytes = preview
+                        .content
+                        .iter()
+                        .find_map(|v| match v {
+                            ContentItem::Image { data, .. } => {
+                                Some(general_purpose::STANDARD.decode(data).unwrap())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        image::load_from_memory(&bytes)
+                            .unwrap()
+                            .to_rgba8()
+                            .dimensions(),
+                        (w, h)
+                    );
+                    std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                    references.push(expected);
+                    receipts.push(
+                        json!({"frame":frame,"effect":effect_id,"parameters":c,"measurements":m}),
+                    );
+                }
+                let movie = dir.join("animation.mov");
+                let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+                assert_ne!(export.is_error, Some(true), "{export:?}");
+                let done = poll_job(&state, &data(&export)["job_id"]).await;
+                assert_eq!(done["status"]["state"], "done", "{done}");
+                photonic_video::export::manifest::verify_manifest(
+                    &photonic_video::export::manifest::manifest_path(&movie),
+                )
+                .unwrap();
+                let decoded = std::process::Command::new(&tools.ffmpeg)
+                    .args(["-v", "error", "-i"])
+                    .arg(&movie)
+                    .args([
+                        "-frames:v",
+                        "3",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgba64le",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(decoded.status.success());
+                assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+                let output =
+                    photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+                for (frame, bytes) in decoded
+                    .stdout
+                    .chunks_exact(w as usize * h as usize * 8)
+                    .enumerate()
+                {
+                    for (i, px) in bytes.chunks_exact(8).enumerate() {
+                        let p = references[frame][i];
+                        let rgb = if p[3] > 1e-6 {
+                            output
+                                .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                                .unwrap()
+                        } else {
+                            [0.0; 3]
+                        };
+                        let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                        assert!(
+                            got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                            "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                            p[3]
+                        );
+                        if p[3] > 0.025 {
+                            for c in 0..3 {
+                                let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                                assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                            }
+                        }
+                    }
+                }
+                let saved = Box::pin(call(
+                    &state,
+                    "save_document",
+                    json!({"path":dir.join("input.photon")}),
+                ))
+                .await;
+                assert_ne!(saved.is_error, Some(true), "{saved:?}");
+                let restored = Document::from_json(
+                    &std::fs::read_to_string(dir.join("input.photon")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&restored).unwrap(),
+                    serde_json::to_value(&*state.document.lock().await).unwrap()
+                );
+                std::fs::write(
+                    dir.join("checks.json"),
+                    serde_json::to_vec_pretty(
+                        &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if which == 3 {
+                    let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                    let revision = state.history.lock().await.revision();
+                    let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":(if vibrance{1.01}else{180.01})}})))).await;
+                    if invalid.is_error == Some(true) {
+                        assert_eq!(state.history.lock().await.revision(), revision);
+                    } else {
+                        let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                        assert_eq!(refused.is_error, Some(true));
+                        assert_ne!(
+                            Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                            Some(true)
+                        );
+                    }
+                    assert_eq!(
+                        serde_json::to_value(&*state.document.lock().await).unwrap(),
+                        before
+                    );
+                }
+                if which == 1 {
+                    let locked = Box::pin(call(
+                        &state,
+                        "set_track_prop",
+                        json!({"track_id":tid,"locked":true}),
+                    ))
+                    .await;
+                    assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                    assert!(
+                        state
+                            .document
+                            .lock()
+                            .await
+                            .timeline
+                            .as_ref()
+                            .unwrap()
+                            .sequences[&sid]
+                            .track(tid)
+                            .unwrap()
+                            .locked
+                    );
+                    let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                    let revision = state.history.lock().await.revision();
+                    let refused = Box::pin(call(
+                        &state,
+                        "effect_stack",
+                        with(json!({"op":"remove","index":0})),
+                    ))
+                    .await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                    assert_eq!(
+                        serde_json::to_value(&*state.document.lock().await).unwrap(),
+                        before
+                    );
+                }
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Independent binary64 authored-tap bilateral reference, with explicit bilinear
+    /// sampling and fixed independently recorded AP1-to-Rec709 coefficients.
+    fn surface_blur_reference(
+        input: &[[f32; 4]],
+        w: u32,
+        h: u32,
+        radius: u32,
+        threshold: f64,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        if radius == 0 || threshold == 0.0 {
+            return input.iter().map(|p| p.map(f64::from)).collect();
+        }
+        let matrix = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let sample = |px: f64, py: f64| {
+            let x = px.clamp(0.0, w as f64 - 1.0);
+            let y = py.clamp(0.0, h as f64 - 1.0);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            let fx = x - x0 as f64;
+            let fy = y - y0 as f64;
+            let mut p = [0.0; 4];
+            for (xx, yy, weight) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+            ] {
+                for c in 0..4 {
+                    p[c] += input[(yy * w + xx) as usize][c] as f64 * weight;
+                }
+            }
+            p
+        };
+        let sigma_s = (radius as f64).max(1.0);
+        let sigma_r = threshold.max(1.0 / 255.0);
+        let mut output = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let center = input[(y * w + x) as usize].map(f64::from);
+                if center[3] <= 0.0 {
+                    output.push([0.0; 4]);
+                    continue;
+                }
+                let mut sum = [0.0; 4];
+                for dy in -(radius as i32)..=radius as i32 {
+                    for dx in -(radius as i32)..=radius as i32 {
+                        let p = sample(
+                            x as f64 + dx as f64 * scale[0],
+                            y as f64 + dy as f64 * scale[1],
+                        );
+                        let d = [p[0] - center[0], p[1] - center[1], p[2] - center[2]];
+                        let distance = matrix
+                            .map(|m| m[0] * d[0] + m[1] * d[1] + m[2] * d[2])
+                            .into_iter()
+                            .map(|v| v * v)
+                            .sum::<f64>();
+                        let weight = (-(dx * dx + dy * dy) as f64 / (2.0 * sigma_s * sigma_s))
+                            .exp()
+                            * (-distance / (2.0 * sigma_r * sigma_r)).exp();
+                        for c in 0..4 {
+                            sum[c] += p[c] * weight;
+                        }
+                    }
+                }
+                if sum[3] > 0.0 {
+                    output.push([
+                        (sum[0] * center[3] / sum[3]).clamp(-65504.0, 65504.0),
+                        (sum[1] * center[3] / sum[3]).clamp(-65504.0, 65504.0),
+                        (sum[2] * center[3] / sum[3]).clamp(-65504.0, 65504.0),
+                        center[3],
+                    ]);
+                } else {
+                    output.push(center);
+                }
+            }
+        }
+        output
+    }
+    #[tokio::test]
+    async fn native_deflicker_mcp_upstream_capacity_refusal_and_recovery() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let retained = std::env::var_os("PHOTONIC_DEFLICKER_FAILURE_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-deflicker-failure-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (320u32, 240u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        for which in [1] {
+            let effect_id = "blur.surface";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native surface blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native surface blur"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            let added = Box::pin(call(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            assert_ne!(added.is_error, Some(true), "{added:?}");
+            let large=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":64.0}})))).await;
+            assert_ne!(large.is_error, Some(true), "{large:?}");
+            let added_analysis=Box::pin(call(&state,"effect_stack",json!({"scope":"master","sequence_id":sid,"op":"add","effect_id":"color.deflicker"}))).await;
+            assert_ne!(added_analysis.is_error, Some(true), "{added_analysis:?}");
+            let request =
+                json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"});
+            let started = std::time::Instant::now();
+            let refused = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(15),
+                "analysis must report upstream capacity error before its deadline"
+            );
+            assert_eq!(refused.is_error, Some(true), "{refused:?}");
+            let detail = format!("{refused:?}");
+            assert!(
+                detail.contains("Surface Blur") && detail.contains("256M"),
+                "{detail}"
+            );
+            let identity=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":0.0}})))).await;
+            assert_ne!(identity.is_error, Some(true), "{identity:?}");
+            let recovered = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+            assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+            let undone = Box::pin(call(&state, "undo", json!({}))).await;
+            assert_ne!(undone.is_error, Some(true));
+            let refused_again = Box::pin(call(&state, "render_frame_at", request)).await;
+            assert_eq!(refused_again.is_error, Some(true));
+            assert!(format!("{refused_again:?}").contains("256M"));
+            let movie = root.join("refused.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let result = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(result["status"]["state"], "failed", "{result}");
+            assert!(result.to_string().contains("256M"), "{result}");
+            assert!(!movie.exists(), "failed export must not publish a movie");
+            assert!(!photonic_video::export::manifest::manifest_path(&movie).exists());
+            std::fs::write(root.join("capacity-checks.json"),serde_json::to_vec_pretty(&json!({"dimensions":[w,h],"refused_radius":64,"recovered_radius":0,"refusal":detail,"undo_refusal":true})).unwrap()).unwrap();
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_surface_blur_mcp_capacity_refusal_and_recovery() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let retained = std::env::var_os("PHOTONIC_SURFACE_BLUR_CAPACITY_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-surface-blur-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (320u32, 240u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        for which in [1] {
+            let effect_id = "blur.surface";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native surface blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native surface blur"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            let added = Box::pin(call(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            assert_ne!(added.is_error, Some(true), "{added:?}");
+            let large=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":64.0}})))).await;
+            assert_ne!(large.is_error, Some(true), "{large:?}");
+            let request =
+                json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"});
+            let refused = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+            assert_eq!(refused.is_error, Some(true), "{refused:?}");
+            let detail = format!("{refused:?}");
+            assert!(
+                detail.contains("Surface Blur") && detail.contains("256M"),
+                "{detail}"
+            );
+            let identity=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":0.0}})))).await;
+            assert_ne!(identity.is_error, Some(true), "{identity:?}");
+            let recovered = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+            assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+            let undone = Box::pin(call(&state, "undo", json!({}))).await;
+            assert_ne!(undone.is_error, Some(true));
+            let refused_again = Box::pin(call(&state, "render_frame_at", request)).await;
+            assert_eq!(refused_again.is_error, Some(true));
+            assert!(format!("{refused_again:?}").contains("256M"));
+            let movie = root.join("refused.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let result = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(result["status"]["state"], "failed", "{result}");
+            assert!(result.to_string().contains("256M"), "{result}");
+            assert!(!movie.exists(), "failed export must not publish a movie");
+            assert!(!photonic_video::export::manifest::manifest_path(&movie).exists());
+            std::fs::write(root.join("capacity-checks.json"),serde_json::to_vec_pretty(&json!({"dimensions":[w,h],"refused_radius":64,"recovered_radius":0,"refusal":detail,"undo_refusal":true})).unwrap()).unwrap();
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Independent binary64 discrete-aperture reference with clamp-edge bilinear taps.
+    fn lens_blur_reference(
+        input: &[[f32; 4]],
+        w: u32,
+        h: u32,
+        radius: f64,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        if radius < 1.0 {
+            return input.iter().map(|p| p.map(f64::from)).collect();
+        }
+        let sample = |px: f64, py: f64| {
+            let x = px.clamp(0.0, w as f64 - 1.0);
+            let y = py.clamp(0.0, h as f64 - 1.0);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            let fx = x - x0 as f64;
+            let fy = y - y0 as f64;
+            let mut p = [0.0; 4];
+            for (xx, yy, weight) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+            ] {
+                for c in 0..4 {
+                    p[c] += input[(yy * w + xx) as usize][c] as f64 * weight;
+                }
+            }
+            p
+        };
+
+        let r = radius.ceil() as i32;
+        let radius2 = ((radius as f32) * (radius as f32)) as f64;
+        let mut output = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = [0.0; 4];
+                let mut count = 0u32;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if (dx * dx + dy * dy) as f64 > radius2 {
+                            continue;
+                        }
+                        let p = sample(
+                            x as f64 + dx as f64 * scale[0],
+                            y as f64 + dy as f64 * scale[1],
+                        );
+                        for c in 0..4 {
+                            sum[c] += p[c];
+                        }
+                        count += 1;
+                    }
+                }
+                output.push([
+                    (sum[0] / count as f64).clamp(-65504.0, 65504.0),
+                    (sum[1] / count as f64).clamp(-65504.0, 65504.0),
+                    (sum[2] / count as f64).clamp(-65504.0, 65504.0),
+                    sum[3] / count as f64,
+                ]);
+            }
+        }
+        output
+    }
+    #[tokio::test]
+    async fn native_lens_blur_mcp_capacity_refusal_and_recovery() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let retained = std::env::var_os("PHOTONIC_LENS_BLUR_CAPACITY_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-lens-blur-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (320u32, 240u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        for which in [1] {
+            let effect_id = "blur.lens";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native lens blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native lens blur"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            let added = Box::pin(call(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            assert_ne!(added.is_error, Some(true), "{added:?}");
+            let large=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":64.0}})))).await;
+            assert_ne!(large.is_error, Some(true), "{large:?}");
+            let request =
+                json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"});
+            let refused = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+            assert_eq!(refused.is_error, Some(true), "{refused:?}");
+            let detail = format!("{refused:?}");
+            assert!(
+                detail.contains("Lens Blur") && detail.contains("256M"),
+                "{detail}"
+            );
+            let identity=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":0.0}})))).await;
+            assert_ne!(identity.is_error, Some(true), "{identity:?}");
+            let recovered = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+            assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+            let undone = Box::pin(call(&state, "undo", json!({}))).await;
+            assert_ne!(undone.is_error, Some(true));
+            let refused_again = Box::pin(call(&state, "render_frame_at", request)).await;
+            assert_eq!(refused_again.is_error, Some(true));
+            assert!(format!("{refused_again:?}").contains("256M"));
+            let movie = root.join("refused.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let result = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(result["status"]["state"], "failed", "{result}");
+            assert!(result.to_string().contains("256M"), "{result}");
+            assert!(!movie.exists(), "failed export must not publish a movie");
+            assert!(!photonic_video::export::manifest::manifest_path(&movie).exists());
+            std::fs::write(root.join("capacity-checks.json"),serde_json::to_vec_pretty(&json!({"dimensions":[w,h],"refused_radius":64,"recovered_radius":0,"refusal":detail,"undo_refusal":true})).unwrap()).unwrap();
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_lens_blur_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_LENS_BLUR_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-lens-blur-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "blur.lens";
+            let paths = ["params.radius"];
+            let path = paths[0];
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native lens blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native lens blur"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let values = [3.25];
+            for (i, path) in paths.iter().enumerate() {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":values[i]}})))).await;
+            }
+            if which == 1 {
+                let target = [6.5];
+                let mut keys = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    for (at, value) in [(0, values[i]), (2 * tpf, target[i])] {
+                        keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                    }
+                }
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":keys}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let target = [6.5];
+                let c = if which == 1 {
+                    std::array::from_fn(|i| {
+                        values[i] + (target[i] - values[i]) * frame as f64 / 2.0
+                    })
+                } else {
+                    values
+                };
+                let expected = lens_blur_reference(
+                    &input
+                        .iter()
+                        .map(|p| p.map(|v| v as f32))
+                        .collect::<Vec<_>>(),
+                    w,
+                    h,
+                    c[0] as f32 as f64,
+                    [1.0; 2],
+                );
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameters":c,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":500.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Independent binary64 sorted-window reference; no implementation helpers.
+    /// Independent binary64 sorted-window reference; no implementation helpers.
+    fn rank_reference(
+        input: &[[f32; 4]],
+        w: u32,
+        h: u32,
+        dust: bool,
+        radius: u32,
+        threshold: u8,
+        scale: [f64; 2],
+    ) -> Vec<[f64; 4]> {
+        if radius == 0 {
+            return input.iter().map(|p| p.map(f64::from)).collect();
+        }
+        let a = [
+            [1.705050992657983, -0.6217921206570056, -0.08325887200097853],
+            [
+                -0.13025641750704342,
+                1.1408047365754022,
+                -0.010548319068358056,
+            ],
+            [
+                -0.024003356804618032,
+                -0.12896897606497063,
+                1.1529723328695884,
+            ],
+        ];
+        let b = [
+            [0.6130974024011878, 0.33952314618410606, 0.04737945141470665],
+            [
+                0.07019372246958168,
+                0.9163538790573436,
+                0.013452398473074122,
+            ],
+            [
+                0.020615592882226925,
+                0.10956977293813544,
+                0.8698146341796377,
+            ],
+        ];
+        let operand = |v: [f64; 4]| {
+            let alpha = v[3].clamp(0.0, 1.0);
+            let rgb = if alpha > 1e-6 {
+                a.map(|m| {
+                    v[1] / alpha + m[0] * (v[0] - v[1]) / alpha + m[2] * (v[2] - v[1]) / alpha
+                })
+            } else {
+                [0.0; 3]
+            };
+            [rgb[0], rgb[1], rgb[2], alpha]
+        };
+        let sample = |px: f64, py: f64| {
+            let x = px.clamp(0.0, w as f64 - 1.0);
+            let y = py.clamp(0.0, h as f64 - 1.0);
+            let x0 = x.floor() as u32;
+            let y0 = y.floor() as u32;
+            let fx = x - x0 as f64;
+            let fy = y - y0 as f64;
+            let mut p = [0.0; 4];
+            for (xx, yy, weight) in [
+                (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+            ] {
+                for c in 0..4 {
+                    p[c] += input[(yy * w + xx) as usize][c] as f64 * weight;
+                }
+            }
+            operand(p)
+        };
+        let r = radius.min(((w as f64 / scale[0]).max(h as f64 / scale[1]).ceil() as u32).max(1))
+            as i32;
+        let mut output = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let mut channels: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let p = sample(
+                            x as f64 + dx as f64 * scale[0],
+                            y as f64 + dy as f64 * scale[1],
+                        );
+                        for c in 0..4 {
+                            channels[c].push(p[c]);
+                        }
+                    }
+                }
+                let mut med = channels.map(|mut c| {
+                    c.sort_by(f64::total_cmp);
+                    c[c.len() / 2]
+                });
+                if dust {
+                    let orig = operand(input[(y * w + x) as usize].map(f64::from));
+                    for c in 0..3 {
+                        if (orig[c] - med[c]).abs() <= threshold as f64 / 255.0 {
+                            med[c] = orig[c];
+                        }
+                    }
+                    med[3] = orig[3];
+                }
+                let rgb = b.map(|m| {
+                    ((med[1] + m[0] * (med[0] - med[1]) + m[2] * (med[2] - med[1])) * med[3])
+                        .clamp(-65504.0, 65504.0)
+                });
+                output.push([rgb[0], rgb[1], rgb[2], med[3]]);
+            }
+        }
+        output
+    }
+    #[tokio::test]
+    async fn native_rank_mcp_capacity_refusal_and_recovery() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let retained = std::env::var_os("PHOTONIC_RANK_CAPACITY_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-rank-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (320u32, 240u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        for dust in [false, true] {
+            for which in [1] {
+                let effect_id = if dust {
+                    "repair.dust_and_scratches"
+                } else {
+                    "filter.median"
+                };
+                let state = test_state();
+                let mut project = TimelineProject::new();
+                let mut seq = Sequence::new("Native rank filter", FrameRate::FPS_30, w, h);
+                let sid = seq.id;
+                let tpf = seq.frame_rate.ticks_per_frame().0;
+                seq.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                let aid = project
+                    .media
+                    .insert(MediaAsset::from_file(AssetKind::Image, &source));
+                let mut track = Track::new(TrackKind::Video, "V1");
+                let tid = track.id;
+                let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+                let cid = clip.id;
+                track.clips.push(clip);
+                seq.video_tracks.push(track);
+                project.active_sequence = Some(sid);
+                project.insert_sequence(seq);
+                state.document.lock().await.timeline = Some(project);
+                assert!(
+                    engine_available(&state).await,
+                    "GPU required for native rank filter"
+                );
+                let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+                assert_ne!(tag.is_error, Some(true), "{tag:?}");
+                let scope = [
+                    json!({"scope":"asset","asset_id":aid}),
+                    json!({"scope":"clip","clip_id":cid}),
+                    json!({"scope":"track","track_id":tid}),
+                    json!({"scope":"master","sequence_id":sid}),
+                ][which]
+                    .clone();
+                let with = |extra: Value| {
+                    let mut v = scope.clone();
+                    v.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    v
+                };
+                let added = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"add","effect_id":effect_id})),
+                ))
+                .await;
+                assert_ne!(added.is_error, Some(true), "{added:?}");
+                let large=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":(if dust{16.0}else{500.0})}})))).await;
+                assert_ne!(large.is_error, Some(true), "{large:?}");
+                let request =
+                    json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"});
+                let refused = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+                assert_eq!(refused.is_error, Some(true), "{refused:?}");
+                let detail = format!("{refused:?}");
+                assert!(
+                    detail.contains("Median") && detail.contains("budget"),
+                    "{detail}"
+                );
+                let identity=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":"params.radius","value":{"t":"float","v":0.0}})))).await;
+                assert_ne!(identity.is_error, Some(true), "{identity:?}");
+                let recovered = Box::pin(call(&state, "render_frame_at", request.clone())).await;
+                assert_ne!(recovered.is_error, Some(true), "{recovered:?}");
+                let undone = Box::pin(call(&state, "undo", json!({}))).await;
+                assert_ne!(undone.is_error, Some(true));
+                let refused_again = Box::pin(call(&state, "render_frame_at", request)).await;
+                assert_eq!(refused_again.is_error, Some(true));
+                assert!(format!("{refused_again:?}").contains("budget"));
+                let movie = root.join(format!("refused-{dust}.mov"));
+                let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+                assert_ne!(export.is_error, Some(true), "{export:?}");
+                let result = poll_job(&state, &data(&export)["job_id"]).await;
+                assert_eq!(result["status"]["state"], "failed", "{result}");
+                assert!(result.to_string().contains("budget"), "{result}");
+                assert!(!movie.exists(), "failed export must not publish a movie");
+                assert!(!photonic_video::export::manifest::manifest_path(&movie).exists());
+                std::fs::write(root.join(format!("capacity-{dust}.json")),serde_json::to_vec_pretty(&json!({"dimensions":[w,h],"refused_radius":(if dust{16}else{500}),"recovered_radius":0,"refusal":detail,"undo_refusal":true})).unwrap()).unwrap();
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// Independent binary64 discrete-aperture reference with clamp-edge bilinear taps.
+    #[tokio::test]
+    async fn native_rank_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_RANK_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-rank-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for dust in [false, true] {
+            for which in 0..4 {
+                let effect_id = if dust {
+                    "repair.dust_and_scratches"
+                } else {
+                    "filter.median"
+                };
+                let paths = if dust {
+                    vec!["params.radius", "params.threshold"]
+                } else {
+                    vec!["params.radius"]
+                };
+                let path = paths[0];
+                let state = test_state();
+                let mut project = TimelineProject::new();
+                let mut seq = Sequence::new("Native rank filter", FrameRate::FPS_30, w, h);
+                let sid = seq.id;
+                let tpf = seq.frame_rate.ticks_per_frame().0;
+                seq.color = SequenceColorConfig::NativeManaged(Box::new(
+                    NativeManagedColorConfig::sdr_draft(),
+                ));
+                let aid = project
+                    .media
+                    .insert(MediaAsset::from_file(AssetKind::Image, &source));
+                let mut track = Track::new(TrackKind::Video, "V1");
+                let tid = track.id;
+                let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+                let cid = clip.id;
+                track.clips.push(clip);
+                seq.video_tracks.push(track);
+                project.active_sequence = Some(sid);
+                project.insert_sequence(seq);
+                state.document.lock().await.timeline = Some(project);
+                assert!(
+                    engine_available(&state).await,
+                    "GPU required for native rank filter"
+                );
+                let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+                assert_ne!(tag.is_error, Some(true), "{tag:?}");
+                let scope = [
+                    json!({"scope":"asset","asset_id":aid}),
+                    json!({"scope":"clip","clip_id":cid}),
+                    json!({"scope":"track","track_id":tid}),
+                    json!({"scope":"master","sequence_id":sid}),
+                ][which]
+                    .clone();
+                let with = |extra: Value| {
+                    let mut v = scope.clone();
+                    v.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    v
+                };
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"add","effect_id":effect_id})),
+                ))
+                .await;
+                let values = if dust { [2.0, 32.0] } else { [2.0, 0.0] };
+                for (i, path) in paths.iter().enumerate() {
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":values[i]}})))).await;
+                }
+                if which == 1 {
+                    let target = if dust { [4.0, 96.0] } else { [5.0, 0.0] };
+                    let mut keys = Vec::new();
+                    for (i, path) in paths.iter().enumerate() {
+                        for (at, value) in [(0, values[i]), (2 * tpf, target[i])] {
+                            keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                        }
+                    }
+                    Box::pin(graph_authoring_edit_roundtrip(
+                        &state,
+                        "batch_set_keyframes",
+                        json!({"ops":keys}),
+                    ))
+                    .await;
+                }
+                let dir = root.join(format!("effect-{}/scope-{which}", dust as u8));
+                std::fs::create_dir_all(&dir).unwrap();
+                let mut references = Vec::new();
+                let mut receipts = Vec::new();
+                for frame in 0..3 {
+                    let target = if dust { [4.0, 96.0] } else { [5.0, 0.0] };
+                    let c = if which == 1 {
+                        std::array::from_fn(|i| {
+                            values[i] + (target[i] - values[i]) * frame as f64 / 2.0
+                        })
+                    } else {
+                        values
+                    };
+                    let expected = rank_reference(
+                        &input
+                            .iter()
+                            .map(|p| p.map(|v| v as f32))
+                            .collect::<Vec<_>>(),
+                        w,
+                        h,
+                        dust,
+                        (c[0] as f32).round() as u32,
+                        c[1] as f32 as u8,
+                        [1.0; 2],
+                    );
+                    let measured = Box::pin(call(
+                        &state,
+                        "measure_native_output",
+                        json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                    ))
+                    .await;
+                    assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                    let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                    // Scene means are straight-color statistics over covered pixels, so
+                    // spatial alpha/color parity is checked in the high-bit export below.
+                    assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                    let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                    assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                    let bytes = preview
+                        .content
+                        .iter()
+                        .find_map(|v| match v {
+                            ContentItem::Image { data, .. } => {
+                                Some(general_purpose::STANDARD.decode(data).unwrap())
+                            }
+                            _ => None,
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        image::load_from_memory(&bytes)
+                            .unwrap()
+                            .to_rgba8()
+                            .dimensions(),
+                        (w, h)
+                    );
+                    std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                    references.push(expected);
+                    receipts.push(
+                        json!({"frame":frame,"effect":effect_id,"parameters":c,"measurements":m}),
+                    );
+                }
+                let movie = dir.join("animation.mov");
+                let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+                assert_ne!(export.is_error, Some(true), "{export:?}");
+                let done = poll_job(&state, &data(&export)["job_id"]).await;
+                assert_eq!(done["status"]["state"], "done", "{done}");
+                photonic_video::export::manifest::verify_manifest(
+                    &photonic_video::export::manifest::manifest_path(&movie),
+                )
+                .unwrap();
+                let decoded = std::process::Command::new(&tools.ffmpeg)
+                    .args(["-v", "error", "-i"])
+                    .arg(&movie)
+                    .args([
+                        "-frames:v",
+                        "3",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                        "rgba64le",
+                        "pipe:1",
+                    ])
+                    .output()
+                    .unwrap();
+                assert!(decoded.status.success());
+                assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+                let output =
+                    photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+                for (frame, bytes) in decoded
+                    .stdout
+                    .chunks_exact(w as usize * h as usize * 8)
+                    .enumerate()
+                {
+                    for (i, px) in bytes.chunks_exact(8).enumerate() {
+                        let p = references[frame][i];
+                        let rgb = if p[3] > 1e-6 {
+                            output
+                                .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                                .unwrap()
+                        } else {
+                            [0.0; 3]
+                        };
+                        let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                        assert!(
+                            got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                            "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                            p[3]
+                        );
+                        if p[3] > 0.025 {
+                            for c in 0..3 {
+                                let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                                assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                            }
+                        }
+                    }
+                }
+                let saved = Box::pin(call(
+                    &state,
+                    "save_document",
+                    json!({"path":dir.join("input.photon")}),
+                ))
+                .await;
+                assert_ne!(saved.is_error, Some(true), "{saved:?}");
+                let restored = Document::from_json(
+                    &std::fs::read_to_string(dir.join("input.photon")).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&restored).unwrap(),
+                    serde_json::to_value(&*state.document.lock().await).unwrap()
+                );
+                std::fs::write(
+                    dir.join("checks.json"),
+                    serde_json::to_vec_pretty(
+                        &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                if which == 3 {
+                    let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                    let revision = state.history.lock().await.revision();
+                    let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":(if dust{16.01}else{500.01})}})))).await;
+                    if invalid.is_error == Some(true) {
+                        assert_eq!(state.history.lock().await.revision(), revision);
+                    } else {
+                        let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                        assert_eq!(refused.is_error, Some(true));
+                        assert_ne!(
+                            Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                            Some(true)
+                        );
+                    }
+                    assert_eq!(
+                        serde_json::to_value(&*state.document.lock().await).unwrap(),
+                        before
+                    );
+                }
+                if which == 1 {
+                    let locked = Box::pin(call(
+                        &state,
+                        "set_track_prop",
+                        json!({"track_id":tid,"locked":true}),
+                    ))
+                    .await;
+                    assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                    assert!(
+                        state
+                            .document
+                            .lock()
+                            .await
+                            .timeline
+                            .as_ref()
+                            .unwrap()
+                            .sequences[&sid]
+                            .track(tid)
+                            .unwrap()
+                            .locked
+                    );
+                    let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                    let revision = state.history.lock().await.revision();
+                    let refused = Box::pin(call(
+                        &state,
+                        "effect_stack",
+                        with(json!({"op":"remove","index":0})),
+                    ))
+                    .await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                    assert_eq!(
+                        serde_json::to_value(&*state.document.lock().await).unwrap(),
+                        before
+                    );
+                }
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_surface_blur_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_SURFACE_BLUR_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-surface-blur-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        for which in 0..4 {
+            let effect_id = "blur.surface";
+            let paths = ["params.radius", "params.threshold"];
+            let path = paths[0];
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native surface blur", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native surface blur"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let values = [3.0, 0.4];
+            for (i, path) in paths.iter().enumerate() {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":values[i]}})))).await;
+            }
+            if which == 1 {
+                let target = [6.0, 0.8];
+                let mut keys = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    for (at, value) in [(0, values[i]), (2 * tpf, target[i])] {
+                        keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                    }
+                }
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":keys}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let target = [6.0, 0.8];
+                let c = if which == 1 {
+                    std::array::from_fn(|i| {
+                        values[i] + (target[i] - values[i]) * frame as f64 / 2.0
+                    })
+                } else {
+                    values
+                };
+                let expected = surface_blur_reference(
+                    &input
+                        .iter()
+                        .map(|p| p.map(|v| v as f32))
+                        .collect::<Vec<_>>(),
+                    w,
+                    h,
+                    (c[0] as f32).round() as u32,
+                    c[1],
+                    [1.0; 2],
+                );
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameters":c,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":64.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_drop_shadow_mcp_spatial_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_SHADOW_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-shadow-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |values: [f64; 7]| {
+            let sample = |px: f64, py: f64| {
+                let x = (px - 0.5).clamp(0.0, w as f64 - 1.0);
+                let y = (py - 0.5).clamp(0.0, h as f64 - 1.0);
+                let x0 = x.floor() as u32;
+                let y0 = y.floor() as u32;
+                let fx = x - x0 as f64;
+                let fy = y - y0 as f64;
+                let mut a = 0.0;
+                for (xx, yy, weight) in [
+                    (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                    ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                    (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                    ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+                ] {
+                    a += input[(yy * w + xx) as usize][3] * weight;
+                }
+                a
+            };
+            let mut alpha = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    alpha.push(sample(
+                        x as f64 + 0.5 - values[0],
+                        y as f64 + 0.5 - values[1],
+                    ));
+                }
+            }
+            let radius = values[2].round() as i64;
+            for axis in 0..2 {
+                let mut out = vec![0.0; alpha.len()];
+                for y in 0..h {
+                    for x in 0..w {
+                        let mut sum = 0.0;
+                        for d in -radius..=radius {
+                            let xx = if axis == 0 {
+                                (x as i64 + d).clamp(0, w as i64 - 1) as u32
+                            } else {
+                                x
+                            };
+                            let yy = if axis == 1 {
+                                (y as i64 + d).clamp(0, h as i64 - 1) as u32
+                            } else {
+                                y
+                            };
+                            sum += alpha[(yy * w + xx) as usize];
+                        }
+                        out[(y * w + x) as usize] = sum / (2 * radius + 1) as f64;
+                    }
+                }
+                alpha = out;
+            }
+            let color = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                values[3], values[4], values[5],
+            ]);
+            input
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let a = alpha[i] * values[6] * (1.0 - c[3]);
+                    [
+                        c[0] + color[0] * a,
+                        c[1] + color[1] * a,
+                        c[2] + color[2] * a,
+                        c[3] + a,
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        for which in 0..4 {
+            let effect_id = "util.drop_shadow";
+            let paths = [
+                "params.x",
+                "params.y",
+                "params.radius",
+                "params.r",
+                "params.g",
+                "params.b",
+                "params.opacity",
+            ];
+            let path = paths[0];
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native shadow", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native shadow"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let values = [2.25, -1.5, 2.0, 0.8, 0.1, 0.3, 0.7];
+            for (i, path) in paths.iter().enumerate() {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":values[i]}})))).await;
+            }
+            if which == 1 {
+                let target = [-3.0, 2.0, 6.0, 0.2, 0.7, 0.9, 0.9];
+                let mut keys = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    for (at, value) in [(0, values[i]), (2 * tpf, target[i])] {
+                        keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                    }
+                }
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":keys}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let target = [-3.0, 2.0, 6.0, 0.2, 0.7, 0.9, 0.9];
+                let c = if which == 1 {
+                    std::array::from_fn(|i| {
+                        values[i] + (target[i] - values[i]) * frame as f64 / 2.0
+                    })
+                } else {
+                    values
+                };
+                let expected = reference(c);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 1.001);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts.push(
+                    json!({"frame":frame,"effect":effect_id,"parameters":c,"measurements":m}),
+                );
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":200.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_perspective_mcp_projective_authoring_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained = std::env::var_os("PHOTONIC_PERSPECTIVE_QUALIFICATION_DIR")
+            .map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "photonic-native-perspective-{}",
+                uuid::Uuid::new_v4()
+            ))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |c: [f64; 8]| {
+            let [x0, y0, x1, y1, x2, y2, x3, y3] = c;
+            let dx1 = x1 - x2;
+            let dx2 = x3 - x2;
+            let dx3 = x0 - x1 + x2 - x3;
+            let dy1 = y1 - y2;
+            let dy2 = y3 - y2;
+            let dy3 = y0 - y1 + y2 - y3;
+            let (g, hp) = if dx3.abs() + dy3.abs() < 1e-12 {
+                (0.0, 0.0)
+            } else {
+                let det = dx1 * dy2 - dx2 * dy1;
+                ((dx3 * dy2 - dx2 * dy3) / det, (dx1 * dy3 - dx3 * dy1) / det)
+            };
+            let a = [
+                x1 - x0 + g * x1,
+                x3 - x0 + hp * x3,
+                x0,
+                y1 - y0 + g * y1,
+                y3 - y0 + hp * y3,
+                y0,
+                g,
+                hp,
+                1.0,
+            ];
+            let b = [
+                a[4] * a[8] - a[5] * a[7],
+                a[2] * a[7] - a[1] * a[8],
+                a[1] * a[5] - a[2] * a[4],
+                a[5] * a[6] - a[3] * a[8],
+                a[0] * a[8] - a[2] * a[6],
+                a[2] * a[3] - a[0] * a[5],
+                a[3] * a[7] - a[4] * a[6],
+                a[1] * a[6] - a[0] * a[7],
+                a[0] * a[4] - a[1] * a[3],
+            ];
+            let a = b.map(|v| v / b[8]);
+            let mut out = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    let px = (x as f64 + 0.5) / w as f64;
+                    let py = (y as f64 + 0.5) / h as f64;
+                    let d = a[6] * px + a[7] * py + a[8];
+                    let u = (a[0] * px + a[1] * py + a[2]) / d;
+                    let v = (a[3] * px + a[4] * py + a[5]) / d;
+                    if d.abs() < 1e-6 || !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                        out.push([0.0; 4]);
+                        continue;
+                    }
+                    let sx = (u * w as f64 - 0.5).clamp(0.0, w as f64 - 1.0);
+                    let sy = (v * h as f64 - 0.5).clamp(0.0, h as f64 - 1.0);
+                    let x0 = sx.floor() as u32;
+                    let y0 = sy.floor() as u32;
+                    let fx = sx - x0 as f64;
+                    let fy = sy - y0 as f64;
+                    let mut p = [0.0; 4];
+                    for (xx, yy, weight) in [
+                        (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                        ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                        (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                        ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+                    ] {
+                        for k in 0..4 {
+                            p[k] += input[(yy * w + xx) as usize][k] * weight;
+                        }
+                    }
+                    out.push(p);
+                }
+            }
+            out
+        };
+        for which in 0..4 {
+            let effect_id = "geo.perspective";
+            let paths = [
+                "params.tl_x",
+                "params.tl_y",
+                "params.tr_x",
+                "params.tr_y",
+                "params.br_x",
+                "params.br_y",
+                "params.bl_x",
+                "params.bl_y",
+            ];
+            let path = paths[0];
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native perspective", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native perspective"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let corners = [0.231, 0.133, 0.811, 0.079, 0.957, 0.911, 0.059, 0.867];
+            for (i, path) in paths.iter().enumerate() {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":corners[i]}})))).await;
+            }
+            if which == 1 {
+                let target = [0.137, 0.183, 0.863, 0.183, 0.863, 0.817, 0.137, 0.817];
+                let mut keys = Vec::new();
+                for (i, path) in paths.iter().enumerate() {
+                    for (at, value) in [(0, corners[i]), (2 * tpf, target[i])] {
+                        keys.push(json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}}));
+                    }
+                }
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":keys}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let target = [0.137, 0.183, 0.863, 0.183, 0.863, 0.817, 0.137, 0.817];
+                let c = if which == 1 {
+                    std::array::from_fn(|i| {
+                        corners[i] + (target[i] - corners[i]) * frame as f64 / 2.0
+                    })
+                } else {
+                    corners
+                };
+                let expected = reference(c);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts
+                    .push(json!({"frame":frame,"effect":effect_id,"corners":c,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":2.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_stylize_mcp_spatial_authoring_chromatic_animation_and_prores() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{AssetKind, Clip, ClipSource, MediaAsset, Track, TrackKind};
+        let tools =
+            photonic_video::media::ffmpeg_locate::locate_for_test().expect("FFmpeg required");
+        let retained =
+            std::env::var_os("PHOTONIC_STYLIZE_QUALIFICATION_DIR").map(std::path::PathBuf::from);
+        let root = retained.clone().unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("photonic-native-stylize-{}", uuid::Uuid::new_v4()))
+        });
+        std::fs::create_dir_all(&root).unwrap();
+        let (w, h) = (16u32, 12u32);
+        let source_pixel = |x: u32, y: u32| {
+            if (2..14).contains(&x) && (2..10).contains(&y) {
+                if x < 8 {
+                    [190u8, 50, 30, 128]
+                } else {
+                    [20, 140, 200, 192]
+                }
+            } else {
+                [0; 4]
+            }
+        };
+        let input_image = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba(source_pixel(x, y)));
+        let source = root.join("source.png");
+        input_image.save(&source).unwrap();
+        let input: Vec<[f64; 4]> = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .map(|(x, y)| {
+                let p = source_pixel(x, y);
+                let a = p[3] as f64 / 255.0;
+                let rgb = photonic_video::color::native::encoded_srgb_to_linear_ap1_display([
+                    p[0] as f64 / 255.0,
+                    p[1] as f64 / 255.0,
+                    p[2] as f64 / 255.0,
+                ]);
+                [rgb[0] * a, rgb[1] * a, rgb[2] * a, a]
+            })
+            .collect();
+        let reference = |kind: usize, amount: f64| {
+            let sample = |px: f64, py: f64| {
+                let x = (px - 0.5).clamp(0.0, w as f64 - 1.0);
+                let y = (py - 0.5).clamp(0.0, h as f64 - 1.0);
+                let x0 = x.floor() as u32;
+                let y0 = y.floor() as u32;
+                let fx = x - x0 as f64;
+                let fy = y - y0 as f64;
+                let mut p = [0.0; 4];
+                for (xx, yy, weight) in [
+                    (x0, y0, (1.0 - fx) * (1.0 - fy)),
+                    ((x0 + 1).min(w - 1), y0, fx * (1.0 - fy)),
+                    (x0, (y0 + 1).min(h - 1), (1.0 - fx) * fy),
+                    ((x0 + 1).min(w - 1), (y0 + 1).min(h - 1), fx * fy),
+                ] {
+                    for c in 0..4 {
+                        p[c] += input[(yy * w + xx) as usize][c] * weight;
+                    }
+                }
+                if p[3] > 1e-8 {
+                    [p[0] / p[3], p[1] / p[3], p[2] / p[3]]
+                } else {
+                    [0.0; 3]
+                }
+            };
+            let mut out = Vec::new();
+            let diagonal = ((w as f64 - 1.0) / 2.0)
+                .hypot((h as f64 - 1.0) / 2.0)
+                .max(0.0001);
+            for y in 0..h {
+                for x in 0..w {
+                    let src = input[(y * w + x) as usize];
+                    if kind == 2 && amount == 0.0 {
+                        out.push(src);
+                        continue;
+                    }
+                    if src[3] <= 0.0 {
+                        out.push([0.0; 4]);
+                        continue;
+                    }
+                    let px = x as f64 + 0.5;
+                    let py = y as f64 + 0.5;
+                    if kind == 2 {
+                        let dx = (px - w as f64 / 2.0) * amount / diagonal;
+                        let dy = (py - h as f64 / 2.0) * amount / diagonal;
+                        let red = sample(px + dx, py + dy);
+                        let blue = sample(px - dx, py - dy);
+                        out.push([red[0] * src[3], src[1], blue[2] * src[3], src[3]]);
+                    } else {
+                        let mut values = [0.0; 9];
+                        for k in 0..9 {
+                            let p = sample(px + (k % 3) as f64 - 1.0, py + (k / 3) as f64 - 1.0);
+                            values[k] =
+                                p[0] * 0.2722287168 + p[1] * 0.6740817658 + p[2] * 0.0536895174;
+                        }
+                        let dot = |kernel: [f64; 9]| {
+                            values.iter().zip(kernel).map(|(a, b)| a * b).sum::<f64>()
+                        };
+                        let gray = if kind == 0 {
+                            128.0 / 255.0 + dot([-1.0, -1.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 1.0])
+                        } else {
+                            dot([-1.0, 0.0, 1.0, -2.0, 0.0, 2.0, -1.0, 0.0, 1.0])
+                                .hypot(dot([-1.0, -2.0, -1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0]))
+                        };
+                        out.push([gray * src[3], gray * src[3], gray * src[3], src[3]]);
+                    }
+                }
+            }
+            out
+        };
+        for case in 0..12 {
+            let which = case % 4;
+            let kind = case / 4;
+            let effect_id = [
+                "stylize.emboss",
+                "stylize.find_edges",
+                "stylize.chromatic_aberration",
+            ][kind];
+            let path = "params.amount";
+            let state = test_state();
+            let mut project = TimelineProject::new();
+            let mut seq = Sequence::new("Native stylization", FrameRate::FPS_30, w, h);
+            let sid = seq.id;
+            let tpf = seq.frame_rate.ticks_per_frame().0;
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let aid = project
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Image, &source));
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let tid = track.id;
+            let clip = Clip::new(ClipSource::Asset { asset: aid }, Tick(0), Tick(3 * tpf));
+            let cid = clip.id;
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            project.active_sequence = Some(sid);
+            project.insert_sequence(seq);
+            state.document.lock().await.timeline = Some(project);
+            assert!(
+                engine_available(&state).await,
+                "GPU required for native stylization"
+            );
+            let tag=Box::pin(call(&state,"set_native_input_color",json!({"scope":"asset","asset_id":aid,"interpretation":{"version":1,"standard":"srgb_display","range":"full","matrix":"rgb"}}))).await;
+            assert_ne!(tag.is_error, Some(true), "{tag:?}");
+            let scope = [
+                json!({"scope":"asset","asset_id":aid}),
+                json!({"scope":"clip","clip_id":cid}),
+                json!({"scope":"track","track_id":tid}),
+                json!({"scope":"master","sequence_id":sid}),
+            ][which]
+                .clone();
+            let with = |extra: Value| {
+                let mut v = scope.clone();
+                v.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                v
+            };
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "effect_stack",
+                with(json!({"op":"add","effect_id":effect_id})),
+            ))
+            .await;
+            let amount = if kind == 2 {
+                [0.0, -4.0, 4.0, 64.0][which]
+            } else {
+                0.0
+            };
+            if kind == 2 && amount != 2.0 {
+                Box::pin(graph_authoring_edit_roundtrip(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":amount}})))).await;
+            }
+            if kind == 2 && which == 1 {
+                let key = |at, value| json!({"target":"clip_effect","clip_id":cid,"effect_index":0,"path":path,"at_ticks":at,"value":{"t":"float","v":value},"interp":{"kind":"linear"}});
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "batch_set_keyframes",
+                    json!({"ops":[key(0,-8.0),key(2*tpf,8.0)]}),
+                ))
+                .await;
+            }
+            let dir = root.join(format!("kind-{kind}-scope-{which}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut references = Vec::new();
+            let mut receipts = Vec::new();
+            for frame in 0..3 {
+                let a = if kind == 2 && which == 1 {
+                    -8.0 + frame as f64 * 8.0
+                } else {
+                    amount
+                };
+                let expected = reference(kind, a);
+                let measured = Box::pin(call(
+                    &state,
+                    "measure_native_output",
+                    json!({"sequence_id":sid,"at_ticks":frame*tpf}),
+                ))
+                .await;
+                assert_ne!(measured.is_error, Some(true), "{measured:?}");
+                let m = &measured.structured_content.as_ref().unwrap()["measurements"];
+                // Scene means are straight-color statistics over covered pixels, so
+                // spatial alpha/color parity is checked in the high-bit export below.
+                assert!(m["alpha_max"].as_f64().unwrap() <= 0.754);
+                let preview=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":frame*tpf,"quality":"full","output_format":"png"}))).await;
+                assert_ne!(preview.is_error, Some(true), "{preview:?}");
+                let bytes = preview
+                    .content
+                    .iter()
+                    .find_map(|v| match v {
+                        ContentItem::Image { data, .. } => {
+                            Some(general_purpose::STANDARD.decode(data).unwrap())
+                        }
+                        _ => None,
+                    })
+                    .unwrap();
+                assert_eq!(
+                    image::load_from_memory(&bytes)
+                        .unwrap()
+                        .to_rgba8()
+                        .dimensions(),
+                    (w, h)
+                );
+                std::fs::write(dir.join(format!("frame-{frame}.png")), bytes).unwrap();
+                references.push(expected);
+                receipts
+                    .push(json!({"frame":frame,"effect":effect_id,"amount":a,"measurements":m}));
+            }
+            let movie = dir.join("animation.mov");
+            let export=Box::pin(call(&state,"export_sequence",json!({"sequence_id":sid,"out_path":movie,"preset":"ProRes Mezzanine","write_manifest":true}))).await;
+            assert_ne!(export.is_error, Some(true), "{export:?}");
+            let done = poll_job(&state, &data(&export)["job_id"]).await;
+            assert_eq!(done["status"]["state"], "done", "{done}");
+            photonic_video::export::manifest::verify_manifest(
+                &photonic_video::export::manifest::manifest_path(&movie),
+            )
+            .unwrap();
+            let decoded = std::process::Command::new(&tools.ffmpeg)
+                .args(["-v", "error", "-i"])
+                .arg(&movie)
+                .args([
+                    "-frames:v",
+                    "3",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    "rgba64le",
+                    "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert_eq!(decoded.stdout.len(), 3 * w as usize * h as usize * 8);
+            let output = photonic_video::color::native_output::Aces2SdrOutput::shared().unwrap();
+            for (frame, bytes) in decoded
+                .stdout
+                .chunks_exact(w as usize * h as usize * 8)
+                .enumerate()
+            {
+                for (i, px) in bytes.chunks_exact(8).enumerate() {
+                    let p = references[frame][i];
+                    let rgb = if p[3] > 1e-6 {
+                        output
+                            .map_straight_video([p[0] / p[3], p[1] / p[3], p[2] / p[3]])
+                            .unwrap()
+                    } else {
+                        [0.0; 3]
+                    };
+                    let got_alpha = u16::from_le_bytes([px[6], px[7]]);
+                    assert!(
+                        got_alpha.abs_diff((p[3] * 65535.0).round() as u16) < 650,
+                        "alpha scope{which} frame{frame} pixel{i}: {got_alpha} vs {}",
+                        p[3]
+                    );
+                    if p[3] > 0.025 {
+                        for c in 0..3 {
+                            let got = u16::from_le_bytes([px[c * 2], px[c * 2 + 1]]);
+                            assert!(
+                                got.abs_diff((rgb[c] * 65535.0).round() as u16) < 1800,
+                                "RGB scope{which} frame{frame} pixel{i} channel{c}: {got} vs {:?}",
+                                rgb
+                            );
+                        }
+                    }
+                }
+            }
+            let saved = Box::pin(call(
+                &state,
+                "save_document",
+                json!({"path":dir.join("input.photon")}),
+            ))
+            .await;
+            assert_ne!(saved.is_error, Some(true), "{saved:?}");
+            let restored =
+                Document::from_json(&std::fs::read_to_string(dir.join("input.photon")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&*state.document.lock().await).unwrap()
+            );
+            std::fs::write(
+                dir.join("checks.json"),
+                serde_json::to_vec_pretty(
+                    &json!({"scope":scope,"frames":receipts,"export_pixel_checks":3*w*h}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if which == 3 && kind == 2 {
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let invalid=Box::pin(call(&state,"effect_stack",with(json!({"op":"set_param","index":0,"path":path,"value":{"t":"float","v":64.01}})))).await;
+                if invalid.is_error == Some(true) {
+                    assert_eq!(state.history.lock().await.revision(), revision);
+                } else {
+                    let refused=Box::pin(call(&state,"render_frame_at",json!({"sequence_id":sid,"at_ticks":0,"quality":"full","output_format":"png"}))).await;
+                    assert_eq!(refused.is_error, Some(true));
+                    assert_ne!(
+                        Box::pin(call(&state, "undo", json!({}))).await.is_error,
+                        Some(true)
+                    );
+                }
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+            if which == 1 {
+                let locked = Box::pin(call(
+                    &state,
+                    "set_track_prop",
+                    json!({"track_id":tid,"locked":true}),
+                ))
+                .await;
+                assert_ne!(locked.is_error, Some(true), "{locked:?}");
+                assert!(
+                    state
+                        .document
+                        .lock()
+                        .await
+                        .timeline
+                        .as_ref()
+                        .unwrap()
+                        .sequences[&sid]
+                        .track(tid)
+                        .unwrap()
+                        .locked
+                );
+                let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+                let revision = state.history.lock().await.revision();
+                let refused = Box::pin(call(
+                    &state,
+                    "effect_stack",
+                    with(json!({"op":"remove","index":0})),
+                ))
+                .await;
+                assert_eq!(refused.is_error, Some(true));
+                assert_eq!(state.history.lock().await.revision(), revision);
+                assert_eq!(
+                    serde_json::to_value(&*state.document.lock().await).unwrap(),
+                    before
+                );
+            }
+        }
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -17603,6 +35997,7 @@ mod tests {
         let mut sequence = Sequence::new("cut", FrameRate::FPS_30, 16, 16);
         let sequence_id = sequence.id;
         sequence.reference_stills.push(ReferenceStill {
+            copied_from: None,
             id,
             name: "Hero".into(),
             image_asset,
@@ -17611,6 +36006,7 @@ mod tests {
             source_time: Tick::ZERO,
             grade_revision: 3,
             color: sequence.color.clone(),
+            native_balance: None,
             format_index: 0,
         });
         project.insert_sequence(sequence);
@@ -17724,6 +36120,7 @@ mod tests {
             },
         );
         sequence.reference_stills.push(ReferenceStill {
+            copied_from: None,
             id: uuid::Uuid::new_v4(),
             name: "Existing".into(),
             image_asset: image.id,
@@ -17732,6 +36129,7 @@ mod tests {
             source_time: Tick::ZERO,
             grade_revision: 0,
             color: sequence.color.clone(),
+            native_balance: None,
             format_index: 0,
         });
         project.media.insert(image);
@@ -17776,17 +36174,262 @@ mod tests {
 
     #[tokio::test]
     async fn capture_reference_still_uses_full_frame_and_one_undo_step() {
+        Box::pin(check_reference_capture_and_match(false)).await;
+    }
+
+    #[tokio::test]
+    async fn copied_reference_gallery_native_match_archive_and_integrity() {
+        use photonic_core::timeline::{AssetSource, SequenceFormat};
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("reference-copy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut project = TimelineProject::new();
+        let mut ids = Vec::new();
+        for index in 0..2 {
+            let mut sequence = Sequence::new(format!("Shot {index}"), FrameRate::FPS_30, 16, 16);
+            sequence.color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+            if index == 1 {
+                sequence
+                    .formats
+                    .insert(0, SequenceFormat::new("Different", 32, 16));
+                sequence.active_format = 1;
+            }
+            let mut track = Track::new(photonic_core::timeline::TrackKind::Video, "V1");
+            let mut clip = Clip::new(
+                ClipSource::SolidColor {
+                    color: Color {
+                        r: 0.1,
+                        g: 0.3,
+                        b: 0.2,
+                        a: 1.0,
+                    },
+                },
+                Tick::ZERO,
+                Tick(TICKS_PER_SECOND),
+            );
+            if index == 1 {
+                let mut g = Grade::new();
+                g.ops.push(GradeOp::new(
+                    GradeOpKind::Exposure,
+                    GradeOpParams::Exposure { stops: 1.0 },
+                ));
+                clip.grade = Some(g);
+            }
+            ids.push((sequence.id, track.id, clip.id));
+            track.clips.push(clip);
+            sequence.video_tracks.push(track);
+            project.insert_sequence(sequence);
+        }
+        project.active_sequence = Some(ids[1].0);
+        state.document.lock().await.timeline = Some(project);
+        state.history.lock().await.reset();
+        *state.document_path.lock().unwrap() = Some(root.join("copy.photon"));
+        let captured = call(
+            &state,
+            "capture_reference_still",
+            json!({"sequence_id":ids[0].0,"at_ticks":0,"source_clip_id":ids[0].2,"name":"Hero"}),
+        )
+        .await;
+        assert_ne!(captured.is_error, Some(true), "{captured:?}");
+        let source_id = data(&captured)["still_id"].clone();
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let rev = state.history.lock().await.revision();
+        let copied = call(
+            &state,
+            "copy_reference_still",
+            json!({"source_sequence_id":ids[0].0,"still_id":source_id}),
+        )
+        .await;
+        assert_ne!(copied.is_error, Some(true), "{copied:?}");
+        let copy_id = data(&copied)["still_id"].clone();
+        assert_ne!(copy_id, source_id);
+        assert_eq!(data(&copied)["sequence_id"], json!(ids[1].0));
+        assert_eq!(state.history.lock().await.undo_depth(), 2);
+        let (asset, path, original, summary) = {
+            let d = state.document.lock().await;
+            let p = d.timeline.as_ref().unwrap();
+            let from = &p.sequences[&ids[0].0].reference_stills[0];
+            let to = &p.sequences[&ids[1].0].reference_stills[0];
+            assert_eq!(from.native_balance, to.native_balance);
+            assert!(to.native_balance.is_some());
+            assert_eq!(from.image_hash, to.image_hash);
+            assert_eq!(from.image_asset, to.image_asset);
+            assert_eq!(to.format_index, 1);
+            assert_eq!(to.copied_from.as_ref().unwrap().sequence_id, ids[0].0);
+            let AssetSource::File { path, .. } = &p.media.assets[&to.image_asset].source else {
+                panic!()
+            };
+            (
+                to.image_asset,
+                path.clone(),
+                std::fs::read(path).unwrap(),
+                to.native_balance.clone(),
+            )
+        };
+        {
+            let mut d = state.document.lock().await;
+            state.history.lock().await.undo(&mut d);
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        {
+            let mut d = state.document.lock().await;
+            state.history.lock().await.redo(&mut d);
+        }
+        let listed = call(
+            &state,
+            "list_reference_stills",
+            json!({"sequence_id":ids[1].0}),
+        )
+        .await;
+        assert_eq!(data(&listed)["stills"][0]["comparable"], true);
+        assert_eq!(data(&listed)["stills"][0]["image_status"], "verified");
+        let compared = call(
+            &state,
+            "compare_reference_still",
+            json!({"sequence_id":ids[1].0,"still_id":copy_id,"at_ticks":0}),
+        )
+        .await;
+        assert_ne!(compared.is_error, Some(true), "{compared:?}");
+        for v in data(&compared)["shot_match_suggestion"]["points"]
+            .as_array()
+            .unwrap()
+        {
+            assert!((v.as_f64().unwrap() + 12.0).abs() < 0.05);
+        }
+        let applied=call(&state,"apply_shot_match",json!({"sequence_id":ids[1].0,"clip_id":ids[1].2,"still_id":copy_id,"at_ticks":0,"expected_revision":data(&compared)["current_revision"]})).await;
+        assert_ne!(applied.is_error, Some(true), "{applied:?}");
+        let matched = call(
+            &state,
+            "compare_reference_still",
+            json!({"sequence_id":ids[1].0,"still_id":copy_id,"at_ticks":0}),
+        )
+        .await;
+        assert_ne!(matched.is_error, Some(true), "{matched:?}");
+        for v in data(&matched)["shot_match_suggestion"]["points"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(v.as_f64().unwrap().abs() < 0.05);
+        }
+        let removed = call(
+            &state,
+            "remove_reference_still",
+            json!({"sequence_id":ids[0].0,"still_id":source_id}),
+        )
+        .await;
+        assert_ne!(removed.is_error, Some(true), "{removed:?}");
+        assert!(
+            !ops::unused_assets(state.document.lock().await.timeline.as_ref().unwrap())
+                .contains(&asset)
+        );
+        let before_bad = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let rev_bad = state.history.lock().await.revision();
+        let bad=call(&state,"copy_reference_still",json!({"source_sequence_id":ids[1].0,"destination_sequence_id":ids[1].0,"still_id":copy_id})).await;
+        assert_eq!(bad.is_error, Some(true));
+        assert_eq!(state.history.lock().await.revision(), rev_bad);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before_bad
+        );
+        std::fs::write(&path, b"changed reference").unwrap();
+        let rejected = call(
+            &state,
+            "compare_reference_still",
+            json!({"sequence_id":ids[1].0,"still_id":copy_id,"at_ticks":0}),
+        )
+        .await;
+        assert_eq!(data(&rejected)["error_code"], "ReferenceChanged");
+        std::fs::write(&path, &original).unwrap();
+        std::fs::write(
+            root.join("copy.photon"),
+            state.document.lock().await.to_json().unwrap(),
+        )
+        .unwrap();
+        let destination = root.join("portable");
+        let archived = call(&state, "archive_project", json!({"path":destination})).await;
+        assert_ne!(archived.is_error, Some(true), "{archived:?}");
+        let old = std::path::PathBuf::from(data(&archived)["path"].as_str().unwrap());
+        let relative = old.strip_prefix(&destination).unwrap().to_owned();
+        let moved = root.join("moved");
+        std::fs::rename(destination, &moved).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let archive_path = moved.join(relative);
+        let mut recovered =
+            photonic_core::Document::from_json(&std::fs::read_to_string(&archive_path).unwrap())
+                .unwrap();
+        photonic_video::project::archive::resolve_project_relative_assets(
+            &mut recovered,
+            &archive_path,
+        );
+        let p = recovered.timeline.as_ref().unwrap();
+        let recovered_still = &p.sequences[&ids[1].0].reference_stills[0];
+        assert_eq!(recovered_still.native_balance, summary);
+        assert_eq!(
+            recovered_still.copied_from.as_ref().unwrap().sequence_id,
+            ids[0].0
+        );
+        let AssetSource::File { path, .. } = &p.media.assets[&asset].source else {
+            panic!()
+        };
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        let cold = AppState::headless_for_test();
+        *cold.document.lock().await = recovered;
+        *cold.document_path.lock().unwrap() = Some(archive_path);
+        let final_match = call(
+            &cold,
+            "compare_reference_still",
+            json!({"sequence_id":ids[1].0,"still_id":copy_id,"at_ticks":0}),
+        )
+        .await;
+        assert_ne!(final_match.is_error, Some(true), "{final_match:?}");
+        for v in data(&final_match)["shot_match_suggestion"]["points"]
+            .as_array()
+            .unwrap()
+        {
+            assert!(v.as_f64().unwrap().abs() < 0.05);
+        }
+        assert!(state.history.lock().await.revision() > rev);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn native_reference_balance_capture_compare_apply_and_recovery() {
+        Box::pin(check_reference_capture_and_match(true)).await;
+    }
+
+    async fn check_reference_capture_and_match(native: bool) {
         use photonic_core::timeline::AssetSource;
         let state = test_state();
         if !engine_available(&state).await {
             assert!(std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none());
             return;
         }
-        let root =
-            std::env::temp_dir().join(format!("photonic-mcp-capture-{}", uuid::Uuid::new_v4()));
+        let retained = native
+            .then(|| std::env::var_os("PHOTONIC_NATIVE_BALANCE_QUALIFICATION_DIR"))
+            .flatten();
+        let root = retained
+            .as_ref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::env::temp_dir().join(format!("photonic-mcp-capture-{}", uuid::Uuid::new_v4()))
+            });
         std::fs::create_dir_all(&root).unwrap();
         let mut project = TimelineProject::new();
         let mut sequence = Sequence::new("capture", FrameRate::FPS_30, 16, 16);
+        if native {
+            sequence.color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+        }
         let sequence_id = sequence.id;
         let mut track = Track::new(photonic_core::timeline::TrackKind::Video, "V1");
         let clip = Clip::new(
@@ -17829,6 +36472,20 @@ mod tests {
         assert_eq!(still.id, still_id);
         assert_eq!(still.source_clip, Some(clip_id));
         assert_eq!(still.name, "Opening frame");
+        assert_eq!(still.native_balance.is_some(), native);
+        assert_eq!(data(&result)["native_balance_available"], native);
+        if let Some(balance) = &still.native_balance {
+            balance
+                .validate_for_image(&still.image_hash, 16, 16)
+                .unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(
+                photonic_core::Document::from_json(&doc.to_json().unwrap()).unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(&*doc).unwrap()
+        );
         let asset = &project.media.assets[&still.image_asset];
         let AssetSource::File { path, .. } = &asset.source else {
             panic!("reference is not a file")
@@ -17894,10 +36551,79 @@ mod tests {
         assert_eq!(proposal["operator"], "printer_lights");
         assert_eq!(
             proposal["method"],
-            "per_channel_10_percent_trimmed_mean_log2_of_opaque_nonclipped_legacy_sdr_pixels"
+            if native {
+                "per_channel_10_percent_trimmed_log2_opaque_positive_scene_linear_ap1_v1"
+            } else {
+                "per_channel_10_percent_trimmed_mean_log2_of_opaque_nonclipped_legacy_sdr_pixels"
+            }
         );
         for point in proposal["points"].as_array().unwrap() {
-            assert!((point.as_f64().unwrap() + 12.0).abs() < 1.0, "{proposal}");
+            assert!(
+                (point.as_f64().unwrap() + 12.0).abs() < if native { 0.05 } else { 1.0 },
+                "{proposal}"
+            );
+        }
+        if native {
+            let baseline = state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_ref()
+                .unwrap()
+                .sequences[&sequence_id]
+                .reference_stills[0]
+                .native_balance
+                .clone();
+            for bad in [
+                None,
+                baseline.clone().map(|mut b| {
+                    b.image_hash = "b".repeat(32);
+                    b
+                }),
+                baseline.clone().map(|mut b| {
+                    b.summary.version = 2;
+                    b
+                }),
+            ] {
+                state
+                    .document
+                    .lock()
+                    .await
+                    .timeline
+                    .as_mut()
+                    .unwrap()
+                    .sequences
+                    .get_mut(&sequence_id)
+                    .unwrap()
+                    .reference_stills[0]
+                    .native_balance = bad;
+                let compared = call(
+                    &state,
+                    "compare_reference_still",
+                    json!({"still_id":still_id}),
+                )
+                .await;
+                assert_ne!(compared.is_error, Some(true), "{compared:?}");
+                assert!(data(&compared)["shot_match_suggestion"].is_null());
+                assert!(data(&compared)["shot_match_unavailable_reason"].is_string());
+                let rev = state.history.lock().await.revision();
+                let rejected=call(&state,"apply_shot_match",json!({"clip_id":clip_id,"still_id":still_id,"at_ticks":0,"expected_revision":rev})).await;
+                assert_eq!(data(&rejected)["error_code"], "MatchUnavailable");
+                assert_eq!(state.history.lock().await.revision(), rev);
+            }
+            state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sequence_id)
+                .unwrap()
+                .reference_stills[0]
+                .native_balance = baseline;
         }
         let stale = call(
             &state,
@@ -17945,6 +36671,18 @@ mod tests {
             .unwrap()
             .video_tracks[0]
             .locked = false;
+        if native {
+            std::fs::write(
+                root.join("before-match.photon"),
+                state.document.lock().await.to_json().unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                root.join("proposal.json"),
+                serde_json::to_vec_pretty(&preview).unwrap(),
+            )
+            .unwrap();
+        }
         let applied = call(
             &state,
             "apply_shot_match",
@@ -17974,6 +36712,34 @@ mod tests {
                 .len(),
             2
         );
+        if native {
+            let after = call(
+                &state,
+                "compare_reference_still",
+                json!({"still_id":still_id}),
+            )
+            .await;
+            assert_ne!(after.is_error, Some(true), "{after:?}");
+            assert!(
+                data(&after)["metrics"]["rgb_mae"].as_f64().unwrap() <= 1. / 255.,
+                "{after:?}"
+            );
+            assert!(data(&after)["shot_match_suggestion"]["points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p.as_f64().unwrap().abs() < 0.05));
+        }
+        if native {
+            let doc = state.document.lock().await;
+            let encoded = doc.to_json().unwrap();
+            let recovered = photonic_core::Document::from_json(&encoded).unwrap();
+            assert_eq!(
+                serde_json::to_value(&*doc).unwrap(),
+                serde_json::to_value(&recovered).unwrap()
+            );
+            std::fs::write(root.join("matched.photon"), encoded).unwrap();
+        }
         let mut doc = state.document.lock().await;
         let mut history = state.history.lock().await;
         assert!(history.undo(&mut doc));
@@ -18011,7 +36777,14 @@ mod tests {
         )
         .await;
         assert_eq!(failed.is_error, Some(true), "{failed:?}");
-        assert_eq!(data(&failed)["error_code"], "ReferenceFrameInvalid");
+        assert_eq!(
+            data(&failed)["error_code"],
+            if native {
+                "ColorPipelineUnavailable"
+            } else {
+                "ReferenceFrameInvalid"
+            }
+        );
         assert!(state
             .document
             .lock()
@@ -18022,7 +36795,9 @@ mod tests {
             .sequences[&sequence_id]
             .reference_stills
             .is_empty());
-        std::fs::remove_dir_all(root).unwrap();
+        if retained.is_none() {
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -18282,6 +37057,419 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_look_versions_native_cross_sequence_archive_delivery() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{
+            Clip, ClipLook, ClipSource, Grade, GradeOp, GradeOpKind, GradeOpParams, SharedLook,
+            SharedLookId, Track, TrackKind,
+        };
+        let state = test_state();
+        assert!(engine_available(&state).await, "GPU required");
+        let mut ids = Vec::new();
+        let look = SharedLookId::new();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.0 },
+        ));
+        grade.convert_to_graph();
+        let output = grade.graph.as_ref().unwrap().output;
+        for n in 0..2 {
+            let made = call(&state,"create_sequence",json!({"name":format!("Shared {n}"),"frame_rate":{"num":30,"den":1},"formats":[{"name":"Test","width":16,"height":16}]})).await;
+            assert_ne!(made.is_error, Some(true), "{made:?}");
+            let sid: SequenceId =
+                serde_json::from_value(data(&made)["sequence_id"].clone()).unwrap();
+            let mut doc = state.document.lock().await;
+            let seq = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap();
+            seq.color =
+                SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+            let mut clip = Clip::new(
+                ClipSource::SolidColor {
+                    color: photonic_core::Color {
+                        r: 0.2,
+                        g: 0.1,
+                        b: 0.05,
+                        a: 1.0,
+                    },
+                },
+                Tick::ZERO,
+                Tick::from_seconds(1),
+            );
+            clip.look = Some(ClipLook::Shared(look));
+            let cid = clip.id;
+            let mut track = Track::new(TrackKind::Video, "V1");
+            track.clips.push(clip);
+            seq.video_tracks.push(track);
+            ids.push((sid, cid));
+        }
+        state
+            .document
+            .lock()
+            .await
+            .timeline
+            .as_mut()
+            .unwrap()
+            .shared_looks
+            .insert(
+                look,
+                SharedLook {
+                    id: look,
+                    name: "Scene".into(),
+                    grade: grade.clone(),
+                    versions: vec![],
+                    active_version: None,
+                },
+            );
+        let stage = json!({"kind":"shared_look","id":look});
+        let a = call(
+            &state,
+            "grade_version",
+            json!({"op":"add","clip_id":ids[0].1,"stage":stage,"name":"Neutral"}),
+        )
+        .await;
+        assert_ne!(a.is_error, Some(true), "{a:?}");
+        let neutral = data(&a)["active_version"].clone();
+        let b = call(
+            &state,
+            "grade_version",
+            json!({"op":"add","clip_id":ids[1].1,"stage":stage,"name":"Bright"}),
+        )
+        .await;
+        assert_ne!(b.is_error, Some(true), "{b:?}");
+        let bright = data(&b)["active_version"].clone();
+        grade.ops[0].params.base = GradeOpParams::Exposure { stops: 1.0 };
+        let edited = call(
+            &state,
+            "shared_look",
+            json!({"op":"update","look_id":look,"grade":grade}),
+        )
+        .await;
+        assert_ne!(edited.is_error, Some(true), "{edited:?}");
+        let base =
+            photonic_video::color::native::encoded_srgb_to_linear_ap1_display([0.2, 0.1, 0.05]);
+        for (version, gain) in [
+            (bright.clone(), 2.0),
+            (neutral.clone(), 1.0),
+            (bright.clone(), 2.0),
+        ] {
+            if state
+                .document
+                .lock()
+                .await
+                .timeline
+                .as_ref()
+                .unwrap()
+                .shared_looks[&look]
+                .active_version
+                .map(|id| json!(id))
+                != Some(version.clone())
+            {
+                let switched = call(
+                    &state,
+                    "grade_version",
+                    json!({"op":"activate","clip_id":ids[0].1,"stage":stage,"version_id":version}),
+                )
+                .await;
+                assert_ne!(switched.is_error, Some(true), "{switched:?}");
+            }
+            let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+            let revision = state.history.lock().await.revision();
+            for (_, cid) in &ids {
+                let rendered = call(
+                    &state,
+                    "inspect_grade_image",
+                    json!({"clip_id":cid,"stage":stage,"graph_node_id":output,"at_ticks":0}),
+                )
+                .await;
+                assert_ne!(rendered.is_error, Some(true), "{rendered:?}");
+                let p = rendered.structured_content.as_ref().unwrap();
+                for c in 0..3 {
+                    assert!(
+                        (p["scene_rgb"]["min"][c].as_f64().unwrap() - base[c] * gain).abs() < 0.001,
+                        "{p}"
+                    );
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+        }
+        let detached = call(
+            &state,
+            "shared_look",
+            json!({"op":"make_independent","clip_id":ids[1].1}),
+        )
+        .await;
+        assert_ne!(detached.is_error, Some(true), "{detached:?}");
+        let switched = call(
+            &state,
+            "grade_version",
+            json!({"op":"activate","clip_id":ids[0].1,"stage":stage,"version_id":neutral}),
+        )
+        .await;
+        assert_ne!(switched.is_error, Some(true), "{switched:?}");
+        for (index, gain) in [(0, 1.0), (1, 2.0)] {
+            let st = if index == 0 {
+                stage.clone()
+            } else {
+                json!({"kind":"local_look"})
+            };
+            let r = call(
+                &state,
+                "inspect_grade_image",
+                json!({"clip_id":ids[index].1,"stage":st,"graph_node_id":output,"at_ticks":0}),
+            )
+            .await;
+            assert_ne!(r.is_error, Some(true), "{r:?}");
+            let p = r.structured_content.unwrap();
+            for c in 0..3 {
+                assert!(
+                    (p["scene_rgb"]["min"][c].as_f64().unwrap() - base[c] * gain).abs() < 0.001,
+                    "{p}"
+                );
+            }
+        }
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("shared-version-delivery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.photon");
+        std::fs::write(&source, state.document.lock().await.to_json().unwrap()).unwrap();
+        *state.document_path.lock().unwrap() = Some(source);
+        let destination = root.join("portable");
+        let archived = call(&state, "archive_project", json!({"path":destination})).await;
+        assert_ne!(archived.is_error, Some(true), "{archived:?}");
+        let old_path = std::path::PathBuf::from(data(&archived)["path"].as_str().unwrap());
+        let relative = old_path.strip_prefix(&destination).unwrap().to_owned();
+        let moved = root.join("moved");
+        std::fs::rename(&destination, &moved).unwrap();
+        let path = moved.join(relative);
+        let mut recovered =
+            photonic_core::Document::from_json(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        photonic_video::project::archive::resolve_project_relative_assets(&mut recovered, &path);
+        assert_eq!(
+            recovered.timeline.as_ref().unwrap().shared_looks[&look]
+                .versions
+                .len(),
+            2
+        );
+        let cold = AppState::headless_for_test();
+        *cold.document.lock().await = recovered;
+        *cold.document_path.lock().unwrap() = Some(path);
+        let switched = call(
+            &cold,
+            "grade_version",
+            json!({"op":"activate","clip_id":ids[0].1,"stage":stage,"version_id":bright}),
+        )
+        .await;
+        assert_ne!(switched.is_error, Some(true), "{switched:?}");
+        let r = call(
+            &cold,
+            "inspect_grade_image",
+            json!({"clip_id":ids[0].1,"stage":stage,"graph_node_id":output,"at_ticks":0}),
+        )
+        .await;
+        assert_ne!(r.is_error, Some(true), "{r:?}");
+        let p = r.structured_content.unwrap();
+        for c in 0..3 {
+            assert!(
+                (p["scene_rgb"]["min"][c].as_f64().unwrap() - base[c] * 2.0).abs() < 0.001,
+                "{p}"
+            );
+        }
+        let before = serde_json::to_value(&*cold.document.lock().await).unwrap();
+        let output = root.join("shared.mov");
+        let queued=call(&cold,"export_sequence",json!({"sequence_id":ids[0].0,"out_path":output,"preset":"ProRes Mezzanine","write_manifest":true})).await;
+        assert_ne!(queued.is_error, Some(true), "{queued:?}");
+        let q = data(&queued);
+        assert_eq!(q["total_frames"], 30);
+        let done = poll_job(&cold, &q["job_id"]).await;
+        assert_eq!(done["status"]["state"], "done", "{done}");
+        photonic_video::export::manifest::verify_manifest(
+            &photonic_video::export::manifest::manifest_path(&output),
+        )
+        .unwrap();
+        let ffmpeg = photonic_video::media::ffmpeg_locate::locate_for_test().unwrap();
+        let decoded = std::process::Command::new(&ffmpeg.ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&output)
+            .args(["-f", "rawvideo", "-pix_fmt", "rgba64le", "pipe:1"])
+            .output()
+            .unwrap();
+        assert!(
+            decoded.status.success(),
+            "{}",
+            String::from_utf8_lossy(&decoded.stderr)
+        );
+        assert_eq!(decoded.stdout.len(), 30 * 16 * 16 * 8);
+        let expected = photonic_video::color::native_output::Aces2SdrOutput::shared()
+            .unwrap()
+            .map_straight_video(base.map(|v| v * 2.0))
+            .unwrap();
+        for pixel in decoded.stdout.chunks_exact(8) {
+            for c in 0..3 {
+                let v = u16::from_le_bytes([pixel[c * 2], pixel[c * 2 + 1]]);
+                assert!(
+                    v.abs_diff((expected[c] * 65535.0).round() as u16) <= 1600,
+                    "{v} vs {expected:?}"
+                );
+            }
+            assert!(u16::from_le_bytes([pixel[6], pixel[7]]) >= 65000);
+        }
+        assert_eq!(
+            serde_json::to_value(&*cold.document.lock().await).unwrap(),
+            before
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_look_versions_mcp_ownership_cross_sequence_locks_and_undo() {
+        let state = test_state();
+        let (_, ta) = create_seq_and_track(&state, "video").await;
+        let a = insert_solid_clip(&state, &ta, 0, 1000).await;
+        let (_, tb) = create_seq_and_track(&state, "video").await;
+        let b = insert_solid_clip(&state, &tb, 0, 1000).await;
+        let made = call(
+            &state,
+            "shared_look",
+            json!({"op":"create","name":"Versioned scene"}),
+        )
+        .await;
+        assert_ne!(made.is_error, Some(true), "{made:?}");
+        let look = data(&made)["looks"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let stage = json!({"kind":"shared_look","id":look});
+        for clip in [&a, &b] {
+            assert_ne!(
+                call(
+                    &state,
+                    "shared_look",
+                    json!({"op":"link","look_id":look,"clip_id":clip})
+                )
+                .await
+                .is_error,
+                Some(true)
+            );
+        }
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let listed = call(
+            &state,
+            "grade_version",
+            json!({"op":"list","clip_id":a,"stage":stage}),
+        )
+        .await;
+        assert_eq!(data(&listed)["affected_linked_clips"], 2);
+        assert_eq!(data(&listed)["versions"], json!([]));
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        let first = call(
+            &state,
+            "grade_version",
+            json!({"op":"add","clip_id":a,"stage":stage,"name":"A"}),
+        )
+        .await;
+        assert_ne!(first.is_error, Some(true), "{first:?}");
+        let va = data(&first)["active_version"].clone();
+        let second = call(
+            &state,
+            "grade_version",
+            json!({"op":"add","clip_id":b,"stage":stage,"name":"B"}),
+        )
+        .await;
+        assert_ne!(second.is_error, Some(true), "{second:?}");
+        assert_ne!(
+            call(
+                &state,
+                "shared_look",
+                json!({"op":"update","look_id":look,"grade":{"ops":[],"bypass":true}})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        let snapshot = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let selected = call(
+            &state,
+            "grade_version",
+            json!({"op":"activate","clip_id":a,"stage":stage,"version_id":va}),
+        )
+        .await;
+        assert_ne!(selected.is_error, Some(true), "{selected:?}");
+        {
+            let mut doc = state.document.lock().await;
+            state.history.lock().await.undo(&mut doc);
+        }
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            snapshot
+        );
+        let ordinary = call(
+            &state,
+            "grade_version",
+            json!({"op":"list","clip_id":a,"stage":null}),
+        )
+        .await;
+        assert_eq!(data(&ordinary)["versions"], json!([]));
+        assert_ne!(
+            call(
+                &state,
+                "set_track_prop",
+                json!({"track_id":tb,"locked":true})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for args in [
+            json!({"op":"add","clip_id":a,"stage":stage,"name":"C"}),
+            json!({"op":"activate","clip_id":a,"stage":stage,"version_id":va}),
+            json!({"op":"list","clip_id":a,"stage":{"kind":"shared_look","id":uuid::Uuid::new_v4()}}),
+            json!({"op":"list","clip_id":a,"stage":{"kind":"local_look"}}),
+        ] {
+            assert_eq!(
+                call(&state, "grade_version", args).await.is_error,
+                Some(true)
+            );
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+        assert_ne!(
+            call(
+                &state,
+                "grade_version",
+                json!({"op":"list","clip_id":a,"stage":stage})
+            )
+            .await
+            .is_error,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
     async fn grade_version_mcp_edits_roundtrip_and_reject_locked_tracks() {
         let state = test_state();
         let (_, track) = create_seq_and_track(&state, "video").await;
@@ -18390,13 +37578,34 @@ mod tests {
         )
         .await;
         assert_ne!(detached.is_error, Some(true), "{detached:?}");
+        let independent = call(
+            &state,
+            "shared_look",
+            json!({"op":"update_independent", "clip_id":first, "grade":{"ops":[],"bypass":false}}),
+        )
+        .await;
+        assert_ne!(independent.is_error, Some(true), "{independent:?}");
+        let revision = state.history.lock().await.revision();
+        let snapshot = serde_json::to_value(&*state.document.lock().await).unwrap();
+        for args in [
+            json!({"op":"update_independent", "clip_id":second, "grade":{"ops":[]}}),
+            json!({"op":"update_independent", "clip_id":first}),
+            json!({"op":"update_independent", "clip_id":first, "look_id":look_id, "grade":{"ops":[]}}),
+        ] {
+            assert_eq!(call(&state, "shared_look", args).await.is_error, Some(true));
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                snapshot
+            );
+        }
         let doc = state.document.lock().await;
         let project = doc.timeline.as_ref().unwrap();
         let first_id: ClipId = serde_json::from_value(first.clone()).unwrap();
         let (seq, trk) = locate_clip(project, first_id).unwrap();
         let local = &find_clip(project, seq, trk, first_id).unwrap().look;
         assert!(
-            matches!(local, Some(photonic_core::timeline::ClipLook::Local(grade)) if grade.bypass)
+            matches!(local, Some(photonic_core::timeline::ClipLook::Local(grade)) if !grade.bypass)
         );
         drop(doc);
         let lock = call(
@@ -18487,6 +37696,162 @@ mod tests {
                 before
             );
         }
+    }
+
+    #[tokio::test]
+    async fn locked_composition_graph_mutations_preserve_document_and_history() {
+        let state = test_state();
+        let (_, track_id) = create_seq_and_track(&state, "video").await;
+        let clip_id = insert_solid_clip(&state, &track_id, 0, 1000).await;
+        let created = call(
+            &state,
+            "create_clip_composition",
+            json!({"clip_id": clip_id}),
+        )
+        .await;
+        assert_ne!(created.is_error, Some(true));
+        let graph_id = data(&created)["graph_id"].clone();
+        let added = call(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":{"op":"blur"}}),
+        )
+        .await;
+        assert_ne!(added.is_error, Some(true));
+        let node_id = data(&added)["node_id"].clone();
+        let loaded = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+        let graph = data(&loaded)["graph"].clone();
+        let source = graph["edges"][0]["from"][0].clone();
+        assert!(!source.is_null(), "{graph}");
+        let locked = call(
+            &state,
+            "set_track_prop",
+            json!({"track_id":track_id,"locked":true}),
+        )
+        .await;
+        assert_ne!(locked.is_error, Some(true));
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for (tool, args) in [
+            (
+                "add_graph_node",
+                json!({"graph_id":graph_id,"op":{"op":"invert"}}),
+            ),
+            (
+                "remove_graph_node",
+                json!({"graph_id":graph_id,"node_id":node_id}),
+            ),
+            (
+                "set_graph_node_param",
+                json!({"graph_id":graph_id,"node_id":node_id,"path":"params.radius","value":{"t":"float","v":4.0}}),
+            ),
+            (
+                "add_graph_edge",
+                json!({"graph_id":graph_id,"from":{"node_id":source},"to":{"node_id":node_id}}),
+            ),
+            (
+                "remove_graph_edge",
+                json!({"graph_id":graph_id,"edge_index":0}),
+            ),
+        ] {
+            let result = call(&state, tool, args).await;
+            assert_eq!(result.is_error, Some(true), "{tool}: {result:?}");
+            assert_eq!(data(&result)["error_code"], "TrackLocked", "{tool}");
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+        let loaded = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+        assert_ne!(loaded.is_error, Some(true), "locked graphs remain readable");
+        assert_eq!(state.history.lock().await.revision(), revision);
+    }
+
+    #[tokio::test]
+    async fn graph_wiring_rejects_out_of_range_ports_without_history_changes() {
+        let state = test_state();
+        let (_, track) = create_seq_and_track(&state, "video").await;
+        let clip = insert_solid_clip(&state, &track, 0, 1000).await;
+        let created = call(&state, "create_clip_composition", json!({"clip_id":clip})).await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+        let source = data(&read)["graph"]["edges"][0]["from"][0].clone();
+        let added = call(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":{"op":"blur"}}),
+        )
+        .await;
+        let blur = data(&added)["node_id"].clone();
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        for (from_port, to_port) in [(7, 0), (0, 9)] {
+            let result=call(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":source,"port":from_port},"to":{"node_id":blur,"port":to_port}})).await;
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(data(&result)["error_code"], "GraphTypeMismatch");
+            assert_eq!(state.history.lock().await.revision(), revision);
+            assert_eq!(
+                serde_json::to_value(&*state.document.lock().await).unwrap(),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn graph_reconnection_is_atomic_repeatable_and_exactly_undoable() {
+        let state = test_state();
+        let (_, track) = create_seq_and_track(&state, "video").await;
+        let clip = insert_solid_clip(&state, &track, 0, 1000).await;
+        let created = call(&state, "create_clip_composition", json!({"clip_id":clip})).await;
+        let graph_id = data(&created)["graph_id"].clone();
+        let read = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+        let graph = data(&read)["graph"].clone();
+        let source = graph["edges"][0]["from"][0].clone();
+        let output = graph["output"].clone();
+        let added = call(
+            &state,
+            "add_graph_node",
+            json!({"graph_id":graph_id,"op":{"op":"blur"}}),
+        )
+        .await;
+        let blur = data(&added)["node_id"].clone();
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_edge",
+            json!({"graph_id":graph_id,"from":{"node_id":source},"to":{"node_id":blur}}),
+        ))
+        .await;
+        let replacement =
+            json!({"graph_id":graph_id,"from":{"node_id":blur},"to":{"node_id":output}});
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "add_graph_edge",
+            replacement.clone(),
+        ))
+        .await;
+        let read = call(&state, "get_graph", json!({"graph_id":graph_id})).await;
+        let edges = data(&read)["graph"]["edges"].as_array().unwrap().clone();
+        assert_eq!(edges.len(), 2);
+        assert_eq!(
+            edges.iter().filter(|edge| edge["to"][0] == output).count(),
+            1
+        );
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let revision = state.history.lock().await.revision();
+        let repeated = call(&state, "add_graph_edge", replacement).await;
+        assert_ne!(repeated.is_error, Some(true));
+        assert_eq!(state.history.lock().await.revision(), revision);
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before
+        );
+        Box::pin(graph_authoring_edit_roundtrip(
+            &state,
+            "remove_graph_edge",
+            json!({"graph_id":graph_id,"edge_index":0}),
+        ))
+        .await;
     }
 
     #[tokio::test]

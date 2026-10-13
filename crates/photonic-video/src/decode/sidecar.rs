@@ -78,6 +78,12 @@ impl Sidecar {
             .arg(&cfg.input)
             .args([
                 "-an",
+                // The PTS model labels one decoded picture per source frame.
+                // Auto/CFR output sync silently drops or duplicates VFR frames.
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base",
+                "-1", // retain the input time base, avoiding rounded duplicate DTS
                 "-f",
                 "rawvideo",
                 "-pix_fmt",

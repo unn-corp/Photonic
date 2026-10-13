@@ -85,22 +85,35 @@ pub const PREFETCH_AHEAD_FRAMES: i64 = 12;
 /// many frames were decoded (0 = ring already ahead / end of stream / no
 /// active process).
 pub fn pump_ahead(source: &mut DecodeSource, playhead: Tick, rate: FrameRate) -> usize {
+    pump_ahead_checked(source, playhead, rate).unwrap_or(0)
+}
+
+/// Worker variant that preserves definitive decoder errors for the presenter.
+pub fn pump_ahead_checked(
+    source: &mut DecodeSource,
+    playhead: Tick,
+    rate: FrameRate,
+) -> Result<usize, crate::decode::DecodeError> {
     if !source.is_active() {
         // Nothing decoded from this source yet this session (first frame comes
         // from the evaluator's on-demand seek); nothing to pump sequentially.
-        return 0;
+        return Ok(0);
     }
-    let target = Tick(rate.snap(playhead).0 + PREFETCH_AHEAD_FRAMES * rate.ticks_per_frame().0);
+    let target = Tick(
+        rate.snap(playhead)
+            .0
+            .saturating_add(PREFETCH_AHEAD_FRAMES.saturating_mul(rate.ticks_per_frame().0)),
+    );
     // Caught up only when the decode *frontier* (newest resident pts) has
     // actually reached the look-ahead horizon. Using `frame_covering` here was
     // wrong: it returns any frame at/before `target`, so the single frame left
     // by a seek made this report "pumped ahead" and forward decode never ran.
     if source.ring().newest().is_some_and(|n| n.0 >= target.0) {
-        return 0; // ring already reaches the look-ahead horizon
+        return Ok(0); // ring already reaches the look-ahead horizon
     }
     // Keep the ring's eviction window tracking the consumer.
     source.ring().set_playhead(playhead);
-    source.pump(PREFETCH_BATCH).unwrap_or(0)
+    source.pump(PREFETCH_BATCH)
 }
 
 // ── Sidecar pool LRU (pure) ─────────────────────────────────────────────────

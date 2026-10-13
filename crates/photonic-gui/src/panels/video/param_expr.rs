@@ -118,7 +118,8 @@ pub fn neutral_float_default(range: Option<(f64, f64)>) -> f64 {
 
 /// DragValue with expression parsing + middle-click reset to `default`.
 ///
-/// Returns `true` when the value changed (drag, typed number/expr, or reset).
+/// Returns `true` when the value changed (drag, committed number/expr, or reset).
+/// Text stays a draft until Enter/focus loss; Escape cancels it.
 /// Typed expressions outside `range` are refused (parser returns `None`); mouse
 /// drag still uses egui's inclusive range clamp for continuous scrubbing.
 pub fn float_drag(
@@ -132,6 +133,10 @@ pub fn float_drag(
     let vars_owned = vars.clone();
     let range_for_parser = range;
     let mut drag = egui::DragValue::new(value)
+        // A typed expression is one edit, not one command per valid prefix.
+        // Enter/focus loss commits; Escape leaves the authored value unchanged.
+        // Mouse scrubbing still updates continuously under pointer coalescing.
+        .update_while_editing(false)
         .speed(speed)
         .custom_parser(move |s| eval_in_range(s, &vars_owned, range_for_parser).ok());
     if let Some((lo, hi)) = range {
@@ -437,5 +442,599 @@ mod tests {
         assert_eq!(neutral_float_default(Some((0.0, 1.0))), 0.0);
         assert_eq!(neutral_float_default(Some((1.0, 4.0))), 1.0);
         assert_eq!(neutral_float_default(None), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod numeric_commit_tests {
+    use super::*;
+
+    struct Harness {
+        ctx: egui::Context,
+        value: f64,
+        changes: usize,
+        time: f64,
+    }
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                value: 16.0,
+                changes: 0,
+                time: 0.0,
+            }
+        }
+        fn frame(&mut self, events: Vec<egui::Event>, focus: bool, owner: u64) {
+            self.time += 0.02;
+            let _ = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.push_id(owner, |ui| {
+                            if focus {
+                                let id = ui.next_auto_id();
+                                ui.memory_mut(|m| m.request_focus(id));
+                            }
+                            let mut proposed = self.value;
+                            if float_drag(
+                                ui,
+                                &mut proposed,
+                                8.0,
+                                Some((1.0, 256.0)),
+                                &vars_from_params([], Some(320.0), Some(240.0)),
+                                0.01,
+                            ) {
+                                self.value = proposed;
+                                self.changes += 1;
+                            }
+                            let _ = ui.button("Other control");
+                        });
+                    });
+                },
+            );
+        }
+        fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }
+        }
+        fn begin(&mut self, owner: u64) {
+            self.frame(vec![], true, owner);
+            self.frame(
+                vec![Self::key(
+                    egui::Key::A,
+                    egui::Modifiers {
+                        ctrl: true,
+                        command: true,
+                        ..egui::Modifiers::NONE
+                    },
+                )],
+                false,
+                owner,
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_text_commits_once_on_enter_and_separate_edits_stay_separate() {
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("3".into())], false, 1);
+        assert_eq!(
+            (h.value, h.changes),
+            (16.0, 0),
+            "numeric prefix must stay an uncommitted draft"
+        );
+        h.frame(vec![egui::Event::Text("2".into())], false, 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            false,
+            1,
+        );
+        h.frame(vec![], false, 1);
+        h.frame(vec![], false, 1);
+        assert_eq!((h.value, h.changes), (32.0, 1));
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("%w/10+2".into())], false, 1);
+        assert_eq!((h.value, h.changes), (32.0, 1));
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            false,
+            1,
+        );
+        h.frame(vec![], false, 1);
+        assert_eq!((h.value, h.changes), (34.0, 2));
+    }
+
+    #[test]
+    fn numeric_text_escape_invalid_and_owner_switch_do_not_commit() {
+        for text in ["47", "999", "1/0"] {
+            let mut h = Harness::new();
+            h.begin(1);
+            h.frame(vec![egui::Event::Text(text.into())], false, 1);
+            assert_eq!((h.value, h.changes), (16.0, 0));
+            let key = if text == "47" {
+                egui::Key::Escape
+            } else {
+                egui::Key::Enter
+            };
+            h.frame(vec![Harness::key(key, egui::Modifiers::NONE)], false, 1);
+            h.frame(vec![], false, 1);
+            h.frame(vec![], false, 1);
+            assert_eq!((h.value, h.changes), (16.0, 0), "{text}");
+        }
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("47".into())], false, 1);
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            false,
+            2,
+        );
+        h.frame(vec![], false, 2);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+    }
+
+    #[test]
+    fn numeric_text_focus_loss_commits_once() {
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("64".into())], false, 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.frame(
+            vec![Harness::key(egui::Key::Tab, egui::Modifiers::NONE)],
+            false,
+            1,
+        );
+        h.frame(vec![], false, 1);
+        h.frame(vec![], false, 1);
+        assert_eq!((h.value, h.changes), (64.0, 1));
+    }
+    #[test]
+    fn numeric_drag_stays_live_and_middle_click_resets() {
+        let mut h = Harness::new();
+        h.frame(vec![], false, 1);
+        h.frame(vec![], false, 1);
+        let start = egui::pos2(24.0, 18.0);
+        let button = |pos, button, pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        h.frame(
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, egui::PointerButton::Primary, true),
+            ],
+            false,
+            1,
+        );
+        h.frame(
+            vec![egui::Event::PointerMoved(start + egui::vec2(80.0, 0.0))],
+            false,
+            1,
+        );
+        h.frame(
+            vec![egui::Event::PointerMoved(start + egui::vec2(100.0, 0.0))],
+            false,
+            1,
+        );
+        assert!(
+            h.value > 16.0 && h.changes > 0,
+            "drag must update before pointer release: {} {}",
+            h.value,
+            h.changes
+        );
+        h.frame(
+            vec![button(
+                start + egui::vec2(100.0, 0.0),
+                egui::PointerButton::Primary,
+                false,
+            )],
+            false,
+            1,
+        );
+        h.frame(
+            vec![
+                egui::Event::PointerMoved(start),
+                button(start, egui::PointerButton::Middle, true),
+            ],
+            false,
+            1,
+        );
+        h.frame(
+            vec![button(start, egui::PointerButton::Middle, false)],
+            false,
+            1,
+        );
+        assert_eq!(h.value, 8.0);
+    }
+}
+
+#[derive(Clone)]
+struct NumericSliderDraft {
+    original: f64,
+    candidate: f64,
+    text: Option<String>,
+}
+
+/// Slider adapter for a single authored numeric value. Styling and range
+/// semantics remain with egui; text-commit behavior is qualified separately.
+pub fn numeric_slider<Num: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut Num,
+    range: std::ops::RangeInclusive<Num>,
+    configure: impl for<'a> FnOnce(egui::Slider<'a>) -> egui::Slider<'a>,
+) -> egui::Response {
+    let draft_id = ui.next_auto_id().with("photonic_numeric_slider_draft");
+    let original = *value;
+    let mut proposed = original;
+    let mut response = ui.add(configure(egui::Slider::new(&mut proposed, range)));
+    // Slider forwards its numeric editor ID while that editor has focus.
+    // A focused handle has no TextEdit state and keeps live keyboard nudging.
+    if !ui.is_enabled() {
+        ui.data_mut(|data| {
+            data.remove::<NumericSliderDraft>(draft_id);
+            data.remove::<String>(response.id);
+        });
+        response.changed = false;
+        return response;
+    }
+    let text_active =
+        response.has_focus() && egui::TextEdit::load_state(ui.ctx(), response.id).is_some();
+    let cancelled = ui.input(|input| input.key_pressed(egui::Key::Escape));
+    let mut draft = ui.data(|data| data.get_temp::<NumericSliderDraft>(draft_id));
+    // Pinned egui DragValue retains its editor string under the forwarded ID.
+    // Compare it only to detect textual changes: invalid text must reset to
+    // the original value, rather than accidentally committing a valid prefix.
+    // Event regressions pin this adapter contract for dependency upgrades.
+    let text = ui.data(|data| data.get_temp::<String>(response.id));
+    if let Some(old) = &draft {
+        if old.original != original.to_f64() {
+            ui.data_mut(|data| {
+                data.remove::<NumericSliderDraft>(draft_id);
+                data.remove::<String>(response.id);
+            });
+            ui.memory_mut(|memory| memory.surrender_focus(response.id));
+            response.changed = false;
+            return response;
+        }
+    }
+    if text_active {
+        if draft.as_ref().is_none_or(|old| old.text != text) {
+            draft = Some(NumericSliderDraft {
+                original: original.to_f64(),
+                candidate: proposed.to_f64(),
+                text,
+            });
+        }
+        if let Some(draft) = draft {
+            ui.data_mut(|data| data.insert_temp(draft_id, draft));
+        }
+    } else {
+        if !cancelled {
+            *value = if response.lost_focus() {
+                draft.map_or(proposed, |draft| {
+                    if draft.text != text {
+                        proposed
+                    } else {
+                        Num::from_f64(draft.candidate)
+                    }
+                })
+            } else {
+                proposed
+            };
+        }
+        let _ = ui.data_mut(|data| data.remove::<NumericSliderDraft>(draft_id));
+    }
+    response.changed = *value != original;
+    response
+}
+
+#[cfg(test)]
+mod slider_commit_tests {
+    use super::*;
+    struct Harness {
+        ctx: egui::Context,
+        value: f64,
+        changes: usize,
+        time: f64,
+        text_pos: egui::Pos2,
+        slider_id: Option<egui::Id>,
+        track_rect: egui::Rect,
+        enabled: bool,
+    }
+    impl Harness {
+        fn new() -> Self {
+            Self {
+                ctx: egui::Context::default(),
+                value: 16.0,
+                changes: 0,
+                time: 0.0,
+                text_pos: egui::Pos2::ZERO,
+                slider_id: None,
+                track_rect: egui::Rect::NOTHING,
+                enabled: true,
+            }
+        }
+        fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }
+        }
+        fn frame(&mut self, events: Vec<egui::Event>, owner: u64) {
+            self.time += 0.02;
+            let old = self.value;
+            let output = self.ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 300.0),
+                    )),
+                    time: Some(self.time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.push_id(owner, |ui| {
+                            if !self.enabled {
+                                ui.disable();
+                            }
+                            let mut proposed = self.value;
+                            let response = numeric_slider(ui, &mut proposed, 0.0..=256.0, |s| {
+                                s.clamping(egui::SliderClamping::Edits)
+                                    .fixed_decimals(2)
+                                    .step_by(1.0)
+                            });
+                            self.slider_id = Some(response.id);
+                            self.track_rect = response.rect;
+                            if response.changed() {
+                                self.value = proposed;
+                                self.changes += 1;
+                            }
+                            let _ = ui.button("Other control");
+                        });
+                    });
+                },
+            );
+            fn find(shape: &egui::Shape, wanted: &str) -> Option<egui::Pos2> {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == wanted => {
+                        Some(t.pos + t.galley.size() * 0.5)
+                    }
+                    egui::Shape::Vec(v) => v.iter().find_map(|s| find(s, wanted)),
+                    _ => None,
+                }
+            }
+            if let Some(pos) = output
+                .shapes
+                .iter()
+                .find_map(|s| find(&s.shape, &format!("{old:.2}")))
+            {
+                self.text_pos = pos;
+            }
+        }
+        fn begin(&mut self, owner: u64) {
+            self.frame(vec![], owner);
+            self.frame(vec![], owner);
+            assert_ne!(self.text_pos, egui::Pos2::ZERO);
+            let pos = self.text_pos;
+            self.frame(
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                owner,
+            );
+            self.frame(
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                owner,
+            );
+            self.frame(
+                vec![Self::key(
+                    egui::Key::A,
+                    egui::Modifiers {
+                        ctrl: true,
+                        command: true,
+                        ..egui::Modifiers::NONE
+                    },
+                )],
+                owner,
+            );
+        }
+    }
+    #[test]
+    fn raw_numeric_slider_text_commits_once_and_escape_cancels() {
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("3".into())], 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.frame(vec![egui::Event::Text("2".into())], 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (32.0, 1));
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("47".into())], 1);
+        h.frame(
+            vec![Harness::key(egui::Key::Escape, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (32.0, 1));
+    }
+    #[test]
+    fn raw_numeric_slider_focus_loss_target_isolation_and_clamp_semantics() {
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("64".into())], 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.frame(vec![Harness::key(egui::Key::Tab, egui::Modifiers::NONE)], 1);
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (64.0, 1));
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("47".into())], 1);
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            2,
+        );
+        h.frame(vec![], 2);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("999".into())], 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (256.0, 1));
+    }
+    #[test]
+    fn raw_numeric_slider_keyboard_and_pointer_scrubbing_remain_live() {
+        let mut h = Harness::new();
+        h.frame(vec![], 1);
+        h.frame(vec![], 1);
+        h.ctx.memory_mut(|m| m.request_focus(h.slider_id.unwrap()));
+        h.frame(
+            vec![Harness::key(egui::Key::ArrowRight, egui::Modifiers::NONE)],
+            1,
+        );
+        assert!(
+            h.value > 16.0 && h.changes > 0,
+            "keyboard handle must stay live: {} {}",
+            h.value,
+            h.changes
+        );
+        let mut h = Harness::new();
+        h.frame(vec![], 1);
+        h.frame(vec![], 1);
+        let pos = egui::pos2(h.track_rect.left() + 70.0, h.track_rect.center().y);
+        h.frame(
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            1,
+        );
+        h.frame(
+            vec![egui::Event::PointerMoved(pos + egui::vec2(10.0, 0.0))],
+            1,
+        );
+        assert!(
+            h.value > 16.0 && h.changes > 0,
+            "pointer handle must stay live"
+        );
+    }
+    #[test]
+    fn raw_numeric_slider_invalid_suffix_same_frame_enter_and_external_update() {
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("32".into())], 1);
+        h.frame(vec![egui::Event::Text("q".into())], 1);
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("3".into())], 1);
+        h.frame(
+            vec![
+                egui::Event::Text("2".into()),
+                Harness::key(egui::Key::Enter, egui::Modifiers::NONE),
+            ],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (32.0, 1));
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("47".into())], 1);
+        h.value = 64.0;
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (64.0, 0));
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("32".into())], 1);
+        h.frame(vec![Harness::key(egui::Key::Tab, egui::Modifiers::NONE)], 1);
+        h.frame(vec![], 1);
+        assert_eq!(h.value, 32.0);
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("48".into())], 1);
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (48.0, 2));
+    }
+    #[test]
+    fn raw_numeric_slider_disabled_scope_cancels_pending_text() {
+        let mut h = Harness::new();
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("47".into())], 1);
+        h.enabled = false;
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (16.0, 0));
+        h.enabled = true;
+        h.frame(vec![], 1);
+        h.begin(1);
+        h.frame(vec![egui::Event::Text("32".into())], 1);
+        h.frame(
+            vec![Harness::key(egui::Key::Enter, egui::Modifiers::NONE)],
+            1,
+        );
+        h.frame(vec![], 1);
+        assert_eq!((h.value, h.changes), (32.0, 1));
     }
 }

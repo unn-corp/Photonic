@@ -131,6 +131,9 @@ impl PhotonicApp {
     }
 }
 
+const READINESS_TEXT_LEVEL: u8 = 240;
+const READINESS_BACKING_ALPHA: u8 = 210;
+
 fn monitor_readiness_text(doc: &Document, status: &photonic_video::EngineStatus) -> String {
     let assets: Vec<_> = match status.preview_target {
         PreviewTarget::Asset { asset, .. } => vec![asset],
@@ -171,6 +174,18 @@ fn monitor_readiness_text(doc: &Document, status: &photonic_video::EngineStatus)
         "{:?} · sources {}/{} · proxies {} ready",
         status.preview_quality, status.readiness.ready, status.readiness.requested, ready
     );
+    if status.pending_computations > 0 {
+        label.push_str(&format!(
+            " · {} background computations pending (provisional)",
+            status.pending_computations
+        ));
+    }
+    if !status.computation_errors.is_empty() {
+        label.push_str(&format!(
+            " · frame computation failed: {}",
+            status.computation_errors.join("; ")
+        ));
+    }
     if pending > 0 {
         label.push_str(&format!(", {pending} building"));
     }
@@ -658,6 +673,18 @@ fn sequence_end_tick(doc: &Document) -> Tick {
         .unwrap_or(Tick::ZERO)
 }
 
+/// Stop forward program playback on the last frame inside the sequence's
+/// half-open content range. Manual seeks and loop playback are not clamped.
+fn forward_playback_end(now: Tick, end: Tick, rate: FrameRate, looping: bool) -> Option<Tick> {
+    if looping || end.0 <= 0 || now < end {
+        return None;
+    }
+    Some(
+        rate.frame_start(rate.frame_at(Tick(end.0 - 1)))
+            .max(Tick::ZERO),
+    )
+}
+
 /// Format a tick as SMPTE timecode (K-A12 / 04 §3.2).
 /// Uses drop-frame (`;`) automatically for 29.97 / 59.94 and honours the
 /// sequence `start_timecode` offset when a document sequence is available.
@@ -1111,14 +1138,20 @@ impl PhotonicApp {
             } else {
                 next = next.max(0);
                 if end.0 > 0 && next >= end.0 {
-                    next = end.0;
+                    next = forward_playback_end(Tick(next), end, active_frame_rate(doc), false)
+                        .expect("positive end reached")
+                        .0;
                     self.monitor_playing = false;
                 }
             }
             self.playhead = Tick(next);
             bridge.seek(self.playhead);
         } else {
-            bridge.set_playing(self.monitor_playing);
+            if matches!(bridge.preview_target, PreviewTarget::Sequence { .. }) {
+                bridge.set_program_playing(self.monitor_playing, self.playhead);
+            } else {
+                bridge.set_playing(self.monitor_playing);
+            }
             if self.monitor_playing {
                 // Cap GUI repaint to ~120 Hz while playing — matches engine
                 // poll (4 ms) without oversubscribing the main thread on Windows
@@ -1127,8 +1160,20 @@ impl PhotonicApp {
                 let status = bridge.status();
                 if status.playing {
                     // The engine's clock is authoritative at 1× (02 §4).
-                    self.playhead = status.playhead;
-                    bridge.note_agreed(self.playhead);
+                    if let Some(last) = forward_playback_end(
+                        status.playhead,
+                        end,
+                        active_frame_rate(doc),
+                        self.monitor_loop_enabled,
+                    ) {
+                        self.monitor_playing = false;
+                        self.playhead = last;
+                        bridge.set_playing(false);
+                        bridge.seek(last);
+                    } else {
+                        self.playhead = status.playhead;
+                        bridge.note_agreed(self.playhead);
+                    }
                 }
             } else {
                 // Paused: a step / seek / scrub-release-settle just issued an
@@ -1169,7 +1214,9 @@ impl PhotonicApp {
         } else {
             next = next.max(0);
             if end > 0 && next >= end {
-                next = end;
+                next = forward_playback_end(Tick(next), Tick(end), active_frame_rate(doc), false)
+                    .expect("positive end reached")
+                    .0;
                 self.monitor_playing = false;
             }
         }
@@ -1196,6 +1243,7 @@ impl PhotonicApp {
         self.video_sample_rect = None;
         self.drive_playback(ctx, doc);
         self.update_qualifier_matte_preview(ctx, doc, history);
+        self.update_grade_matte(ctx, doc, history);
         self.handle_video_keyboard(ctx, doc, history);
 
         let format = active_format(doc);
@@ -1572,6 +1620,100 @@ impl PhotonicApp {
             }
         }
 
+        if let (Some(preview), Some(bridge)) = (&self.grade_matte_preview, &self.engine) {
+            if bridge.session.latest_frame().as_ref().is_some_and(|frame| {
+                !self.monitor_playing
+                    && self.grade_matte_target == Some(preview.key.target)
+                    && frame.sequence == preview.key.target.sequence
+                    && frame.time == preview.key.time
+                    && frame.doc_revision == history.revision()
+                    && frame.doc_revision == preview.key.revision
+                    && frame.snapshot_generation == preview.key.generation
+                    && frame.content_hash.0 == preview.key.hash
+                    && frame.preview_quality == preview.key.quality
+                    && frame.proxy_mode == preview.key.proxy
+                    && bridge.presented_frame == Some((frame.time, frame.sequence))
+                    && frame.scope_tap_point == preview.key.target.tap()
+            }) {
+                if preview.key.target.image {
+                    content_painter.rect_filled(video_rect, 0.0, egui::Color32::BLACK);
+                }
+                content_painter.image(
+                    preview.texture.id(),
+                    video_rect,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                // Raw mattes can be fully white: use the same verified contrast
+                // palette as readiness, at the bottom away from the readiness line.
+                let label = format!(
+                    "{} · {} · {}",
+                    match preview.key.target.stage {
+                        photonic_core::timeline::GradeInspectionStage::Clip => "Clip".to_owned(),
+                        photonic_core::timeline::GradeInspectionStage::LocalLook =>
+                            "Local look".to_owned(),
+                        photonic_core::timeline::GradeInspectionStage::SharedLook { .. } =>
+                            "Linked shared look".to_owned(),
+                        photonic_core::timeline::GradeInspectionStage::GroupPre { id } => format!(
+                            "Group pre {} · clip {}",
+                            &id.to_string()[..8],
+                            &preview.key.target.clip.to_string()[..8]
+                        ),
+                        photonic_core::timeline::GradeInspectionStage::GroupPost { id } => format!(
+                            "Group post {} · clip {}",
+                            &id.to_string()[..8],
+                            &preview.key.target.clip.to_string()[..8]
+                        ),
+                    },
+                    match (preview.key.target.input.is_some(), preview.key.target.image) {
+                        (true, true) => "Correction input",
+                        (true, false) => "Qualifier key coverage",
+                        (false, true) => "Image output",
+                        (false, false) => "Matte output",
+                    },
+                    preview.key.target.input_label(doc)
+                );
+                let text_color = egui::Color32::from_gray(READINESS_TEXT_LEVEL);
+                let galley = content_painter.layout(
+                    label,
+                    egui::FontId::proportional(12.0),
+                    text_color,
+                    (video_rect.width() - 16.0).max(1.0),
+                );
+                let position = video_rect.right_bottom() - galley.size() - egui::vec2(8.0, 8.0);
+                content_painter.rect_filled(
+                    egui::Rect::from_min_size(position, galley.size())
+                        .expand2(egui::vec2(4.0, 2.0)),
+                    3.0,
+                    egui::Color32::from_black_alpha(READINESS_BACKING_ALPHA),
+                );
+                content_painter.galley(position, galley, text_color);
+            }
+        }
+
+        if self.grade_matte_target.is_some()
+            && ui
+                .put(
+                    egui::Rect::from_min_size(
+                        // Keep the inspection control below the preview/source status line.
+                        video_rect.left_top() + egui::vec2(8.0, 28.0),
+                        egui::vec2(92.0, 24.0),
+                    ),
+                    egui::Button::new(
+                        if self.grade_matte_target.is_some_and(|target| target.image) {
+                            "Exit image"
+                        } else {
+                            "Exit matte"
+                        },
+                    ),
+                )
+                .clicked()
+        {
+            self.grade_matte_target = None;
+            // Drain the single pending worker before another target may start.
+            self.grade_matte_preview = None;
+        }
+
         if self.monitor_safe_area {
             draw_safe_area_guides(&content_painter, video_rect);
         }
@@ -1679,16 +1821,27 @@ impl PhotonicApp {
                 }
             }
             let readiness = monitor_readiness_text(doc, &status);
-            painter.text(
-                video_rect.left_top() + egui::vec2(6., 6.),
-                egui::Align2::LEFT_TOP,
+            // Status is part of the interpretation contract (a subject mask
+            // may still be provisional). Keep it legible over white footage.
+            let position = video_rect.left_top() + egui::vec2(6., 6.);
+            let text_color = egui::Color32::from_gray(READINESS_TEXT_LEVEL);
+            let galley = painter.layout(
                 readiness,
                 egui::FontId::proportional(11.),
-                egui::Color32::from_gray(200),
+                text_color,
+                (video_rect.width() - 12.0).max(1.0),
             );
+            let backing =
+                egui::Rect::from_min_size(position, galley.size()).expand2(egui::vec2(4., 2.));
+            painter.rect_filled(
+                backing,
+                3.0,
+                egui::Color32::from_black_alpha(READINESS_BACKING_ALPHA),
+            );
+            painter.galley(position, galley, text_color);
             if let Some(error) = &status.source_audition_error {
                 painter.text(
-                    video_rect.left_top() + egui::vec2(6., 22.),
+                    egui::pos2(video_rect.left() + 6.0, backing.bottom() + 4.0),
                     egui::Align2::LEFT_TOP,
                     error,
                     egui::FontId::proportional(12.),
@@ -2632,6 +2785,153 @@ mod transport_tests {
     use super::*;
 
     #[test]
+    fn forward_end_uses_last_covering_frame_and_preserves_loops_and_seeks() {
+        for rate in [FrameRate::FPS_30, FrameRate::FPS_29_97] {
+            let end = rate.frame_start(240);
+            let last = rate.frame_start(239);
+            assert_eq!(
+                forward_playback_end(Tick(end.0 - 1), end, rate, false),
+                None
+            );
+            assert_eq!(forward_playback_end(end, end, rate, false), Some(last));
+            assert_eq!(
+                forward_playback_end(Tick(end.0 + 999), end, rate, false),
+                Some(last)
+            );
+            assert_eq!(forward_playback_end(end, end, rate, true), None);
+            // A subframe tail is covered by the frame beginning at nominal end.
+            assert_eq!(
+                forward_playback_end(Tick(end.0 + 1), Tick(end.0 + 1), rate, false),
+                Some(end)
+            );
+            assert_eq!(
+                forward_playback_end(Tick(1), Tick(1), rate, false),
+                Some(Tick::ZERO)
+            );
+            assert_eq!(forward_playback_end(end, Tick::ZERO, rate, false), None);
+            assert_eq!(forward_playback_end(end, Tick(-1), rate, false), None);
+        }
+    }
+
+    #[test]
+    fn engine_backed_program_transport_stops_but_loop_and_manual_seek_survive() {
+        use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
+        use photonic_core::timeline::{Clip, ClipSource, TimelineProject, Track, TrackKind};
+        use std::time::{Duration, Instant};
+        let engine = photonic_video::VideoEngine::headless()
+            .expect("transport qualification requires a GPU adapter");
+        let rate = FrameRate::FPS_30;
+        let end = rate.frame_start(6);
+        let last = rate.frame_start(5);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("bounded", rate, 16, 16);
+        sequence.color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut track = Track::new(TrackKind::Video, "V1");
+        track.clips.push(Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color {
+                    r: 0.4,
+                    g: 0.2,
+                    b: 0.1,
+                    a: 1.0,
+                },
+            },
+            Tick::ZERO,
+            end,
+        ));
+        sequence.video_tracks.push(track);
+        let id = sequence.id;
+        project.insert_sequence(sequence);
+        project.active_sequence = Some(id);
+        let mut doc = Document::new("bounded", 16.0, 16.0);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        let history = CommandHistory::new(8);
+        let mut bridge = engine::EngineBridge::new(engine);
+        bridge.sync_document(&doc, &history);
+        let mut app = PhotonicApp::default();
+        app.engine = Some(bridge);
+        app.monitor_playing = true;
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.drive_playback(ctx, &doc)
+            });
+            let bridge = app.engine.as_ref().unwrap();
+            if !app.monitor_playing
+                && !bridge.status().playing
+                && bridge
+                    .session()
+                    .latest_frame()
+                    .is_some_and(|f| f.time == last)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "program did not pause and settle at final valid frame"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.playhead, last);
+        assert!(app
+            .engine
+            .as_ref()
+            .unwrap()
+            .status()
+            .computation_errors
+            .is_empty());
+        // A paused manual seek beyond content is still a legitimate editing operation.
+        app.playhead = rate.frame_start(20);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            app.drive_playback(ctx, &doc)
+        });
+        assert_eq!(app.playhead, rate.frame_start(20));
+        assert!(!app.monitor_playing);
+        // Looping must continue through multiple end boundaries.
+        app.playhead = Tick::ZERO;
+        app.monitor_loop_enabled = true;
+        app.monitor_playing = true;
+        let until = Instant::now() + Duration::from_millis(750);
+        while Instant::now() < until {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.drive_playback(ctx, &doc)
+            });
+            assert!(app.monitor_playing, "loop incorrectly stopped");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.engine.as_ref().unwrap().status().playing);
+        let paused_target = rate.snap(app.playhead);
+        // Simulate an idle GUI while the independent engine advances.
+        std::thread::sleep(Duration::from_millis(79));
+        app.monitor_playing = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.drive_playback(ctx, &doc)
+            });
+            let bridge = app.engine.as_ref().unwrap();
+            if !bridge.status().playing
+                && bridge
+                    .session()
+                    .latest_frame()
+                    .is_some_and(|f| f.time == paused_target)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "paused picture drifted from GUI playhead"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert_eq!(history.revision(), 0);
+    }
+
+    #[test]
     fn play_pause_j_k_l_toggle_intent() {
         let mut app = PhotonicApp::default();
         assert!(!app.monitor_playing);
@@ -2799,5 +3099,69 @@ mod master_meter_tests {
         );
         assert!(state.l.peak_db > state.r.peak_db);
         assert_eq!(state.peak_db(), state.l.peak_db);
+    }
+}
+
+#[cfg(test)]
+mod subject_readiness_tests {
+    use super::*;
+    #[test]
+    fn provisional_and_failed_subject_status_are_explicit() {
+        let doc = Document::new("subject", 96.0, 96.0);
+        let mut status = photonic_video::EngineStatus::default();
+        status.pending_computations = 2;
+        let label = monitor_readiness_text(&doc, &status);
+        assert!(label.contains("2 background computations pending (provisional)"));
+        status.pending_computations = 0;
+        status
+            .computation_errors
+            .push("missing pinned model".into());
+        let label = monitor_readiness_text(&doc, &status);
+        assert!(label.contains("frame computation failed"));
+        assert!(!label.contains("provisional"));
+    }
+    #[test]
+    fn native_deflicker_compile_refusal_is_visible_and_clears() {
+        let doc = Document::new("deflicker", 16.0, 16.0);
+        let mut status = photonic_video::EngineStatus::default();
+        status
+            .computation_errors
+            .push("native Deflicker requires one clip-scoped instance".into());
+        assert!(monitor_readiness_text(&doc, &status).contains("one clip-scoped instance"));
+        status.computation_errors.clear();
+        assert!(!monitor_readiness_text(&doc, &status).contains("Deflicker"));
+        status.pending_computations = 1;
+        let label = monitor_readiness_text(&doc, &status);
+        assert!(label.contains("background computations pending"));
+        assert!(!label.contains("subject masks"));
+    }
+    #[test]
+    fn native_surface_blur_refusal_has_actionable_monitor_message() {
+        let doc = Document::new("surface", 320.0, 240.0);
+        let mut status = photonic_video::EngineStatus::default();
+        status.computation_errors.push("native Surface Blur exceeds the 256M estimated texture-fetch budget per frame; reduce radius or render dimensions".into());
+        let label = monitor_readiness_text(&doc, &status);
+        assert!(
+            label.contains("Surface Blur") && label.contains("reduce radius or render dimensions")
+        );
+        status.computation_errors.clear();
+        assert!(!monitor_readiness_text(&doc, &status).contains("computation failed"));
+    }
+    #[test]
+    fn readiness_backing_preserves_contrast_on_white_footage() {
+        let decode = |v: f64| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let brightest_background = 1.0 - f64::from(READINESS_BACKING_ALPHA) / 255.0;
+        let contrast = (decode(f64::from(READINESS_TEXT_LEVEL) / 255.0) + 0.05)
+            / (decode(brightest_background) + 0.05);
+        assert!(
+            contrast > 7.0,
+            "status must remain readable over the opaque provisional mask"
+        );
     }
 }

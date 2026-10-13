@@ -55,6 +55,8 @@ pub enum EditError {
     IndexOutOfRange,
     /// A graph edge would create a cycle (01 §8).
     WouldCreateCycle,
+    /// A graph wire references an unavailable port or an occupied input.
+    InvalidGraphConnection(String),
     /// A composition was requested on a `ClipSource::Adjustment` clip (07 §6.6).
     CompositionOnAdjustment,
     /// A ducking/sidechain wiring would create a cycle (09 §6.3).
@@ -79,6 +81,7 @@ pub enum EditError {
     InvalidGradeCopy(String),
     InvalidLutAsset(String),
     InvalidGradeGraph(String),
+    InvalidGradeParameters(String),
     InvalidQualifierKeys(String),
     InvalidQualifierMatteLevels(String),
     InvalidSharedLook(String),
@@ -402,6 +405,13 @@ pub fn unused_assets(p: &TimelineProject) -> Vec<AssetId> {
                 if let Some(g) = &clip.grade {
                     collect_grade_asset_refs(g, &mut used);
                 }
+                // Saved alternatives remain live project dependencies even
+                // when inactive, bypassed, disabled, or the current grade is empty.
+                for version in &clip.grade_versions {
+                    if let Some(grade) = &version.grade {
+                        collect_grade_asset_refs(grade, &mut used);
+                    }
+                }
                 if let Some(super::grade::ClipLook::Local(g)) = &clip.look {
                     collect_grade_asset_refs(g, &mut used);
                 }
@@ -411,6 +421,9 @@ pub fn unused_assets(p: &TimelineProject) -> Vec<AssetId> {
 
     for look in p.shared_looks.values() {
         collect_grade_asset_refs(&look.grade, &mut used);
+        for version in &look.versions {
+            collect_grade_asset_refs(&version.grade, &mut used);
+        }
     }
 
     // Asset scope: a grade bound beneath every clip referencing that asset.
@@ -911,6 +924,10 @@ fn lut_used_on_locked_track(p: &TimelineProject, asset: AssetId) -> bool {
         if grade_uses(sequence.master_grade.as_ref(), asset)
             || grade_uses(track.grade.as_ref(), asset)
             || grade_uses(clip.grade.as_ref(), asset)
+            || clip
+                .grade_versions
+                .iter()
+                .any(|version| grade_uses(version.grade.as_ref(), asset))
         {
             return true;
         }
@@ -943,7 +960,13 @@ fn lut_used_on_locked_track(p: &TimelineProject, asset: AssetId) -> bool {
                 return true
             }
             Some(super::grade::ClipLook::Shared(id))
-                if grade_uses(p.shared_looks.get(id).map(|l| &l.grade), asset) =>
+                if p.shared_looks.get(id).is_some_and(|look| {
+                    grade_uses(Some(&look.grade), asset)
+                        || look
+                            .versions
+                            .iter()
+                            .any(|v| grade_uses(Some(&v.grade), asset))
+                }) =>
             {
                 return true
             }
@@ -1246,11 +1269,11 @@ pub fn set_clip_native_input_color(
 
 /// Add a captured image to a sequence's comparison gallery. The image asset
 /// must already be registered (typically in the same history batch).
-pub fn add_reference_still(
+pub(super) fn validate_reference_still(
     p: &TimelineProject,
     seq_id: SequenceId,
-    still: super::sequence::ReferenceStill,
-) -> Result<TimelineCmd, EditError> {
+    still: &super::sequence::ReferenceStill,
+) -> Result<(), EditError> {
     let sequence = seq(p, seq_id)?;
     if still.name.trim().is_empty()
         || still.name.chars().count() > 128
@@ -1277,6 +1300,30 @@ pub fn add_reference_still(
             "reference image asset is missing or is not an image".into(),
         ));
     }
+    if let Some(balance) = &still.native_balance {
+        if !matches!(
+            still.color,
+            super::color::SequenceColorConfig::NativeManaged(_)
+        ) {
+            return Err(EditError::InvalidReferenceStill(
+                "native balance requires native reference color".into(),
+            ));
+        }
+        let format = &sequence.formats[still.format_index];
+        balance
+            .validate_for_image(&still.image_hash, format.width, format.height)
+            .map_err(|e| EditError::InvalidReferenceStill(e.into()))?;
+    }
+    Ok(())
+}
+
+pub fn add_reference_still(
+    p: &TimelineProject,
+    seq_id: SequenceId,
+    still: super::sequence::ReferenceStill,
+) -> Result<TimelineCmd, EditError> {
+    validate_reference_still(p, seq_id, &still)?;
+    let sequence = seq(p, seq_id)?;
     if sequence
         .reference_stills
         .iter()
@@ -1628,6 +1675,26 @@ pub fn set_track_prop(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if new
+        .opacity
+        .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
+    {
+        return Err(EditError::InvalidColorConfiguration(
+            "track opacity must be finite and in 0..=1".into(),
+        ));
+    }
+    let composite_changed =
+        new.blend.is_some_and(|v| v != t.blend) || new.opacity.is_some_and(|v| v != t.opacity);
+    if composite_changed {
+        if t.locked {
+            return Err(EditError::TrackLocked);
+        }
+        if t.kind == TrackKind::Audio {
+            return Err(EditError::InvalidColorConfiguration(
+                "audio tracks do not have image compositing controls".into(),
+            ));
+        }
+    }
     Ok(TimelineCmd::SetTrackProp {
         seq: id,
         track: track_id,
@@ -3395,6 +3462,12 @@ fn read_tracks<'a>(p: &'a TimelineProject, target: &AnimTarget) -> Option<&'a Ve
             .iter()
             .find(|o| o.id == *op)
             .map(|o| &o.params.tracks),
+        AnimTarget::GradeStageOp { clip, stage, op } => stage
+            .resolve_grade(p, find_clip(*clip)?)?
+            .ops
+            .iter()
+            .find(|o| o.id == *op)
+            .map(|o| &o.params.tracks),
         AnimTarget::ClipAudio { clip } => {
             find_clip(*clip)?.audio.as_ref().map(|a| &a.params.tracks)
         }
@@ -3424,6 +3497,107 @@ fn read_tracks<'a>(p: &'a TimelineProject, target: &AnimTarget) -> Option<&'a Ve
     }
 }
 
+/// Validate external animation authoring without changing pure command replay.
+/// Reads/copy remain permitted on locked tracks; mutations fail atomically.
+pub fn ensure_anim_target_editable(
+    p: &TimelineProject,
+    target: &AnimTarget,
+) -> Result<(), EditError> {
+    read_tracks(p, target).ok_or(EditError::IndexOutOfRange)?;
+    let locked = match target {
+        AnimTarget::ClipTransform { clip }
+        | AnimTarget::ClipEffect { clip, .. }
+        | AnimTarget::GradeOp { clip, .. }
+        | AnimTarget::ClipAudio { clip } => p
+            .sequences
+            .values()
+            .flat_map(|s| s.tracks())
+            .any(|t| t.locked && t.clips.iter().any(|c| c.id == *clip)),
+        AnimTarget::GradeStageOp { clip, stage, .. } => {
+            use super::GradeInspectionStage as S;
+            match *stage {
+                S::Clip | S::LocalLook => grade_scope_locked(p, VfxOwner::Clip(*clip)),
+                S::GroupPre { id } => grade_scope_locked(p, VfxOwner::GroupPre(id)),
+                S::GroupPost { id } => grade_scope_locked(p, VfxOwner::GroupPost(id)),
+                S::SharedLook { id } => p
+                    .sequences
+                    .values()
+                    .flat_map(|s| s.tracks())
+                    .filter(|t| t.locked)
+                    .flat_map(|t| &t.clips)
+                    .any(|c| c.look == Some(super::ClipLook::Shared(id))),
+            }
+        }
+        AnimTarget::TrackAudio { track }
+        | AnimTarget::AudioFx {
+            owner: FxOwner::Track(track),
+            ..
+        } => find_track_anywhere(p, *track).is_some_and(|t| t.locked),
+        AnimTarget::MasterBus { .. }
+        | AnimTarget::AudioFx {
+            owner: FxOwner::Master,
+            ..
+        } => false,
+    };
+    if locked {
+        Err(EditError::TrackLocked)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn set_keyframe_checked(
+    p: &TimelineProject,
+    target: AnimTarget,
+    path: PropPath,
+    kf: Keyframe,
+) -> Result<TimelineCmd, EditError> {
+    ensure_anim_target_editable(p, &target)?;
+    let grade_address = match &target {
+        AnimTarget::GradeOp { clip, op } => Some((*clip, super::GradeInspectionStage::Clip, *op)),
+        AnimTarget::GradeStageOp { clip, stage, op } => Some((*clip, *stage, *op)),
+        _ => None,
+    };
+    if let Some((clip, stage, op)) = grade_address {
+        let grade = find_clip_anywhere(p, clip)
+            .and_then(|c| stage.resolve_grade(p, c))
+            .ok_or(EditError::NoGradeOp(op))?;
+        let corrector = grade
+            .ops
+            .iter()
+            .find(|o| o.id == op)
+            .ok_or(EditError::NoGradeOp(op))?;
+        let entry = super::prop_registry::resolve(corrector.kind.target_kind(), path.as_str())
+            .ok_or_else(|| {
+                EditError::InvalidGradeParameters("unknown grade animation property".into())
+            })?;
+        if corrector.params.base.kind() != Some(corrector.kind)
+            || corrector.scalar_property(path.as_str()).is_none()
+        {
+            return Err(EditError::InvalidGradeParameters(
+                "grade animation property and operator do not match".into(),
+            ));
+        }
+        let valid = match kf.value {
+            super::PropValue::Float(v) => {
+                v.is_finite()
+                    && (v as f32).is_finite()
+                    && (!path.as_str().starts_with("mask.size[") || v > 0.0)
+                    && entry
+                        .range
+                        .is_none_or(|(low, high)| (low..=high).contains(&v))
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(EditError::InvalidGradeParameters(
+                "grade keyframe must be a finite scalar within its registered range".into(),
+            ));
+        }
+    }
+    Ok(set_keyframe(p, target, path, kf))
+}
+
 pub fn set_keyframe(
     p: &TimelineProject,
     target: AnimTarget,
@@ -3445,6 +3619,7 @@ pub fn remove_keyframe(
     path: PropPath,
     at: Tick,
 ) -> Result<TimelineCmd, EditError> {
+    ensure_anim_target_editable(p, &target)?;
     let kf = existing_kf(p, &target, &path, at).ok_or(EditError::IndexOutOfRange)?;
     Ok(TimelineCmd::RemoveKeyframe {
         target,
@@ -3460,6 +3635,7 @@ pub fn set_keyframe_interp(
     at: Tick,
     new: Interp,
 ) -> Result<TimelineCmd, EditError> {
+    ensure_anim_target_editable(p, &target)?;
     let kf = existing_kf(p, &target, &path, at).ok_or(EditError::IndexOutOfRange)?;
     Ok(TimelineCmd::SetKeyframeInterp {
         target,
@@ -3519,6 +3695,7 @@ pub fn paste_keyframes(
     mapping: &[(PropPath, PropPath)],
     time_offset: Tick,
 ) -> Result<Vec<TimelineCmd>, EditError> {
+    ensure_anim_target_editable(p, &target)?;
     // Prove the target exists before building commands.
     let _ = read_tracks(p, &target).ok_or(EditError::IndexOutOfRange)?;
 
@@ -3534,9 +3711,20 @@ pub fn paste_keyframes(
             None => src.property.clone(),
         };
         for kf in &src.keyframes {
-            let at = Tick((kf.at.0 + time_offset.0).max(0));
+            let at = Tick(
+                kf.at
+                    .0
+                    .checked_add(time_offset.0)
+                    .ok_or(EditError::IndexOutOfRange)?
+                    .max(0),
+            );
             let new_kf = Keyframe::new(at, kf.value, kf.interp);
-            cmds.push(set_keyframe(p, target.clone(), dest_path.clone(), new_kf));
+            cmds.push(set_keyframe_checked(
+                p,
+                target.clone(),
+                dest_path.clone(),
+                new_kf,
+            )?);
         }
     }
     Ok(cmds)
@@ -3550,7 +3738,12 @@ pub fn paste_keyframes_reanchored(
     mapping: &[(PropPath, PropPath)],
     dest_anchor: Tick,
 ) -> Result<Vec<TimelineCmd>, EditError> {
-    let offset = Tick(dest_anchor.0 - clipboard.anchor.0);
+    let offset = Tick(
+        dest_anchor
+            .0
+            .checked_sub(clipboard.anchor.0)
+            .ok_or(EditError::IndexOutOfRange)?,
+    );
     paste_keyframes(p, target, clipboard, mapping, offset)
 }
 
@@ -3656,6 +3849,9 @@ pub fn add_effect_scoped(
     effect: ClipEffect,
     index: Option<usize>,
 ) -> Result<TimelineCmd, EditError> {
+    if grade_scope_locked(p, owner) {
+        return Err(EditError::TrackLocked);
+    }
     // Manifest Applicability gate (K-B residual): refuse scopes the effect
     // does not declare. Unknown / unmanifested ids stay allowed (forward-compat).
     let mid = if effect.id.is_empty() {
@@ -3682,6 +3878,9 @@ pub fn remove_effect_scoped(
     owner: VfxOwner,
     index: usize,
 ) -> Result<TimelineCmd, EditError> {
+    if grade_scope_locked(p, owner) {
+        return Err(EditError::TrackLocked);
+    }
     let effect = effect_stack(p, owner)?
         .get(index)
         .ok_or(EditError::IndexOutOfRange)?
@@ -3700,6 +3899,9 @@ pub fn reorder_effects_scoped(
     owner: VfxOwner,
     new_order: Vec<usize>,
 ) -> Result<TimelineCmd, EditError> {
+    if grade_scope_locked(p, owner) {
+        return Err(EditError::TrackLocked);
+    }
     let len = effect_stack(p, owner)?.len();
     if new_order.len() != len || !is_permutation(&new_order, len) {
         return Err(EditError::IndexOutOfRange);
@@ -3718,6 +3920,9 @@ pub fn set_effect_scoped(
     index: usize,
     new: ClipEffect,
 ) -> Result<TimelineCmd, EditError> {
+    if grade_scope_locked(p, owner) {
+        return Err(EditError::TrackLocked);
+    }
     let old = effect_stack(p, owner)?
         .get(index)
         .ok_or(EditError::IndexOutOfRange)?
@@ -3753,6 +3958,95 @@ pub fn set_effect_zone(
     set_effect_scoped(p, owner, index, new)
 }
 
+fn validate_authored_grade(grade: &Grade) -> Result<(), EditError> {
+    for op in &grade.ops {
+        if op.kind == super::GradeOpKind::TonalExposure
+            || matches!(op.params.base, GradeOpParams::TonalExposure { .. })
+        {
+            match op.params.base {
+                GradeOpParams::TonalExposure {
+                    stops,
+                    boundaries,
+                    softness,
+                } if op.kind == super::GradeOpKind::TonalExposure => {
+                    super::validate_tonal_exposure(stops, boundaries, softness)
+                        .map_err(|e| EditError::InvalidGradeParameters(e.into()))?;
+                }
+                _ => {
+                    return Err(EditError::InvalidGradeParameters(
+                        "tonal exposure operator and parameters must match".into(),
+                    ))
+                }
+            }
+        }
+        if op.kind == super::GradeOpKind::WhiteBalanceCct
+            || matches!(op.params.base, GradeOpParams::WhiteBalanceCct { .. })
+        {
+            let valid = match op.params.base {
+                GradeOpParams::WhiteBalanceCct {
+                    source_kelvin,
+                    target_kelvin,
+                } => {
+                    op.kind == super::GradeOpKind::WhiteBalanceCct
+                        && [source_kelvin, target_kelvin]
+                            .iter()
+                            .all(|v| v.is_finite() && (1667.0..=25000.0).contains(v))
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(EditError::InvalidGradeParameters("Kelvin white balance requires a matching operator and finite source/target values in 1667..=25000 K".into()));
+            }
+        }
+        if let Some(spatial) = op.qualifier_spatial {
+            if op.kind != super::GradeOpKind::HslQualifier
+                || !matches!(op.params.base, GradeOpParams::HslQualifier { .. })
+            {
+                return Err(EditError::InvalidQualifierKeys(
+                    "spatial cleanup requires a qualifier".into(),
+                ));
+            }
+            spatial
+                .validate()
+                .map_err(|error| EditError::InvalidQualifierKeys(error.into()))?;
+        }
+        if let GradeOpParams::HslQualifier {
+            keys, matte_levels, ..
+        } = &op.params.base
+        {
+            if matte_levels
+                .iter()
+                .any(|value| !value.is_finite() || !(0.0..=0.49).contains(value))
+            {
+                return Err(EditError::InvalidQualifierMatteLevels(format!(
+                    "corrector {} requires black and white matte thresholds in 0..=0.49",
+                    op.id
+                )));
+            }
+            if keys.len() > super::MAX_QUALIFIER_KEYS {
+                return Err(EditError::InvalidQualifierKeys(format!(
+                    "corrector {} has {} sampled keys; maximum is {}",
+                    op.id,
+                    keys.len(),
+                    super::MAX_QUALIFIER_KEYS
+                )));
+            }
+            if keys.iter().any(|key| !key.is_valid()) {
+                return Err(EditError::InvalidQualifierKeys(format!(
+                    "corrector {} contains an invalid sampled HSL key",
+                    op.id
+                )));
+            }
+        }
+    }
+    if let Some(graph) = &grade.graph {
+        graph
+            .validate(&grade.ops)
+            .map_err(|error| EditError::InvalidGradeGraph(error.into()))?;
+    }
+    Ok(())
+}
+
 pub fn set_grade_scoped(
     p: &TimelineProject,
     owner: VfxOwner,
@@ -3762,41 +4056,7 @@ pub fn set_grade_scoped(
         return Err(EditError::TrackLocked);
     }
     if let Some(grade) = &new {
-        for op in &grade.ops {
-            if let GradeOpParams::HslQualifier {
-                keys, matte_levels, ..
-            } = &op.params.base
-            {
-                if matte_levels
-                    .iter()
-                    .any(|value| !value.is_finite() || !(0.0..=0.49).contains(value))
-                {
-                    return Err(EditError::InvalidQualifierMatteLevels(format!(
-                        "corrector {} requires black and white matte thresholds in 0..=0.49",
-                        op.id
-                    )));
-                }
-                if keys.len() > super::MAX_QUALIFIER_KEYS {
-                    return Err(EditError::InvalidQualifierKeys(format!(
-                        "corrector {} has {} sampled keys; maximum is {}",
-                        op.id,
-                        keys.len(),
-                        super::MAX_QUALIFIER_KEYS
-                    )));
-                }
-                if keys.iter().any(|key| !key.is_valid()) {
-                    return Err(EditError::InvalidQualifierKeys(format!(
-                        "corrector {} contains an invalid sampled HSL key",
-                        op.id
-                    )));
-                }
-            }
-        }
-        if let Some(graph) = &grade.graph {
-            graph
-                .validate(&grade.ops)
-                .map_err(|error| EditError::InvalidGradeGraph(error.into()))?;
-        }
+        validate_authored_grade(grade)?;
     }
     let old = scope_grade(p, owner)?.cloned();
     Ok(TimelineCmd::SetGrade {
@@ -3992,6 +4252,7 @@ pub fn copy_grade_correctors(
             graph: g.graph.clone().map(|mut graph| {
                 for node in graph.nodes.values_mut() {
                     if let super::grade::GradeGraphNode::Corrector { op, .. }
+                    | super::grade::GradeGraphNode::WindowMatte { op, .. }
                     | super::grade::GradeGraphNode::QualifierMatte { op, .. } = node
                     {
                         *op = id_map[op];
@@ -4020,16 +4281,14 @@ pub fn create_shared_look(
             "name is empty or already used".into(),
         ));
     }
-    if let Some(graph) = &grade.graph {
-        graph
-            .validate(&grade.ops)
-            .map_err(|error| EditError::InvalidSharedLook(error.into()))?;
-    }
+    validate_authored_grade(&grade)?;
     let id = super::ids::SharedLookId::new();
     Ok(TimelineCmd::SetSharedLook {
         id,
         old: None,
         new: Some(Box::new(super::grade::SharedLook {
+            versions: Vec::new(),
+            active_version: None,
             id,
             name: name.into(),
             grade,
@@ -4056,11 +4315,7 @@ pub fn update_shared_look(
             "name is empty or already used".into(),
         ));
     }
-    if let Some(graph) = &grade.graph {
-        graph
-            .validate(&grade.ops)
-            .map_err(|error| EditError::InvalidSharedLook(error.into()))?;
-    }
+    validate_authored_grade(&grade)?;
     for sequence in p.sequences.values() {
         for track in sequence.tracks() {
             if track.locked
@@ -4073,14 +4328,14 @@ pub fn update_shared_look(
             }
         }
     }
+    let mut new = old.clone();
+    new.name = name.into();
+    new.grade = grade;
+    new.sync_active_version();
     Ok(TimelineCmd::SetSharedLook {
         id,
         old: Some(Box::new(old.clone())),
-        new: Some(Box::new(super::grade::SharedLook {
-            id,
-            name: name.into(),
-            grade,
-        })),
+        new: Some(Box::new(new)),
     })
 }
 
@@ -4120,6 +4375,57 @@ pub fn link_shared_look(
     let mut new = old.clone();
     new.look = Some(super::grade::ClipLook::Shared(id));
     set_clip_prop(p, sequence, track_id, new)
+}
+
+/// Replace a correction stage without changing its owner, clip link or render
+/// position. Shared edits still protect every linked locked track. The stage
+/// address is checked at commit time, so a stale sampler cannot edit a new link.
+pub fn set_clip_stage_grade(
+    p: &TimelineProject,
+    sequence: SequenceId,
+    track_id: TrackId,
+    clip_id: ClipId,
+    stage: super::GradeInspectionStage,
+    grade: Grade,
+) -> Result<TimelineCmd, EditError> {
+    let current = clip(track(seq(p, sequence)?, track_id)?, clip_id)?;
+    match stage {
+        super::GradeInspectionStage::Clip => set_grade(p, sequence, track_id, clip_id, Some(grade)),
+        super::GradeInspectionStage::GroupPre { id }
+        | super::GradeInspectionStage::GroupPost { id } => {
+            if stage.resolve_grade(p, current).is_none() {
+                return Err(EditError::InvalidSharedLook(
+                    "group stage is not on the selected clip's valid ancestor chain".into(),
+                ));
+            }
+            let owner = if matches!(stage, super::GradeInspectionStage::GroupPre { .. }) {
+                VfxOwner::GroupPre(id)
+            } else {
+                VfxOwner::GroupPost(id)
+            };
+            set_grade_scoped(p, owner, Some(grade))
+        }
+        super::GradeInspectionStage::LocalLook => {
+            if !matches!(current.look, Some(super::grade::ClipLook::Local(_))) {
+                return Err(EditError::InvalidSharedLook(
+                    "clip has no independent look".into(),
+                ));
+            }
+            validate_authored_grade(&grade)?;
+            let mut new = current.clone();
+            new.look = Some(super::grade::ClipLook::Local(Box::new(grade)));
+            set_clip_prop(p, sequence, track_id, new)
+        }
+        super::GradeInspectionStage::SharedLook { id } => {
+            if current.look != Some(super::grade::ClipLook::Shared(id)) {
+                return Err(EditError::InvalidSharedLook(
+                    "clip is not linked to the addressed shared look".into(),
+                ));
+            }
+            let look = p.shared_looks.get(&id).ok_or(EditError::NoSharedLook(id))?;
+            update_shared_look(p, id, &look.name, grade)
+        }
+    }
 }
 
 pub fn make_shared_look_independent(
@@ -6323,6 +6629,58 @@ mod tests {
     }
 
     #[test]
+    fn scoped_effect_mutations_respect_locked_tracks_and_asset_users() {
+        let (mut doc, seq, track, clip, asset) = scoped_fixture();
+        for owner in [
+            VfxOwner::Clip(clip),
+            VfxOwner::Track(track),
+            VfxOwner::Asset(asset),
+            VfxOwner::Master(seq),
+        ] {
+            let cmd = add_effect_scoped(
+                doc.timeline.as_ref().unwrap(),
+                owner,
+                fx(EffectKind::Blur),
+                None,
+            )
+            .unwrap();
+            cmd.apply(&mut doc);
+        }
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .track_mut(track)
+            .unwrap()
+            .locked = true;
+        let p = doc.timeline.as_ref().unwrap();
+        let before = serde_json::to_value(p).unwrap();
+        for owner in [
+            VfxOwner::Clip(clip),
+            VfxOwner::Track(track),
+            VfxOwner::Asset(asset),
+        ] {
+            assert!(
+                effect_stack(p, owner).is_ok(),
+                "locked reads remain available"
+            );
+            for result in [
+                add_effect_scoped(p, owner, fx(EffectKind::Blur), None),
+                remove_effect_scoped(p, owner, 0),
+                reorder_effects_scoped(p, owner, vec![0]),
+                set_effect_scoped(p, owner, 0, fx(EffectKind::Blur)),
+                set_effect_zone(p, owner, 0, Some((Tick(0), Tick(1)))),
+            ] {
+                assert!(matches!(result, Err(EditError::TrackLocked)));
+            }
+        }
+        assert!(set_effect_scoped(p, VfxOwner::Master(seq), 0, fx(EffectKind::Blur)).is_ok());
+        assert_eq!(serde_json::to_value(p).unwrap(), before);
+    }
+
+    #[test]
     fn add_effect_scoped_honours_applicability() {
         use super::super::effect_manifest::Applicability;
         // Unit: CLIP_ONLY vs ALL_SCOPES on every owner shape.
@@ -6519,6 +6877,134 @@ mod tests {
             ),
             Err(EditError::NonPositiveDuration)
         ));
+    }
+
+    #[test]
+    fn parked_grade_versions_keep_luts_reachable_and_lock_protected() {
+        use super::super::grade::{GradeOp, GradeOpKind, LutInterp};
+        use super::super::media::{AssetKind, MediaAsset};
+        for bypass in [false, true] {
+            let (mut doc, sequence, track, _) = fixture();
+            let p = doc.timeline.as_mut().unwrap();
+            let lut = p
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Lut3d, "/tmp/parked.cube"));
+            let orphan = p
+                .media
+                .insert(MediaAsset::from_file(AssetKind::Lut3d, "/tmp/orphan.cube"));
+            let mut grade = Grade::new();
+            grade.bypass = bypass;
+            let mut op = GradeOp::new(
+                GradeOpKind::Lut3d,
+                GradeOpParams::Lut3d {
+                    asset: lut,
+                    intensity: 1.0,
+                    interp: LutInterp::Trilinear,
+                },
+            );
+            op.enabled = !bypass;
+            grade.ops.push(op);
+            let t = p
+                .sequences
+                .get_mut(&sequence)
+                .unwrap()
+                .track_mut(track)
+                .unwrap();
+            t.clips[0].grade = None;
+            t.clips[0]
+                .grade_versions
+                .push(super::super::clip::GradeVersion {
+                    id: uuid::Uuid::new_v4(),
+                    name: "Parked alternate".into(),
+                    grade: Some(grade),
+                });
+            assert!(
+                !unused_assets(p).contains(&lut),
+                "parked LUT must survive remove-unused"
+            );
+            assert!(unused_assets(p).contains(&orphan));
+            let before = doc.clone();
+            let commands = remove_unused_assets(doc.timeline.as_ref().unwrap());
+            let mut history = crate::history::CommandHistory::new(16);
+            history.execute_discrete(
+                Command::Batch(commands.into_iter().map(Command::Timeline).collect()),
+                &mut doc,
+            );
+            assert!(doc
+                .timeline
+                .as_ref()
+                .unwrap()
+                .media
+                .assets
+                .contains_key(&lut));
+            assert!(!doc
+                .timeline
+                .as_ref()
+                .unwrap()
+                .media
+                .assets
+                .contains_key(&orphan));
+            assert!(remove_unused_assets(doc.timeline.as_ref().unwrap()).is_empty());
+            history.undo(&mut doc);
+            assert_eq!(
+                serde_json::to_value(&doc).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+            let loaded: Document =
+                serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
+            assert!(!unused_assets(loaded.timeline.as_ref().unwrap()).contains(&lut));
+            let p = doc.timeline.as_mut().unwrap();
+            p.sequences
+                .get_mut(&sequence)
+                .unwrap()
+                .track_mut(track)
+                .unwrap()
+                .locked = true;
+            assert_eq!(
+                set_asset_lut_hash(p, lut, Some("changed".into())),
+                Err(EditError::TrackLocked)
+            );
+            assert_eq!(
+                set_asset_lut_color(p, lut, None),
+                Err(EditError::TrackLocked)
+            );
+            p.sequences
+                .get_mut(&sequence)
+                .unwrap()
+                .track_mut(track)
+                .unwrap()
+                .locked = false;
+            assert!(set_asset_lut_hash(p, lut, Some("changed".into())).is_ok());
+            // A locked parent protects an inactive version reached through a nest.
+            let mut parent = Sequence::new("parent", FrameRate::FPS_30, 1920, 1080);
+            let mut parent_track = Track::new(TrackKind::Video, "locked outer");
+            parent_track.locked = true;
+            parent_track.clips.push(Clip::new(
+                ClipSource::NestedSequence { sequence },
+                Tick::ZERO,
+                Tick(100),
+            ));
+            parent.video_tracks.push(parent_track);
+            p.insert_sequence(parent);
+            assert_eq!(
+                set_asset_lut_hash(p, lut, Some("changed".into())),
+                Err(EditError::TrackLocked)
+            );
+            assert_eq!(
+                set_asset_lut_color(p, lut, None),
+                Err(EditError::TrackLocked)
+            );
+            // Removing the last saved reference releases the orphan normally.
+            p.sequences
+                .get_mut(&sequence)
+                .unwrap()
+                .track_mut(track)
+                .unwrap()
+                .clips[0]
+                .grade_versions
+                .clear();
+            assert!(unused_assets(p).contains(&lut));
+        }
     }
 
     #[test]
@@ -8171,6 +8657,8 @@ mod tests {
                 }
                 6 => {
                     let look = super::super::grade::SharedLook {
+                        versions: Vec::new(),
+                        active_version: None,
                         id: super::super::ids::SharedLookId::new(),
                         name: "locked look".into(),
                         grade,
@@ -8358,6 +8846,104 @@ mod tests {
             update_shared_look(&locked, id, "Scene balance", grade).unwrap_err(),
             EditError::TrackLocked
         );
+    }
+
+    #[test]
+    fn authored_look_stages_are_exact_validated_locked_and_undoable() {
+        use super::super::{ClipLook, GradeInspectionStage as Stage, GradeOp, GradeOpKind};
+        let mut p = TimelineProject::new();
+        let mut sequence = Sequence::new("looks", FrameRate::FPS_30, 32, 32);
+        let seq = sequence.id;
+        let mut t = Track::new(TrackKind::Video, "V1");
+        let track = t.id;
+        let mut first = Clip::new(super::super::ClipSource::Adjustment, Tick(0), Tick(100));
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.5 },
+        ));
+        first.grade = Some(grade.clone());
+        first.look = Some(ClipLook::Local(Box::new(grade.clone())));
+        let clip_id = first.id;
+        t.clips.push(first);
+        sequence.video_tracks.push(t);
+        p.insert_sequence(sequence);
+        let mut doc = Document::new("stage", 32., 32.);
+        doc.timeline = Some(p);
+        let before = doc.clone();
+        let mut changed = grade.clone();
+        changed.ops[0].params.base = GradeOpParams::Exposure { stops: 2.0 };
+        let cmd = set_clip_stage_grade(
+            doc.timeline.as_ref().unwrap(),
+            seq,
+            track,
+            clip_id,
+            Stage::LocalLook,
+            changed.clone(),
+        )
+        .unwrap();
+        assert_undo_roundtrip(&doc, &cmd);
+        Command::Timeline(cmd).apply(&mut doc);
+        let p = doc.timeline.as_ref().unwrap();
+        let clip = &p.sequences[&seq].video_tracks[0].clips[0];
+        assert_eq!(clip.grade, Some(grade.clone()));
+        assert_eq!(clip.look, Some(ClipLook::Local(Box::new(changed))));
+        let wrong = super::super::SharedLookId::new();
+        assert!(set_clip_stage_grade(
+            p,
+            seq,
+            track,
+            clip_id,
+            Stage::SharedLook { id: wrong },
+            grade.clone()
+        )
+        .is_err());
+        let mut invalid = grade.clone();
+        invalid.ops[0].kind = GradeOpKind::WhiteBalanceCct;
+        invalid.ops[0].params.base = GradeOpParams::WhiteBalanceCct {
+            source_kelvin: f32::NAN,
+            target_kelvin: 6500.,
+        };
+        assert!(
+            set_clip_stage_grade(p, seq, track, clip_id, Stage::LocalLook, invalid.clone())
+                .is_err()
+        );
+        assert!(create_shared_look(p, "Invalid", invalid.clone()).is_err());
+        let cmd = create_shared_look(p, "Scene", grade.clone()).unwrap();
+        let TimelineCmd::SetSharedLook { id, .. } = cmd.clone() else {
+            panic!()
+        };
+        Command::Timeline(cmd).apply(&mut doc);
+        assert!(update_shared_look(doc.timeline.as_ref().unwrap(), id, "Scene", invalid).is_err());
+        let cmd =
+            link_shared_look(doc.timeline.as_ref().unwrap(), seq, track, clip_id, id).unwrap();
+        Command::Timeline(cmd).apply(&mut doc);
+        let p = doc.timeline.as_ref().unwrap();
+        assert!(
+            set_clip_stage_grade(p, seq, track, clip_id, Stage::LocalLook, grade.clone()).is_err()
+        );
+        let cmd = set_clip_stage_grade(
+            p,
+            seq,
+            track,
+            clip_id,
+            Stage::SharedLook { id },
+            Grade::new(),
+        )
+        .unwrap();
+        assert_undo_roundtrip(&doc, &cmd);
+        for mut locked in [before.timeline.unwrap(), doc.timeline.unwrap()] {
+            locked.sequences.get_mut(&seq).unwrap().video_tracks[0].locked = true;
+            let stage = match locked.sequences[&seq].video_tracks[0].clips[0].look {
+                Some(ClipLook::Local(_)) => Stage::LocalLook,
+                _ => Stage::SharedLook { id },
+            };
+            assert_eq!(
+                set_clip_stage_grade(&locked, seq, track, clip_id, stage, grade.clone())
+                    .unwrap_err(),
+                EditError::TrackLocked
+            );
+        }
     }
 
     #[test]
@@ -8795,6 +9381,7 @@ mod tests {
             },
         );
         let still = super::super::ReferenceStill {
+            copied_from: None,
             id: uuid::Uuid::new_v4(),
             name: "Hero balance".into(),
             image_asset: asset.id,
@@ -8805,6 +9392,7 @@ mod tests {
             color: doc.timeline.as_ref().unwrap().sequences[&sequence]
                 .color
                 .clone(),
+            native_balance: None,
             format_index: 0,
         };
         assert!(
@@ -9096,11 +9684,18 @@ mod tests {
             GradeOpKind::Exposure,
             GradeOpParams::Exposure { stops: 1.0 },
         );
-        let grade = Grade {
+        let mut grade = Grade {
             ops: vec![op.clone()],
             bypass: false,
             graph: Some(GradeGraph::from_stack(std::slice::from_ref(&op))),
         };
+        grade
+            .add_graph_utility(super::super::grade::GradeGraphNode::WindowMatte {
+                input: 0,
+                op: op.id,
+                label: "Window".into(),
+            })
+            .unwrap();
         let track = doc
             .timeline
             .as_mut()
@@ -9204,6 +9799,509 @@ mod tests {
             set_grade_scoped(project, VfxOwner::Clip(clip), Some(grade)),
             Err(EditError::InvalidQualifierMatteLevels(_))
         ));
+    }
+
+    #[test]
+    fn stage_animation_is_exact_locked_and_undoable() {
+        use crate::timeline::{
+            ClipLook, GradeInspectionStage as S, GradeOp, GradeOpKind, GroupKind, GroupNode,
+            PropValue, SharedLook, SharedLookId,
+        };
+        for which in 0..4 {
+            let (mut doc, seq, track, clip, _) = scoped_fixture();
+            let mut grade = Grade::new();
+            let op = GradeOp::new(
+                GradeOpKind::Exposure,
+                GradeOpParams::Exposure { stops: 0.0 },
+            );
+            let op_id = op.id;
+            grade.ops.push(op);
+            let group = GroupNode::new(GroupKind::Normal);
+            let gid = group.id;
+            let look = SharedLookId::new();
+            let stage = [
+                S::LocalLook,
+                S::SharedLook { id: look },
+                S::GroupPre { id: gid },
+                S::GroupPost { id: gid },
+            ][which];
+            {
+                let p = doc.timeline.as_mut().unwrap();
+                p.shared_looks.insert(
+                    look,
+                    SharedLook {
+                        versions: Vec::new(),
+                        active_version: None,
+                        id: look,
+                        name: "Shared".into(),
+                        grade: grade.clone(),
+                    },
+                );
+                let sequence = p.sequences.get_mut(&seq).unwrap();
+                let mut group = group;
+                group.pre_grade = Some(grade.clone());
+                group.post_grade = Some(grade.clone());
+                sequence.groups.insert(gid, group);
+                let first = sequence
+                    .track_mut(track)
+                    .unwrap()
+                    .clips
+                    .iter_mut()
+                    .find(|c| c.id == clip)
+                    .unwrap();
+                first.grade = Some(grade.clone());
+                first.group = Some(gid);
+                first.look = Some(if which == 0 {
+                    ClipLook::Local(Box::new(grade.clone()))
+                } else {
+                    ClipLook::Shared(look)
+                });
+                let mut second = first.clone();
+                second.id = ClipId::new();
+                second.start = Tick(1000);
+                let mut second_track = Track::new(TrackKind::Video, "Second");
+                second_track.clips.push(second);
+                sequence.video_tracks.push(second_track);
+            }
+            let target = AnimTarget::GradeStageOp {
+                clip,
+                stage,
+                op: op_id,
+            };
+            let path = PropPath::new("params.stops");
+            let key = Keyframe::new(Tick(0), PropValue::Float(1.0), Interp::Linear);
+            let before = doc.clone();
+            let command = set_keyframe_checked(
+                doc.timeline.as_ref().unwrap(),
+                target.clone(),
+                path.clone(),
+                key,
+            )
+            .unwrap();
+            assert_undo_roundtrip(&doc, &command);
+            let encoded = serde_json::to_string(&command).unwrap();
+            let restored: TimelineCmd = serde_json::from_str(&encoded).unwrap();
+            Command::Timeline(restored).apply(&mut doc);
+            let p = doc.timeline.as_ref().unwrap();
+            assert_eq!(
+                copy_keyframes(p, &target, None).unwrap().tracks[0].keyframes[0],
+                key
+            );
+            assert_eq!(
+                find_clip_anywhere(p, clip).unwrap().grade,
+                Some(grade.clone())
+            );
+            let clipboard = copy_keyframes(p, &target, None).unwrap();
+            assert_eq!(
+                paste_keyframes(p, target.clone(), &clipboard, &[], Tick(100))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            let mut overflowing = clipboard.clone();
+            overflowing.tracks[0].keyframes[0].at = Tick(i64::MAX);
+            assert!(paste_keyframes(p, target.clone(), &overflowing, &[], Tick(1)).is_err());
+            assert!(
+                paste_keyframes_reanchored(p, target.clone(), &clipboard, &[], Tick(i64::MIN))
+                    .is_ok()
+            );
+            let bad = Keyframe::new(Tick(0), PropValue::Float(f64::NAN), Interp::Linear);
+            assert!(set_keyframe_checked(p, target.clone(), path.clone(), bad).is_err());
+            let wrong = AnimTarget::GradeStageOp {
+                clip,
+                stage: S::SharedLook {
+                    id: SharedLookId::new(),
+                },
+                op: op_id,
+            };
+            assert!(copy_keyframes(p, &wrong, None).is_err());
+            let mut locked = p.clone();
+            locked
+                .sequences
+                .get_mut(&seq)
+                .unwrap()
+                .video_tracks
+                .last_mut()
+                .unwrap()
+                .locked = true;
+            if which == 0 {
+                assert!(set_keyframe_checked(&locked, target.clone(), path.clone(), key).is_ok());
+            } else {
+                assert_eq!(
+                    set_keyframe_checked(&locked, target.clone(), path.clone(), key).unwrap_err(),
+                    EditError::TrackLocked
+                );
+                assert_eq!(
+                    remove_keyframe(&locked, target.clone(), path.clone(), Tick(0)).unwrap_err(),
+                    EditError::TrackLocked
+                );
+                assert_eq!(
+                    set_keyframe_interp(
+                        &locked,
+                        target.clone(),
+                        path.clone(),
+                        Tick(0),
+                        Interp::Hold
+                    )
+                    .unwrap_err(),
+                    EditError::TrackLocked
+                );
+                assert!(copy_keyframes(&locked, &target, None).is_ok());
+            }
+            let mut detached = p.clone();
+            let first = detached
+                .sequences
+                .get_mut(&seq)
+                .unwrap()
+                .track_mut(track)
+                .unwrap()
+                .clips
+                .iter_mut()
+                .find(|c| c.id == clip)
+                .unwrap();
+            first.look = None;
+            first.group = None;
+            assert!(set_keyframe_checked(&detached, target.clone(), path.clone(), key).is_err());
+            Command::Timeline(command.inverse(&doc).unwrap()).apply(&mut doc);
+            assert_eq!(
+                serde_json::to_value(&doc).unwrap(),
+                serde_json::to_value(&before).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn checked_grade_animation_rejects_invalid_values_and_locked_mutations() {
+        use crate::timeline::{GradeOp, GradeOpKind, PropValue};
+        let (mut doc, seq, track, clip, _) = scoped_fixture();
+        let op = GradeOp::new(
+            GradeOpKind::WhiteBalanceCct,
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin: 6500.0,
+                target_kelvin: 6500.0,
+            },
+        );
+        let target = AnimTarget::GradeOp { clip, op: op.id };
+        let mut grade = Grade::new();
+        grade.ops.push(op);
+        let command = set_grade_scoped(
+            doc.timeline.as_ref().unwrap(),
+            VfxOwner::Clip(clip),
+            Some(grade),
+        )
+        .unwrap();
+        Command::Timeline(command).apply(&mut doc);
+        let path = PropPath::new("params.source_kelvin");
+        let key = Keyframe::new(Tick(10), PropValue::Float(3200.0), Interp::Linear);
+        let cmd = set_keyframe_checked(
+            doc.timeline.as_ref().unwrap(),
+            target.clone(),
+            path.clone(),
+            key,
+        )
+        .unwrap();
+        assert_undo_roundtrip(&doc, &cmd);
+        Command::Timeline(cmd).apply(&mut doc);
+        for (path, value) in [
+            ("params.source_kelvin", PropValue::Float(1000.0)),
+            ("params.source_kelvin", PropValue::Float(f64::NAN)),
+            ("params.source_kelvin", PropValue::Bool(true)),
+            ("params.bogus", PropValue::Float(3200.0)),
+        ] {
+            assert!(set_keyframe_checked(
+                doc.timeline.as_ref().unwrap(),
+                target.clone(),
+                PropPath::new(path),
+                Keyframe::new(Tick(20), value, Interp::Linear)
+            )
+            .is_err());
+        }
+        let clipboard = copy_keyframes(doc.timeline.as_ref().unwrap(), &target, None).unwrap();
+        doc.timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .track_mut(track)
+            .unwrap()
+            .locked = true;
+        let p = doc.timeline.as_ref().unwrap();
+        assert!(matches!(
+            set_keyframe_checked(p, target.clone(), path.clone(), key),
+            Err(EditError::TrackLocked)
+        ));
+        assert!(matches!(
+            remove_keyframe(p, target.clone(), path.clone(), Tick(10)),
+            Err(EditError::TrackLocked)
+        ));
+        assert!(matches!(
+            set_keyframe_interp(p, target.clone(), path.clone(), Tick(10), Interp::Hold),
+            Err(EditError::TrackLocked)
+        ));
+        assert!(matches!(
+            paste_keyframes(p, target.clone(), &clipboard, &[], Tick(0)),
+            Err(EditError::TrackLocked)
+        ));
+        assert!(copy_keyframes(p, &target, None).is_ok());
+        assert!(matches!(
+            set_keyframe_checked(
+                p,
+                AnimTarget::ClipTransform { clip },
+                PropPath::new("transform.x"),
+                key
+            ),
+            Err(EditError::TrackLocked)
+        ));
+    }
+
+    #[test]
+    fn checked_window_animation_requires_a_power_window_and_valid_scalar() {
+        use crate::timeline::{GradeMask, GradeOp, GradeOpKind, PropValue, WindowShape};
+        let (mut doc, seq, track, clip, _) = scoped_fixture();
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        let target = AnimTarget::GradeOp { clip, op: op.id };
+        op.mask = Some(GradeMask::PowerWindow {
+            shape: WindowShape::Rectangle,
+            center: [0.5; 2],
+            size: [0.2; 2],
+            rotation: 0.0,
+            softness: 0.0,
+            invert: false,
+        });
+        let mut grade = Grade::new();
+        grade.ops.push(op);
+        let cmd = set_grade_scoped(
+            doc.timeline.as_ref().unwrap(),
+            VfxOwner::Clip(clip),
+            Some(grade),
+        )
+        .unwrap();
+        Command::Timeline(cmd).apply(&mut doc);
+        let key = Keyframe::new(Tick(10), PropValue::Float(0.5), Interp::Linear);
+        let cmd = set_keyframe_checked(
+            doc.timeline.as_ref().unwrap(),
+            target.clone(),
+            PropPath::new("mask.softness"),
+            key,
+        )
+        .unwrap();
+        assert_undo_roundtrip(&doc, &cmd);
+        for (path, value) in [
+            ("mask.size[0]", 0.0),
+            ("mask.size[1]", -0.1),
+            ("mask.softness", 1.1),
+            ("mask.center[0]", f64::MAX),
+            ("mask.unknown", 0.5),
+        ] {
+            assert!(set_keyframe_checked(
+                doc.timeline.as_ref().unwrap(),
+                target.clone(),
+                PropPath::new(path),
+                Keyframe::new(Tick(10), PropValue::Float(value), Interp::Linear)
+            )
+            .is_err());
+        }
+        let t = doc
+            .timeline
+            .as_mut()
+            .unwrap()
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .track_mut(track)
+            .unwrap();
+        t.clips
+            .iter_mut()
+            .find(|c| c.id == clip)
+            .unwrap()
+            .grade
+            .as_mut()
+            .unwrap()
+            .ops[0]
+            .mask = None;
+        assert!(set_keyframe_checked(
+            doc.timeline.as_ref().unwrap(),
+            target,
+            PropPath::new("mask.softness"),
+            key
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn tonal_grade_edits_validate_and_roundtrip_at_all_scopes() {
+        use crate::timeline::{GradeOp, GradeOpKind};
+        let (doc, seq, track, clip, asset) = scoped_fixture();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::TonalExposure,
+            GradeOpParams::TonalExposure {
+                stops: [1.0, -0.5, 0.25],
+                boundaries: [-2.0, 2.0],
+                softness: 1.0,
+            },
+        ));
+        for owner in owners(seq, track, clip, asset) {
+            let cmd = set_grade_scoped(doc.timeline.as_ref().unwrap(), owner, Some(grade.clone()))
+                .unwrap();
+            assert_undo_roundtrip(&doc, &cmd);
+        }
+        let encoded = serde_json::to_string(&grade).unwrap();
+        assert!(encoded.contains("tonal_exposure"));
+        assert_eq!(serde_json::from_str::<Grade>(&encoded).unwrap(), grade);
+        for params in [
+            GradeOpParams::TonalExposure {
+                stops: [9.0; 3],
+                boundaries: [-2.0, 2.0],
+                softness: 1.0,
+            },
+            GradeOpParams::TonalExposure {
+                stops: [1.0; 3],
+                boundaries: [2.0, 2.0],
+                softness: 1.0,
+            },
+            GradeOpParams::TonalExposure {
+                stops: [1.0; 3],
+                boundaries: [-2.0, 2.0],
+                softness: 0.0,
+            },
+            GradeOpParams::Exposure { stops: 0.0 },
+        ] {
+            grade.ops[0].params.base = params;
+            assert!(matches!(
+                set_grade_scoped(
+                    doc.timeline.as_ref().unwrap(),
+                    VfxOwner::Clip(clip),
+                    Some(grade.clone())
+                ),
+                Err(EditError::InvalidGradeParameters(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn kelvin_grade_edits_validate_and_roundtrip_at_all_scopes() {
+        use crate::timeline::{GradeOp, GradeOpKind};
+        let (doc, seq, track, clip, asset) = scoped_fixture();
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::WhiteBalanceCct,
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin: 3200.0,
+                target_kelvin: 6500.0,
+            },
+        ));
+        for owner in owners(seq, track, clip, asset) {
+            let command =
+                set_grade_scoped(doc.timeline.as_ref().unwrap(), owner, Some(grade.clone()))
+                    .unwrap();
+            assert_undo_roundtrip(&doc, &command);
+        }
+        let encoded = serde_json::to_string(&grade).unwrap();
+        assert!(encoded.contains("white_balance_cct"));
+        assert_eq!(serde_json::from_str::<Grade>(&encoded).unwrap(), grade);
+        for (source_kelvin, target_kelvin) in [
+            (f32::NAN, 6500.0),
+            (3200.0, f32::INFINITY),
+            (1666.0, 6500.0),
+            (3200.0, 25001.0),
+        ] {
+            grade.ops[0].params.base = GradeOpParams::WhiteBalanceCct {
+                source_kelvin,
+                target_kelvin,
+            };
+            assert!(matches!(
+                set_grade_scoped(
+                    doc.timeline.as_ref().unwrap(),
+                    VfxOwner::Clip(clip),
+                    Some(grade.clone())
+                ),
+                Err(EditError::InvalidGradeParameters(_))
+            ));
+        }
+        grade.ops[0].params.base = GradeOpParams::Exposure { stops: 0.0 };
+        assert!(set_grade_scoped(
+            doc.timeline.as_ref().unwrap(),
+            VfxOwner::Clip(clip),
+            Some(grade)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn qualifier_spatial_validation_roundtrip_and_legacy_document_defaults() {
+        use crate::timeline::{CdlParams, GradeOp, GradeOpKind, GradeQualifierSpatial};
+        let (doc, seq, track, clip, asset) = scoped_fixture();
+        let mut op = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::identity(),
+                keys: vec![],
+                matte_levels: [0.0; 2],
+            },
+        );
+        let old = serde_json::to_value(&op).unwrap();
+        assert!(old.get("qualifier_spatial").is_none());
+        assert_eq!(
+            serde_json::from_value::<GradeOp>(old)
+                .unwrap()
+                .qualifier_spatial,
+            None
+        );
+        op.qualifier_spatial = Some(GradeQualifierSpatial {
+            denoise: true,
+            grow: -0.01,
+            blur: 0.02,
+        });
+        let mut grade = Grade::new();
+        grade.ops.push(op);
+        for owner in owners(seq, track, clip, asset) {
+            let command =
+                set_grade_scoped(doc.timeline.as_ref().unwrap(), owner, Some(grade.clone()))
+                    .unwrap();
+            assert_undo_roundtrip(&doc, &command);
+            let encoded = serde_json::to_string(&command).unwrap();
+            assert_eq!(
+                serde_json::from_str::<TimelineCmd>(&encoded).unwrap(),
+                command
+            );
+        }
+        for (grow, blur) in [
+            (f32::NAN, 0.0),
+            (0.021, 0.0),
+            (-0.021, 0.0),
+            (0.0, -0.001),
+            (0.0, 0.021),
+            (0.0, f32::INFINITY),
+        ] {
+            grade.ops[0].qualifier_spatial = Some(GradeQualifierSpatial {
+                denoise: false,
+                grow,
+                blur,
+            });
+            assert!(set_grade_scoped(
+                doc.timeline.as_ref().unwrap(),
+                VfxOwner::Clip(clip),
+                Some(grade.clone())
+            )
+            .is_err());
+        }
+        grade.ops[0].qualifier_spatial = Some(Default::default());
+        grade.ops[0].kind = GradeOpKind::Exposure;
+        assert!(set_grade_scoped(
+            doc.timeline.as_ref().unwrap(),
+            VfxOwner::Clip(clip),
+            Some(grade)
+        )
+        .is_err());
     }
 
     #[test]

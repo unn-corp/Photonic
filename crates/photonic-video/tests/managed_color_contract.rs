@@ -84,7 +84,7 @@ fn managed_intent_never_falls_through_to_legacy_rendering_or_export() {
 }
 
 #[test]
-fn native_managed_draft_keeps_full_compiler_and_unqualified_export_gated() {
+fn native_managed_qualified_solid_delivery_preserves_unqualified_export_gates() {
     let (mut project, id) = project();
     project.sequences.get_mut(&id).unwrap().color =
         SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
@@ -124,10 +124,54 @@ fn native_managed_draft_keeps_full_compiler_and_unqualified_export_gated() {
         .find(|p| p.name == "ProRes Mezzanine")
         .unwrap();
     qualified_preset.preset.audio = None;
+    qualified_preset.output = "unused-native-color-test.mov".into();
+    // Native solid sources are now qualified for original/full ProRes delivery.
+    // Keep testing the supported path and the actual remaining refusal boundaries.
+    let resolved = resolve_export_job(&project, &qualified_preset).unwrap();
+    assert_eq!(resolved.out_size, (32, 32));
+    assert_eq!(resolved.total_frames, 30);
+    let delivery = photonic_video::graph::compile::compile_native_delivery(
+        &project,
+        id,
+        0,
+        Tick::ZERO,
+        Quality::FULL,
+    );
+    assert!(
+        delivery.diagnostics.is_empty(),
+        "{:?}",
+        delivery.diagnostics
+    );
+    assert!(delivery
+        .graph
+        .nodes
+        .iter()
+        .any(|n| matches!(n.op, IrOp::NativeSdrVideoOutput)));
+    for preview_resolution in [false, true] {
+        let mut unsupported = qualified_preset.clone();
+        unsupported.options.use_proxies = !preview_resolution;
+        unsupported.options.preview_resolution = preview_resolution;
+        assert!(resolve_export_job(&project, &unsupported)
+            .unwrap_err()
+            .to_string()
+            .contains("full-resolution, original-media ProRes MOV"));
+    }
+    project
+        .sequences
+        .get_mut(&id)
+        .unwrap()
+        .master_effects
+        .push(ClipEffect::new(EffectKind::Deflicker));
     assert!(resolve_export_job(&project, &qualified_preset)
         .unwrap_err()
         .to_string()
         .contains("native delivery first frame is unavailable"));
+    project
+        .sequences
+        .get_mut(&id)
+        .unwrap()
+        .master_effects
+        .clear();
     if let SequenceColorConfig::NativeManaged(config) =
         &mut project.sequences.get_mut(&id).unwrap().color
     {

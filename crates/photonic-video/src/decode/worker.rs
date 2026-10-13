@@ -22,7 +22,7 @@ use std::time::Duration;
 use photonic_core::timeline::{FrameRate, Tick};
 
 use crate::decode::scheduler::DecodeSource;
-use crate::playback::prefetch::pump_ahead;
+use crate::playback::prefetch::pump_ahead_checked;
 
 // Diagnostic counters (temporary): how the worker spent its decode budget.
 pub static WORKER_SEEKS: AtomicU64 = AtomicU64::new(0);
@@ -57,7 +57,15 @@ struct Steer {
     stop: bool,
 }
 
+#[derive(Clone)]
+struct DecodeFailure {
+    target: Tick,
+    scrub: bool,
+    message: String,
+}
+
 struct Ctrl {
+    failure: arc_swap::ArcSwapOption<DecodeFailure>,
     steer: Mutex<Steer>,
     wake: Condvar,
 }
@@ -78,6 +86,7 @@ impl DecodeWorker {
             .unwrap_or_else(|e| e.into_inner())
             .cancellation();
         let ctrl = Arc::new(Ctrl {
+            failure: arc_swap::ArcSwapOption::empty(),
             steer: Mutex::new(Steer {
                 target: None,
                 scrub: false,
@@ -103,10 +112,22 @@ impl DecodeWorker {
     pub fn steer(&self, target: Tick) {
         let mut g = self.ctrl.steer.lock().unwrap_or_else(|e| e.into_inner());
         if g.target != Some(target) || g.scrub {
+            self.ctrl.failure.store(None);
             g.target = Some(target);
             g.scrub = false;
             self.ctrl.wake.notify_one();
         }
+    }
+
+    /// Only the exact request that failed is rejected. Moving the playhead
+    /// remains recoverable without relinking or poisoning the whole asset.
+    pub fn failure_at(&self, target: Tick, scrub: bool) -> Option<String> {
+        self.ctrl
+            .failure
+            .load()
+            .as_ref()
+            .filter(|f| f.target == target && f.scrub == scrub)
+            .map(|f| f.message.clone())
     }
 
     /// Point the worker at a scrub target: decode just the keyframe covering it
@@ -114,6 +135,7 @@ impl DecodeWorker {
     pub fn steer_scrub(&self, target: Tick) {
         let mut g = self.ctrl.steer.lock().unwrap_or_else(|e| e.into_inner());
         if g.target != Some(target) || !g.scrub {
+            self.ctrl.failure.store(None);
             g.target = Some(target);
             g.scrub = true;
             self.ctrl.wake.notify_one();
@@ -161,27 +183,60 @@ fn run(ctrl: Arc<Ctrl>, decode: Arc<Mutex<DecodeSource>>, rate: FrameRate) {
         // then decodes *forward* to keep the ring pumped ahead. Forward decode is
         // cheap (one frame); a seek respawns ffmpeg + decodes a GOP, so we do it
         // as rarely as possible. The engine thread never seeks.
-        let progressed = {
+        // A definitive failed request must not respawn ffmpeg every 4 ms.
+        let failed = ctrl
+            .failure
+            .load()
+            .as_ref()
+            .is_some_and(|f| f.target == t && f.scrub == scrub);
+        let result = if failed {
+            Ok(false)
+        } else {
             let mut src = decode.lock().unwrap_or_else(|e| e.into_inner());
             if scrub {
                 WORKER_SEEKS.fetch_add(1, Ordering::Relaxed);
-                src.scrub_to(t).unwrap_or(false)
+                src.scrub_to(t).map_err(|e| e.to_string())
             } else {
                 let need_seek = match (src.ring().oldest(), src.ring().newest()) {
-                    // Sequential playback stays inside the resident window; a jump
-                    // before the oldest frame or far past the frontier re-seeks.
-                    (Some(lo), Some(hi)) => t.0 < lo.0 || t.0 > hi.0 + SEEK_AHEAD_FRAMES * tpf,
-                    // Empty ring (cold start / just after a clear) ⇒ bootstrap seek.
+                    (Some(lo), Some(hi)) => {
+                        t < lo || t.0 > hi.0.saturating_add(SEEK_AHEAD_FRAMES.saturating_mul(tpf))
+                    }
                     _ => true,
                 };
-                if !src.is_active() || need_seek {
+                if src.ended_before(t, rate) {
+                    Err("requested video time is beyond the last decoded frame".into())
+                } else if !src.is_active() || need_seek {
                     WORKER_SEEKS.fetch_add(1, Ordering::Relaxed);
-                    src.seek(t).is_ok()
+                    src.seek_covering(t)
+                        .map(|_| true)
+                        .map_err(|e| e.to_string())
                 } else {
-                    let n = pump_ahead(&mut src, t, rate);
-                    WORKER_PUMPED.fetch_add(n as u64, Ordering::Relaxed);
-                    n > 0
+                    match pump_ahead_checked(&mut src, t, rate) {
+                        Ok(n) => {
+                            WORKER_PUMPED.fetch_add(n as u64, Ordering::Relaxed);
+                            if src.ended_before(t, rate) {
+                                Err("requested video time is beyond the last decoded frame".into())
+                            } else {
+                                Ok(n > 0)
+                            }
+                        }
+                        // A hardware failure can switch to software; let the
+                        // next iteration perform that existing recovery first.
+                        Err(_) if !src.is_active() => Ok(true),
+                        Err(e) => Err(e.to_string()),
+                    }
                 }
+            }
+        };
+        let progressed = match result {
+            Ok(progressed) => progressed,
+            Err(message) => {
+                ctrl.failure.store(Some(Arc::new(DecodeFailure {
+                    target: t,
+                    scrub,
+                    message,
+                })));
+                false
             }
         };
         if progressed {

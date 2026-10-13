@@ -440,6 +440,7 @@ impl PhotonicApp {
             // Seed a clip grade's HSL qualifier from the sampled colour (07 §5).
             // Routes through the one eyedropper idiom → `SetGrade` → history.
             Some(EyedropperTarget::GradeQualifier {
+                stage,
                 seq,
                 track,
                 clip,
@@ -455,13 +456,16 @@ impl PhotonicApp {
                 if !h.is_finite() || !s.is_finite() || !l.is_finite() {
                     return;
                 }
-                let grade = doc
-                    .timeline
-                    .as_ref()
-                    .and_then(|p| p.sequences.get(&seq))
-                    .and_then(|sq| sq.track(track))
-                    .and_then(|t| t.clips.iter().find(|c| c.id == clip))
-                    .and_then(|c| c.grade.clone());
+                let grade = doc.timeline.as_ref().and_then(|p| {
+                    let c = p
+                        .sequences
+                        .get(&seq)?
+                        .track(track)?
+                        .clips
+                        .iter()
+                        .find(|c| c.id == clip)?;
+                    stage.resolve_grade(p, c).cloned()
+                });
                 if let Some(mut grade) = grade {
                     let mut seeded = false;
                     if let Some(o) = grade.ops.iter_mut().find(|o| o.id == op) {
@@ -527,7 +531,7 @@ impl PhotonicApp {
                     }
                     if seeded {
                         let cmd = doc.timeline.as_ref().and_then(|proj| {
-                            tlops::set_grade(proj, seq, track, clip, Some(grade)).ok()
+                            tlops::set_clip_stage_grade(proj, seq, track, clip, stage, grade).ok()
                         });
                         if let Some(cmd) = cmd {
                             history.execute_discrete(Command::Timeline(cmd), doc);
@@ -537,6 +541,7 @@ impl PhotonicApp {
                 }
             }
             Some(EyedropperTarget::GradeCurve {
+                stage,
                 seq,
                 track,
                 clip,
@@ -550,13 +555,16 @@ impl PhotonicApp {
                     .as_ref()
                     .and_then(|p| p.sequences.get(&seq))
                     .is_some_and(|sequence| !sequence.color.is_legacy());
-                let grade = doc
-                    .timeline
-                    .as_ref()
-                    .and_then(|p| p.sequences.get(&seq))
-                    .and_then(|sq| sq.track(track))
-                    .and_then(|t| t.clips.iter().find(|c| c.id == clip))
-                    .and_then(|c| c.grade.clone());
+                let grade = doc.timeline.as_ref().and_then(|p| {
+                    let c = p
+                        .sequences
+                        .get(&seq)?
+                        .track(track)?
+                        .clips
+                        .iter()
+                        .find(|c| c.id == clip)?;
+                    stage.resolve_grade(p, c).cloned()
+                });
                 if let Some(mut grade) = grade {
                     let mut added = false;
                     if let Some(o) = grade.ops.iter_mut().find(|o| o.id == op) {
@@ -604,7 +612,8 @@ impl PhotonicApp {
                     }
                     if added {
                         let command = doc.timeline.as_ref().and_then(|project| {
-                            tlops::set_grade(project, seq, track, clip, Some(grade)).ok()
+                            tlops::set_clip_stage_grade(project, seq, track, clip, stage, grade)
+                                .ok()
                         });
                         if let Some(command) = command {
                             history.execute_discrete(Command::Timeline(command), doc);

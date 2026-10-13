@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use photonic_core::timeline::{
     anim::{self, PropValue},
-    AssetId, CdlParams, Grade, GradeMask, GradeOpParams, LutInterp, Tick, WindowShape,
+    AssetId, CdlParams, Grade, GradeMask, GradeOp, GradeOpParams, LutInterp, Tick, WindowShape,
 };
 
 use crate::lut::Lut3d;
@@ -276,6 +276,11 @@ pub enum ResolvedGradePayload {
         temp: f32,
         tint: f32,
     },
+    /// Explicit row-major transform in the resolved working RGB coordinates.
+    LinearMatrix {
+        rows: [[f32; 3]; 3],
+    },
+    TonalExposure(crate::tonal_exposure::ResolvedTonalExposure),
     Cdl(ResolvedCdl),
     Curves(Box<ResolvedCurves>),
     /// The fixed-capacity sampled-key array lives out of line so common
@@ -484,6 +489,10 @@ pub enum GradeIssue {
     UnresolvedMask,
     InvalidQualifierKeys,
     InvalidQualifierMatteLevels,
+    QualifierSpatialUnavailable(String),
+    InvalidWhiteBalanceCct(String),
+    InvalidTonalExposure(String),
+    InvalidWindowAnimation(String),
 }
 
 impl std::fmt::Display for GradeDiagnostic {
@@ -534,6 +543,10 @@ impl std::fmt::Display for GradeDiagnostic {
             GradeIssue::UnsupportedOperator => write!(f, "unsupported grading operator")?,
             GradeIssue::NativeCorrectionUnavailable(reason) => write!(f, "{reason}")?,
             GradeIssue::UnresolvedMask => write!(f, "mask cannot be resolved")?,
+            GradeIssue::QualifierSpatialUnavailable(reason)
+            | GradeIssue::InvalidWhiteBalanceCct(reason)
+            | GradeIssue::InvalidTonalExposure(reason)
+            | GradeIssue::InvalidWindowAnimation(reason) => write!(f, "{reason}")?,
             GradeIssue::InvalidQualifierKeys => write!(
                 f,
                 "qualifier key list is invalid or exceeds the supported limit"
@@ -579,6 +592,21 @@ pub fn resolve_with_ids_and_diagnostics(
     Vec<(photonic_core::timeline::GradeOpId, ResolvedGradeOp)>,
     Vec<GradeDiagnostic>,
 ) {
+    resolve_with_ids_and_native_policy(grade, tick, lut_provider, false)
+}
+
+/// Resolve in explicit working RGB coordinates. Native permits graph-lowered
+/// spatial cleanup and derives AP1 matrices; the default resolver uses Legacy
+/// linear Rec.709 and rejects spatial cleanup requiring native graph lowering.
+pub fn resolve_with_ids_and_native_policy(
+    grade: &Grade,
+    tick: Tick,
+    lut_provider: impl Fn(AssetId) -> Option<Arc<Lut3d>>,
+    native: bool,
+) -> (
+    Vec<(photonic_core::timeline::GradeOpId, ResolvedGradeOp)>,
+    Vec<GradeDiagnostic>,
+) {
     if grade.bypass {
         return (Vec::new(), Vec::new());
     }
@@ -587,6 +615,62 @@ pub fn resolve_with_ids_and_diagnostics(
     for op in &grade.ops {
         if !op.enabled {
             continue;
+        }
+        if (op.kind == photonic_core::timeline::GradeOpKind::TonalExposure
+            || matches!(op.params.base, GradeOpParams::TonalExposure { .. }))
+            && op.params.base.kind() != Some(op.kind)
+        {
+            diagnostics.push(GradeDiagnostic {
+                op: op.id,
+                sequence_path: Vec::new(),
+                graph_node: None,
+                owner: None,
+                stage: None,
+                issue: GradeIssue::InvalidTonalExposure(
+                    "tonal operator and parameters do not match".into(),
+                ),
+            });
+            continue;
+        }
+        if (op.kind == photonic_core::timeline::GradeOpKind::WhiteBalanceCct
+            || matches!(op.params.base, GradeOpParams::WhiteBalanceCct { .. }))
+            && op.params.base.kind() != Some(op.kind)
+        {
+            diagnostics.push(GradeDiagnostic {
+                op: op.id,
+                sequence_path: Vec::new(),
+                graph_node: None,
+                owner: None,
+                stage: None,
+                issue: GradeIssue::InvalidWhiteBalanceCct(
+                    "Kelvin operator and parameter kind do not match".into(),
+                ),
+            });
+            continue;
+        }
+        if let Some(spatial) = op.qualifier_spatial {
+            let error = if op.kind != photonic_core::timeline::GradeOpKind::HslQualifier
+                || !matches!(op.params.base, GradeOpParams::HslQualifier { .. })
+            {
+                Some("spatial cleanup requires a qualifier")
+            } else if let Err(error) = spatial.validate() {
+                Some(error)
+            } else if !native && !spatial.is_neutral() {
+                Some("qualifier spatial cleanup requires Native Managed graph evaluation")
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                diagnostics.push(GradeDiagnostic {
+                    op: op.id,
+                    sequence_path: Vec::new(),
+                    graph_node: None,
+                    owner: None,
+                    stage: None,
+                    issue: GradeIssue::QualifierSpatialUnavailable(error.into()),
+                });
+                continue;
+            }
         }
         if op.kind.is_unknown() {
             diagnostics.push(GradeDiagnostic {
@@ -610,6 +694,20 @@ pub fn resolve_with_ids_and_diagnostics(
             });
             continue;
         }
+        let sampled_mask = match op.mask_at(tick) {
+            Ok(mask) => mask,
+            Err(error) => {
+                diagnostics.push(GradeDiagnostic {
+                    op: op.id,
+                    sequence_path: Vec::new(),
+                    graph_node: None,
+                    owner: None,
+                    stage: None,
+                    issue: GradeIssue::InvalidWindowAnimation(error.into()),
+                });
+                continue;
+            }
+        };
         let params = eval_params(&op.params, tick);
         if let GradeOpParams::HslQualifier {
             keys, matte_levels, ..
@@ -665,6 +763,52 @@ pub fn resolve_with_ids_and_diagnostics(
             GradeOpParams::Contrast { pivot, amount } => ResolvedGradePayload::Contrast {
                 pivot: *pivot,
                 amount: *amount,
+            },
+            GradeOpParams::TonalExposure {
+                stops,
+                boundaries,
+                softness,
+            } => {
+                if let Err(error) =
+                    photonic_core::timeline::validate_tonal_exposure(*stops, *boundaries, *softness)
+                {
+                    diagnostics.push(GradeDiagnostic {
+                        op: op.id,
+                        sequence_path: Vec::new(),
+                        graph_node: None,
+                        owner: None,
+                        stage: None,
+                        issue: GradeIssue::InvalidTonalExposure(error.into()),
+                    });
+                    continue;
+                }
+                if *stops == [0.0; 3] {
+                    continue;
+                }
+                ResolvedGradePayload::TonalExposure(crate::tonal_exposure::ResolvedTonalExposure {
+                    stops: *stops,
+                    boundaries: *boundaries,
+                    softness: *softness,
+                    native_ap1: native,
+                })
+            }
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin,
+                target_kelvin,
+            } => match crate::white_balance::cct_matrix(*source_kelvin, *target_kelvin, native) {
+                Ok(rows) if crate::white_balance::is_identity(&rows) => continue,
+                Ok(rows) => ResolvedGradePayload::LinearMatrix { rows },
+                Err(error) => {
+                    diagnostics.push(GradeDiagnostic {
+                        op: op.id,
+                        sequence_path: Vec::new(),
+                        graph_node: None,
+                        owner: None,
+                        stage: None,
+                        issue: GradeIssue::InvalidWhiteBalanceCct(error.into()),
+                    });
+                    continue;
+                }
             },
             GradeOpParams::WhiteBalance { temp, tint } => ResolvedGradePayload::WhiteBalance {
                 temp: *temp,
@@ -778,11 +922,28 @@ pub fn resolve_with_ids_and_diagnostics(
             op.id,
             ResolvedGradeOp {
                 payload,
-                mask: resolve_mask(op.mask.as_ref()),
+                mask: resolve_mask(sampled_mask.as_ref()),
             },
         ));
     }
     (out, diagnostics)
+}
+
+/// Resolve only the animated window, without evaluating an operator's color
+/// parameters. A missing window is a full-frame key; unresolved roto is an error.
+pub fn resolve_window_matte(
+    op: &GradeOp,
+    tick: Tick,
+) -> Result<Option<ResolvedMask>, &'static str> {
+    let sampled = op.mask_at(tick)?;
+    if matches!(sampled, Some(GradeMask::RotoMatte { .. })) {
+        return Err("window matte requires a primitive power window; roto is unresolved");
+    }
+    let mask = resolve_mask(sampled.as_ref());
+    if let Some(mask) = &mask {
+        crate::grade_gpu::validate_native_mask(mask)?;
+    }
+    Ok(mask)
 }
 
 /// Resolve an op's `GradeMask`. Only `PowerWindow` is real in v1 (07 §4.1);
@@ -833,92 +994,7 @@ fn eval_params(props: &anim::AnimProps<GradeOpParams>, tick: Tick) -> GradeOpPar
 /// the kind in `p`. Paths mirror `prop_registry.rs`'s grade blocks. `None` for
 /// paths that do not resolve for this kind (e.g. structural curve vectors).
 fn scalar_field_mut<'a>(p: &'a mut GradeOpParams, path: &str) -> Option<&'a mut f32> {
-    use GradeOpParams::*;
-    match p {
-        Exposure { stops } => (path == "params.stops").then_some(stops),
-        LinearOffset { rgb } => match path {
-            "params.rgb[0]" => Some(&mut rgb[0]),
-            "params.rgb[1]" => Some(&mut rgb[1]),
-            "params.rgb[2]" => Some(&mut rgb[2]),
-            _ => None,
-        },
-        PrinterLights { points } => match path {
-            "params.points[0]" => Some(&mut points[0]),
-            "params.points[1]" => Some(&mut points[1]),
-            "params.points[2]" => Some(&mut points[2]),
-            _ => None,
-        },
-        HighlightRolloff { knee, strength } => match path {
-            "params.knee" => Some(knee),
-            "params.strength" => Some(strength),
-            _ => None,
-        },
-        SaturationVibrance {
-            saturation,
-            vibrance,
-        } => match path {
-            "params.saturation" => Some(saturation),
-            "params.vibrance" => Some(vibrance),
-            _ => None,
-        },
-        Contrast { pivot, amount } => match path {
-            "params.pivot" => Some(pivot),
-            "params.amount" => Some(amount),
-            _ => None,
-        },
-        WhiteBalance { temp, tint } => match path {
-            "params.temp" => Some(temp),
-            "params.tint" => Some(tint),
-            _ => None,
-        },
-        Cdl {
-            slope,
-            offset,
-            power,
-            sat,
-        } => match path {
-            "params.slope[0]" => Some(&mut slope[0]),
-            "params.slope[1]" => Some(&mut slope[1]),
-            "params.slope[2]" => Some(&mut slope[2]),
-            "params.offset[0]" => Some(&mut offset[0]),
-            "params.offset[1]" => Some(&mut offset[1]),
-            "params.offset[2]" => Some(&mut offset[2]),
-            "params.power[0]" => Some(&mut power[0]),
-            "params.power[1]" => Some(&mut power[1]),
-            "params.power[2]" => Some(&mut power[2]),
-            "params.sat" => Some(sat),
-            _ => None,
-        },
-        Wheels {
-            lift,
-            gamma,
-            gain,
-            sat,
-        } => match path {
-            "params.lift[0]" => Some(&mut lift[0]),
-            "params.lift[1]" => Some(&mut lift[1]),
-            "params.lift[2]" => Some(&mut lift[2]),
-            "params.gamma[0]" => Some(&mut gamma[0]),
-            "params.gamma[1]" => Some(&mut gamma[1]),
-            "params.gamma[2]" => Some(&mut gamma[2]),
-            "params.gain[0]" => Some(&mut gain[0]),
-            "params.gain[1]" => Some(&mut gain[1]),
-            "params.gain[2]" => Some(&mut gain[2]),
-            "params.sat" => Some(sat),
-            _ => None,
-        },
-        HslQualifier {
-            softness,
-            correction,
-            ..
-        } => match path {
-            "params.softness" => Some(softness),
-            "params.correction.sat" => Some(&mut correction.sat),
-            _ => None,
-        },
-        Lut3d { intensity, .. } => (path == "params.intensity").then_some(intensity),
-        Curves { .. } | Unknown(_) => None,
-    }
+    p.scalar_property_mut(path)
 }
 
 // ── CPU reference apply (07 §3; operand space 03 §4.5.3) ────────────────────
@@ -1047,6 +1123,10 @@ pub fn apply_op(payload: &ResolvedGradePayload, rgb: [f32; 3], mask_w: f32) -> [
                 } => apply_saturation_vibrance(rgb, *saturation, *vibrance),
                 ResolvedGradePayload::Contrast { pivot, amount } => {
                     apply_contrast(rgb, *pivot, *amount)
+                }
+                ResolvedGradePayload::TonalExposure(tonal) => tonal.apply(rgb),
+                ResolvedGradePayload::LinearMatrix { rows } => {
+                    crate::white_balance::apply_matrix(rows, rgb)
                 }
                 ResolvedGradePayload::WhiteBalance { temp, tint } => {
                     apply_white_balance(rgb, *temp, *tint)
@@ -1313,6 +1393,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn animated_window_resolution_is_shared_and_invalid_samples_diagnose() {
+        use photonic_core::timeline::{
+            Grade, GradeMask, GradeOp, GradeOpKind, GradeOpParams, Interp, Keyframe, PropPath,
+            PropValue, WindowShape,
+        };
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        );
+        op.mask = Some(GradeMask::PowerWindow {
+            shape: WindowShape::Rectangle,
+            center: [0.25, 0.5],
+            size: [0.2; 2],
+            rotation: 0.0,
+            softness: 0.0,
+            invert: false,
+        });
+        for (at, v) in [(0, 0.0), (100, 1.0)] {
+            op.params
+                .track_mut(&PropPath::new("mask.softness"))
+                .insert_keyframe(Keyframe::new(Tick(at), PropValue::Float(v), Interp::Linear));
+        }
+        let mut grade = Grade::new();
+        grade.ops.push(op);
+        for native in [false, true] {
+            let (ops, diagnostics) =
+                resolve_with_ids_and_native_policy(&grade, Tick(50), |_| None, native);
+            assert!(diagnostics.is_empty());
+            assert_eq!(ops[0].1.mask.unwrap().softness, 0.5);
+            assert_eq!(
+                grade.ops[0]
+                    .mask
+                    .as_ref()
+                    .unwrap()
+                    .scalar_property("mask.softness"),
+                Some(0.0)
+            );
+        }
+        grade.ops[0]
+            .params
+            .track_mut(&PropPath::new("mask.size[0]"))
+            .insert_keyframe(Keyframe::new(
+                Tick(0),
+                PropValue::Float(-1.0),
+                Interp::Linear,
+            ));
+        let (ops, diagnostics) = resolve_with_diagnostics(&grade, Tick(0), |_| None);
+        assert!(ops.is_empty());
+        assert!(matches!(
+            diagnostics[0].issue,
+            GradeIssue::InvalidWindowAnimation(_)
+        ));
+    }
+
+    #[test]
     fn resolved_payload_remains_compact_with_sampled_qualifier_keys() {
         assert!(std::mem::size_of::<ResolvedGradePayload>() <= 64);
     }
@@ -1478,6 +1613,7 @@ mod tests {
             kind: GradeOpKind::Exposure,
             params: props,
             mask: None,
+            qualifier_spatial: None,
         });
         // At t=50, stops interpolates to 1.0.
         let ops = resolve(&grade, Tick(50), none_provider);
@@ -1488,6 +1624,197 @@ mod tests {
             }
             _ => panic!("wrong payload"),
         }
+    }
+
+    #[test]
+    fn tonal_resolution_samples_animation_and_rejects_invalid_loaded_grades() {
+        use photonic_core::timeline::{Interp, Keyframe, PropValue, PropertyTrack};
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::TonalExposure,
+            GradeOpParams::TonalExposure {
+                stops: [0.0; 3],
+                boundaries: [-2.0, 2.0],
+                softness: 1.0,
+            },
+        );
+        let mut lane = PropertyTrack::new("params.stops[1]");
+        lane.insert_keyframe(Keyframe::new(
+            Tick(0),
+            PropValue::Float(0.0),
+            Interp::Linear,
+        ));
+        lane.insert_keyframe(Keyframe::new(
+            Tick(100),
+            PropValue::Float(2.0),
+            Interp::Linear,
+        ));
+        op.params.tracks.push(lane);
+        grade.ops.push(op);
+        for native in [false, true] {
+            let (ops, errors) =
+                resolve_with_ids_and_native_policy(&grade, Tick(50), none_provider, native);
+            assert!(errors.is_empty());
+            assert_eq!(ops.len(), 1);
+            let ResolvedGradePayload::TonalExposure(tonal) = ops[0].1.payload else {
+                panic!()
+            };
+            assert_eq!(tonal.stops, [0.0, 1.0, 0.0]);
+            assert_eq!(tonal.native_ap1, native);
+        }
+        grade.ops[0].params.tracks.clear();
+        assert!(resolve(&grade, Tick::ZERO, none_provider).is_empty());
+        grade.ops[0].params.base = GradeOpParams::TonalExposure {
+            stops: [1.0; 3],
+            boundaries: [1.0, -1.0],
+            softness: 1.0,
+        };
+        let (ops, errors) =
+            resolve_with_ids_and_native_policy(&grade, Tick::ZERO, none_provider, true);
+        assert!(ops.is_empty());
+        assert!(matches!(
+            errors[0].issue,
+            GradeIssue::InvalidTonalExposure(_)
+        ));
+        grade.ops[0].params.base = GradeOpParams::Exposure { stops: 0.0 };
+        assert!(
+            !resolve_with_ids_and_native_policy(&grade, Tick::ZERO, none_provider, true)
+                .1
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn kelvin_resolution_preserves_artistic_wb_and_samples_native_coordinates() {
+        use photonic_core::timeline::{Interp, Keyframe, PropValue, PropertyTrack};
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::WhiteBalanceCct,
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin: 3200.0,
+                target_kelvin: 6500.0,
+            },
+        );
+        let mut lane = PropertyTrack::new("params.source_kelvin");
+        lane.insert_keyframe(Keyframe::new(
+            Tick(0),
+            PropValue::Float(3200.0),
+            Interp::Linear,
+        ));
+        lane.insert_keyframe(Keyframe::new(
+            Tick(100),
+            PropValue::Float(6400.0),
+            Interp::Linear,
+        ));
+        op.params.tracks.push(lane);
+        grade.ops.push(op);
+        for native in [false, true] {
+            let (ops, errors) =
+                resolve_with_ids_and_native_policy(&grade, Tick(50), none_provider, native);
+            assert!(errors.is_empty());
+            assert_eq!(ops.len(), 1);
+            assert_eq!(
+                ops[0].1.payload,
+                ResolvedGradePayload::LinearMatrix {
+                    rows: crate::white_balance::cct_matrix(4800.0, 6500.0, native).unwrap()
+                }
+            );
+        }
+        grade.ops[0].params.tracks.clear();
+        grade.ops[0].params.base = GradeOpParams::WhiteBalanceCct {
+            source_kelvin: 6500.0,
+            target_kelvin: 6500.0,
+        };
+        assert!(resolve(&grade, Tick::ZERO, none_provider).is_empty());
+        grade.ops[0].params.base = GradeOpParams::WhiteBalanceCct {
+            source_kelvin: 0.0,
+            target_kelvin: 6500.0,
+        };
+        assert!(matches!(
+            resolve_with_diagnostics(&grade, Tick::ZERO, none_provider).1[0].issue,
+            GradeIssue::InvalidWhiteBalanceCct(_)
+        ));
+        grade.ops[0].kind = GradeOpKind::Exposure;
+        assert!(
+            resolve_with_ids_and_native_policy(&grade, Tick::ZERO, none_provider, true)
+                .0
+                .is_empty()
+        );
+        let old = Grade {
+            ops: vec![GradeOp::new(
+                GradeOpKind::WhiteBalance,
+                GradeOpParams::WhiteBalance {
+                    temp: 0.25,
+                    tint: -0.5,
+                },
+            )],
+            bypass: false,
+            graph: None,
+        };
+        assert_eq!(
+            resolve(&old, Tick::ZERO, none_provider)[0].payload,
+            ResolvedGradePayload::WhiteBalance {
+                temp: 0.25,
+                tint: -0.5
+            }
+        );
+    }
+
+    #[test]
+    fn qualifier_spatial_requires_explicit_graph_lowering_and_valid_kind() {
+        use photonic_core::timeline::GradeQualifierSpatial;
+        let mut grade = Grade::new();
+        let mut op = GradeOp::new(
+            GradeOpKind::HslQualifier,
+            GradeOpParams::HslQualifier {
+                hue: [0.0, 1.0],
+                sat: [0.0, 1.0],
+                lum: [0.0, 1.0],
+                softness: 0.0,
+                correction: CdlParams::identity(),
+                keys: vec![],
+                matte_levels: [0.0; 2],
+            },
+        );
+        op.qualifier_spatial = Some(GradeQualifierSpatial {
+            denoise: true,
+            ..Default::default()
+        });
+        grade.ops.push(op);
+        let (resolved, errors) =
+            resolve_with_ids_and_diagnostics(&grade, Tick::ZERO, none_provider);
+        assert!(resolved.is_empty());
+        assert!(matches!(
+            errors[0].issue,
+            GradeIssue::QualifierSpatialUnavailable(_)
+        ));
+        let (resolved, errors) =
+            resolve_with_ids_and_native_policy(&grade, Tick::ZERO, none_provider, true);
+        assert_eq!(resolved.len(), 1);
+        assert!(errors.is_empty());
+        grade.ops[0].qualifier_spatial = Some(Default::default());
+        let (neutral, errors) = resolve_with_ids_and_diagnostics(&grade, Tick::ZERO, none_provider);
+        assert!(errors.is_empty());
+        grade.ops[0].qualifier_spatial = None;
+        assert_eq!(
+            neutral,
+            resolve_with_ids_and_diagnostics(&grade, Tick::ZERO, none_provider).0
+        );
+        grade.ops[0].qualifier_spatial = Some(GradeQualifierSpatial {
+            blur: f32::NAN,
+            ..Default::default()
+        });
+        assert!(
+            resolve_with_ids_and_native_policy(&grade, Tick::ZERO, none_provider, true)
+                .0
+                .is_empty()
+        );
+        grade.ops[0].enabled = false;
+        assert!(
+            resolve_with_ids_and_native_policy(&grade, Tick::ZERO, none_provider, true)
+                .1
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1514,6 +1841,7 @@ mod tests {
             kind: GradeOpKind::LinearOffset,
             params,
             mask: None,
+            qualifier_spatial: None,
         });
         let ops = resolve(&grade, Tick(50), none_provider);
         assert_eq!(
@@ -1560,6 +1888,7 @@ mod tests {
             kind: GradeOpKind::PrinterLights,
             params: props,
             mask: None,
+            qualifier_spatial: None,
         });
         let ops = resolve(&grade, Tick(50), none_provider);
         assert!(
@@ -1629,6 +1958,7 @@ mod tests {
             kind: GradeOpKind::SaturationVibrance,
             params: props,
             mask: None,
+            qualifier_spatial: None,
         });
         let resolved = resolve(&grade, Tick(50), none_provider);
         assert!(matches!(resolved[0].payload,
@@ -2284,5 +2614,41 @@ mod tests {
         assert!(nested_diagnostic
             .to_string()
             .contains("Nested sequence path"));
+    }
+}
+
+#[cfg(test)]
+mod window_matte_resolution_tests {
+    use super::*;
+    use photonic_core::timeline::{GradeOpKind, MaskRef};
+
+    #[test]
+    fn window_matte_resolver_is_color_independent_and_rejects_unresolved_geometry() {
+        let mut op = GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: f32::NAN },
+        );
+        assert!(resolve_window_matte(&op, Tick::ZERO).unwrap().is_none());
+        op.mask = Some(GradeMask::PowerWindow {
+            shape: WindowShape::Ellipse,
+            center: [0.5; 2],
+            size: [0.2; 2],
+            rotation: 0.0,
+            softness: 0.2,
+            invert: false,
+        });
+        assert!(
+            resolve_window_matte(&op, Tick::ZERO).unwrap().is_some(),
+            "RGB is not evaluated by a geometric key"
+        );
+        if let Some(GradeMask::PowerWindow { size, .. }) = &mut op.mask {
+            size[0] = 0.0;
+        }
+        assert!(resolve_window_matte(&op, Tick::ZERO).is_err());
+        op.mask = Some(GradeMask::RotoMatte {
+            source: MaskRef::Matte,
+            invert: false,
+        });
+        assert!(resolve_window_matte(&op, Tick::ZERO).is_err());
     }
 }

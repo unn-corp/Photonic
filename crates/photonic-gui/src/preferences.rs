@@ -66,11 +66,17 @@ pub struct ScopeWindowPreferences {
     /// [left, top, width, height]. Old installations leave this unset.
     #[serde(default)]
     pub(crate) rect: Option<[f32; 4]>,
+    /// Measured client area; avoids re-adding title/frame margins on restore.
+    #[serde(default)]
+    pub(crate) body_size: Option<[f32; 2]>,
     /// Additional simultaneous scope views, each with a stable analysis ID.
     #[serde(default)]
     pub(crate) additional: Vec<AdditionalScopePreferences>,
     #[serde(default = "default_next_scope_window_id")]
     pub(crate) next_id: u32,
+    /// One-frame geometry restore after loading a named arrangement.
+    #[serde(skip)]
+    pub(crate) restore_geometry: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,6 +92,9 @@ pub struct AdditionalScopePreferences {
     pub(crate) vectorscope_targets: VectorscopeTargets,
     #[serde(default)]
     pub(crate) rect: Option<[f32; 4]>,
+    /// Measured client area; avoids re-adding title/frame margins on restore.
+    #[serde(default)]
+    pub(crate) body_size: Option<[f32; 2]>,
 }
 
 fn default_scope_dock_height() -> f32 {
@@ -108,8 +117,10 @@ impl Default for ScopeWindowPreferences {
             vectorscope_601: false,
             vectorscope_targets: VectorscopeTargets::default(),
             rect: None,
+            body_size: None,
             additional: Vec::new(),
             next_id: default_next_scope_window_id(),
+            restore_geometry: false,
         }
     }
 }
@@ -121,6 +132,15 @@ impl ScopeWindowPreferences {
         } else {
             default_scope_dock_height()
         };
+        let valid_rect =
+            |rect: &[f32; 4]| rect.iter().all(|v| v.is_finite()) && rect[2] > 0.0 && rect[3] > 0.0;
+        self.rect = self.rect.filter(valid_rect);
+        let valid_size = |size: &[f32; 2]| size.iter().all(|v| v.is_finite() && *v > 0.0);
+        self.body_size = self.body_size.filter(valid_size);
+        for extra in &mut self.additional {
+            extra.rect = extra.rect.filter(valid_rect);
+            extra.body_size = extra.body_size.filter(valid_size);
+        }
         let mut seen = std::collections::HashSet::new();
         self.additional
             .retain(|window| window.id != 0 && seen.insert(window.id));
@@ -155,8 +175,22 @@ impl ScopeWindowPreferences {
             vectorscope_601: self.vectorscope_601,
             vectorscope_targets: self.vectorscope_targets,
             rect: None,
+            body_size: None,
         });
     }
+}
+
+/// A local Color-workspace arrangement. No project, selection or media data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ColorWorkspaceLayout {
+    pub name: String,
+    pub color_open: bool,
+    pub advanced: bool,
+    pub gallery_width: f32,
+    pub strip_height: f32,
+    pub right_width: f32,
+    pub right_drawer: Option<RightDrawerGroup>,
+    pub scopes: ScopeWindowPreferences,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +352,9 @@ pub struct AppPreferences {
     /// Floating scopes arrangement; local to this installation.
     #[serde(default)]
     pub scope_window: ScopeWindowPreferences,
+    /// Named local Color arrangements; unrelated preferences are never restored.
+    #[serde(default)]
+    pub color_layouts: Vec<ColorWorkspaceLayout>,
 
     // HOTBAR — the always-on adaptive second toolbar row (#154 Phase 4).
     /// Static (curated default order) or Adaptive (ranked by the user's usage).
@@ -549,6 +586,7 @@ impl Default for AppPreferences {
             color_gallery_width: default_color_gallery_width(),
             color_shot_strip_height: default_color_shot_strip_height(),
             scope_window: ScopeWindowPreferences::default(),
+            color_layouts: Vec::new(),
             hotbar_mode: HotbarMode::default(),
             hotbar_usage: HashMap::new(),
             keymap: HashMap::new(),
@@ -642,8 +680,23 @@ impl AppPreferences {
         *m.entry(item_id.to_string()).or_insert(0.0) += 1.0;
     }
 
+    #[cfg(not(test))]
     fn prefs_path() -> Option<std::path::PathBuf> {
         crate::welcome::config_dir().map(|d| d.join("preferences.json"))
+    }
+
+    // Unit tests exercise persistence (including imported keymaps) without
+    // reading or overwriting the developer's installed application settings.
+    // Per-thread paths also prevent parallel tests from sharing preferences.
+    // Do not implement this by mutating HOME/XDG_CONFIG_HOME process-wide.
+    #[cfg(test)]
+    fn prefs_path() -> Option<std::path::PathBuf> {
+        thread_local! {
+            static PATH: std::path::PathBuf = std::env::temp_dir()
+                .join(format!("photonic-test-preferences-{}", uuid::Uuid::new_v4()))
+                .join("preferences.json");
+        }
+        Some(PATH.with(Clone::clone))
     }
 
     /// Load from disk, falling back to Default on any error.
@@ -675,17 +728,116 @@ impl AppPreferences {
         prefs
     }
 
-    /// Serialize and write to disk, silently ignoring errors.
-    pub fn save(&self) {
-        let Some(path) = Self::prefs_path() else {
-            return;
+    pub(crate) fn save_color_layout(&mut self, name: &str) -> Result<(), String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            return Err("Use a layout name of 1–64 characters without control characters".into());
+        }
+        let index = self
+            .color_layouts
+            .iter()
+            .position(|p| p.name.to_lowercase() == name.to_lowercase());
+        if index.is_none() && self.color_layouts.len() >= 16 {
+            return Err("Up to 16 layouts can be saved; remove or replace an existing one".into());
+        }
+        let bounded = |v: f32, min, max, default| {
+            if v.is_finite() {
+                v.clamp(min, max)
+            } else {
+                default
+            }
         };
+        self.color_gallery_width = bounded(
+            self.color_gallery_width,
+            145.0,
+            420.0,
+            default_color_gallery_width(),
+        );
+        self.color_shot_strip_height = bounded(
+            self.color_shot_strip_height,
+            80.0,
+            240.0,
+            default_color_shot_strip_height(),
+        );
+        self.right_drawer_width = bounded(self.right_drawer_width, 220.0, 480.0, 280.0);
+        self.scope_window.normalize();
+        let mut scopes = self.scope_window.clone();
+        scopes.normalize();
+        scopes.restore_geometry = false;
+        let layout = ColorWorkspaceLayout {
+            name: name.into(),
+            color_open: self.color_workspace_open,
+            advanced: self.color_advanced_controls,
+            gallery_width: self.color_gallery_width,
+            strip_height: self.color_shot_strip_height,
+            right_width: self.right_drawer_width,
+            right_drawer: self.open_right_drawer,
+            scopes,
+        };
+        if let Some(i) = index {
+            self.color_layouts[i] = layout;
+        } else {
+            self.color_layouts.push(layout);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn restore_color_layout(&mut self, name: &str) -> bool {
+        let Some(layout) = self.color_layouts.iter().find(|p| p.name == name).cloned() else {
+            return false;
+        };
+        let bounded = |v: f32, min, max, default| {
+            if v.is_finite() {
+                v.clamp(min, max)
+            } else {
+                default
+            }
+        };
+        self.color_workspace_open = layout.color_open;
+        self.color_advanced_controls = layout.advanced;
+        self.color_gallery_width = bounded(
+            layout.gallery_width,
+            145.0,
+            420.0,
+            default_color_gallery_width(),
+        );
+        self.color_shot_strip_height = bounded(
+            layout.strip_height,
+            80.0,
+            240.0,
+            default_color_shot_strip_height(),
+        );
+        self.right_drawer_width = bounded(layout.right_width, 220.0, 480.0, 280.0);
+        self.open_right_drawer = if layout.right_drawer == Some(RightDrawerGroup::Unknown) {
+            Some(RightDrawerGroup::ColorControls)
+        } else {
+            layout.right_drawer
+        };
+        self.scope_window = layout.scopes;
+        self.scope_window.normalize();
+        self.scope_window.restore_geometry = true;
+        true
+    }
+
+    pub(crate) fn remove_color_layout(&mut self, name: &str) -> bool {
+        let before = self.color_layouts.len();
+        self.color_layouts.retain(|layout| layout.name != name);
+        before != self.color_layouts.len()
+    }
+
+    /// Save with an observable failure for workflows that promise persistence.
+    pub(crate) fn save_checked(&self) -> Result<(), String> {
+        let path = Self::prefs_path().ok_or("Preferences folder is unavailable")?;
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, json);
-        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| e.to_string())
+    }
+
+    /// Existing preference callers retain best-effort behavior.
+    pub fn save(&self) {
+        let _ = self.save_checked();
     }
 }
 
@@ -852,6 +1004,7 @@ mod tests {
                 vectorscope_601: true,
                 vectorscope_targets: VectorscopeTargets::Pct100,
                 rect: Some([24.0, 48.0, 640.0, 400.0]),
+                body_size: None,
                 additional: vec![AdditionalScopePreferences {
                     id: 7,
                     kind: ScopeKind::Vectorscope,
@@ -859,8 +1012,10 @@ mod tests {
                     vectorscope_601: false,
                     vectorscope_targets: VectorscopeTargets::Pct75,
                     rect: Some([680.0, 48.0, 360.0, 400.0]),
+                    body_size: None,
                 }],
                 next_id: 8,
+                restore_geometry: false,
             },
             ..AppPreferences::default()
         };
@@ -968,6 +1123,7 @@ mod tests {
             vectorscope_601: false,
             vectorscope_targets: VectorscopeTargets::Pct75,
             rect: None,
+            body_size: None,
         });
         restored.normalize();
         assert_eq!(
@@ -975,6 +1131,50 @@ mod tests {
             vec![1, 3, 4]
         );
         assert_eq!(restored.next_id, 5);
+    }
+
+    #[test]
+    fn preference_unit_test_persistence_leaves_installed_file_untouched() {
+        let installed = crate::welcome::config_dir().map(|d| d.join("preferences.json"));
+        let before = installed.as_ref().map(|p| std::fs::read(p).ok());
+        assert_ne!(AppPreferences::prefs_path(), installed);
+        let mut prefs = AppPreferences::default();
+        prefs
+            .keymap
+            .insert("edit.undo".into(), KeyBinding::ctrl(egui::Key::U));
+        prefs.save_checked().unwrap();
+        assert_eq!(AppPreferences::load().keymap, prefs.keymap);
+        let after = installed.as_ref().map(|p| std::fs::read(p).ok());
+        assert_eq!(
+            before, after,
+            "unit tests must not modify installed preferences"
+        );
+    }
+
+    #[test]
+    fn preference_unit_test_paths_are_thread_local() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = [37.0, 83.0]
+            .into_iter()
+            .map(|value| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let mut prefs = AppPreferences::default();
+                    prefs.nudge_distance = value;
+                    prefs.save_checked().unwrap();
+                    barrier.wait();
+                    assert_eq!(AppPreferences::load().nudge_distance, value);
+                    AppPreferences::prefs_path().unwrap()
+                })
+            })
+            .collect();
+        let paths: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_ne!(paths[0], paths[1]);
+        assert_ne!(paths[0], AppPreferences::prefs_path().unwrap());
+        for path in paths {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::remove_dir(path.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -992,6 +1192,111 @@ mod tests {
         assert_eq!(imported.import_keymap(&path).expect("import keymap"), 1);
         assert_eq!(imported.keymap, prefs.keymap);
         assert!(!imported.dark_mode);
+        let restored = AppPreferences::load();
+        assert_eq!(restored.keymap, imported.keymap);
+        assert!(!restored.dark_mode);
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod color_layout_tests {
+    use super::*;
+
+    #[test]
+    fn named_color_layout_roundtrips_without_restoring_unrelated_preferences() {
+        let mut prefs = AppPreferences::default();
+        prefs.color_workspace_open = true;
+        prefs.color_gallery_width = 310.0;
+        prefs.color_shot_strip_height = 150.0;
+        prefs.right_drawer_width = 390.0;
+        prefs.color_advanced_controls = false;
+        prefs.scope_window.open = true;
+        prefs.scope_window.docked = true;
+        prefs.scope_window.add_scope();
+        prefs.save_color_layout("  Grade desk  ").unwrap();
+        let encoded = serde_json::to_string(&prefs).unwrap();
+        let mut restored: AppPreferences = serde_json::from_str(&encoded).unwrap();
+        restored.color_gallery_width = 180.0;
+        restored.color_workspace_open = false;
+        restored.drawer_width = 333.0;
+        restored.timeline_snap_enabled = false;
+        assert!(restored.restore_color_layout("Grade desk"));
+        assert_eq!(restored.color_gallery_width, 310.0);
+        assert_eq!(restored.color_shot_strip_height, 150.0);
+        assert_eq!(restored.right_drawer_width, 390.0);
+        assert!(restored.color_workspace_open);
+        assert!(!restored.color_advanced_controls);
+        assert!(restored.scope_window.open);
+        assert!(restored.scope_window.docked);
+        assert_eq!(restored.scope_window.additional.len(), 1);
+        assert!(restored.scope_window.restore_geometry);
+        assert_eq!(restored.drawer_width, 333.0);
+        assert!(!restored.timeline_snap_enabled);
+        assert!(!serde_json::to_string(&restored)
+            .unwrap()
+            .contains("restore_geometry"));
+    }
+
+    #[test]
+    fn named_color_layout_validates_names_replacement_and_capacity() {
+        let mut prefs = AppPreferences::default();
+        for name in ["", "  ", "bad\nname", &"x".repeat(65)] {
+            assert!(prefs.save_color_layout(name).is_err());
+        }
+        prefs.save_color_layout("Desk").unwrap();
+        prefs.color_gallery_width = 300.0;
+        prefs.save_color_layout("desk").unwrap();
+        assert_eq!(prefs.color_layouts.len(), 1);
+        assert_eq!(prefs.color_layouts[0].gallery_width, 300.0);
+        for n in 1..16 {
+            prefs.save_color_layout(&format!("Layout {n}")).unwrap();
+        }
+        assert!(prefs.save_color_layout("Extra").is_err());
+        assert!(prefs.remove_color_layout("desk"));
+        assert!(!prefs.remove_color_layout("desk"));
+        assert!(prefs.save_color_layout("Extra").is_ok());
+    }
+
+    #[test]
+    fn missing_or_invalid_layout_does_not_reset_other_state() {
+        let mut prefs = AppPreferences::default();
+        prefs.save_color_layout("Desk").unwrap();
+        let before = serde_json::to_value(&prefs).unwrap();
+        assert!(!prefs.restore_color_layout("Missing"));
+        assert_eq!(serde_json::to_value(&prefs).unwrap(), before);
+        let layout = &mut prefs.color_layouts[0];
+        layout.gallery_width = f32::NAN;
+        layout.strip_height = 1000.0;
+        layout.right_width = -1.0;
+        layout.scopes.dock_height = f32::INFINITY;
+        assert!(prefs.restore_color_layout("Desk"));
+        assert_eq!(prefs.color_gallery_width, 178.0);
+        assert_eq!(prefs.color_shot_strip_height, 240.0);
+        assert_eq!(prefs.right_drawer_width, 220.0);
+        assert_eq!(prefs.scope_window.dock_height, 280.0);
+    }
+
+    #[test]
+    fn older_preferences_default_to_no_named_layouts() {
+        let mut json = serde_json::to_value(AppPreferences::default()).unwrap();
+        json.as_object_mut().unwrap().remove("color_layouts");
+        let prefs: AppPreferences = serde_json::from_value(json).unwrap();
+        assert!(prefs.color_layouts.is_empty());
+    }
+    #[test]
+    fn saving_layout_sanitizes_nonfinite_geometry_before_serialization() {
+        let mut prefs = AppPreferences::default();
+        prefs.color_gallery_width = f32::NAN;
+        prefs.scope_window.rect = Some([f32::INFINITY, 0.0, 320.0, 420.0]);
+        prefs.scope_window.add_scope();
+        prefs.scope_window.additional[0].rect = Some([0.0, 0.0, f32::NAN, 400.0]);
+        prefs.save_color_layout("Desk").unwrap();
+        let loaded: AppPreferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(loaded.color_layouts.len(), 1);
+        assert_eq!(loaded.color_gallery_width, 178.0);
+        assert!(loaded.scope_window.rect.is_none());
+        assert!(loaded.scope_window.additional[0].rect.is_none());
     }
 }

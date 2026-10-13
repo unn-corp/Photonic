@@ -7,6 +7,7 @@ description = "Video engine for Photonic: frame-graph IR, decode, playback, audi
 
 [dependencies]
 photonic-core = { path = "../photonic-core" }
+photonic-matte = { path = "../photonic-matte" }
 # Decode delivers YUV planes to the render crate's consumer type
 # (photonic_render::video::YuvPlanes) — allowed dep direction per 00 §3.
 photonic-render = { path = "../photonic-render" }
@@ -70,6 +71,8 @@ bytemuck = { workspace = true }
 # no longer live only in this crate's test binary. Promoted from a dev-dependency
 # to a normal one for exactly that reason; already a vetted workspace dependency.
 image = { workspace = true }
+# Already used by cosmic-text; the same Unicode bidi levels bound karaoke fallback.
+unicode-bidi = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 # Named pipe (FIFO) for the export encoder's second (audio) piped ffmpeg

@@ -10,6 +10,7 @@
 pub mod canvas;
 pub mod capability;
 pub mod caption;
+pub mod caption_decoration;
 pub mod color;
 pub mod compositor;
 pub mod gpu_state;
@@ -18,10 +19,14 @@ pub mod grade_gpu;
 pub mod grade_graph;
 pub mod headless;
 pub mod lut;
+pub mod matte_inspection;
+pub mod native_caption;
 pub mod native_display;
 pub mod native_transfer;
 pub mod pipeline;
 pub mod renderer;
+pub mod scene_measurement;
+pub mod scene_scopes;
 pub mod scopes;
 pub mod tessellator;
 pub mod text_outline;
@@ -51,3 +56,10 @@ pub use scopes::{
 pub use text_outline::{
     layout_text_flat, outline_document_text, resolve_document_font, ResolvedFace,
 };
+
+pub mod tonal_exposure;
+pub mod white_balance;
+
+pub mod window_tracking;
+
+pub mod native_vector;

@@ -382,6 +382,23 @@ fn fs_present_encoded(in: VOut) -> @location(0) vec4<f32> {
     );
 }
 
+// Native monitor targets have exact logical dimensions. Copy texels rather
+// than fitting the entire padded pool bucket into that smaller target.
+@fragment
+fn fs_present_encoded_logical(in: VOut) -> @location(0) vec4<f32> {
+    let p = textureLoad(t_src, vec2<i32>(in.clip_pos.xy), 0);
+    // egui's registered texture blend uses One / OneMinusSrcAlpha. Keep the
+    // encoded RGB premultiplied; the sRGB target re-encodes these decoded bytes.
+    // Unpremultiplying here makes feathered pixels additive/bright at the edge.
+    let encoded = select(vec3<f32>(0.0), p.rgb, p.a > 0.0);
+    return vec4<f32>(srgb_decode(encoded.r), srgb_decode(encoded.g), srgb_decode(encoded.b), p.a);
+}
+@fragment
+fn fs_present_alpha_logical(in: VOut) -> @location(0) vec4<f32> {
+    let p = textureLoad(t_src, vec2<i32>(in.clip_pos.xy), 0);
+    return vec4<f32>(p.a, p.a, p.a, 1.0);
+}
+
 // K-B17 alpha view: show the alpha channel as luminance so keys are
 // judicable against something other than black. Fully opaque so the
 // checkerboard / compositor behind does not dim the matte.
@@ -1312,6 +1329,9 @@ pub struct VideoPresenter {
     bgl: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     pipeline_encoded: wgpu::RenderPipeline,
+    pipeline_encoded_logical: wgpu::RenderPipeline,
+    pipeline_alpha_logical: wgpu::RenderPipeline,
+    target_format: wgpu::TextureFormat,
     /// K-B17 alpha-as-luminance present path (same BGL/sampler as colour).
     pipeline_alpha: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
@@ -1358,6 +1378,20 @@ impl VideoPresenter {
             "fs_present_alpha",
             target_format,
         );
+        let pipeline_encoded_logical = fullscreen_pipeline(
+            device,
+            &bgl,
+            PRESENT_SHADER,
+            "fs_present_encoded_logical",
+            target_format,
+        );
+        let pipeline_alpha_logical = fullscreen_pipeline(
+            device,
+            &bgl,
+            PRESENT_SHADER,
+            "fs_present_alpha_logical",
+            target_format,
+        );
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("present_sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -1370,6 +1404,9 @@ impl VideoPresenter {
             bgl,
             pipeline,
             pipeline_encoded,
+            pipeline_encoded_logical,
+            pipeline_alpha_logical,
+            target_format,
             pipeline_alpha,
             sampler,
         }
@@ -1398,7 +1435,7 @@ impl VideoPresenter {
         target: &wgpu::TextureView,
         channel: PresentChannel,
     ) {
-        self.present_with_encoding(device, encoder, source, target, channel, false);
+        self.present_with_encoding(device, encoder, source, target, channel, false, false);
     }
 
     /// Present a premultiplied sRGB-encoded managed output without applying a
@@ -1411,7 +1448,56 @@ impl VideoPresenter {
         target: &wgpu::TextureView,
         channel: PresentChannel,
     ) {
-        self.present_with_encoding(device, encoder, source, target, channel, true);
+        self.present_with_encoding(device, encoder, source, target, channel, true, false);
+    }
+
+    /// Present just the source's top-left logical region into an exact-sized
+    /// sRGB monitor target. Its real texture edge now clamps bilinear display
+    /// sampling, so magnification cannot blend in transparent pool padding.
+    /// Color bytes retain encoded premultiplication for egui's native-texture
+    /// blend contract. This differs from the older straight-alpha present API.
+    /// Does not alter source pixels, graph caches, or the Legacy present path.
+    pub fn present_encoded_engine_frame_logical_channel(
+        &self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        source: &wgpu::Texture,
+        target: &wgpu::Texture,
+        channel: PresentChannel,
+    ) -> Result<(), &'static str> {
+        if source.format() != WORKING_FORMAT
+            || target.format() != self.target_format
+            || !matches!(
+                target.format(),
+                wgpu::TextureFormat::Rgba8UnormSrgb | wgpu::TextureFormat::Bgra8UnormSrgb
+            )
+            || !source
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            || !target
+                .usage()
+                .contains(wgpu::TextureUsages::RENDER_ATTACHMENT)
+            || source.sample_count() != 1
+            || target.sample_count() != 1
+            || source.dimension() != wgpu::TextureDimension::D2
+            || target.dimension() != wgpu::TextureDimension::D2
+            || source.size().depth_or_array_layers != 1
+            || target.size().depth_or_array_layers != 1
+            || target.width() > source.width()
+            || target.height() > source.height()
+        {
+            return Err("logical native presentation requires a single-sample RGBA16F source and a bounded matching sRGB target");
+        }
+        self.present_with_encoding(
+            device,
+            encoder,
+            &source.create_view(&Default::default()),
+            &target.create_view(&Default::default()),
+            channel,
+            true,
+            true,
+        );
+        Ok(())
     }
 
     fn present_with_encoding(
@@ -1422,6 +1508,7 @@ impl VideoPresenter {
         target: &wgpu::TextureView,
         channel: PresentChannel,
         encoded: bool,
+        logical: bool,
     ) {
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("present_bg"),
@@ -1452,6 +1539,8 @@ impl VideoPresenter {
             occlusion_query_set: None,
         });
         let pipeline = match channel {
+            PresentChannel::Color if logical => &self.pipeline_encoded_logical,
+            PresentChannel::Alpha if logical => &self.pipeline_alpha_logical,
             PresentChannel::Color if encoded => &self.pipeline_encoded,
             PresentChannel::Color => &self.pipeline,
             PresentChannel::Alpha => &self.pipeline_alpha,
@@ -1975,6 +2064,292 @@ mod tests {
                 );
             }
             assert_eq!(px[3], 255, "alpha must be opaque");
+        }
+    }
+
+    #[test]
+    fn managed_present_logical_pixels_alpha_and_invalid_targets_are_checked() {
+        let (device, queue) = try_device().expect("GPU required");
+        let make = |label, w, h, format, usage| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let source = make(
+            "padded pattern",
+            4,
+            4,
+            WORKING_FORMAT,
+            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        );
+        let target = make(
+            "logical monitor",
+            3,
+            2,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        );
+        let colors = [
+            [0.1f32, 0.2, 0.3, 0.25],
+            [0.8, 0.1, 0.5, 0.5],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.25, 0.0, 1.0],
+            [0.4, 0.6, 0.8, 0.75],
+            [0.9, 0.0, 0.1, 1.0],
+        ];
+        let mut bytes = vec![0u8; 4 * 4 * 8];
+        for y in 0..4 {
+            for x in 0..4 {
+                let p = if x < 3 && y < 2 {
+                    colors[y * 3 + x]
+                } else {
+                    [0.0, 1.0, 0.0, 1.0]
+                };
+                let i = (y * 4 + x) * 8;
+                for c in 0..4 {
+                    let v = if c < 3 { p[c] * p[3] } else { p[3] };
+                    bytes[i + c * 2..i + c * 2 + 2].copy_from_slice(&f32_to_f16(v).to_le_bytes());
+                }
+            }
+        }
+        queue.write_texture(
+            source.as_image_copy(),
+            &bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(32),
+                rows_per_image: Some(4),
+            },
+            source.size(),
+        );
+        let presenter = VideoPresenter::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        for channel in [PresentChannel::Color, PresentChannel::Alpha] {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            presenter
+                .present_encoded_engine_frame_logical_channel(
+                    &device,
+                    &mut encoder,
+                    &source,
+                    &target,
+                    channel,
+                )
+                .unwrap();
+            queue.submit([encoder.finish()]);
+            let pixels = readback(&device, &queue, &target, 3, 2, 4);
+            for (actual, expected) in pixels.chunks_exact(4).zip(colors) {
+                for c in 0..4 {
+                    let value = if channel == PresentChannel::Color {
+                        if c < 3 {
+                            expected[c] * expected[3]
+                        } else {
+                            expected[c]
+                        }
+                    } else if c == 3 {
+                        1.0
+                    } else {
+                        let v = f64::from(expected[3]);
+                        if v <= 0.0031308 {
+                            (v * 12.92) as f32
+                        } else {
+                            (1.055 * v.powf(1.0 / 2.4) - 0.055) as f32
+                        }
+                    };
+                    assert!(
+                        actual[c].abs_diff((value * 255.0).round() as u8) <= 2,
+                        "{channel:?} {actual:?} vs {expected:?}"
+                    );
+                }
+            }
+        }
+        let baseline = readback(&device, &queue, &target, 3, 2, 4);
+        let wrong_format = make(
+            "bad input",
+            4,
+            4,
+            wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureUsages::TEXTURE_BINDING,
+        );
+        let too_large = make(
+            "too large",
+            5,
+            4,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let wrong_usage = make(
+            "copy only target",
+            3,
+            2,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureUsages::COPY_SRC,
+        );
+        let mut encoder = device.create_command_encoder(&Default::default());
+        assert!(presenter
+            .present_encoded_engine_frame_logical_channel(
+                &device,
+                &mut encoder,
+                &wrong_format,
+                &target,
+                PresentChannel::Color
+            )
+            .is_err());
+        assert!(presenter
+            .present_encoded_engine_frame_logical_channel(
+                &device,
+                &mut encoder,
+                &source,
+                &too_large,
+                PresentChannel::Color
+            )
+            .is_err());
+        assert!(presenter
+            .present_encoded_engine_frame_logical_channel(
+                &device,
+                &mut encoder,
+                &source,
+                &wrong_usage,
+                PresentChannel::Color
+            )
+            .is_err());
+        queue.submit([encoder.finish()]);
+        assert_eq!(readback(&device, &queue, &target, 3, 2, 4), baseline);
+    }
+
+    #[test]
+    fn managed_present_magnification_does_not_blend_pool_padding_into_picture() {
+        let (device, queue) = try_device().expect("GPU required for presentation qualification");
+        let source = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("logical source in padded bucket"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: WORKING_FORMAT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let mut bytes = vec![0u8; 64 * 64 * 8];
+        for y in 0..2 {
+            for x in 0..3 {
+                let i = (y * 64 + x) * 8;
+                for (c, v) in [0.3f32, 0.1, 0.2, 0.5].into_iter().enumerate() {
+                    bytes[i + c * 2..i + c * 2 + 2].copy_from_slice(&f32_to_f16(v).to_le_bytes());
+                }
+            }
+        }
+        queue.write_texture(
+            source.as_image_copy(),
+            &bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(64 * 8),
+                rows_per_image: Some(64),
+            },
+            source.size(),
+        );
+        let texture = |label, size: (u32, u32)| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size.0,
+                    height: size.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            })
+        };
+        let presented = texture("monitor presentation", (3, 2));
+        let magnified = texture("magnified logical viewport", (24, 16));
+        let presenter = VideoPresenter::new(&device, wgpu::TextureFormat::Rgba8UnormSrgb);
+        let mut encoder = device.create_command_encoder(&Default::default());
+        presenter
+            .present_encoded_engine_frame_logical_channel(
+                &device,
+                &mut encoder,
+                &source,
+                &presented,
+                PresentChannel::Color,
+            )
+            .unwrap();
+        let shader=r#"
+@group(0) @binding(0) var src:texture_2d<f32>;
+@group(0) @binding(1) var samp:sampler;
+struct VOut{@builtin(position) p:vec4<f32>,@location(0) uv:vec2<f32>}
+@vertex fn vs_quad(@builtin(vertex_index) i:u32)->VOut{
+var p=array<vec2<f32>,6>(vec2(-1.,-1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,-1.),vec2(1.,1.),vec2(-1.,1.));
+var o:VOut;o.p=vec4(p[i],0.,1.);o.uv=vec2((p[i].x+1.)*.5,(1.-p[i].y)*.5)*vec2<f32>(UV_X,UV_Y);return o;}
+@fragment fn fs_copy(i:VOut)->@location(0) vec4<f32>{return textureSample(src,samp,i.uv);}
+"#.replace("UV_X",&(3.0/presented.width()as f32).to_string()).replace("UV_Y",&(2.0/presented.height()as f32).to_string());
+        let pipeline = fullscreen_pipeline(
+            &device,
+            &presenter.bgl,
+            &shader,
+            "fs_copy",
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+        let view = presented.create_view(&Default::default());
+        let target = magnified.create_view(&Default::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("magnification sampler"),
+            layout: &presenter.bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&presenter.sampler),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("logical crop magnification"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..6, 0..1);
+        }
+        queue.submit([encoder.finish()]);
+        let pixels = readback(&device, &queue, &magnified, 24, 16, 4);
+        for (index, p) in pixels.chunks_exact(4).enumerate() {
+            for (channel, want) in [77u8, 26, 51, 128].into_iter().enumerate() {
+                assert!(p[channel].abs_diff(want)<=2,"pixel {index} channel {channel}: {} vs {want}; logical edges must not sample the padded bucket",p[channel]);
+            }
         }
     }
 

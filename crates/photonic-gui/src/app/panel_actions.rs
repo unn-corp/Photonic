@@ -59,6 +59,12 @@ impl PhotonicApp {
         // to &self/&mut self methods (build_shape_with_tool, do_group_selected).
         'actions: for action in std::mem::take(&mut self.pending_panel_actions) {
             match action {
+                PanelAction::CancelGradeSampling => {
+                    self.eyedropper.cancel();
+                    if let Some(job) = self.video_eyedropper_job.as_mut() {
+                        job.canceled = true;
+                    }
+                }
                 PanelAction::GradeInputSelectionChanged {
                     seq,
                     track,
@@ -75,6 +81,77 @@ impl PhotonicApp {
                             clip,
                             op,
                             graph_node,
+                        },
+                    );
+                }
+                PanelAction::ShowWindowTracking { clip, op } => {
+                    self.open_window_tracking(doc, clip, op)
+                }
+                PanelAction::ShowProgramMeasurements { sequence } => {
+                    self.open_program_measurement(ctx, doc, sequence)
+                }
+                PanelAction::ToggleGradeInput {
+                    seq,
+                    track,
+                    clip,
+                    stage,
+                    op,
+                    node,
+                    qualifier,
+                } => {
+                    self.toggle_grade_matte(
+                        ctx,
+                        doc,
+                        super::grade_matte::Target {
+                            sequence: seq,
+                            track,
+                            clip,
+                            stage,
+                            node: node.unwrap_or(u32::MAX),
+                            image: !qualifier,
+                            input: Some((op, node)),
+                        },
+                    );
+                }
+                PanelAction::ToggleGradeMatte {
+                    seq,
+                    track,
+                    clip,
+                    node,
+                    stage,
+                } => {
+                    self.toggle_grade_matte(
+                        ctx,
+                        doc,
+                        super::grade_matte::Target {
+                            input: None,
+                            stage,
+                            sequence: seq,
+                            track,
+                            clip,
+                            node,
+                            image: false,
+                        },
+                    );
+                }
+                PanelAction::ToggleGradeImage {
+                    seq,
+                    track,
+                    clip,
+                    node,
+                    stage,
+                } => {
+                    self.toggle_grade_matte(
+                        ctx,
+                        doc,
+                        super::grade_matte::Target {
+                            input: None,
+                            stage,
+                            sequence: seq,
+                            track,
+                            clip,
+                            node,
+                            image: true,
                         },
                     );
                 }
@@ -2985,6 +3062,9 @@ impl PhotonicApp {
                 }
 
                 PanelAction::StartEyedropper(target) => {
+                    if let Some(job) = self.video_eyedropper_job.as_mut() {
+                        job.canceled = true;
+                    }
                     self.eyedropper.target = Some(target);
                     self.eyedropper.skip_click = true;
                 }
@@ -6134,8 +6214,8 @@ impl PhotonicApp {
                             else {
                                 continue 'actions;
                             };
-                            const GOLDEN_ANGLE: f64 =
-                                std::f64::consts::TAU * (1.0 - 1.0 / 1.618_033_988_749_895);
+                            const GOLDEN_ANGLE: f64 = std::f64::consts::TAU
+                                * (1.0 - 1.0 / std::f64::consts::GOLDEN_RATIO);
                             for i in 0..count {
                                 let r = spread * ((i as f64 + 0.5) / count as f64).sqrt();
                                 let theta = i as f64 * GOLDEN_ANGLE;

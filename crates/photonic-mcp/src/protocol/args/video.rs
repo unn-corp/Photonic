@@ -44,12 +44,20 @@ pub enum ClipSourceArg {
     Adjustment,
 }
 
-/// A generic keyframe/animation target (01 §6). P2 scope: clip transform and
-/// clip-effect params only — grade/audio/graph-node targets land with their
-/// respective domains (P3+).
+/// A generic keyframe/animation target (01 §6): clip transform,
+/// clip-effect parameters and local clip-grade scalar parameters.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum AnimTargetArg {
+    GradeStageOp {
+        clip_id: ClipId,
+        stage: photonic_core::timeline::GradeInspectionStage,
+        op_id: GradeOpId,
+    },
+    GradeOp {
+        clip_id: ClipId,
+        op_id: GradeOpId,
+    },
     ClipTransform {
         clip_id: ClipId,
     },
@@ -63,7 +71,9 @@ impl AnimTargetArg {
     pub fn clip_id(&self) -> ClipId {
         match self {
             AnimTargetArg::ClipTransform { clip_id }
-            | AnimTargetArg::ClipEffect { clip_id, .. } => *clip_id,
+            | AnimTargetArg::ClipEffect { clip_id, .. }
+            | AnimTargetArg::GradeOp { clip_id, .. }
+            | AnimTargetArg::GradeStageOp { clip_id, .. } => *clip_id,
         }
     }
 }
@@ -342,6 +352,10 @@ pub struct SetTrackPropArgs {
     pub locked: Option<bool>,
     #[serde(default)]
     pub height_px: Option<f32>,
+    #[serde(default)]
+    pub blend: Option<photonic_core::layer::BlendMode>,
+    #[serde(default)]
+    pub opacity: Option<f32>,
 }
 
 /// Args shape matches `ops::reorder_track` (single track → target index
@@ -1722,10 +1736,40 @@ pub struct SetCaptionWordArgs {
     pub end_seconds: Option<f64>,
 }
 
+/// Word-pop highlight colors; exact per-word timing comes from the cue.
+#[derive(Debug, Deserialize)]
+pub struct CaptionWordPopArg {
+    pub active_color: String,
+    pub inactive_color: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptionStrokeArg {
+    pub color: String,
+    pub width: f32,
+}
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptionBackgroundArg {
+    pub color: String,
+    pub padding: f32,
+    pub corner_radius: f32,
+}
+
 /// Partial caption style — only supplied fields change; the rest inherit the
 /// current effective style at the chosen scope (01 §7 cascade word→cue→track).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptionUnderlineArg {
+    pub active_color: String,
+}
+
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CaptionStyleArg {
+    #[serde(default)]
+    pub direction: Option<photonic_core::timeline::TextDirection>,
     #[serde(default)]
     pub font_family: Option<String>,
     #[serde(default)]
@@ -1735,6 +1779,25 @@ pub struct CaptionStyleArg {
     /// `#rrggbb` / `#rrggbbaa`.
     #[serde(default)]
     pub fill: Option<String>,
+    /// Explicitly remove the inherited outline, without changing other style fields.
+    #[serde(default)]
+    pub clear_stroke: bool,
+    #[serde(default)]
+    pub stroke: Option<CaptionStrokeArg>,
+    #[serde(default)]
+    pub background: Option<CaptionBackgroundArg>,
+    #[serde(default)]
+    pub clear_background: bool,
+    #[serde(default)]
+    pub animation: Option<photonic_core::timeline::CaptionAnim>,
+    #[serde(default)]
+    pub word_pop: Option<CaptionWordPopArg>,
+    #[serde(default)]
+    pub fill_sweep: Option<CaptionWordPopArg>,
+    #[serde(default)]
+    pub underline: Option<CaptionUnderlineArg>,
+    #[serde(default)]
+    pub clear_highlight: bool,
     /// Normalized position `[x, y]`.
     #[serde(default)]
     pub position: Option<[f32; 2]>,
@@ -1849,8 +1912,17 @@ pub enum GradeVersionOp {
     Remove,
 }
 
+fn deserialize_grade_version_stage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<photonic_core::timeline::GradeInspectionStage, D::Error> {
+    Option::<photonic_core::timeline::GradeInspectionStage>::deserialize(deserializer)
+        .map(Option::unwrap_or_default)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct GradeVersionArgs {
+    #[serde(default, deserialize_with = "deserialize_grade_version_stage")]
+    pub stage: photonic_core::timeline::GradeInspectionStage,
     pub clip_id: ClipId,
     pub op: GradeVersionOp,
     #[serde(default)]
@@ -1868,6 +1940,7 @@ pub enum SharedLookOp {
     Remove,
     Link,
     MakeIndependent,
+    UpdateIndependent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1888,6 +1961,16 @@ pub struct SharedLookArgs {
 pub struct ListReferenceStillsArgs {
     #[serde(default)]
     pub sequence_id: Option<SequenceId>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CopyReferenceStillArgs {
+    pub source_sequence_id: SequenceId,
+    #[serde(default)]
+    pub destination_sequence_id: Option<SequenceId>,
+    pub still_id: uuid::Uuid,
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1975,6 +2058,8 @@ pub struct GradePresetArgs {
 /// Read a selected qualifier's isolation matte from its exact grading input.
 #[derive(Debug, Deserialize)]
 pub struct InspectQualifierArgs {
+    #[serde(default)]
+    pub stage: Option<photonic_core::timeline::GradeInspectionStage>,
     pub clip_id: ClipId,
     pub op_id: photonic_core::timeline::GradeOpId,
     #[serde(default)]
@@ -1989,9 +2074,45 @@ pub struct InspectQualifierArgs {
     pub format_index: Option<usize>,
 }
 
+/// Inspect a reachable native grading graph's raw matte-node output.
+#[derive(Debug, Deserialize)]
+pub struct InspectGradeMatteArgs {
+    #[serde(default)]
+    pub stage: Option<photonic_core::timeline::GradeInspectionStage>,
+    pub clip_id: ClipId,
+    pub graph_node_id: u32,
+    #[serde(default)]
+    pub at_ticks: Option<i64>,
+    #[serde(default)]
+    pub at_tc: Option<String>,
+    #[serde(default)]
+    pub at_seconds: Option<f64>,
+    #[serde(default)]
+    pub format_index: Option<usize>,
+}
+
+/// Measure the same Native Managed program before and after its SDR transform.
+#[derive(Debug, Deserialize)]
+pub struct MeasureNativeOutputArgs {
+    pub sequence_id: SequenceId,
+    #[serde(default)]
+    pub at_ticks: Option<i64>,
+    #[serde(default)]
+    pub at_tc: Option<String>,
+    #[serde(default)]
+    pub at_seconds: Option<f64>,
+    #[serde(default)]
+    pub format_index: Option<usize>,
+}
+
+/// Inspect a reachable native grading graph image output.
+pub type InspectGradeImageArgs = InspectGradeMatteArgs;
+
 /// Sample bounded ACEScct/AP1 input coordinates before a native corrector.
 #[derive(Debug, Deserialize)]
 pub struct SampleGradeInputArgs {
+    #[serde(default)]
+    pub stage: Option<photonic_core::timeline::GradeInspectionStage>,
     pub clip_id: ClipId,
     pub op_id: photonic_core::timeline::GradeOpId,
     #[serde(default)]
@@ -2070,6 +2191,47 @@ pub struct AddGraphNodeArgs {
     /// Editor position `[x, y]`; default `[0, 0]`.
     #[serde(default)]
     pub pos: Option<[f32; 2]>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetGraphTimeOffsetArgs {
+    pub graph_id: GraphId,
+    pub node_id: GraphNodeId,
+    pub offset_ticks: photonic_core::timeline::Tick,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetGraphMaskShapeArgs {
+    pub graph_id: GraphId,
+    pub node_id: GraphNodeId,
+    #[serde(deserialize_with = "deserialize_mask_shape_edit")]
+    pub shape: photonic_core::timeline::MaskShapeKind,
+}
+
+fn deserialize_mask_shape_edit<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<photonic_core::timeline::MaskShapeKind, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| serde::de::Error::custom("shape must be an object"))?;
+    let polygon = object.get("shape").and_then(|v| v.as_str()) == Some("polygon");
+    if object
+        .keys()
+        .any(|key| key != "shape" && (!polygon || key != "vertices"))
+    {
+        return Err(serde::de::Error::custom("unknown mask shape field"));
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetGraphTextArgs {
+    pub graph_id: GraphId,
+    pub node_id: GraphNodeId,
+    pub text: photonic_core::timeline::TextGen,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2265,4 +2427,33 @@ pub struct AnalyzeStabilizationArgs {
 #[derive(Debug, Deserialize)]
 pub struct GetStabilizationStatusArgs {
     pub clip_id: ClipId,
+}
+
+/// Bounded translation-only power-window tracking. Times are sequence ticks.
+#[derive(Debug, Deserialize)]
+pub struct TrackGradeWindowArgs {
+    #[serde(default)]
+    pub method: photonic_render::window_tracking::TrackingMethod,
+    pub clip_id: ClipId,
+    pub op_id: photonic_core::timeline::GradeOpId,
+    pub start_ticks: i64,
+    pub end_ticks: i64,
+    #[serde(default)]
+    pub step_frames: Option<u32>,
+    #[serde(default)]
+    pub format_index: Option<usize>,
+    #[serde(default)]
+    pub search_radius: Option<i32>,
+    #[serde(default)]
+    pub minimum_score: Option<f64>,
+    #[serde(default)]
+    pub minimum_margin: Option<f64>,
+}
+#[derive(Debug, Deserialize)]
+pub struct ApplyWindowTrackArgs {
+    pub job_id: uuid::Uuid,
+    #[serde(default)]
+    pub replace_center_keys: bool,
+    #[serde(default)]
+    pub allow_partial: bool,
 }

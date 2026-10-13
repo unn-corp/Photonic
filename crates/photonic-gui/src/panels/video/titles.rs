@@ -83,7 +83,9 @@ pub(crate) fn draw_titles(ui: &mut Ui, ctx: &mut PropPanelCtx) {
 
     ui.add_space(8.0);
     section_header(ui, "EDIT TITLE");
-    draw_text_editor(ui, ctx.video.selection, project, &mut action);
+    ui.push_id(ctx.doc.id, |ui| {
+        draw_text_editor(ui, ctx.video.selection, project, &mut action)
+    });
 
     if action.is_some() {
         ctx.action = action;
@@ -251,6 +253,7 @@ fn draw_text_editor(
             .add(
                 egui::DragValue::new(&mut style.font_size)
                     .range(8.0..=400.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.5),
             )
             .changed();
@@ -265,6 +268,7 @@ fn draw_text_editor(
             .add(
                 egui::DragValue::new(&mut style.position[0])
                     .range(0.0..=1.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.01),
             )
             .changed();
@@ -272,10 +276,59 @@ fn draw_text_editor(
             .add(
                 egui::DragValue::new(&mut style.position[1])
                     .range(0.0..=1.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.01),
             )
             .changed();
     });
+
+    let native = matches!(
+        project.sequences[&seq_id].color,
+        photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+    );
+    let mut animation_changed = false;
+    if native {
+        ui.horizontal(|ui| {
+            ui.label("Entrance:");
+            for (value, label) in [
+                (photonic_core::timeline::CaptionAnim::None, "None"),
+                (photonic_core::timeline::CaptionAnim::SlideUp, "Slide up"),
+            ] {
+                animation_changed |= ui
+                    .selectable_value(&mut style.animation, value, label)
+                    .changed();
+            }
+        });
+        ui.small("Slide up: whole title and paint, 200ms from clip start.");
+        changed |= animation_changed;
+    }
+    let decorated = photonic_video::graph::compile::native_text_decoration(&style).is_err()
+        || style.highlight.is_some()
+        || !matches!(
+            style.animation,
+            photonic_core::timeline::CaptionAnim::None
+                | photonic_core::timeline::CaptionAnim::SlideUp
+        );
+    let mut plain_clicked = false;
+    if native && decorated {
+        ui.label("This title has unsupported styling. Managed outline ≤8px; box padding/radius ≤128px; title karaoke and word-timed animations are not yet qualified.");
+        let candidate = plain_title_command(project, seq_id, track_id, clip_id, content);
+        if ui
+            .add_enabled(
+                candidate.is_some() && action.is_none() && !changed,
+                egui::Button::new("Use plain fill (remove decorations)"),
+            )
+            .clicked()
+        {
+            if let Some(command) = candidate {
+                *action = Some(PanelAction::ClipEditDiscrete(command));
+                plain_clicked = true;
+            }
+        }
+    }
+    if plain_clicked {
+        return;
+    }
 
     if changed {
         let mut new_content = content.clone();
@@ -287,9 +340,186 @@ fn draw_text_editor(
             clip_id,
             new_content,
             action,
-            true,
+            !animation_changed,
         );
     }
+    if native {
+        draw_title_paint_editor(ui, project, seq_id, track_id, clip_id, content, action);
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct TitlePaintValues {
+    stroke: Option<(photonic_core::Color, f32)>,
+    background: Option<photonic_core::timeline::CaptionBackground>,
+}
+impl TitlePaintValues {
+    fn from_content(content: &TextClipContent) -> Self {
+        Self {
+            stroke: content.style.stroke,
+            background: content.style.background,
+        }
+    }
+    fn apply(&self, content: &mut TextClipContent) {
+        content.style.stroke = self.stroke;
+        content.style.background = self.background;
+    }
+}
+#[derive(Clone)]
+struct TitlePaintDraft {
+    base: TitlePaintValues,
+    edited: TitlePaintValues,
+}
+
+fn title_paint_command(
+    project: &TimelineProject,
+    seq: SequenceId,
+    track: TrackId,
+    clip: ClipId,
+    content: &TextClipContent,
+    paint: &TitlePaintValues,
+) -> Option<TimelineCmd> {
+    if &TitlePaintValues::from_content(content) == paint {
+        return None;
+    }
+    let mut next = content.clone();
+    paint.apply(&mut next);
+    photonic_video::graph::compile::native_text_decoration(&next.style).ok()?;
+    ops::replace_clip_source(
+        project,
+        seq,
+        track,
+        clip,
+        ClipSource::Text { content: next },
+        None,
+    )
+    .ok()
+}
+
+fn title_paint_fields(ui: &mut Ui, paint: &mut TitlePaintValues) {
+    let mut outline = paint.stroke.is_some();
+    if ui.checkbox(&mut outline, "Outline").changed() {
+        paint.stroke = outline.then_some((photonic_core::Color::BLACK, 2.0));
+    }
+    if let Some((color, width)) = &mut paint.stroke {
+        ui.horizontal(|ui| {
+            crate::color_popup::ColorPopup::swatch_color(ui, color);
+            ui.label("Width");
+            ui.add(
+                egui::DragValue::new(width)
+                    .range(0.0..=8.0)
+                    .clamp_existing_to_range(false)
+                    .speed(0.1),
+            );
+        });
+    }
+    let mut background = paint.background.is_some();
+    if ui.checkbox(&mut background, "Background").changed() {
+        paint.background = background.then_some(photonic_core::timeline::CaptionBackground {
+            color: photonic_core::Color::new(0.0, 0.0, 0.0, 0.6),
+            padding: 8.0,
+            corner_radius: 4.0,
+        });
+    }
+    if let Some(background) = &mut paint.background {
+        crate::color_popup::ColorPopup::swatch_color(ui, &mut background.color);
+        ui.horizontal(|ui| {
+            ui.label("Padding");
+            ui.add(
+                egui::DragValue::new(&mut background.padding)
+                    .range(0.0..=128.0)
+                    .clamp_existing_to_range(false)
+                    .speed(0.5),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Radius");
+            ui.add(
+                egui::DragValue::new(&mut background.corner_radius)
+                    .range(0.0..=128.0)
+                    .clamp_existing_to_range(false)
+                    .speed(0.5),
+            );
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_title_paint_editor(
+    ui: &mut Ui,
+    project: &TimelineProject,
+    seq: SequenceId,
+    track: TrackId,
+    clip: ClipId,
+    content: &TextClipContent,
+    action: &mut Option<PanelAction>,
+) {
+    let key = ui.id().with(("title_paint_draft", seq, clip));
+    let base = TitlePaintValues::from_content(content);
+    let mut draft = ui
+        .data(|d| d.get_temp::<TitlePaintDraft>(key))
+        .filter(|d| d.base == base)
+        .unwrap_or_else(|| TitlePaintDraft {
+            base: base.clone(),
+            edited: base.clone(),
+        });
+    ui.collapsing("Outline and background", |ui| {
+        title_paint_fields(ui, &mut draft.edited);
+        let mut proposed = content.clone();
+        draft.edited.apply(&mut proposed);
+        if let Err(error) = photonic_video::graph::compile::native_text_decoration(&proposed.style)
+        {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
+        let command = title_paint_command(project, seq, track, clip, content, &draft.edited);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    action.is_none() && command.is_some(),
+                    egui::Button::new("Apply paint"),
+                )
+                .clicked()
+            {
+                if let Some(cmd) = command {
+                    *action = Some(PanelAction::ClipEditDiscrete(cmd));
+                }
+            }
+            if ui
+                .add_enabled(draft.edited != base, egui::Button::new("Revert paint"))
+                .clicked()
+            {
+                draft.edited = base.clone();
+            }
+        });
+        ui.small("Outer outline: up to 8px. Box padding/radius: up to 128px.");
+    });
+    ui.data_mut(|d| d.insert_temp(key, draft));
+}
+
+fn plain_title_command(
+    project: &TimelineProject,
+    seq_id: SequenceId,
+    track_id: TrackId,
+    clip_id: ClipId,
+    content: &TextClipContent,
+) -> Option<TimelineCmd> {
+    let mut plain = content.clone();
+    plain.style.stroke = None;
+    plain.style.background = None;
+    plain.style.highlight = None;
+    plain.style.animation = photonic_core::timeline::CaptionAnim::None;
+    if &plain == content {
+        return None;
+    }
+    ops::replace_clip_source(
+        project,
+        seq_id,
+        track_id,
+        clip_id,
+        ClipSource::Text { content: plain },
+        None,
+    )
+    .ok()
 }
 
 fn commit_text_edit(
@@ -333,6 +563,214 @@ mod tests {
         let seq_id = project.insert_sequence(seq);
         project.active_sequence = Some(seq_id);
         (project, seq_id, track_id)
+    }
+
+    #[test]
+    fn native_title_slide_view_is_read_only() {
+        use photonic_core::timeline::{
+            color::{NativeManagedColorConfig, SequenceColorConfig},
+            CaptionAnim,
+        };
+        let (mut project, seq, _) = project_with_video_track();
+        project.sequences.get_mut(&seq).unwrap().color =
+            SequenceColorConfig::NativeManaged(Box::new(NativeManagedColorConfig::sdr_draft()));
+        let mut content = TextClipContent::new("Keep animated title");
+        content.style.animation = CaptionAnim::SlideUp;
+        let clip = Clip::new(
+            ClipSource::Text { content },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let id = clip.id;
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0]
+            .clips
+            .push(clip);
+        let original = serde_json::to_value(&project).unwrap();
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let mut action = None;
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default()
+                    .show(ctx, |ui| draw_text_editor(ui, &[id], &project, &mut action));
+            });
+            assert!(action.is_none());
+            assert_eq!(serde_json::to_value(&project).unwrap(), original);
+        }
+    }
+    #[test]
+    fn native_title_slide_edit_is_discrete_reversible_and_locked() {
+        let (mut project, seq, track) = project_with_video_track();
+        let original = TextClipContent::new("Keep title paint");
+        let clip = Clip::new(
+            ClipSource::Text {
+                content: original.clone(),
+            },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let id = clip.id;
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0]
+            .clips
+            .push(clip);
+        let mut next = original.clone();
+        next.style.animation = photonic_core::timeline::CaptionAnim::SlideUp;
+        let mut action = None;
+        commit_text_edit(&project, seq, track, id, next.clone(), &mut action, false);
+        let Some(PanelAction::ClipEditDiscrete(command)) = action else {
+            panic!("one discrete animation edit")
+        };
+        let mut doc = photonic_core::Document::new("title slide", 1920.0, 1080.0);
+        doc.timeline = Some(project.clone());
+        let before = serde_json::to_value(&doc).unwrap();
+        let inverse = command.inverse(&doc).unwrap();
+        command.apply(&mut doc);
+        assert_eq!(
+            doc.timeline.as_ref().unwrap().sequences[&seq].video_tracks[0].clips[0].source,
+            ClipSource::Text {
+                content: next.clone()
+            }
+        );
+        inverse.apply(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0].locked = true;
+        let mut action = None;
+        commit_text_edit(&project, seq, track, id, next, &mut action, false);
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn title_panel_view_does_not_clamp_stored_values_or_emit_an_edit() {
+        let (mut project, seq, _) = project_with_video_track();
+        let mut content = TextClipContent::new("Read only");
+        content.style.font_size = 512.0;
+        content.style.position = [1.25, -0.25];
+        let clip = Clip::new(
+            ClipSource::Text { content },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let id = clip.id;
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0]
+            .clips
+            .push(clip);
+        let before = serde_json::to_value(&project).unwrap();
+        let mut action = None;
+        let context = egui::Context::default();
+        let _ = context.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default()
+                .show(ctx, |ui| draw_text_editor(ui, &[id], &project, &mut action));
+        });
+        assert!(action.is_none());
+        assert_eq!(serde_json::to_value(&project).unwrap(), before);
+    }
+
+    #[test]
+    fn title_paint_edit_is_atomic_validated_and_preserves_unrelated_content() {
+        let (mut project, seq, track) = project_with_video_track();
+        let content = TextClipContent::new("Keep title");
+        let clip = Clip::new(
+            ClipSource::Text {
+                content: content.clone(),
+            },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let id = clip.id;
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0]
+            .clips
+            .push(clip);
+        let original = TitlePaintValues::from_content(&content);
+        assert!(title_paint_command(&project, seq, track, id, &content, &original).is_none());
+        let paint = TitlePaintValues {
+            stroke: Some((photonic_core::Color::RED, 3.0)),
+            background: Some(photonic_core::timeline::CaptionBackground {
+                color: photonic_core::Color::BLACK,
+                padding: 6.0,
+                corner_radius: 5.0,
+            }),
+        };
+        let cmd = title_paint_command(&project, seq, track, id, &content, &paint).unwrap();
+        let mut doc = photonic_core::Document::new("paint", 128.0, 64.0);
+        doc.timeline = Some(project.clone());
+        let before = serde_json::to_value(&doc).unwrap();
+        let inv = cmd.inverse(&doc).unwrap();
+        cmd.apply(&mut doc);
+        let ClipSource::Text { content: after } =
+            &doc.timeline.as_ref().unwrap().sequences[&seq].video_tracks[0].clips[0].source
+        else {
+            panic!("title")
+        };
+        let mut expected = content.clone();
+        paint.apply(&mut expected);
+        assert_eq!(after, &expected);
+        inv.apply(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        let mut invalid = paint.clone();
+        invalid.stroke = Some((photonic_core::Color::RED, 9.0));
+        assert!(title_paint_command(&project, seq, track, id, &content, &invalid).is_none());
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0].locked = true;
+        assert!(title_paint_command(&project, seq, track, id, &content, &paint).is_none());
+    }
+    #[test]
+    fn title_paint_view_does_not_clamp_or_commit_stored_values() {
+        let ctx = egui::Context::default();
+        let mut paint = TitlePaintValues {
+            stroke: Some((photonic_core::Color::RED, 20.0)),
+            background: Some(photonic_core::timeline::CaptionBackground {
+                color: photonic_core::Color::BLACK,
+                padding: 200.0,
+                corner_radius: 300.0,
+            }),
+        };
+        let before = paint.clone();
+        for _ in 0..3 {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| title_paint_fields(ui, &mut paint));
+            });
+            assert!(paint == before);
+        }
+    }
+
+    #[test]
+    fn plain_title_edit_is_discrete_reversible_and_respects_track_lock() {
+        let (mut project, seq, track) = project_with_video_track();
+        let content = TextClipContent::new("Keep this text");
+        let clip = Clip::new(
+            ClipSource::Text {
+                content: content.clone(),
+            },
+            Tick::ZERO,
+            Tick::from_seconds(2),
+        );
+        let id = clip.id;
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0]
+            .clips
+            .push(clip);
+        let command = plain_title_command(&project, seq, track, id, &content).unwrap();
+        let mut doc = photonic_core::Document::new("title", 128.0, 64.0);
+        doc.timeline = Some(project.clone());
+        let before = serde_json::to_value(&doc).unwrap();
+        let undo = command.inverse(&doc).unwrap();
+        command.apply(&mut doc);
+        let changed = &doc.timeline.as_ref().unwrap().sequences[&seq].video_tracks[0].clips[0];
+        let ClipSource::Text { content: plain } = &changed.source else {
+            panic!("title source")
+        };
+        assert_eq!(plain.text, content.text);
+        assert_eq!(plain.style.fill, content.style.fill);
+        assert!(plain.style.stroke.is_none());
+        assert!(
+            plain_title_command(doc.timeline.as_ref().unwrap(), seq, track, id, plain).is_none()
+        );
+        let restored = photonic_core::Document::from_json(&doc.to_json().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
+        undo.apply(&mut doc);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        project.sequences.get_mut(&seq).unwrap().video_tracks[0].locked = true;
+        assert!(plain_title_command(&project, seq, track, id, &content).is_none());
     }
 
     #[test]

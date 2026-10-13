@@ -43,7 +43,11 @@ pub fn luma_at(kind: LumaWipeKind, u: f32, v: f32, invert: bool) -> f32 {
             let dx = u - 0.5;
             let dy = v - 0.5;
             // atan2: (-π, π] → [0, 1) clockwise from +x.
-            let a = dy.atan2(dx); // -π..π from +x, CCW
+            let a = if dx == 0.0 && dy == 0.0 {
+                0.0
+            } else {
+                dy.atan2(dx)
+            }; // -π..π from +x, CCW
             let mut t = (-a + std::f32::consts::PI) / (2.0 * std::f32::consts::PI);
             if t >= 1.0 {
                 t = 0.0;
@@ -56,6 +60,19 @@ pub fn luma_at(kind: LumaWipeKind, u: f32, v: f32, invert: bool) -> f32 {
         1.0 - t
     } else {
         t
+    }
+}
+
+/// Native scene transitions sweep the complete softened map, with exact
+/// endpoints even when a hard map contains a pixel at zero or one. Legacy
+/// progress mapping is intentionally unchanged.
+pub(crate) fn native_edge(t: f32, softness: f32) -> f32 {
+    if t <= 0.0 {
+        -1.0
+    } else if t >= 1.0 {
+        2.0
+    } else {
+        -softness + t * (1.0 + 2.0 * softness)
     }
 }
 
@@ -110,6 +127,17 @@ mod tests {
         let a = luma_at(LumaWipeKind::LinearV, 0.5, 0.25, false);
         let b = luma_at(LumaWipeKind::LinearV, 0.5, 0.25, true);
         assert!((a + b - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn clock_center_and_native_softened_endpoints_are_explicit() {
+        assert_eq!(luma_at(LumaWipeKind::Clock, 0.5, 0.5, false), 0.5);
+        for softness in [0.0, 0.2, 0.5] {
+            for map in [0.0, 0.5, 1.0] {
+                assert_eq!(soft_mix(native_edge(0.0, softness), map, softness), 0.0);
+                assert_eq!(soft_mix(native_edge(1.0, softness), map, softness), 1.0);
+            }
+        }
     }
 
     #[test]

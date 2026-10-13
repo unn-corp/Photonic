@@ -31,7 +31,7 @@ use super::audio::{
 use super::captions::{CaptionCue, CaptionStyle, CaptionTrack, CaptionWord};
 use super::clip::{Clip, ClipEffect};
 use super::grade::Grade;
-use super::graph::{GraphEdge, GraphNode, GraphNodeParams, NodePos};
+use super::graph::{GraphEdge, GraphNode, GraphNodeParams, GraphOp, NodePos, TextGen};
 use super::ids::*;
 use super::media::{AssetSource, MediaAsset, MediaBin, MediaProbe, MediaTag, ProxyRef};
 use super::sequence::{
@@ -68,7 +68,8 @@ impl ClipTiming {
     }
 }
 
-/// Track settings (everything but the clip list) — snapshotted for `SetTrackProp`.
+/// General track settings — effects and grades have their own scoped commands.
+/// Composite fields are optional only for old serialized command compatibility.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackSettings {
     pub name: String,
@@ -80,6 +81,11 @@ pub struct TrackSettings {
     pub sync_lock: bool,
     pub height_px: f32,
     pub audio: Option<TrackAudio>,
+    /// Missing in historical commands: applying those must leave compositing alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blend: Option<crate::layer::BlendMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opacity: Option<f32>,
 }
 
 impl TrackSettings {
@@ -91,6 +97,8 @@ impl TrackSettings {
             sync_lock: t.sync_lock,
             height_px: t.height_px,
             audio: t.audio.clone(),
+            blend: Some(t.blend),
+            opacity: Some(t.opacity),
         }
     }
     pub fn apply_to(&self, t: &mut Track) {
@@ -100,6 +108,12 @@ impl TrackSettings {
         t.sync_lock = self.sync_lock;
         t.height_px = self.height_px;
         t.audio = self.audio.clone();
+        if let Some(blend) = self.blend {
+            t.blend = blend;
+        }
+        if let Some(opacity) = self.opacity {
+            t.opacity = opacity;
+        }
     }
 }
 
@@ -197,9 +211,12 @@ pub enum GraphCmd {
     AddNode {
         graph: GraphId,
         node: Box<GraphNode>,
-        pos: NodePos,
+        pos: Option<NodePos>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         edges: Vec<GraphEdge>,
+        /// Exact edge order for restoring a removed node; absent in old history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_edges: Option<Vec<GraphEdge>>,
     },
     RemoveNode {
         graph: GraphId,
@@ -207,6 +224,9 @@ pub enum GraphCmd {
         pos: Option<NodePos>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         edges: Vec<GraphEdge>,
+        /// Exact edge order for restoring a removed node; absent in old history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_edges: Option<Vec<GraphEdge>>,
     },
     AddEdge {
         graph: GraphId,
@@ -215,6 +235,30 @@ pub enum GraphCmd {
     RemoveEdge {
         graph: GraphId,
         edge: GraphEdge,
+    },
+    /// Atomic edge replacement preserving serialized order through undo/redo.
+    SetEdges {
+        graph: GraphId,
+        old: Vec<GraphEdge>,
+        new: Vec<GraphEdge>,
+    },
+    SetTimeOffset {
+        graph: GraphId,
+        node: GraphNodeId,
+        old: Tick,
+        new: Tick,
+    },
+    SetMaskShape {
+        graph: GraphId,
+        node: GraphNodeId,
+        old: Box<super::graph::MaskShapeKind>,
+        new: Box<super::graph::MaskShapeKind>,
+    },
+    SetText {
+        graph: GraphId,
+        node: GraphNodeId,
+        old: Box<TextGen>,
+        new: Box<TextGen>,
     },
     SetNodeParam {
         graph: GraphId,
@@ -238,8 +282,10 @@ pub enum GraphCmd {
     MoveNode {
         graph: GraphId,
         node: GraphNodeId,
-        old: NodePos,
-        new: NodePos,
+        // Older commands encode positions as objects, which deserialize as Some.
+        // None preserves an absent layout entry through undo instead of inventing (0,0).
+        old: Option<NodePos>,
+        new: Option<NodePos>,
     },
 }
 
@@ -386,13 +432,36 @@ pub enum AudioCmd {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "target", rename_all = "snake_case")]
 pub enum AnimTarget {
-    ClipTransform { clip: ClipId },
-    ClipEffect { clip: ClipId, effect_index: usize },
-    GradeOp { clip: ClipId, op: GradeOpId },
-    TrackAudio { track: TrackId },
-    ClipAudio { clip: ClipId },
-    MasterBus { seq: SequenceId },
-    AudioFx { owner: FxOwner, index: usize },
+    ClipTransform {
+        clip: ClipId,
+    },
+    ClipEffect {
+        clip: ClipId,
+        effect_index: usize,
+    },
+    GradeOp {
+        clip: ClipId,
+        op: GradeOpId,
+    },
+    /// Exact selected-member stage; keys use each member's clip-relative clock.
+    GradeStageOp {
+        clip: ClipId,
+        stage: super::GradeInspectionStage,
+        op: GradeOpId,
+    },
+    TrackAudio {
+        track: TrackId,
+    },
+    ClipAudio {
+        clip: ClipId,
+    },
+    MasterBus {
+        seq: SequenceId,
+    },
+    AudioFx {
+        owner: FxOwner,
+        index: usize,
+    },
 }
 
 // ── The top-level command ───────────────────────────────────────────────────
@@ -814,10 +883,36 @@ pub enum TimelineCmd {
         old: Option<BinId>,
         new: Option<BinId>,
     },
-    GraphEdit(GraphCmd),
-    CaptionEdit(CaptionCmd),
-    TtsEdit(TtsCmd),
-    AudioEdit(AudioCmd),
+    GraphEdit(#[serde(with = "subcommand_envelope")] GraphCmd),
+    CaptionEdit(#[serde(with = "subcommand_envelope")] CaptionCmd),
+    TtsEdit(#[serde(with = "subcommand_envelope")] TtsCmd),
+    AudioEdit(#[serde(with = "subcommand_envelope")] AudioCmd),
+}
+
+/// The outer and inner commands both use a `cmd` discriminator. Nest the
+/// inner payload explicitly; flattening the old newtype emitted duplicate
+/// `cmd` keys that could not deserialize back into a TimelineCmd.
+mod subcommand_envelope {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    #[derive(Serialize)]
+    struct Borrowed<'a, T> {
+        command: &'a T,
+    }
+    #[derive(Deserialize)]
+    struct Owned<T> {
+        command: T,
+    }
+    pub fn serialize<T: Serialize, S: Serializer>(
+        value: &T,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Borrowed { command: value }.serialize(serializer)
+    }
+    pub fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<T, D::Error> {
+        Owned::<T>::deserialize(deserializer).map(|value| value.command)
+    }
 }
 
 // ── Resolution helpers ──────────────────────────────────────────────────────
@@ -921,6 +1016,52 @@ fn resolve_tracks_mut<'a>(
             .map(|e| &mut e.params.tracks),
         AnimTarget::GradeOp { clip, op } => {
             let grade = find_clip_mut(proj, *clip)?.grade.as_mut()?;
+            grade
+                .ops
+                .iter_mut()
+                .find(|o| o.id == *op)
+                .map(|o| &mut o.params.tracks)
+        }
+        AnimTarget::GradeStageOp { clip, stage, op } => {
+            let sequence_id = {
+                let mut owners = proj
+                    .sequences
+                    .iter()
+                    .filter(|(_, s)| s.tracks().any(|t| t.clips.iter().any(|c| c.id == *clip)));
+                let (sid, sequence) = owners.next()?;
+                if owners.next().is_some() {
+                    return None;
+                }
+                let member = sequence
+                    .tracks()
+                    .flat_map(|t| &t.clips)
+                    .find(|c| c.id == *clip)?;
+                stage.resolve_grade(proj, member)?;
+                *sid
+            };
+            use super::GradeInspectionStage as S;
+            let grade = match *stage {
+                S::Clip => find_clip_mut(proj, *clip)?.grade.as_mut()?,
+                S::LocalLook => match find_clip_mut(proj, *clip)?.look.as_mut()? {
+                    super::ClipLook::Local(grade) => grade.as_mut(),
+                    _ => return None,
+                },
+                S::SharedLook { id } => &mut proj.shared_looks.get_mut(&id)?.grade,
+                S::GroupPre { id } => proj
+                    .sequences
+                    .get_mut(&sequence_id)?
+                    .groups
+                    .get_mut(&id)?
+                    .pre_grade
+                    .as_mut()?,
+                S::GroupPost { id } => proj
+                    .sequences
+                    .get_mut(&sequence_id)?
+                    .groups
+                    .get_mut(&id)?
+                    .post_grade
+                    .as_mut()?,
+            };
             grade
                 .ops
                 .iter_mut()
@@ -1105,6 +1246,10 @@ impl GraphCmd {
             | GraphCmd::RemoveNode { graph, .. }
             | GraphCmd::AddEdge { graph, .. }
             | GraphCmd::RemoveEdge { graph, .. }
+            | GraphCmd::SetEdges { graph, .. }
+            | GraphCmd::SetText { graph, .. }
+            | GraphCmd::SetMaskShape { graph, .. }
+            | GraphCmd::SetTimeOffset { graph, .. }
             | GraphCmd::SetNodeParam { graph, .. }
             | GraphCmd::SetKeyframe { graph, .. }
             | GraphCmd::RemoveKeyframe { graph, .. }
@@ -1118,13 +1263,25 @@ impl GraphCmd {
         };
         match self {
             GraphCmd::AddNode {
-                node, pos, edges, ..
+                node,
+                pos,
+                edges,
+                restore_edges,
+                ..
             } => {
                 g.nodes.insert(node.id, (**node).clone());
-                g.ui.insert(node.id, *pos);
-                for e in edges {
-                    if !g.edges.contains(e) {
-                        g.edges.push(*e);
+                if let Some(pos) = pos {
+                    g.ui.insert(node.id, *pos);
+                } else {
+                    g.ui.remove(&node.id);
+                }
+                if let Some(original) = restore_edges {
+                    g.edges = original.clone();
+                } else {
+                    for e in edges {
+                        if !g.edges.contains(e) {
+                            g.edges.push(*e);
+                        }
                     }
                 }
             }
@@ -1139,6 +1296,32 @@ impl GraphCmd {
                 }
             }
             GraphCmd::RemoveEdge { edge, .. } => g.edges.retain(|e| e != edge),
+            GraphCmd::SetEdges { new, .. } => g.edges = new.clone(),
+            GraphCmd::SetTimeOffset { node, new, .. } => {
+                if let Some(n) = g.nodes.get_mut(node) {
+                    if matches!(n.op, GraphOp::TimeOffset { .. }) {
+                        n.op = GraphOp::TimeOffset { offset: *new };
+                    }
+                }
+            }
+            GraphCmd::SetMaskShape { node, new, .. } => {
+                if let Some(n) = g.nodes.get_mut(node) {
+                    if matches!(n.op, GraphOp::MaskShape { .. }) {
+                        n.op = GraphOp::MaskShape {
+                            shape: (**new).clone(),
+                        };
+                    }
+                }
+            }
+            GraphCmd::SetText { node, new, .. } => {
+                if let Some(n) = g.nodes.get_mut(node) {
+                    if matches!(n.op, GraphOp::Text { .. }) {
+                        n.op = GraphOp::Text {
+                            text: (**new).clone(),
+                        };
+                    }
+                }
+            }
             GraphCmd::SetNodeParam { node, new, .. } => {
                 if let Some(n) = g.nodes.get_mut(node) {
                     n.params.base = (**new).clone();
@@ -1162,7 +1345,11 @@ impl GraphCmd {
                 }
             }
             GraphCmd::MoveNode { node, new, .. } => {
-                g.ui.insert(*node, *new);
+                if let Some(position) = new {
+                    g.ui.insert(*node, *position);
+                } else {
+                    g.ui.remove(node);
+                }
             }
         }
     }
@@ -1174,22 +1361,26 @@ impl GraphCmd {
                 node,
                 pos,
                 edges,
+                restore_edges,
             } => GraphCmd::RemoveNode {
                 graph: *graph,
                 node: node.clone(),
-                pos: Some(*pos),
+                pos: *pos,
                 edges: edges.clone(),
+                restore_edges: restore_edges.clone(),
             },
             GraphCmd::RemoveNode {
                 graph,
                 node,
                 pos,
                 edges,
+                restore_edges,
             } => GraphCmd::AddNode {
                 graph: *graph,
                 node: node.clone(),
-                pos: pos.unwrap_or(NodePos { x: 0.0, y: 0.0 }),
+                pos: *pos,
                 edges: edges.clone(),
+                restore_edges: restore_edges.clone(),
             },
             GraphCmd::AddEdge { graph, edge } => GraphCmd::RemoveEdge {
                 graph: *graph,
@@ -1198,6 +1389,44 @@ impl GraphCmd {
             GraphCmd::RemoveEdge { graph, edge } => GraphCmd::AddEdge {
                 graph: *graph,
                 edge: *edge,
+            },
+            GraphCmd::SetEdges { graph, old, new } => GraphCmd::SetEdges {
+                graph: *graph,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            GraphCmd::SetTimeOffset {
+                graph,
+                node,
+                old,
+                new,
+            } => GraphCmd::SetTimeOffset {
+                graph: *graph,
+                node: *node,
+                old: *new,
+                new: *old,
+            },
+            GraphCmd::SetMaskShape {
+                graph,
+                node,
+                old,
+                new,
+            } => GraphCmd::SetMaskShape {
+                graph: *graph,
+                node: *node,
+                old: new.clone(),
+                new: old.clone(),
+            },
+            GraphCmd::SetText {
+                graph,
+                node,
+                old,
+                new,
+            } => GraphCmd::SetText {
+                graph: *graph,
+                node: *node,
+                old: new.clone(),
+                new: old.clone(),
             },
             GraphCmd::SetNodeParam {
                 graph,
@@ -2295,6 +2524,15 @@ impl TimelineCmd {
                 if let Some(tracks) = resolve_tracks_mut(p, target) {
                     set_kf_on(tracks, path, *new);
                 }
+                if let AnimTarget::GradeStageOp {
+                    stage: super::GradeInspectionStage::SharedLook { id },
+                    ..
+                } = target
+                {
+                    if let Some(look) = p.shared_looks.get_mut(id) {
+                        look.sync_active_version();
+                    }
+                }
             }
             TimelineCmd::RemoveKeyframe {
                 target,
@@ -2303,6 +2541,15 @@ impl TimelineCmd {
             } => {
                 if let Some(tracks) = resolve_tracks_mut(p, target) {
                     remove_kf_on(tracks, path, keyframe.at);
+                }
+                if let AnimTarget::GradeStageOp {
+                    stage: super::GradeInspectionStage::SharedLook { id },
+                    ..
+                } = target
+                {
+                    if let Some(look) = p.shared_looks.get_mut(id) {
+                        look.sync_active_version();
+                    }
                 }
             }
             TimelineCmd::SetKeyframeInterp {
@@ -2317,6 +2564,15 @@ impl TimelineCmd {
                         if let Some(kf) = lane.keyframes.iter_mut().find(|k| k.at == *at) {
                             kf.interp = *new;
                         }
+                    }
+                }
+                if let AnimTarget::GradeStageOp {
+                    stage: super::GradeInspectionStage::SharedLook { id },
+                    ..
+                } = target
+                {
+                    if let Some(look) = p.shared_looks.get_mut(id) {
+                        look.sync_active_version();
                     }
                 }
             }

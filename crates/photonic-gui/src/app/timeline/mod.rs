@@ -195,6 +195,8 @@ impl PhotonicApp {
         doc: &mut Document,
         history: &mut CommandHistory,
     ) {
+        tracks::draw_composite_dialog(ui.ctx(), doc, history);
+
         // Reserve the dock's current content rect once. Fixed-position controls
         // below use `put_fixed`, so they cannot extend this reservation.
         let panel_rect = ui.max_rect();
@@ -837,20 +839,6 @@ impl PhotonicApp {
         if let Some(seq) = doc.timeline.as_ref().and_then(|p| p.sequences.get(&seq_id)) {
             draw_navigator(ui, nav_rect, lane_left, seq, &mut view);
         }
-
-        // Keyframe / curve editor (04 §4.1, 01 §6): a floating editor that
-        // auto-targets the selected clip. Invoked from here — the one video-mode
-        // draw path that already holds `doc`, `history`, the playhead, and the
-        // live selection — so it needs no `app/mod.rs` call-site wiring. Every
-        // edit flows through a pure core keyframe op → `CommandHistory`.
-        crate::panels::video::keyframe_editor::draw_window(
-            ui.ctx(),
-            doc,
-            history,
-            &mut self.keyframe_editor_target,
-            &selection,
-            playhead,
-        );
 
         // K-A7: paint grab ghost + status strip while a keyboard grab is open.
         if let Some(session) = self.timeline_grab.as_ref() {

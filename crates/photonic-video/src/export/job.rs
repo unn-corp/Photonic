@@ -240,29 +240,14 @@ fn resolve_export_job_impl(
         let first = seq_rate.frame_start(seq_rate.frame_at(start));
         let mut luts = crate::session::LutCache::default();
         luts.warm(project);
-        let compiled = crate::graph::compile::compile_native_delivery_with_luts(
+        crate::graph::compile::validate_native_delivery_before_analysis(
             project,
             job.sequence,
             format_index,
             first,
-            crate::graph::compile::Quality::FULL,
             &luts,
-        );
-        if let Some(error) = compiled
-            .diagnostics
-            .iter()
-            .find(|d| d.severity == crate::graph::compile::DiagSeverity::Error)
-        {
-            return Err(ExportError::Resolve(format!(
-                "native delivery first frame is unavailable: {}",
-                error.message
-            )));
-        }
-        if compiled.graph.output_color_encoding() != Ok(FrameColorEncoding::Bt709Video) {
-            return Err(ExportError::Resolve(
-                "native delivery first frame lacks BT.709 video-signal output".into(),
-            ));
-        }
+        )
+        .map_err(ExportError::Resolve)?;
         native_delivery_sources_online(project, job.sequence, first)
             .map_err(ExportError::Resolve)?;
     }
@@ -643,6 +628,7 @@ fn run_export_group(
 
     let mut prev = session.latest_frame();
     let mut frame_fail: Option<ExportError> = None;
+    let mut subject_matte_used = false;
     let frame_source = |i: u64| -> Frame {
         // Output tick → nearest sequence frame (05 §6.2 retiming: the engine
         // presents exact sequence-grid ticks, so snap the output-grid tick).
@@ -660,7 +646,15 @@ fn run_export_group(
                 };
             }
         }
-        session.send(EngineCmd::Seek(snapped));
+        let request_id = i.saturating_add(1);
+        session.send(EngineCmd::InspectFrame {
+            request_id,
+            sequence: seq_id,
+            time: snapped,
+            proxy_mode: proxy,
+            quality,
+            scope_tap: crate::graph::ScopeTapPoint::Program,
+        });
         let deadline = Instant::now() + Duration::from_secs(30);
         let frame = loop {
             if cancel.load(Ordering::Relaxed) {
@@ -669,6 +663,8 @@ fn run_export_group(
             if let Some(f) = session.latest_frame() {
                 let fresh = prev.as_ref().map(|q| !Arc::ptr_eq(q, &f)).unwrap_or(true);
                 if fresh
+                    && (f.pending_computations == 0 || !f.color_errors.is_empty())
+                    && f.inspection_request_id == Some(request_id)
                     && f.time == snapped
                     && f.sequence == seq_id
                     && f.doc_revision == expected_revision
@@ -680,6 +676,14 @@ fn run_export_group(
                 {
                     break Some(f);
                 }
+            }
+            let status = session.status();
+            if status.computation_error_inspection == Some(request_id)
+                && !status.computation_errors.is_empty()
+            {
+                frame_fail = Some(ExportError::Resolve(status.computation_errors.join("; ")));
+                cancel.store(true, Ordering::Relaxed);
+                break None;
             }
             if Instant::now() >= deadline {
                 break None;
@@ -748,6 +752,7 @@ fn run_export_group(
                         encoding: FrameColorEncoding::LegacyLinearRec709,
                     };
                 }
+                subject_matte_used |= f.subject_matte_used;
                 prev = Some(Arc::clone(&f));
                 // Logical region only (bucket-padded texture, see render loop).
                 let (render_w, render_h) = f.logical_size;
@@ -844,7 +849,12 @@ fn run_export_group(
                             r.preset.loudness_target.as_ref(),
                         )?;
                     }
-                    if let Some(manifest) = manifests[output_index].take() {
+                    if let Some(mut manifest) = manifests[output_index].take() {
+                        manifest.toolchain["subject_matte_used"] = if subject_matte_used {
+                            serde_json::json!({"model":"U2NetP","sha256":photonic_matte::PINNED_MODEL_SHA256})
+                        } else {
+                            serde_json::Value::Null
+                        };
                         super::manifest::publish(manifest, &project, &r.out_path, cancel)?;
                     }
                     on_event(output_index, ExportEvent::Done);
@@ -941,7 +951,7 @@ fn box_downscale(src: &[[f32; 4]], w: u32, h: u32, ow: u32, oh: u32) -> Vec<[f32
 fn validate_export_frame_color(encoding: FrameColorEncoding) -> Result<(), ExportError> {
     match encoding {
         FrameColorEncoding::LegacyLinearRec709 | FrameColorEncoding::Bt709Video => Ok(()),
-        FrameColorEncoding::MatteWeight | FrameColorEncoding::SceneLinearAcescg | FrameColorEncoding::Acescct | FrameColorEncoding::SrgbDisplay => {
+        FrameColorEncoding::ScalarChannel | FrameColorEncoding::MatteWeight | FrameColorEncoding::SceneLinearAcescg | FrameColorEncoding::Acescct | FrameColorEncoding::SrgbDisplay => {
             Err(ExportError::Resolve(
                 "export encoder requires linear Rec.709 working pixels; managed output needs a dedicated export transform".into(),
             ))

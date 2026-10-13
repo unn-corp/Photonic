@@ -90,7 +90,10 @@ pub fn source_range_for_op(op: &IrOp, out: Tick) -> FrameRange {
         | IrOp::NativeDecodeVideo { .. }
         | IrOp::DecodeStill { .. }
         | IrOp::NativeDecodeStill { .. }
+        | IrOp::NativeMediaVideo { .. }
+        | IrOp::NativeMediaStill { .. }
         | IrOp::RasterVector { .. }
+        | IrOp::NativeRasterVector { .. }
         | IrOp::SolidColor { .. }
         | IrOp::Transform2D { .. }
         | IrOp::Transform2DTransparent { .. }
@@ -100,13 +103,58 @@ pub fn source_range_for_op(op: &IrOp, out: Tick) -> FrameRange {
         // frames' pixels.
         | IrOp::StabilizeWarp { .. }
         | IrOp::Effect { .. }
-        | IrOp::QualifierMatte { .. }
+        | IrOp::WindowMatte { .. }
+        | IrOp::BezierMatte { .. }
+                        | IrOp::QualifierMatte { .. }
         | IrOp::GradeKeyMix { .. }
         | IrOp::GradeMatteRefine { .. }
+        | IrOp::NativeMatteCdl { .. }
+        | IrOp::NativeRgbMatrix { .. }
+                        | IrOp::NativeTonalExposure { .. }
         | IrOp::GradeMatteApply
         | IrOp::GradeMatteConstant { .. }
         | IrOp::GradeLayerMix { .. }
         | IrOp::Grade { .. }
+        | IrOp::NativeMotionBlur { .. }
+        | IrOp::NativeOutline { .. }
+        | IrOp::NativeLinearHsl { .. }
+        | IrOp::NativeLensBlur { .. }
+        | IrOp::NativeSurfaceBlur { .. }
+        | IrOp::NativeRankFilter{..}
+        | IrOp::NativeDeflicker{..}
+        | IrOp::NativeUnpremultiply
+        | IrOp::NativeAlphaView { .. }
+        | IrOp::NativeTransferLevels { .. }
+        | IrOp::NativeTransferCurves { .. }
+        | IrOp::NativeColorBalance { .. }
+        | IrOp::NativePhotoFilter { .. }
+        | IrOp::NativeTransferMatrix { .. }
+        | IrOp::NativeTransferArtistic { .. }
+        | IrOp::NativeDropShadow { .. }
+        | IrOp::NativePerspective { .. }
+        | IrOp::NativeStylize { .. }
+        | IrOp::NativeDetail { .. }
+        | IrOp::NativeGeometricWarp { .. }
+        | IrOp::NativeBoxBlur { .. }
+        | IrOp::NativeMosaic { .. }
+        | IrOp::NativeGaussianBlur { .. }
+        | IrOp::NativeUnsharp { .. }
+        | IrOp::NativeChannelExtract { .. }
+        | IrOp::NativeImageToMask
+        | IrOp::NativeMaskToImage
+        | IrOp::NativeChannelCombine
+        | IrOp::NativeInvert
+        | IrOp::NativeVignette { .. }
+        | IrOp::NativeGrain { .. }
+        | IrOp::NativeDenoise { .. }
+        | IrOp::NativeMaskShape { .. }
+        | IrOp::NativePolygonMask { .. }
+        | IrOp::NativeGlow { .. }
+        | IrOp::NativeChromaKey { .. }
+        | IrOp::NativeLumaKey { .. }
+        | IrOp::NativeCanvas { .. }
+        | IrOp::NativeDissolve { .. }
+        | IrOp::NativeLumaWipe { .. }
         | IrOp::NativeExposure { .. }
         | IrOp::NativeLinearOffset { .. }
         | IrOp::NativePrinterLights { .. }
@@ -121,15 +169,22 @@ pub fn source_range_for_op(op: &IrOp, out: Tick) -> FrameRange {
         | IrOp::NativeAcescct { .. }
         | IrOp::NativeSdrOutput
         | IrOp::NativeSdrVideoOutput
+        | IrOp::NativeLuminanceMerge { .. }
+        | IrOp::NativeBoundedMerge { .. }
+        | IrOp::NativeArithmeticMerge { .. }
         | IrOp::Merge { .. }
         | IrOp::WipeMix { .. }
         | IrOp::PushMix { .. }
         | IrOp::LumaWipeMix { .. }
+        | IrOp::NativeCaptionOutput { .. }
         | IrOp::CaptionOverlay { .. }
         | IrOp::Crop { .. }
         | IrOp::Resize { .. }
         | IrOp::MatteExtract { .. }
+        | IrOp::NativeMatteExtract
         | IrOp::TextGen { .. }
+        | IrOp::NativeTextGen { .. }
+        | IrOp::NativeDecoratedTextGen { .. }
         | IrOp::ChannelSplit { .. }
         | IrOp::ChannelCombine
         | IrOp::Output { .. } => FrameRange::identity(out),

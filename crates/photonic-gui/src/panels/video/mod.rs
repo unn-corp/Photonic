@@ -38,6 +38,8 @@ use photonic_core::timeline::{
 };
 
 pub(crate) mod audio_mixer;
+mod bezier_animation;
+mod bezier_window;
 pub(crate) mod caption_editor;
 pub(crate) mod clip_inspector;
 pub(crate) mod color_page;

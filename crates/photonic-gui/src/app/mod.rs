@@ -1,9 +1,12 @@
 mod dialogs;
 mod geometry;
+mod grade_matte;
 mod hotbar_ui;
 mod panel_actions;
+mod program_measurement;
 mod raster_ops;
 mod search_ui;
+mod window_tracking;
 use geometry::*;
 mod demos;
 use demos::*;
@@ -21,6 +24,7 @@ pub mod source_marks;
 pub mod autosave;
 mod clipboard;
 mod close_guard;
+mod color_layout;
 mod color_windows;
 mod command_center;
 mod direct_select;
@@ -796,6 +800,7 @@ struct PendingReferenceStill {
 }
 
 struct ReferenceStillCapture {
+    native_balance: Option<photonic_core::timeline::native_balance::NativeReferenceBalance>,
     id: uuid::Uuid,
     relative: std::path::PathBuf,
     path: std::path::PathBuf,
@@ -845,6 +850,9 @@ struct ShotMatchPreview {
 }
 
 struct VideoEyedropperJob {
+    selected_clips: Vec<ClipId>,
+    document_id: uuid::Uuid,
+    canceled: bool,
     target: EyedropperTarget,
     sequence: SequenceId,
     time: Tick,
@@ -1111,6 +1119,9 @@ pub struct PhotonicApp {
     /// Grading layout (restored from preferences): a shot strip takes the timeline's space.
     pub(crate) color_workspace_open: bool,
     color_layout_dirty: bool,
+    color_layout_name: String,
+    color_layout_status: Option<String>,
+    color_layout_remove: Option<String>,
     pending_reference_still: Option<PendingReferenceStill>,
     reference_still_job: Option<ReferenceStillJob>,
     pending_shot_match: Option<PendingShotMatch>,
@@ -1118,6 +1129,11 @@ pub struct PhotonicApp {
     shot_match_preview: Option<ShotMatchPreview>,
     video_sample_rect: Option<(egui::Rect, egui::Rect)>,
     video_eyedropper_job: Option<VideoEyedropperJob>,
+    program_measurement: program_measurement::State,
+    window_tracking: window_tracking::State,
+    grade_matte_target: Option<grade_matte::Target>,
+    grade_matte_job: Option<grade_matte::Job>,
+    grade_matte_preview: Option<grade_matte::Preview>,
     qualifier_matte_target: Option<QualifierMatteTarget>,
     qualifier_matte_job: Option<QualifierMatteJob>,
     qualifier_matte_preview: Option<QualifierMattePreview>,
@@ -1859,6 +1875,9 @@ impl Default for PhotonicApp {
             scopes_panel_open: false,
             color_workspace_open: false,
             color_layout_dirty: false,
+            color_layout_name: String::new(),
+            color_layout_status: None,
+            color_layout_remove: None,
             pending_reference_still: None,
             reference_still_job: None,
             pending_shot_match: None,
@@ -1866,6 +1885,11 @@ impl Default for PhotonicApp {
             shot_match_preview: None,
             video_sample_rect: None,
             video_eyedropper_job: None,
+            program_measurement: Default::default(),
+            window_tracking: Default::default(),
+            grade_matte_target: None,
+            grade_matte_job: None,
+            grade_matte_preview: None,
             qualifier_matte_target: None,
             qualifier_matte_job: None,
             qualifier_matte_preview: None,
@@ -2630,6 +2654,8 @@ impl PhotonicApp {
             ..Self::default()
         };
         s.prefs = prefs;
+        s.scope_kind = s.prefs.scope_window.kind;
+        s.scopes_panel_open = s.prefs.scope_window.open;
         s.fill_color = fill_color;
         s.lua_console.visible = console_visible;
         s.timeline_snap_enabled = s.prefs.timeline_snap_enabled;
@@ -3722,6 +3748,10 @@ impl PhotonicApp {
                         self.prefs.save();
                     }
 
+                    if self.mode == AppMode::Video {
+                        self.draw_color_layout_menu(ui);
+                    }
+
                     // Audit log toggle
                     if ui
                         .selectable_label(self.audit.panel_open, "Audit")
@@ -4405,6 +4435,7 @@ impl PhotonicApp {
                                     &mut self.selected_grade_op,
                                     &mut self.color_page_tab,
                                     &mut self.scopes_panel_open,
+                                    Some(self.playhead),
                                 );
                                 let advanced = ui.ctx().data(|data| {
                                     data.get_temp::<bool>(controls_id).unwrap_or(true)
@@ -4470,6 +4501,7 @@ impl PhotonicApp {
         // egui-stacking order, so this must land after the console panel's
         // `show_animated` and before `CentralPanel::show`.
         if self.mode == AppMode::Video {
+            let timeline_revision_before = history.revision();
             if self.color_workspace_open {
                 let panel = egui::TopBottomPanel::bottom("color_shot_strip")
                     .resizable(true)
@@ -4491,6 +4523,11 @@ impl PhotonicApp {
                         self.draw_timeline_panel(ui, doc, history);
                     });
             }
+            // The floating editor belongs to video mode, not the timeline dock.
+            // Color workspace replaces that dock with the shot strip.
+            self.draw_video_keyframe_editor(ctx, doc, history);
+            doc_modified |=
+                self.record_timeline_history_edits(doc, history, timeline_revision_before);
         }
 
         if self.mode == AppMode::Video && self.color_workspace_open {
@@ -4510,6 +4547,12 @@ impl PhotonicApp {
             self.prefs.save();
             self.color_layout_dirty = false;
         }
+
+        let tracking_revision = history.revision();
+        self.draw_window_tracking(ctx, doc, history);
+        doc_modified |= self.record_timeline_history_edits(doc, history, tracking_revision);
+        self.update_program_measurement(ctx, doc, history);
+        self.draw_program_measurement(ctx);
 
         // ── Audio mixer (floating window, 09) ────────────────────────────────
         // A rack of 88 px channel strips plus the master bus needs far more
@@ -4601,6 +4644,9 @@ impl PhotonicApp {
                 }
                 desired_tap = want;
             }
+            if let Some(target) = self.grade_matte_target {
+                desired_tap = target.tap();
+            }
             if let Some(target) = self.qualifier_matte_target {
                 desired_tap = target.tap(doc);
             }
@@ -4656,6 +4702,67 @@ impl PhotonicApp {
                         }
                     };
                 }
+            }
+            if let Some(
+                EyedropperTarget::GradeQualifier {
+                    stage,
+                    seq,
+                    clip,
+                    op,
+                    graph_node,
+                    ..
+                }
+                | EyedropperTarget::GradeCurve {
+                    stage,
+                    seq,
+                    clip,
+                    op,
+                    graph_node,
+                    ..
+                },
+            ) = self.eyedropper.target.as_ref()
+            {
+                if *stage != photonic_core::timeline::GradeInspectionStage::Clip
+                    && doc
+                        .timeline
+                        .as_ref()
+                        .and_then(|p| p.sequences.get(seq))
+                        .is_some_and(|s| !s.color.is_legacy())
+                {
+                    desired_tap = photonic_video::graph::ScopeTapPoint::GradeStageInput {
+                        clip: *clip,
+                        stage: *stage,
+                        node: *graph_node,
+                        op: *op,
+                    };
+                }
+            }
+            let native_reference_pending = [
+                self.pending_reference_still.as_ref().map(|r| r.sequence),
+                self.pending_shot_match.as_ref().map(|r| r.sequence),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|id| {
+                doc.timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(&id))
+                    .is_some_and(|seq| {
+                        matches!(
+                            seq.color,
+                            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                        ) && u64::from(seq.format().width) * u64::from(seq.format().height)
+                            <= photonic_core::timeline::native_balance::NATIVE_BALANCE_MAX_PIXELS
+                    })
+            });
+            if native_reference_pending {
+                desired_tap = photonic_video::graph::ScopeTapPoint::NativeSceneProgram;
+            }
+            if self.program_measurement.open
+                && ((self.program_measurement.requested && !self.monitor_playing)
+                    || (self.program_measurement.live && self.monitor_playing))
+            {
+                desired_tap = photonic_video::graph::ScopeTapPoint::NativeSceneProgram;
             }
             if let Some(bridge) = self.engine.as_ref() {
                 if bridge.session().status().scope_tap != desired_tap {
@@ -7183,6 +7290,11 @@ impl PhotonicApp {
                 }
             });
         doc_modified = self.process_panel_actions(ctx, doc, view, renderer, history, doc_modified);
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            if let Some(job) = self.video_eyedropper_job.as_mut() {
+                job.canceled = true;
+            }
+        }
         if self.finish_video_eyedropper_if_ready(doc, history, &mut doc_modified) {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
@@ -7602,6 +7714,7 @@ mod reference_still_tests {
             .unwrap()
             .contains("Managed-color"));
         let still = photonic_core::timeline::ReferenceStill {
+            copied_from: None,
             id: uuid::Uuid::new_v4(),
             name: "old".into(),
             image_asset: photonic_core::timeline::AssetId::new(),
@@ -7612,6 +7725,7 @@ mod reference_still_tests {
             color: doc.timeline.as_ref().unwrap().sequences[&sequence_id]
                 .color
                 .clone(),
+            native_balance: None,
             format_index: 0,
         };
         assert!(app
@@ -7673,6 +7787,7 @@ mod reference_still_tests {
         sequence
             .reference_stills
             .push(photonic_core::timeline::ReferenceStill {
+                copied_from: None,
                 id,
                 name: "Reference".into(),
                 image_asset: image_id,
@@ -7681,6 +7796,7 @@ mod reference_still_tests {
                 source_time: Tick::ZERO,
                 grade_revision: 0,
                 color: sequence.color.clone(),
+                native_balance: None,
                 format_index: 0,
             });
         let mut project = TimelineProject::new();
@@ -7926,6 +8042,15 @@ mod reference_still_tests {
 
     #[test]
     fn gallery_shot_match_is_one_undoable_edit_and_rejects_stale_preview() {
+        check_gallery_shot_match(false);
+    }
+
+    #[test]
+    fn native_gallery_shot_match_captures_scene_and_rejects_stale_preview() {
+        check_gallery_shot_match(true);
+    }
+
+    fn check_gallery_shot_match(native: bool) {
         use photonic_core::timeline::{Clip, ClipSource, GradeOpParams, Track, TrackKind};
         let Some(engine) = photonic_video::VideoEngine::headless() else {
             eprintln!("GPU unavailable; gallery shot match integration skipped");
@@ -7939,6 +8064,11 @@ mod reference_still_tests {
         let mut doc = Document::new("test", 32.0, 32.0);
         let mut project = TimelineProject::new();
         let mut sequence = Sequence::new("cut", photonic_core::timeline::FrameRate::FPS_30, 32, 32);
+        if native {
+            sequence.color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+            );
+        }
         let sequence_id = sequence.id;
         let mut track = Track::new(TrackKind::Video, "V1");
         let first = Clip::new(
@@ -7985,9 +8115,54 @@ mod reference_still_tests {
         assert!(app.pending_reference_still.is_none());
         let still_id =
             doc.timeline.as_ref().unwrap().sequences[&sequence_id].reference_stills[0].id;
+        let reference = &doc.timeline.as_ref().unwrap().sequences[&sequence_id].reference_stills[0];
+        assert_eq!(
+            reference.native_balance.is_some(),
+            native,
+            "{:?}",
+            app.reference_still_status
+        );
+        if let Some(balance) = &reference.native_balance {
+            balance
+                .validate_for_image(&reference.image_hash, 32, 32)
+                .unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(Document::from_json(&doc.to_json().unwrap()).unwrap()).unwrap(),
+            serde_json::to_value(&doc).unwrap()
+        );
         app.engine.as_mut().unwrap().sync_document(&doc, &history);
         app.playhead = Tick::from_seconds(1);
         app.timeline_selection = vec![second_id];
+        if native {
+            let balance = doc
+                .timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sequence_id)
+                .unwrap()
+                .reference_stills[0]
+                .native_balance
+                .take();
+            let rev = history.revision();
+            app.request_shot_match(&doc, &history, sequence_id, still_id);
+            assert!(app.pending_shot_match.is_none());
+            assert_eq!(history.revision(), rev);
+            assert!(app
+                .reference_still_status
+                .as_deref()
+                .unwrap()
+                .contains("capture it again"));
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sequence_id)
+                .unwrap()
+                .reference_stills[0]
+                .native_balance = balance;
+        }
         app.request_shot_match(&doc, &history, sequence_id, still_id);
         assert!(app.pending_shot_match.is_some());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -8151,6 +8326,7 @@ mod reference_still_tests {
                 path: path.clone(),
                 hash: "hash".into(),
                 image_hash: "image-hash".into(),
+                native_balance: None,
             }))
             .unwrap();
         app.reference_still_job = Some(ReferenceStillJob {
@@ -8182,6 +8358,7 @@ mod reference_still_tests {
                 path: abandoned.clone(),
                 hash: "hash".into(),
                 image_hash: "image-hash".into(),
+                native_balance: None,
             }))
             .unwrap();
         drop(ReferenceStillJob {
@@ -8291,6 +8468,7 @@ mod reference_still_tests {
         app.start_video_eyedropper_sample(
             rect.center(),
             EyedropperTarget::GradeCurve {
+                stage: photonic_core::timeline::GradeInspectionStage::Clip,
                 graph_node: None,
                 seq: sequence_id,
                 track: track_id,
@@ -8374,6 +8552,7 @@ mod reference_still_tests {
         doc.timeline = Some(project);
         let mut history = CommandHistory::new(20);
         let target = EyedropperTarget::GradeQualifier {
+            stage: photonic_core::timeline::GradeInspectionStage::Clip,
             graph_node: None,
             seq: sequence_id,
             track: track_id,
@@ -8391,6 +8570,9 @@ mod reference_still_tests {
             }))
             .unwrap();
         app.video_eyedropper_job = Some(VideoEyedropperJob {
+            selected_clips: app.timeline_selection.clone(),
+            document_id: doc.id,
+            canceled: false,
             target: target.clone(),
             sequence: sequence_id,
             time: Tick::ZERO,
@@ -8415,6 +8597,7 @@ mod reference_still_tests {
         assert!(lum[0] <= l && l <= lum[1]);
         let seeded_hue = *hue;
         app.eyedropper.target = Some(EyedropperTarget::GradeQualifier {
+            stage: photonic_core::timeline::GradeInspectionStage::Clip,
             graph_node: None,
             seq: sequence_id,
             track: track_id,
@@ -8447,6 +8630,7 @@ mod reference_still_tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].mode, photonic_core::timeline::QualifierKeyMode::Add);
         app.eyedropper.target = Some(EyedropperTarget::GradeQualifier {
+            stage: photonic_core::timeline::GradeInspectionStage::Clip,
             graph_node: None,
             seq: sequence_id,
             track: track_id,
@@ -8469,6 +8653,7 @@ mod reference_still_tests {
         assert!(!changed);
         assert_eq!(history.revision(), 2);
         app.eyedropper.target = Some(EyedropperTarget::GradeQualifier {
+            stage: photonic_core::timeline::GradeInspectionStage::Clip,
             graph_node: None,
             seq: sequence_id,
             track: track_id,
@@ -8524,6 +8709,9 @@ mod reference_still_tests {
             }))
             .unwrap();
         app.video_eyedropper_job = Some(VideoEyedropperJob {
+            selected_clips: app.timeline_selection.clone(),
+            document_id: doc.id,
+            canceled: false,
             target,
             sequence: sequence_id,
             time: Tick::ZERO,
@@ -8571,6 +8759,7 @@ mod reference_still_tests {
             graph_node: Some(2),
         };
         let eye = EyedropperTarget::GradeCurve {
+            stage: photonic_core::timeline::GradeInspectionStage::Clip,
             seq: target.sequence,
             track: target.track,
             clip: target.clip,
@@ -8582,6 +8771,9 @@ mod reference_still_tests {
         app.eyedropper.target = Some(eye.clone());
         let (sender, receiver) = std::sync::mpsc::channel();
         app.video_eyedropper_job = Some(VideoEyedropperJob {
+            selected_clips: app.timeline_selection.clone(),
+            document_id: doc.id,
+            canceled: false,
             target: eye,
             sequence: target.sequence,
             time: Tick::ZERO,
@@ -8591,11 +8783,15 @@ mod reference_still_tests {
         });
         app.change_grade_input_selection(&egui::Context::default(), &doc, target);
         assert!(app.eyedropper.target.is_none());
+        assert!(app.video_eyedropper_job.as_ref().unwrap().canceled);
+        sender.send(None).unwrap();
+        let mut doc = doc;
+        let mut history = CommandHistory::new(20);
+        let mut changed = false;
+        app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut changed);
         assert!(app.video_eyedropper_job.is_none());
-        assert!(
-            sender.send(None).is_err(),
-            "a pending result cannot reach the changed input selection"
-        );
+        assert!(!changed);
+        assert_eq!(history.revision(), 0);
         assert_eq!(serde_json::to_value(&doc).unwrap(), before);
     }
 
@@ -8614,7 +8810,114 @@ mod reference_still_tests {
         check_native_correction_input_sampling(true, true, Some(2));
     }
 
+    #[test]
+    fn interrupted_eyedropper_drains_worker_and_rejects_replacement_document() {
+        let mut app = PhotonicApp::default();
+        let mut doc = Document::new("old", 16., 16.);
+        let mut project = TimelineProject::new();
+        let sequence = photonic_core::timeline::Sequence::new(
+            "sample",
+            photonic_core::timeline::FrameRate::FPS_30,
+            16,
+            16,
+        );
+        let seq_id = sequence.id;
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let mut history = CommandHistory::new(20);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        app.video_eyedropper_job = Some(VideoEyedropperJob {
+            selected_clips: app.timeline_selection.clone(),
+            document_id: doc.id,
+            canceled: false,
+            target: EyedropperTarget::GradeCurve {
+                stage: photonic_core::timeline::GradeInspectionStage::LocalLook,
+                seq: SequenceId::new(),
+                track: TrackId::new(),
+                clip: ClipId::new(),
+                op: GradeOpId::new(),
+                graph_node: None,
+                channel: 0,
+            },
+            sequence: seq_id,
+            time: Tick::ZERO,
+            revision: 0,
+            frame_identity: None,
+            receiver,
+        });
+        let mut modified = false;
+        assert!(app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut modified));
+        assert!(!app.video_eyedropper_job.as_ref().unwrap().canceled);
+        doc.id = uuid::Uuid::new_v4();
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut modified = false;
+        assert!(app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut modified));
+        assert!(app.video_eyedropper_job.as_ref().unwrap().canceled);
+        sender.send(Some(photonic_core::Color::WHITE)).unwrap();
+        assert!(!app.finish_video_eyedropper_if_ready(&mut doc, &mut history, &mut modified));
+        assert!(app.video_eyedropper_job.is_none());
+        assert!(!modified);
+        assert_eq!(history.revision(), 0);
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+    }
+
+    #[test]
+    fn native_look_eyedroppers_edit_only_exact_local_and_linked_stages() {
+        for shared in [false, true] {
+            for graph in [false, true] {
+                for curves in [false, true] {
+                    check_native_correction_input_stage(
+                        curves,
+                        graph,
+                        graph.then_some(2),
+                        Some(if shared {
+                            SamplingStageFixture::Shared
+                        } else {
+                            SamplingStageFixture::Local
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SamplingStageFixture {
+        Local,
+        Shared,
+        GroupPre,
+        GroupPost,
+    }
+
+    #[test]
+    fn native_group_member_eyedroppers_edit_exact_pre_and_post_stages() {
+        for stage in [
+            SamplingStageFixture::GroupPre,
+            SamplingStageFixture::GroupPost,
+        ] {
+            for graph in [false, true] {
+                for curves in [false, true] {
+                    check_native_correction_input_stage(
+                        curves,
+                        graph,
+                        graph.then_some(2),
+                        Some(stage),
+                    );
+                }
+            }
+        }
+    }
+
     fn check_native_correction_input_sampling(curves: bool, graph: bool, graph_node: Option<u32>) {
+        check_native_correction_input_stage(curves, graph, graph_node, None);
+    }
+
+    fn check_native_correction_input_stage(
+        curves: bool,
+        graph: bool,
+        graph_node: Option<u32>,
+        look: Option<SamplingStageFixture>,
+    ) {
         use photonic_core::timeline::color::{
             InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
             NativeManagedColorConfig, SequenceColorConfig,
@@ -8732,8 +9035,63 @@ mod reference_still_tests {
                     .unwrap();
             }
         }
-        clip.grade = Some(grade);
+        let stage = if let Some(kind) = look {
+            let mut ordinary = grade.clone();
+            ordinary.ops[1].enabled = false;
+            ordinary.ops[2].enabled = false;
+            clip.grade = Some(ordinary);
+            if kind == SamplingStageFixture::Shared {
+                let id = photonic_core::timeline::SharedLookId::new();
+                project.shared_looks.insert(
+                    id,
+                    photonic_core::timeline::SharedLook {
+                        versions: Vec::new(),
+                        active_version: None,
+                        id,
+                        name: "Linked".into(),
+                        grade,
+                    },
+                );
+                clip.look = Some(photonic_core::timeline::ClipLook::Shared(id));
+                photonic_core::timeline::GradeInspectionStage::SharedLook { id }
+            } else if kind == SamplingStageFixture::Local {
+                clip.look = Some(photonic_core::timeline::ClipLook::Local(Box::new(grade)));
+                photonic_core::timeline::GradeInspectionStage::LocalLook
+            } else {
+                let mut group = photonic_core::timeline::GroupNode::new(
+                    photonic_core::timeline::GroupKind::Normal,
+                );
+                let id = group.id;
+                let pre = kind == SamplingStageFixture::GroupPre;
+                if pre {
+                    group.pre_grade = Some(grade);
+                } else {
+                    group.post_grade = Some(grade);
+                }
+                sequence.groups.insert(id, group);
+                clip.group = Some(id);
+                if pre {
+                    photonic_core::timeline::GradeInspectionStage::GroupPre { id }
+                } else {
+                    photonic_core::timeline::GradeInspectionStage::GroupPost { id }
+                }
+            }
+        } else {
+            clip.grade = Some(grade);
+            photonic_core::timeline::GradeInspectionStage::Clip
+        };
+        let ordinary_before = clip.grade.clone();
         track.clips.push(clip);
+        if matches!(
+            look,
+            Some(SamplingStageFixture::GroupPre | SamplingStageFixture::GroupPost)
+        ) {
+            let mut sibling = track.clips[0].clone();
+            sibling.id = ClipId::new();
+            sibling.start = Tick::from_seconds(1);
+            track.clips.push(sibling);
+        }
+
         sequence.video_tracks.push(track);
         project.insert_sequence(sequence);
         let mut doc = Document::new("native key", 16.0, 16.0);
@@ -8751,7 +9109,14 @@ mod reference_still_tests {
             clip: clip_id,
             op,
         };
-        let point = if curves {
+        let point = if look.is_some() {
+            photonic_video::graph::ScopeTapPoint::GradeStageInput {
+                clip: clip_id,
+                stage,
+                node: graph_node,
+                op,
+            }
+        } else if curves {
             if let Some(node) = graph_node {
                 photonic_video::graph::ScopeTapPoint::NativeGraphCurveInput {
                     clip: clip_id,
@@ -8767,6 +9132,7 @@ mod reference_still_tests {
         let sample_target = || {
             if curves {
                 EyedropperTarget::GradeCurve {
+                    stage,
                     graph_node,
                     seq: sequence_id,
                     track: track_id,
@@ -8776,6 +9142,7 @@ mod reference_still_tests {
                 }
             } else {
                 EyedropperTarget::GradeQualifier {
+                    stage,
                     graph_node,
                     seq: sequence_id,
                     track: track_id,
@@ -8812,7 +9179,7 @@ mod reference_still_tests {
         app.engine = Some(bridge);
         app.timeline_selection.push(clip_id);
         let ctx = egui::Context::default();
-        if !curves {
+        if !curves && look.is_none() {
             app.toggle_qualifier_matte(&ctx, &doc, target);
             assert_eq!(app.qualifier_matte_target, Some(target));
             while app.qualifier_matte_preview.is_none() && std::time::Instant::now() < deadline {
@@ -8844,6 +9211,9 @@ mod reference_still_tests {
                 }))
                 .unwrap();
             app.video_eyedropper_job = Some(VideoEyedropperJob {
+                selected_clips: app.timeline_selection.clone(),
+                document_id: doc.id,
+                canceled: false,
                 target: sample_target(),
                 sequence: sequence_id,
                 time: Tick::ZERO,
@@ -8888,14 +9258,25 @@ mod reference_still_tests {
             linear[0] * 0.0701937225 + linear[1] * 0.9163538791 + linear[2] * 0.0134523985,
             linear[0] * 0.0206155929 + linear[1] * 0.1095697729 + linear[2] * 0.8698146342,
         ];
-        let logs = ap1.map(|v| ((v * 2.0).log2() + 9.72) / 17.52);
+        let logs = ap1.map(|v| {
+            ((v * if look.is_some() && look != Some(SamplingStageFixture::GroupPre) {
+                4.0
+            } else {
+                2.0
+            })
+            .log2()
+                + 9.72)
+                / 17.52
+        });
         let expected_l = (logs.into_iter().fold(f64::INFINITY, f64::min)
             + logs.into_iter().fold(f64::NEG_INFINITY, f64::max))
             / 2.0;
-        let grade = doc.timeline.as_ref().unwrap().sequences[&sequence_id].video_tracks[0].clips[0]
-            .grade
-            .as_ref()
-            .unwrap();
+        let project = doc.timeline.as_ref().unwrap();
+        let current = &project.sequences[&sequence_id].video_tracks[0].clips[0];
+        if look.is_some() {
+            assert_eq!(current.grade, ordinary_before);
+        }
+        let grade = stage.resolve_grade(project, current).unwrap();
         if curves {
             let GradeOpParams::Curves { luma_vs_sat, .. } = &grade.ops[1].params.base else {
                 panic!("curves")
@@ -9652,7 +10033,11 @@ impl PhotonicApp {
                                 clip.start,
                                 track.name.as_str(),
                                 clip.id,
-                                clip.name.as_str(),
+                                if clip.name.trim().is_empty() {
+                                    format!("Shot {}", &clip.id.to_string()[..8])
+                                } else {
+                                    clip.name.clone()
+                                },
                                 source,
                             )
                         })
@@ -9780,6 +10165,16 @@ impl PhotonicApp {
         if !bridge.prepare_full_preview() {
             self.reference_still_status = Some("Could not request a full-quality frame".into());
             return;
+        }
+        if matches!(
+            sequence.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        ) && u64::from(sequence.format().width) * u64::from(sequence.format().height)
+            <= photonic_core::timeline::native_balance::NATIVE_BALANCE_MAX_PIXELS
+        {
+            bridge.session.send(photonic_video::EngineCmd::SetScopeTap(
+                photonic_video::graph::ScopeTapPoint::NativeSceneProgram,
+            ));
         }
         bridge.seek(self.playhead);
         let source_clip = sequence
@@ -9943,9 +10338,69 @@ impl PhotonicApp {
                         "Printer lights · R {:+.1}  G {:+.1}  B {:+.1}",
                         preview.points[0], preview.points[1], preview.points[2]
                     ));
-                    ui.label("Global balance from the central 80% of usable pixels; inspect the result after applying.");
+                    ui.label(if still.color.is_legacy() {
+                        "Legacy SDR balance from the central 80% of usable pixels; inspect the result after applying."
+                    } else {
+                        "Scene-linear AP1 balance from opaque positive channels, capped at two stops. Different subjects or later nonlinear grades can mislead it; inspect the result."
+                    });
                     if ui.button("Apply shot match").clicked() {
                         self.apply_shot_match(doc, history);
+                    }
+                }
+            }
+            if let Some(origin) = &still.copied_from {
+                let source = doc
+                    .timeline
+                    .as_ref()
+                    .and_then(|p| p.sequences.get(&origin.sequence_id))
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| "removed sequence".into());
+                ui.label(format!("Copied reference · original gallery: {source}"));
+            }
+            let mut destinations: Vec<_> = doc
+                .timeline
+                .as_ref()
+                .map(|p| {
+                    p.sequences
+                        .values()
+                        .filter(|s| s.id != sequence_id)
+                        .map(|s| (s.id, s.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            destinations.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+            if !destinations.is_empty() {
+                let key = ui
+                    .id()
+                    .with(("reference_copy_destination", sequence_id, still.id));
+                let mut destination = ui
+                    .data(|d| d.get_temp::<SequenceId>(key))
+                    .filter(|id| destinations.iter().any(|(i, _)| i == id));
+                egui::ComboBox::from_id_salt(("reference_copy_destination", still.id))
+                    .selected_text(
+                        destination
+                            .and_then(|id| {
+                                destinations
+                                    .iter()
+                                    .find(|(i, _)| *i == id)
+                                    .map(|(_, n)| n.as_str())
+                            })
+                            .unwrap_or("Copy to sequence…"),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (id, name) in &destinations {
+                            ui.selectable_value(&mut destination, Some(*id), name);
+                        }
+                    });
+                if let Some(id) = destination {
+                    ui.data_mut(|d| d.insert_temp(key, id));
+                    if ui.button("Copy reference").on_hover_text("Independent gallery entry sharing the pinned image; source is unchanged").clicked() {
+                        if let Some(project)=doc.timeline.as_ref() {
+                            match photonic_core::timeline::reference_gallery::copy_reference_still(project,sequence_id,id,still.id,None) {
+                                Ok(cmd)=>{history.execute_discrete(Command::Timeline(cmd),doc);self.reference_still_status=Some("Reference copied to destination gallery".into());},
+                                Err(e)=>self.reference_still_status=Some(format!("Reference copy refused: {e}")),
+                            }
+                        }
                     }
                 }
             }
@@ -9985,7 +10440,9 @@ impl PhotonicApp {
                 .is_some_and(|job| matches(&job.target))
         {
             self.eyedropper.cancel();
-            self.video_eyedropper_job = None;
+            if let Some(job) = self.video_eyedropper_job.as_mut() {
+                job.canceled = true;
+            }
             self.reference_still_status = Some("Choose a sample from the new graph input".into());
         }
         if self.qualifier_matte_target.is_some_and(|old| {
@@ -10004,11 +10461,18 @@ impl PhotonicApp {
         doc: &Document,
         target: QualifierMatteTarget,
     ) {
+        self.eyedropper.cancel();
+        if let Some(job) = self.video_eyedropper_job.as_mut() {
+            job.canceled = true;
+        }
         let native = doc
             .timeline
             .as_ref()
             .and_then(|project| project.sequences.get(&target.sequence))
             .is_some_and(|sequence| !sequence.color.is_legacy());
+        self.grade_matte_target = None;
+        self.grade_matte_job = None;
+        self.grade_matte_preview = None;
         let valid = doc
             .timeline
             .as_ref()
@@ -10235,13 +10699,14 @@ impl PhotonicApp {
         std::thread::spawn(move || {
             let result = (|| -> Result<_, String> {
                 let matte = if let Some(key) = native_key {
-                    photonic_render::grade_gpu::native_qualifier_matte_gpu(
+                    photonic_render::grade_gpu::native_qualifier_matte_with_spatial_gpu(
                         gpu.device(),
                         gpu.queue(),
                         &texture,
                         &key.qualifier,
                         key.mask.as_ref(),
                         (width, height),
+                        key.spatial,
                     )
                     .map_err(str::to_owned)?
                 } else {
@@ -10282,7 +10747,10 @@ impl PhotonicApp {
         let Some(job) = self.video_eyedropper_job.as_ref() else {
             return false;
         };
-        let stale = history.revision() != job.revision
+        let stale = job.canceled
+            || self.timeline_selection != job.selected_clips
+            || doc.id != job.document_id
+            || history.revision() != job.revision
             || self.playhead != job.time
             || doc.timeline.as_ref().and_then(|p| p.active_sequence) != Some(job.sequence)
             || job.frame_identity.is_some_and(|identity| {
@@ -10294,10 +10762,20 @@ impl PhotonicApp {
                     })
             });
         if stale {
-            self.video_eyedropper_job = None;
+            // Drain the one bounded worker before permitting another readback.
+            // Closing/changing a scope never lets an old sample mutate a new document.
+            let pending = matches!(
+                job.receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            );
+            if pending {
+                self.video_eyedropper_job.as_mut().unwrap().canceled = true;
+            } else {
+                self.video_eyedropper_job = None;
+            }
             self.reference_still_status =
-                Some("Video colour sample canceled: frame changed".into());
-            return false;
+                Some("Video colour sample canceled: context changed".into());
+            return pending;
         }
         match job.receiver.try_recv() {
             Ok(Some(color)) => {
@@ -10334,6 +10812,11 @@ impl PhotonicApp {
         doc: &Document,
         history: &CommandHistory,
     ) {
+        if self.video_eyedropper_job.is_some() {
+            self.reference_still_status =
+                Some("A previous sample is finishing; try again shortly".into());
+            return;
+        }
         let Some((image_rect, hit_rect)) = self.video_sample_rect else {
             return;
         };
@@ -10360,9 +10843,53 @@ impl PhotonicApp {
             .as_ref()
             .and_then(|p| p.sequences.get(&frame.sequence))
             .is_some_and(|s| !s.color.is_legacy());
+        if !native
+            && matches!(&target,
+            EyedropperTarget::GradeQualifier { stage, .. } | EyedropperTarget::GradeCurve { stage, .. }
+            if *stage != photonic_core::timeline::GradeInspectionStage::Clip)
+        {
+            self.reference_still_status =
+                Some("Look input sampling requires Native Managed".into());
+            return;
+        }
         let texture = if native {
             use photonic_video::graph::ScopeTapPoint;
             let (seq, point, input_available) = match &target {
+                EyedropperTarget::GradeQualifier {
+                    stage,
+                    seq,
+                    clip,
+                    op,
+                    graph_node,
+                    ..
+                }
+                | EyedropperTarget::GradeCurve {
+                    stage,
+                    seq,
+                    clip,
+                    op,
+                    graph_node,
+                    ..
+                } if *stage != photonic_core::timeline::GradeInspectionStage::Clip => {
+                    let available = photonic_video::graph::compile::NativeStageGradeInput::find(
+                        &frame.native_stage_grade_inputs,
+                        *clip,
+                        *stage,
+                        *graph_node,
+                        *op,
+                    )
+                    .is_some();
+                    (
+                        *seq,
+                        ScopeTapPoint::GradeStageInput {
+                            clip: *clip,
+                            stage: *stage,
+                            node: *graph_node,
+                            op: *op,
+                        },
+                        available,
+                    )
+                }
                 EyedropperTarget::GradeQualifier {
                     graph_node,
                     seq,
@@ -10503,6 +11030,9 @@ impl PhotonicApp {
             let _ = sender.send(sampled);
         });
         self.video_eyedropper_job = Some(VideoEyedropperJob {
+            selected_clips: self.timeline_selection.clone(),
+            document_id: doc.id,
+            canceled: false,
             target,
             sequence: frame.sequence,
             time: self.playhead,
@@ -10529,8 +11059,13 @@ impl PhotonicApp {
         let Some(sequence) = project.sequences.get(&sequence_id) else {
             return;
         };
-        if !sequence.color.is_legacy() {
-            self.reference_still_status = Some("Shot match currently requires Legacy SDR".into());
+        let native = matches!(
+            sequence.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        );
+        if !sequence.color.is_legacy() && !native {
+            self.reference_still_status =
+                Some("Shot match requires Legacy SDR or Native Managed color".into());
             return;
         }
         let visible: Vec<_> = sequence
@@ -10558,6 +11093,22 @@ impl PhotonicApp {
             self.reference_still_status = Some("Reference color or format changed".into());
             return;
         }
+        if native
+            && still.native_balance.as_ref().is_none_or(|balance| {
+                balance
+                    .validate_for_image(
+                        &still.image_hash,
+                        sequence.format().width,
+                        sequence.format().height,
+                    )
+                    .is_err()
+            })
+        {
+            self.reference_still_status = Some(
+                "Reference has no valid scene-linear balance measurement; capture it again".into(),
+            );
+            return;
+        }
         let Some(bridge) = self.engine.as_mut() else {
             return;
         };
@@ -10566,6 +11117,11 @@ impl PhotonicApp {
         if !bridge.prepare_full_preview() {
             self.reference_still_status = Some("Could not request a full-quality frame".into());
             return;
+        }
+        if native {
+            bridge.session.send(photonic_video::EngineCmd::SetScopeTap(
+                photonic_video::graph::ScopeTapPoint::NativeSceneProgram,
+            ));
         }
         bridge.seek(self.playhead);
         self.pending_shot_match = Some(PendingShotMatch {
@@ -10696,6 +11252,30 @@ impl PhotonicApp {
         else {
             return;
         };
+        let native = matches!(
+            sequence.color,
+            photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+        );
+        let reference_balance = still.native_balance.clone();
+        let scene_texture = if native {
+            if frame.output_encoding != photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay
+                || frame.scope_tap_point != photonic_video::graph::ScopeTapPoint::NativeSceneProgram
+                || frame.scope_tap_encoding
+                    != Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+                || frame
+                    .scope_tap
+                    .as_ref()
+                    .is_none_or(|tap| (tap.width, tap.height) != (w, h))
+            {
+                self.pending_shot_match = Some(request);
+                return;
+            }
+            Some(std::sync::Arc::clone(
+                &frame.scope_tap.as_ref().unwrap().texture,
+            ))
+        } else {
+            None
+        };
         let expected_hash = still.image_hash.clone();
         let gpu = photonic_video::GpuContext::new(
             std::sync::Arc::clone(bridge.gpu().device()),
@@ -10712,6 +11292,28 @@ impl PhotonicApp {
                 let reference = photonic_core::RasterImage::from_encoded(&bytes)?;
                 if (reference.width, reference.height) != (w, h) {
                     return Err("reference dimensions changed".into());
+                }
+                if let Some(scene_texture) = scene_texture {
+                    let reference_balance = reference_balance
+                        .ok_or("reference has no scene-linear balance measurement")?;
+                    reference_balance
+                        .validate_for_image(&expected_hash, w, h)
+                        .map_err(str::to_string)?;
+                    let scene = photonic_video::graph::eval::read_texture_rgba16f(
+                        &gpu,
+                        &scene_texture,
+                        w,
+                        h,
+                    );
+                    let current =
+                        photonic_video::native_shot_match::measure_native_balance(&scene, w, h)
+                            .map_err(str::to_string)?;
+                    return photonic_video::native_shot_match::suggest_native_printer_lights(
+                        &reference_balance.summary,
+                        &current,
+                    )
+                    .map(Some)
+                    .map_err(str::to_string);
                 }
                 let pixels =
                     photonic_video::graph::eval::read_texture_rgba16f(&gpu, &texture, w, h);
@@ -10964,6 +11566,7 @@ impl PhotonicApp {
                     );
                     asset.content_hash = Some(capture.hash);
                     let still = ReferenceStill {
+                        copied_from: None,
                         id: capture.id,
                         name: format!("Still {}", sequence.reference_stills.len() + 1),
                         image_asset: asset.id,
@@ -10972,6 +11575,7 @@ impl PhotonicApp {
                         source_time: job.request.time,
                         grade_revision: job.request.revision,
                         color: sequence.color.clone(),
+                        native_balance: capture.native_balance,
                         format_index: sequence.active_format,
                     };
                     let mut projected = doc.timeline.as_ref().unwrap().clone();
@@ -11062,6 +11666,28 @@ impl PhotonicApp {
             self.reference_still_status = Some("Capture failed: frame format changed".into());
             return;
         }
+        let scene_texture = if expected_encoding
+            == photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay
+            && u64::from(w) * u64::from(h)
+                <= photonic_core::timeline::native_balance::NATIVE_BALANCE_MAX_PIXELS
+        {
+            if frame.scope_tap_point != photonic_video::graph::ScopeTapPoint::NativeSceneProgram
+                || frame.scope_tap_encoding
+                    != Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+                || frame
+                    .scope_tap
+                    .as_ref()
+                    .is_none_or(|tap| (tap.width, tap.height) != (w, h))
+            {
+                self.pending_reference_still = Some(request);
+                return;
+            }
+            Some(std::sync::Arc::clone(
+                &frame.scope_tap.as_ref().unwrap().texture,
+            ))
+        } else {
+            None
+        };
         let id = uuid::Uuid::new_v4();
         let relative = std::path::PathBuf::from("reference-stills").join(format!("{id}.png"));
         let path = request
@@ -11089,6 +11715,21 @@ impl PhotonicApp {
                 if worker_canceled.load(Ordering::Acquire) {
                     return Err("canceled".into());
                 }
+                let native_summary = if let Some(scene_texture) = scene_texture {
+                    let scene = photonic_video::graph::eval::read_texture_rgba16f(
+                        &gpu,
+                        &scene_texture,
+                        w,
+                        h,
+                    );
+                    // Validate coverage/finite values against the same display
+                    // frame before accepting optional assistance metadata.
+                    photonic_render::scene_measurement::measure_pair(&scene, &pixels, w, h)
+                        .map_err(str::to_string)?;
+                    photonic_video::native_shot_match::measure_native_balance(&scene, w, h).ok()
+                } else {
+                    None
+                };
                 let temporary = path.with_extension("tmp.png");
                 let written = photonic_video::export::write_frame_png_encoded(
                     &photonic_video::export::flatten_pixels(&pixels),
@@ -11114,7 +11755,14 @@ impl PhotonicApp {
                     let _ = std::fs::remove_file(&path);
                     return Err("could not hash reference image".into());
                 };
+                let native_balance = native_summary.map(|summary| {
+                    photonic_core::timeline::native_balance::NativeReferenceBalance {
+                        summary,
+                        image_hash: image_hash.clone(),
+                    }
+                });
                 Ok(ReferenceStillCapture {
+                    native_balance,
                     id,
                     relative,
                     path: path.clone(),
@@ -11140,5 +11788,92 @@ impl PhotonicApp {
             receiver,
         });
         self.reference_still_status = Some("Writing reference still in background…".into());
+    }
+}
+
+impl PhotonicApp {
+    fn draw_video_keyframe_editor(
+        &mut self,
+        ctx: &egui::Context,
+        doc: &mut Document,
+        history: &mut CommandHistory,
+    ) {
+        if self.mode != AppMode::Video {
+            return;
+        }
+        crate::panels::video::keyframe_editor::draw_window(
+            ctx,
+            doc,
+            history,
+            &mut self.keyframe_editor_target,
+            &self.timeline_selection,
+            self.playhead,
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyframe_workspace_tests {
+    use super::*;
+    use photonic_core::timeline::{
+        Clip, ClipSource, FrameRate, Sequence, TimelineProject, Track, TrackKind,
+    };
+
+    #[test]
+    fn keyframe_window_is_visible_in_edit_and_color_workspaces_without_edits() {
+        for color in [false, true] {
+            let mut app = PhotonicApp::default();
+            app.mode = AppMode::Video;
+            app.color_workspace_open = color;
+            let mut doc = Document::new("workspace", 16.0, 16.0);
+            let mut project = TimelineProject::new();
+            let mut sequence = Sequence::new("Sequence", FrameRate::FPS_30, 16, 16);
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick::from_seconds(1));
+            let id = clip.id;
+            track.clips.push(clip);
+            sequence.video_tracks.push(track);
+            project.active_sequence = Some(sequence.id);
+            project.insert_sequence(sequence);
+            doc.timeline = Some(project);
+            app.timeline_selection = vec![id];
+            app.keyframe_editor_target = Some(id);
+            let before = serde_json::to_value(&doc).unwrap();
+            let mut history = CommandHistory::new(20);
+            let revision = history.revision();
+            let ctx = egui::Context::default();
+            let mut text = String::new();
+            fn gather(shape: &egui::Shape, text: &mut String) {
+                match shape {
+                    egui::Shape::Text(t) => text.push_str(&t.galley.job.text),
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            gather(shape, text)
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for frame in 0..4 {
+                let output = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 800.0),
+                        )),
+                        time: Some(frame as f64),
+                        ..Default::default()
+                    },
+                    |ctx| app.draw_video_keyframe_editor(ctx, &mut doc, &mut history),
+                );
+                for shape in output.shapes {
+                    gather(&shape.shape, &mut text);
+                }
+            }
+            assert!(text.contains("Keyframes"), "color={color}: {text}");
+            assert_eq!(app.keyframe_editor_target, Some(id));
+            assert_eq!(history.revision(), revision);
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        }
     }
 }

@@ -196,10 +196,14 @@ pub(crate) fn capture(
             "output_rate": resolved.out_rate, "start_tick": resolved.start.0,
             "end_tick": resolved.end.0, "total_frames": resolved.total_frames,
             "preset": resolved.preset, "options": job.options,
+            "caption_notes": project.sequences.get(&job.sequence).map(|seq| {
+                if !matches!(seq.color,photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)){return Vec::new();}
+                seq.caption_tracks.iter().filter(|t|t.enabled).flat_map(|t|t.cues.iter().filter(|c|c.start<resolved.end && c.end>resolved.start).filter_map(|c|crate::graph::compile::caption_sweep_direction_note(t,c))).collect::<Vec<_>>()
+            }).unwrap_or_default(),
         }),
         project_pool_sources: source_inventory(project, cancel)?,
         source_verification: "full_bytes_before_and_after_render_project_pool".into(),
-        toolchain: json!({"ffmpeg_version": ffmpeg_version, "ffmpeg_full_hash": full_hash(&tools.ffmpeg, cancel)?, "ffprobe_full_hash": full_hash(&tools.ffprobe, cancel)?}),
+        toolchain: json!({"ffmpeg_version": ffmpeg_version, "ffmpeg_full_hash": full_hash(&tools.ffmpeg, cancel)?, "ffprobe_full_hash": full_hash(&tools.ffprobe, cancel)?, "available_subject_matte_implementation": {"model":"U2NetP", "sha256":photonic_matte::PINNED_MODEL_SHA256, "input_encoding":"bounded_srgb_from_unassociated_ap1", "source_alpha":"separate_from_raw_matte_weight", "note":"implementation identity, not a claim that a model was used by this render"}}),
         output_file,
         output_full_hash: String::new(),
     })
@@ -303,6 +307,121 @@ mod tests {
             output_file: root.join("delivery.mov").file_name().unwrap().into(),
             output_full_hash: String::new(),
         }
+    }
+
+    #[test]
+    fn persisted_animation_floats_roundtrip_bit_exactly() {
+        let values = [
+            0.09638437298605207_f64,
+            0.09643390813287307,
+            0.09645425414426517,
+            0.09643275287634033,
+            -0.09638437298605207,
+            f64::MIN_POSITIVE,
+            f64::MAX,
+            f64::from_bits(1),
+            -0.0,
+        ];
+        for value in values {
+            let encoded = serde_json::to_vec(&value).unwrap();
+            let recovered: f64 = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                value.to_bits(),
+                recovered.to_bits(),
+                "JSON changed {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_json_float_patterns_keep_their_bits() {
+        let mut bits = 0x9e3779b97f4a7c15_u64;
+        for _ in 0..10_000 {
+            bits ^= bits << 13;
+            bits ^= bits >> 7;
+            bits ^= bits << 17;
+            let value = f64::from_bits(bits);
+            if value.is_finite() {
+                let text = serde_json::to_string(&value).unwrap();
+                let parsed: f64 = serde_json::from_str(&text).unwrap();
+                assert_eq!(value.to_bits(), parsed.to_bits(), "{text}");
+            }
+            let value = f32::from_bits(bits as u32);
+            if value.is_finite() {
+                let text = serde_json::to_string(&value).unwrap();
+                let parsed: f32 = serde_json::from_str(&text).unwrap();
+                assert_eq!(value.to_bits(), parsed.to_bits(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn tracked_fractional_manifest_roundtrips_and_rejects_tampering() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Interp, Keyframe, PropPath, PropValue, Sequence, Tick,
+            Track, TrackKind,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "photonic-fractional-manifest-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let output = root.join("delivery.mov");
+        std::fs::write(&output, b"fixture output identity").unwrap();
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Fractional tracked keys", FrameRate::FPS_30, 16, 16);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(
+            ClipSource::SolidColor {
+                color: photonic_core::Color::new(0.2, 0.3, 0.4, 1.0),
+            },
+            Tick::ZERO,
+            Tick(100),
+        );
+        clip.transform
+            .track_mut(&PropPath::new("transform.x"))
+            .insert_keyframe(Keyframe::new(
+                Tick(0),
+                PropValue::Float(0.09638437298605207),
+                Interp::Linear,
+            ));
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        let mut document = photonic_core::Document::new("Fractional", 16.0, 16.0);
+        document.timeline = Some(project.clone());
+        let mut record = fixture(&root, &project);
+        record.embedded_document_hash =
+            Some(canonical_hash(serde_json::to_value(&document).unwrap()).unwrap());
+        record.embedded_document = Some(document);
+        publish(record, &project, &output, &AtomicBool::new(false)).unwrap();
+        let path = manifest_path(&output);
+        let original = verify_manifest(&path).unwrap();
+        let mut recovered = original.clone();
+        assert_eq!(
+            serde_json::to_value(&recovered.timeline_snapshot).unwrap(),
+            serde_json::to_value(&project).unwrap()
+        );
+        recovered
+            .timeline_snapshot
+            .sequences
+            .values_mut()
+            .next()
+            .unwrap()
+            .name
+            .push_str(" changed");
+        std::fs::write(&path, serde_json::to_vec_pretty(&recovered).unwrap()).unwrap();
+        assert!(read_manifest(&path).is_err());
+        let mut document_changed = original;
+        document_changed
+            .embedded_document
+            .as_mut()
+            .unwrap()
+            .name
+            .push_str(" changed");
+        std::fs::write(&path, serde_json::to_vec_pretty(&document_changed).unwrap()).unwrap();
+        assert!(read_manifest(&path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

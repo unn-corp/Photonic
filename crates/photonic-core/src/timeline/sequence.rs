@@ -275,17 +275,32 @@ fn is_tick_zero(t: &Tick) -> bool {
 /// the media pool; its file may be missing after relink, but metadata survives.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReferenceStill {
+    /// Original gallery identity for an explicitly copied immutable reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copied_from: Option<ReferenceStillOrigin>,
     pub id: uuid::Uuid,
     pub name: String,
     pub image_asset: AssetId,
     /// Full-file hash of the captured PNG; independent of mutable media metadata.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub image_hash: String,
+    /// Optional same-frame scene-linear measurement; absent on older references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_balance: Option<super::native_balance::NativeReferenceBalance>,
     pub source_clip: Option<ClipId>,
     pub source_time: Tick,
     /// Document revision of the rendered frame, not the later gallery edit.
     pub grade_revision: u64,
     pub color: super::color::SequenceColorConfig,
+    pub format_index: usize,
+}
+
+/// Capture provenance stays stable through repeated gallery copies. It is not
+/// a live link and may outlive the original sequence or still.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ReferenceStillOrigin {
+    pub sequence_id: SequenceId,
+    pub still_id: uuid::Uuid,
     pub format_index: usize,
 }
 

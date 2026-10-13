@@ -257,6 +257,41 @@ impl HeadlessRenderer {
         h: u32,
         opts: &ExportOptions,
     ) -> (Vec<u8>, u32, u32) {
+        self.render_rgba_with_fit(document, w, h, opts, false)
+    }
+
+    /// Native video vector boundary: authored sRGB paints decoded before linear
+    /// source-over, no canvas-preview margin, and a premultiplied scene readback.
+    /// Unsupported document features fail before GPU work; Legacy stays intact.
+    pub fn render_managed_vector_rgba(
+        &self,
+        document: &Document,
+        w: u32,
+        h: u32,
+    ) -> Result<(Vec<u8>, u32, u32), &'static str> {
+        if w == 0 || h == 0 || w > 8192 || h > 8192 || u64::from(w) * u64::from(h) > 16_777_216 {
+            return Err("managed vector output exceeds bounded canvas");
+        }
+        let document = crate::native_vector::linearized_document(document)?;
+        let opts = ExportOptions {
+            background: ExportBackground::Transparent,
+            ..Default::default()
+        };
+        let result = self.render_rgba_with_fit(&document, w, h, &opts, true);
+        if result.0.len() != (w as usize) * (h as usize) * 4 {
+            return Err("managed vector GPU readback failed");
+        }
+        Ok(result)
+    }
+
+    fn render_rgba_with_fit(
+        &self,
+        document: &Document,
+        w: u32,
+        h: u32,
+        opts: &ExportOptions,
+        exact: bool,
+    ) -> (Vec<u8>, u32, u32) {
         let w = w.max(1);
         let h = h.max(1);
 
@@ -302,6 +337,11 @@ impl HeadlessRenderer {
             view.fit_to_rect(0.0, 0.0, document.width, document.height);
         }
 
+        if exact {
+            view.fit_to_rect_exact(0.0, 0.0, document.width, document.height);
+            view.pan_x = (w as f64 - document.width * view.zoom) * 0.5;
+            view.pan_y = (h as f64 - document.height * view.zoom) * 0.5;
+        }
         let (verts, idxs, segments, blur_jobs) = build_geometry(
             document,
             include_artboard_bg,

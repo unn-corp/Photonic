@@ -133,6 +133,7 @@ const CAPTION_LOOKS: &[(CaptionLook, &str)] = &[
 fn caption_look_style(look: CaptionLook) -> CaptionStyle {
     match look {
         CaptionLook::Clean => CaptionStyle {
+            direction: photonic_core::timeline::TextDirection::Auto,
             font_family: "sans-serif".into(),
             font_size: 42.0,
             weight: 600,
@@ -145,6 +146,7 @@ fn caption_look_style(look: CaptionLook) -> CaptionStyle {
             animation: CaptionAnim::None,
         },
         CaptionLook::Karaoke => CaptionStyle {
+            direction: photonic_core::timeline::TextDirection::Auto,
             font_family: "sans-serif".into(),
             font_size: 52.0,
             weight: 700,
@@ -161,6 +163,7 @@ fn caption_look_style(look: CaptionLook) -> CaptionStyle {
             animation: CaptionAnim::FadeWords,
         },
         CaptionLook::Social => CaptionStyle {
+            direction: photonic_core::timeline::TextDirection::Auto,
             font_family: "sans-serif".into(),
             font_size: 56.0,
             weight: 800,
@@ -343,6 +346,8 @@ fn draw_track_selector(ui: &mut Ui, ctx: &mut PropPanelCtx, seq_id: SequenceId, 
             .map(|t| t.name.clone())
             .unwrap_or_else(|| "—".to_string());
         egui::ComboBox::from_id_salt("caption_track_select")
+            .width((ui.available_width() - 32.0).max(48.0))
+            .truncate()
             .selected_text(selected_name)
             .show_ui(ui, |ui| {
                 for t in &seq.caption_tracks {
@@ -379,7 +384,7 @@ fn draw_track_selector(ui: &mut Ui, ctx: &mut PropPanelCtx, seq_id: SequenceId, 
     });
 
     let new_name_id = id("new_track_name");
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let mut buf: String = ui.data(|d| d.get_temp(new_name_id).unwrap_or_default());
         ui.add(
             egui::TextEdit::singleline(&mut buf)
@@ -430,6 +435,20 @@ fn draw_cue_list(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, track: 
         });
 }
 
+/// Reserve the delete affordance and truncate long summaries, rather than
+/// widening the entire scrolling sidebar and hiding neighboring controls.
+fn cue_summary_button(ui: &mut Ui, editing: bool, text: &str) -> egui::Response {
+    let width = (ui.available_width() - 32.0).max(8.0);
+    ui.add_sized(
+        [width, ui.spacing().interact_size.y],
+        egui::Button::new(text)
+            .selected(editing)
+            .frame(false)
+            .truncate(),
+    )
+    .on_hover_text(text)
+}
+
 fn draw_cue_row(
     ui: &mut Ui,
     ctx: &mut PropPanelCtx,
@@ -448,7 +467,7 @@ fn draw_cue_row(
         } else {
             cue_text.as_str()
         };
-        let resp = ui.selectable_label(editing, row_label);
+        let resp = cue_summary_button(ui, editing, row_label);
         if resp.clicked() {
             *ctx.video.caption_edit_cue = if editing { None } else { Some(cue.id) };
         }
@@ -475,6 +494,32 @@ fn draw_cue_row(
             }
         });
     });
+
+    let managed = ctx
+        .doc
+        .timeline
+        .as_ref()
+        .and_then(|p| p.active_sequence.and_then(|id| p.sequences.get(&id)))
+        .is_some_and(|seq| {
+            matches!(
+                seq.color,
+                photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+            )
+        });
+    if managed {
+        if let Some(note) = photonic_video::graph::compile::caption_sweep_direction_note(track, cue)
+        {
+            ui.add(
+                egui::Label::new(
+                    RichText::new("RTL: using WordPop")
+                        .small()
+                        .color(ui.visuals().warn_fg_color),
+                )
+                .wrap(),
+            )
+            .on_hover_text(note);
+        }
+    }
 
     if !editing {
         return;
@@ -770,29 +815,121 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
     // Draft persists across frames (temp memory) so multi-field edits
     // accumulate before an explicit Apply — undo-spam guard, same discipline
     // `ops_bridge` uses for drag commits (preview locally, commit once).
-    let draft_key = id("style_draft");
-    let draft_target_key = id("style_draft_target");
-    let target_sig = format!("{target:?}");
-    let stored_sig: Option<String> = ui.data(|d| d.get_temp(draft_target_key));
-    let mut draft: CaptionStyle = if stored_sig.as_deref() == Some(target_sig.as_str()) {
-        ui.data(|d| d.get_temp(draft_key))
-            .unwrap_or_else(|| base.clone())
-    } else {
-        base.clone()
-    };
+    let draft_key = id("style_draft").with((ctx.doc.id, track_id, format!("{target:?}")));
+    let mut draft = caption_style_draft(ui, draft_key, &base);
 
+    draw_caption_style_fields(ui, &mut draft, !matches!(target, StyleTarget::Word(..)));
+
+    ui.data_mut(|d| {
+        d.insert_temp(
+            draft_key,
+            CaptionStyleDraft {
+                base: base.clone(),
+                edited: draft.clone(),
+            },
+        )
+    });
+
+    let changed = draft != base;
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(changed, egui::Button::new("Apply"))
+            .clicked()
+        {
+            let old = raw_style_override(track, &target);
+            let cmd = TimelineCmd::CaptionEdit(CaptionCmd::SetStyle {
+                track: track_id,
+                target: target.clone(),
+                old: old.map(Box::new),
+                new: Some(Box::new(draft.clone())),
+            });
+            ctx.action = Some(PanelAction::CaptionEditBatch(vec![cmd]));
+            ui.data_mut(|d| d.remove::<CaptionStyleDraft>(draft_key));
+        }
+        if ui
+            .add_enabled(changed, egui::Button::new("Revert"))
+            .clicked()
+        {
+            ui.data_mut(|d| {
+                d.insert_temp(
+                    draft_key,
+                    CaptionStyleDraft {
+                        base: base.clone(),
+                        edited: base.clone(),
+                    },
+                )
+            });
+        }
+        if !matches!(target, StyleTarget::Track) {
+            let has_override = raw_style_override(track, &target).is_some();
+            if ui
+                .add_enabled(has_override, egui::Button::new("Clear override"))
+                .clicked()
+            {
+                let old = raw_style_override(track, &target);
+                let cmd = TimelineCmd::CaptionEdit(CaptionCmd::SetStyle {
+                    track: track_id,
+                    target: target.clone(),
+                    old: old.map(Box::new),
+                    new: None,
+                });
+                ctx.action = Some(PanelAction::CaptionEditBatch(vec![cmd]));
+                ui.data_mut(|d| d.remove::<CaptionStyleDraft>(draft_key));
+            }
+        }
+    });
+}
+
+#[derive(Clone)]
+struct CaptionStyleDraft {
+    base: CaptionStyle,
+    edited: CaptionStyle,
+}
+fn caption_style_draft(ui: &Ui, key: egui::Id, base: &CaptionStyle) -> CaptionStyle {
+    ui.data(|d| d.get_temp::<CaptionStyleDraft>(key))
+        .filter(|draft| draft.base == *base)
+        .map(|draft| draft.edited)
+        .unwrap_or_else(|| base.clone())
+}
+fn draw_caption_style_fields(ui: &mut Ui, draft: &mut CaptionStyle, paragraph_editable: bool) {
+    let controls = (ui.available_width() - 86.0).clamp(64.0, 180.0);
     egui::Grid::new("cap_style_grid")
         .num_columns(2)
+        .max_col_width(controls)
         .spacing([6.0, 4.0])
         .show(ui, |ui| {
+            ui.label("Direction:");
+            ui.add_enabled_ui(paragraph_editable, |ui| {
+                egui::ComboBox::from_id_salt("caption_direction")
+                    .truncate()
+                    .width(controls)
+                    .selected_text(match draft.direction {
+                        photonic_core::timeline::TextDirection::Auto => "Auto",
+                        photonic_core::timeline::TextDirection::Ltr => "Left to right",
+                        photonic_core::timeline::TextDirection::Rtl => "Right to left",
+                    })
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (photonic_core::timeline::TextDirection::Auto, "Auto"),
+                            (photonic_core::timeline::TextDirection::Ltr, "Left to right"),
+                            (photonic_core::timeline::TextDirection::Rtl, "Right to left"),
+                        ] {
+                            ui.selectable_value(&mut draft.direction, value, label);
+                        }
+                    });
+            })
+            .response
+            .on_hover_text("Paragraph direction is edited at Track or Cue scope.");
+            ui.end_row();
             ui.label("Font:");
-            ui.text_edit_singleline(&mut draft.font_family);
+            ui.add(egui::TextEdit::singleline(&mut draft.font_family).desired_width(controls));
             ui.end_row();
 
             ui.label("Size:");
             ui.add(
                 egui::DragValue::new(&mut draft.font_size)
                     .range(8.0..=200.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.5),
             );
             ui.end_row();
@@ -801,6 +938,7 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.add(
                 egui::DragValue::new(&mut draft.weight)
                     .range(100..=900)
+                    .clamp_existing_to_range(false)
                     .speed(10.0),
             );
             ui.end_row();
@@ -810,13 +948,18 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.end_row();
 
             ui.label("Stroke:");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let mut has_stroke = draft.stroke.is_some();
                 ui.checkbox(&mut has_stroke, "");
                 if has_stroke {
                     let (mut c, mut w) = draft.stroke.unwrap_or((Color::BLACK, 2.0));
                     ColorPopup::swatch_color(ui, &mut c);
-                    ui.add(egui::DragValue::new(&mut w).range(0.0..=20.0).speed(0.1));
+                    ui.add(
+                        egui::DragValue::new(&mut w)
+                            .range(0.0..=20.0)
+                            .clamp_existing_to_range(false)
+                            .speed(0.1),
+                    );
                     draft.stroke = Some((c, w));
                 } else {
                     draft.stroke = None;
@@ -825,7 +968,7 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.end_row();
 
             ui.label("Background:");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let mut has_bg = draft.background.is_some();
                 ui.checkbox(&mut has_bg, "");
                 if has_bg {
@@ -836,9 +979,17 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
                     });
                     ColorPopup::swatch_color(ui, &mut bg.color);
                     ui.label("radius");
-                    ui.add(egui::DragValue::new(&mut bg.corner_radius).range(0.0..=40.0));
+                    ui.add(
+                        egui::DragValue::new(&mut bg.corner_radius)
+                            .range(0.0..=40.0)
+                            .clamp_existing_to_range(false),
+                    );
                     ui.label("pad");
-                    ui.add(egui::DragValue::new(&mut bg.padding).range(0.0..=40.0));
+                    ui.add(
+                        egui::DragValue::new(&mut bg.padding)
+                            .range(0.0..=40.0)
+                            .clamp_existing_to_range(false),
+                    );
                     draft.background = Some(bg);
                 } else {
                     draft.background = None;
@@ -847,15 +998,17 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.end_row();
 
             ui.label("Position:");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.add(
                     egui::DragValue::new(&mut draft.position[0])
                         .range(0.0..=1.0)
+                        .clamp_existing_to_range(false)
                         .speed(0.01),
                 );
                 ui.add(
                     egui::DragValue::new(&mut draft.position[1])
                         .range(0.0..=1.0)
+                        .clamp_existing_to_range(false)
                         .speed(0.01),
                 );
             });
@@ -865,12 +1018,15 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.add(
                 egui::DragValue::new(&mut draft.max_width)
                     .range(0.05..=1.0)
+                    .clamp_existing_to_range(false)
                     .speed(0.01),
             );
             ui.end_row();
 
             ui.label("Animation:");
             egui::ComboBox::from_id_salt("cap_style_anim")
+                .truncate()
+                .width(controls)
                 .selected_text(anim_label(draft.animation))
                 .show_ui(ui, |ui| {
                     for a in [
@@ -885,7 +1041,7 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.end_row();
 
             ui.label("Karaoke:");
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let mut has_hl = draft.highlight.is_some();
                 ui.checkbox(&mut has_hl, "");
                 if has_hl {
@@ -893,6 +1049,8 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
                         .highlight
                         .unwrap_or_else(|| karaoke_preset(KaraokeMode::FillSweep, draft.fill));
                     egui::ComboBox::from_id_salt("cap_karaoke_mode")
+                        .truncate()
+                        .width((controls - 24.0).max(48.0))
                         .selected_text(karaoke_mode_label(hl.mode))
                         .show_ui(ui, |ui| {
                             for m in [
@@ -913,23 +1071,37 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
             ui.end_row();
         });
 
+    if draft
+        .highlight
+        .is_some_and(|h| h.mode == KaraokeMode::FillSweep)
+    {
+        ui.add(
+            egui::Label::new(
+                RichText::new("Managed FillSweep uses WordPop for right-to-left text.")
+                    .small()
+                    .weak(),
+            )
+            .wrap(),
+        );
+    }
+
     // ── Look chips (also in draft for cue/word scope) ───────────────────────
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Looks:").weak());
         for &(look, label) in CAPTION_LOOKS {
             let style = caption_look_style(look);
             if ui
-                .selectable_label(draft == style, label)
+                .selectable_label(*draft == style, label)
                 .on_hover_text("Apply full style look to this draft (Apply to commit)")
                 .clicked()
             {
-                draft = style;
+                *draft = style;
             }
         }
     });
 
     // ── Karaoke mode chips (highlight only) ─────────────────────────────────
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Karaoke mode:").weak());
         for (label, mode) in [
             ("Fill sweep", KaraokeMode::FillSweep),
@@ -938,52 +1110,6 @@ fn draw_style_editor(ui: &mut Ui, ctx: &mut PropPanelCtx, track_id: TrackId, tra
         ] {
             if ui.small_button(label).clicked() {
                 draft.highlight = Some(karaoke_preset(mode, draft.fill));
-            }
-        }
-    });
-
-    ui.data_mut(|d| {
-        d.insert_temp(draft_key, draft.clone());
-        d.insert_temp(draft_target_key, target_sig);
-    });
-
-    let changed = draft != base;
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(changed, egui::Button::new("Apply"))
-            .clicked()
-        {
-            let old = raw_style_override(track, &target);
-            let cmd = TimelineCmd::CaptionEdit(CaptionCmd::SetStyle {
-                track: track_id,
-                target: target.clone(),
-                old: old.map(Box::new),
-                new: Some(Box::new(draft.clone())),
-            });
-            ctx.action = Some(PanelAction::CaptionEditBatch(vec![cmd]));
-            ui.data_mut(|d| d.remove::<CaptionStyle>(draft_key));
-        }
-        if ui
-            .add_enabled(changed, egui::Button::new("Revert"))
-            .clicked()
-        {
-            ui.data_mut(|d| d.insert_temp(draft_key, base.clone()));
-        }
-        if !matches!(target, StyleTarget::Track) {
-            let has_override = raw_style_override(track, &target).is_some();
-            if ui
-                .add_enabled(has_override, egui::Button::new("Clear override"))
-                .clicked()
-            {
-                let old = raw_style_override(track, &target);
-                let cmd = TimelineCmd::CaptionEdit(CaptionCmd::SetStyle {
-                    track: track_id,
-                    target: target.clone(),
-                    old: old.map(Box::new),
-                    new: None,
-                });
-                ctx.action = Some(PanelAction::CaptionEditBatch(vec![cmd]));
-                ui.data_mut(|d| d.remove::<CaptionStyle>(draft_key));
             }
         }
     });
@@ -1498,5 +1624,115 @@ mod tests {
         let spans = selected_clip_spans(&seq, &[cid]);
         assert_eq!(spans, vec![(Tick(10), Tick(30))]);
         assert!(selected_clip_spans(&seq, &[ClipId::new()]).is_empty());
+    }
+    #[test]
+    fn caption_style_fields_preserve_loaded_values_and_fit_narrow_panel() {
+        let ctx = egui::Context::default();
+        let mut style = CaptionStyle::default();
+        style.direction = photonic_core::timeline::TextDirection::Rtl;
+        style.font_size = 256.0;
+        style.weight = 42;
+        style.position = [-0.2, 1.2];
+        style.max_width = 1.5;
+        style.background = Some(CaptionBackground {
+            color: Color::BLACK,
+            padding: 80.0,
+            corner_radius: 70.0,
+        });
+        style.highlight = Some(karaoke_preset(KaraokeMode::Underline, style.fill));
+        let before = style.clone();
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(208.0, 1200.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let available = ui.available_rect_before_wrap();
+                        draw_caption_style_fields(ui, &mut style, true);
+                        assert!(
+                            ui.min_rect().right() <= available.right() + 1.0,
+                            "caption controls overflow narrow panel: {:?} vs {:?}",
+                            ui.min_rect(),
+                            available
+                        );
+                    });
+                },
+            );
+            assert_eq!(
+                style, before,
+                "passive style controls must not rewrite imported values"
+            );
+        }
+    }
+    #[test]
+    fn caption_style_draft_resets_on_external_edit_and_is_scope_specific() {
+        let ctx = egui::Context::default();
+        let base = CaptionStyle::default();
+        let mut changed = base.clone();
+        changed.font_size += 4.0;
+        let key = egui::Id::new(("doc-a", "track-a", "Track"));
+        let other = egui::Id::new(("doc-b", "track-a", "Track"));
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                key,
+                CaptionStyleDraft {
+                    base: base.clone(),
+                    edited: changed.clone(),
+                },
+            )
+        });
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                assert_eq!(caption_style_draft(ui, key, &base), changed);
+                assert_eq!(caption_style_draft(ui, other, &base), base);
+                let mut restored = base.clone();
+                restored.highlight = Some(karaoke_preset(KaraokeMode::Underline, restored.fill));
+                assert_eq!(
+                    caption_style_draft(ui, key, &restored),
+                    restored,
+                    "Undo or external change discards stale draft"
+                );
+            });
+        });
+    }
+    #[test]
+    fn long_caption_summary_leaves_room_for_delete_in_narrow_sidebar() {
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(208.0, 100.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let available = ui.available_rect_before_wrap();
+                        ui.horizontal(|ui| {
+                            ui.label("0:00.0–0:00.6");
+                            cue_summary_button(
+                                ui,
+                                true,
+                                "A very long caption with Brand שלום and many more words",
+                            );
+                            let _ = ui.small_button("X");
+                        });
+                        assert!(
+                            ui.min_rect().right() <= available.right() + 1.0,
+                            "{:?} vs {:?}",
+                            ui.min_rect(),
+                            available
+                        );
+                    });
+                },
+            );
+        }
     }
 }

@@ -91,6 +91,10 @@ impl PhotonicApp {
             return false;
         }
         match id {
+            "file.save" => {
+                self.ensure_initial_tab(doc, history);
+                self.save_tab(self.active_tab, doc, history);
+            }
             "edit.undo" => {
                 if history.undo(doc) {
                     self.selected_id = doc.selection.ids().next().copied();

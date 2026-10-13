@@ -58,6 +58,15 @@ pub trait FrameProvider {
         Image::new(w, h)
     }
     fn decode_still(&mut self, asset: AssetId, w: u32, h: u32) -> Image;
+    fn native_raster_vector(
+        &mut self,
+        _vref: VectorRef,
+        _key: VectorStateKey,
+        w: u32,
+        h: u32,
+    ) -> Image {
+        Image::new(w, h)
+    }
     fn raster_vector(&mut self, vref: VectorRef, key: VectorStateKey, w: u32, h: u32) -> Image;
 }
 
@@ -114,14 +123,40 @@ pub fn evaluate_at(
                         .expect("input evaluated before consumer (topo order)")
                 })
                 .collect();
-            eval_op(
-                &node.op.at_canvas_scale(canvas_scale),
-                &inputs,
-                cw,
-                ch,
-                provider,
-                native[i],
-            )
+            match (&node.op, inputs.as_slice()) {
+                (
+                    IrOp::Merge {
+                        mode: photonic_core::layer::BlendMode::Normal,
+                        opacity,
+                    },
+                    [top, bottom],
+                ) if graph.working_color_domain
+                    == crate::graph::ir::WorkingColorDomain::SceneLinearAcescg =>
+                {
+                    ops::native_normal_merge(top, bottom, *opacity)
+                }
+                (
+                    IrOp::Merge {
+                        mode: photonic_core::layer::BlendMode::SoftLight,
+                        opacity,
+                    },
+                    [top, bottom],
+                ) if graph.working_color_domain
+                    == crate::graph::ir::WorkingColorDomain::SceneLinearAcescg =>
+                {
+                    ops::native_soft_light_merge(top, bottom, *opacity)
+                }
+                _ => eval_op(
+                    &node
+                        .op
+                        .at_evaluation_scale(canvas_scale, graph.working_color_domain),
+                    &inputs,
+                    cw,
+                    ch,
+                    provider,
+                    native[i],
+                ),
+            }
         };
         if graph.working_color_domain != crate::graph::ir::WorkingColorDomain::LegacyLinearRec709 {
             // Native graph nodes store premultiplied RGB in RGBA16F textures.
@@ -169,6 +204,23 @@ fn eval_op(
     };
 
     match op {
+        IrOp::BezierMatte { window } => {
+            let src = in0();
+            ops::bezier_matte(src.width, src.height, window)
+        }
+        IrOp::WindowMatte { mask } => {
+            let mut image = in0();
+            for (index, pixel) in image.pixels.iter_mut().enumerate() {
+                let w = mask.weight(
+                    (index as u32 % image.width) as f32 / image.width as f32
+                        + 0.5 / image.width as f32,
+                    (index as u32 / image.width) as f32 / image.height as f32
+                        + 0.5 / image.height as f32,
+                );
+                *pixel = [w, w, w, 1.0];
+            }
+            image
+        }
         IrOp::GradeMatteConstant { weight } => {
             let mut image = Image::new(cw, ch);
             image.pixels.fill([*weight, *weight, *weight, 1.0]);
@@ -295,6 +347,53 @@ fn eval_op(
                 normalize_source(image, cw, ch)
             }
         }
+        IrOp::NativeMediaVideo {
+            asset,
+            src_time,
+            input,
+            w,
+            h,
+            native_extent,
+        } => {
+            let image = provider.decode_native_video(*asset, *src_time, input, *w, *h);
+            if (image.width, image.height) != (*w, *h) {
+                Image::new(cw, ch)
+            } else if *native_extent {
+                image
+            } else {
+                normalize_source(image, cw, ch)
+            }
+        }
+        IrOp::NativeMediaStill {
+            asset,
+            w,
+            h,
+            native_extent,
+        } => {
+            let source = provider.decode_still(*asset, *w, *h);
+            if (source.width, source.height) != (*w, *h) {
+                Image::new(cw, ch)
+            } else {
+                let mut image = if *native_extent {
+                    source
+                } else {
+                    normalize_source(source, cw, ch)
+                };
+                let matrix = crate::color::native::linear_srgb_to_ap1();
+                for pixel in &mut image.pixels {
+                    if pixel[3] <= 0. {
+                        *pixel = [0.; 4];
+                        continue;
+                    }
+                    let mapped =
+                        matrix.transform([pixel[0] as f64, pixel[1] as f64, pixel[2] as f64]);
+                    for c in 0..3 {
+                        pixel[c] = mapped[c] as f32;
+                    }
+                }
+                image
+            }
+        }
         IrOp::NativeDecodeStill { asset } => {
             let mut image = normalize_source(provider.decode_still(*asset, cw, ch), cw, ch);
             let matrix = crate::color::native::linear_srgb_to_ap1();
@@ -316,6 +415,31 @@ fn eval_op(
         }
         IrOp::DecodeStill { asset } => {
             normalize_source(provider.decode_still(*asset, cw, ch), cw, ch)
+        }
+        IrOp::NativeRasterVector {
+            vref, doc_state, ..
+        } => {
+            let mut image = normalize_source(
+                provider.native_raster_vector(*vref, *doc_state, cw, ch),
+                cw,
+                ch,
+            );
+            let matrix = crate::color::native::linear_srgb_to_ap1();
+            for pixel in &mut image.pixels {
+                if pixel[3] <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let mapped = matrix.transform([
+                    f64::from(pixel[0]),
+                    f64::from(pixel[1]),
+                    f64::from(pixel[2]),
+                ]);
+                for channel in 0..3 {
+                    pixel[channel] = mapped[channel] as f32;
+                }
+            }
+            image
         }
         IrOp::RasterVector {
             vref,
@@ -440,6 +564,187 @@ fn eval_op(
         },
         // Real kernel: the resolved grade stack (07 §3), the GPU-parity golden.
         IrOp::Grade { ops: grade_ops } => apply_grade_cpu_image(in0(), grade_ops),
+        IrOp::NativeLumaWipe {
+            kind,
+            softness,
+            invert,
+            t,
+        } => match (inputs.first(), inputs.get(1)) {
+            (Some(incoming), Some(outgoing)) => ops::luma_wipe(
+                incoming,
+                outgoing,
+                *kind,
+                *softness,
+                *invert,
+                super::luma_wipe::native_edge(*t, *softness),
+            ),
+            _ => Image::new(cw, ch),
+        },
+        IrOp::NativeDissolve { t } => {
+            let mut image = inputs
+                .get(1)
+                .map_or_else(|| Image::new(cw, ch), |image| (*image).clone());
+            if let Some(incoming) = inputs.first() {
+                for (pixel, incoming) in image.pixels.iter_mut().zip(&incoming.pixels) {
+                    for channel in 0..4 {
+                        pixel[channel] += (incoming[channel] - pixel[channel]) * *t;
+                    }
+                }
+            }
+            image
+        }
+        IrOp::NativeCanvas { .. } => in0(),
+        IrOp::NativeChannelExtract { .. } | IrOp::NativeImageToMask => {
+            let channel = match op {
+                IrOp::NativeChannelExtract { channel } => Some(*channel),
+                _ => None,
+            };
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                *pixel = super::native_channels::extract_pixel(*pixel, channel);
+            }
+            image
+        }
+        IrOp::NativeMaskToImage => {
+            let mut image = in0();
+            for p in &mut image.pixels {
+                *p = [p[0], p[0], p[0], 1.];
+            }
+            image
+        }
+        IrOp::NativeChannelCombine => {
+            let mut image = Image::new(cw, ch);
+            for (i, p) in image.pixels.iter_mut().enumerate() {
+                *p = super::native_channels::combine_pixel(std::array::from_fn(|c| {
+                    inputs
+                        .get(c)
+                        .and_then(|im| im.pixels.get(i))
+                        .map_or(if c == 3 { 1. } else { 0. }, |p| p[0])
+                }));
+            }
+            image
+        }
+        IrOp::NativeInvert => ops::invert(&in0()),
+        IrOp::NativeDenoise {
+            strength,
+            spatial_scale,
+        } => ops::native_denoise(&in0(), *strength, *spatial_scale),
+        IrOp::NativeGrain {
+            amount,
+            monochrome,
+            seed,
+            pixel_scale,
+        } => ops::native_grain(&in0(), *amount, *monochrome, *seed, *pixel_scale),
+        IrOp::NativeVignette { amount, feather } => ops::native_vignette(&in0(), *amount, *feather),
+        IrOp::NativeMaskShape {
+            rect,
+            center,
+            size,
+            rotation,
+            feather,
+        } => ops::native_mask_shape(cw, ch, *rect, *center, *size, *rotation, *feather),
+        IrOp::NativePolygonMask {
+            vertices,
+            center,
+            size,
+            rotation,
+            feather,
+        } => ops::native_polygon_mask(cw, ch, vertices, *center, *size, *rotation, *feather),
+        IrOp::NativeGlow {
+            sigma,
+            threshold,
+            intensity,
+            tint,
+        } => ops::native_glow(&in0(), *sigma, *threshold, *intensity, *tint),
+        IrOp::NativeChromaKey {
+            key,
+            tolerance,
+            softness,
+            spill,
+        } => ops::chroma_key(&in0(), *key, *tolerance, *softness, *spill),
+        IrOp::NativeLumaKey {
+            threshold,
+            softness,
+            invert,
+        } => ops::native_luma_key(&in0(), *threshold, *softness, *invert),
+        IrOp::NativeUnsharp { amount, sigma } => ops::native_unsharp(&in0(), *amount, *sigma),
+        IrOp::NativeOutline {
+            thickness,
+            color,
+            opacity,
+            pixel_scale,
+        } => ops::native_outline(&in0(), *thickness, *color, *opacity, *pixel_scale),
+        IrOp::NativeLinearHsl { vibrance, controls } => {
+            ops::native_linear_hsl(&in0(), *vibrance, *controls)
+        }
+        IrOp::NativeSurfaceBlur {
+            radius,
+            threshold,
+            pixel_scale,
+        } => ops::native_surface_blur(&in0(), *radius, *threshold, *pixel_scale),
+        IrOp::NativeLensBlur {
+            radius,
+            pixel_scale,
+        } => ops::native_lens_blur(&in0(), *radius, *pixel_scale),
+        IrOp::NativeRankFilter {
+            kind,
+            radius,
+            threshold,
+            pixel_scale,
+        } => ops::native_rank_filter(&in0(), *kind, *radius, *threshold, *pixel_scale),
+        IrOp::NativeDeflicker { gain, band } => ops::native_deflicker(&in0(), *gain, *band),
+        IrOp::NativeUnpremultiply => ops::native_unpremultiply(&in0()),
+        IrOp::NativeAlphaView { mode } => ops::native_alpha_view(&in0(), *mode),
+        IrOp::NativeTransferLevels {
+            black_white,
+            gamma,
+            output,
+        } => ops::native_levels(&in0(), *black_white, *gamma, *output),
+        IrOp::NativeTransferCurves { knots, contrast } => {
+            ops::native_transfer_curves(&in0(), *knots, *contrast)
+        }
+        IrOp::NativeColorBalance { shifts, preserve } => {
+            ops::native_color_balance(&in0(), *shifts, *preserve)
+        }
+        IrOp::NativePhotoFilter {
+            color,
+            density,
+            preserve,
+        } => ops::native_photo_filter(&in0(), *color, *density, *preserve),
+        IrOp::NativeTransferMatrix { matrix } => ops::native_transfer_matrix(&in0(), *matrix),
+        IrOp::NativeTransferArtistic { kind, parameter } => {
+            ops::native_transfer_artistic(&in0(), *kind, *parameter)
+        }
+        IrOp::NativeDropShadow {
+            offset,
+            radius,
+            color,
+            opacity,
+            pixel_scale,
+        } => ops::native_drop_shadow(&in0(), *offset, *radius, *color, *opacity, *pixel_scale),
+        IrOp::NativePerspective { inverse } => ops::native_perspective(&in0(), inverse),
+        IrOp::NativeStylize {
+            kind,
+            amount,
+            pixel_scale,
+        } => ops::native_stylize(&in0(), *kind, *amount, *pixel_scale),
+        IrOp::NativeDetail {
+            kind,
+            amount,
+            sigma,
+            threshold,
+            pixel_scale,
+        } => ops::native_detail(&in0(), *kind, *amount, *sigma, *threshold, *pixel_scale),
+        IrOp::NativeGeometricWarp {
+            kind,
+            amount,
+            wavelength,
+            pixel_scale,
+        } => ops::native_geometric_warp(&in0(), *kind, *amount, *wavelength, *pixel_scale),
+        IrOp::NativeBoxBlur { radius } => ops::native_box_blur(&in0(), *radius),
+        IrOp::NativeMosaic { block } => ops::native_mosaic(&in0(), *block),
+        IrOp::NativeMotionBlur { delta } => ops::native_motion_blur(&in0(), *delta),
+        IrOp::NativeGaussianBlur { sigma } => ops::blur(&in0(), *sigma),
         IrOp::NativeExposure { stops } => {
             let gain = stops.exp2();
             let mut image = in0();
@@ -562,6 +867,71 @@ fn eval_op(
             }
             image
         }
+        IrOp::NativeTonalExposure { tonal } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                let alpha = pixel[3];
+                if alpha <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let rgb = tonal.apply([pixel[0] / alpha, pixel[1] / alpha, pixel[2] / alpha]);
+                for c in 0..3 {
+                    pixel[c] = rgb[c] * alpha;
+                }
+            }
+            image
+        }
+        IrOp::NativeRgbMatrix { rows } => {
+            let mut image = in0();
+            for pixel in &mut image.pixels {
+                if pixel[3] <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let rgb = photonic_render::white_balance::apply_matrix(
+                    rows,
+                    [pixel[0], pixel[1], pixel[2]],
+                );
+                pixel[..3].copy_from_slice(&rgb);
+            }
+            image
+        }
+        IrOp::NativeMatteCdl { cdl } => {
+            let mut image = in0();
+            let Some(matte) = inputs.get(1) else {
+                return Image::new(cw, ch);
+            };
+            for (pixel, key) in image.pixels.iter_mut().zip(&matte.pixels) {
+                let alpha = f64::from(pixel[3]);
+                if alpha <= 0.0 {
+                    *pixel = [0.0; 4];
+                    continue;
+                }
+                let weight = key[0].clamp(0.0, 1.0);
+                if weight == 0.0
+                    || (cdl.slope == [1.0; 3]
+                        && cdl.offset == [0.0; 3]
+                        && cdl.power == [1.0; 3]
+                        && cdl.sat == 1.0)
+                {
+                    continue;
+                }
+                let log = crate::color::native::acescg_to_acescct(
+                    [pixel[0], pixel[1], pixel[2]].map(|v| f64::from(v) / alpha),
+                );
+                let corrected =
+                    photonic_render::native_transfer::cdl_no_clamp(log.map(|v| v as f32), *cdl);
+                let mixed = std::array::from_fn(|c| {
+                    log[c] + (f64::from(corrected[c]) - log[c]) * f64::from(weight)
+                });
+                let linear = crate::color::native::acescct_to_acescg(mixed);
+                for c in 0..3 {
+                    pixel[c] = (linear[c] * alpha) as f32;
+                }
+            }
+            image
+        }
         IrOp::NativeLogCdl { cdl } => {
             let mut image = in0();
             for pixel in &mut image.pixels {
@@ -672,15 +1042,30 @@ fn eval_op(
             }
             image
         }
-        IrOp::CaptionOverlay { .. } => in0(), // GPU-only glyph composite (see header); CPU passes through
-        IrOp::MatteExtract { .. } => in0(),   // P8 U²-Net inference
+        IrOp::CaptionOverlay { .. } | IrOp::NativeCaptionOutput { .. } => in0(), // GPU-only glyph composite (see header); CPU passes through
+        IrOp::NativeMatteExtract => Image::new(cw, ch), // asynchronous GPU-source inference only
+        IrOp::MatteExtract { .. } => in0(),             // P8 U²-Net inference
         IrOp::ChannelSplit { .. } => in0(),
         IrOp::ChannelCombine => in0(),
         IrOp::Deinterlace {
             method,
             field_order,
         } => ops::deinterlace(&in0(), *method, *field_order),
-        IrOp::TextGen { .. } => Image::new(cw, ch), // GPU-only glyph composite (see header); CPU emits transparent
+        IrOp::TextGen { .. } | IrOp::NativeTextGen { .. } | IrOp::NativeDecoratedTextGen { .. } => {
+            Image::new(cw, ch)
+        } // GPU-only glyph composite (see header); CPU emits transparent
+        IrOp::NativeLuminanceMerge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
+            (Some(top), Some(bottom)) => ops::native_luminance_merge(top, bottom, *mode, *opacity),
+            _ => Image::new(cw, ch),
+        },
+        IrOp::NativeBoundedMerge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
+            (Some(top), Some(bottom)) => ops::native_bounded_merge(top, bottom, *mode, *opacity),
+            _ => Image::new(cw, ch),
+        },
+        IrOp::NativeArithmeticMerge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
+            (Some(top), Some(bottom)) => ops::native_arithmetic_merge(top, bottom, *mode, *opacity),
+            _ => Image::new(cw, ch), // validation requires exactly two inputs
+        },
         IrOp::Merge { mode, opacity } => match (inputs.first(), inputs.get(1)) {
             (Some(top), Some(bottom)) => ops::merge(top, bottom, *mode, *opacity),
             (Some(top), None) => (*top).clone(),
@@ -771,7 +1156,10 @@ fn apply_grade_cpu_image(mut img: Image, ops: &[photonic_render::grade::Resolved
 /// to reason about the graph without re-matching the op).
 pub fn merge_mode(op: &IrOp) -> Option<BlendMode> {
     match op {
-        IrOp::Merge { mode, .. } => Some(*mode),
+        IrOp::Merge { mode, .. }
+        | IrOp::NativeBoundedMerge { mode, .. }
+        | IrOp::NativeArithmeticMerge { mode, .. }
+        | IrOp::NativeLuminanceMerge { mode, .. } => Some(*mode),
         _ => None,
     }
 }

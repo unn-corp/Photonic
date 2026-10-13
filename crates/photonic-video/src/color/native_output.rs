@@ -9,6 +9,7 @@ mod aces2_sdr;
 mod chroma;
 mod gamut;
 pub mod gpu;
+pub mod inspection;
 mod jmh;
 mod sdr;
 pub use aces2_sdr::Aces2SdrOutput;

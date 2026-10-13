@@ -16,9 +16,10 @@
 //!    `EngineFrame`→screen present pass (03 §5,
 //!    `photonic_render::video::VideoPresenter`) into an intermediate
 //!    `Rgba8UnormSrgb` texture registered with egui as a native texture; the
-//!    monitor paints it with a UV rect cropped to the frame's logical size
-//!    (the engine's frame textures are pool-bucket padded — see the facade
-//!    notes in `photonic_video::session`).
+//!    native SDR target is exactly logical-sized so magnification clamps at
+//!    the picture edge, and retains encoded premultiplication for egui blending.
+//!    Legacy retains its original padded target, straight-alpha pass and UV crop.
+//!    The engine's working textures remain pool-bucket padded.
 //!
 //! 3. **Desired-state reconciliation.** Transport methods only mutate GUI
 //!    intent (`monitor_playing`, playhead, loop toggle, proxy mode);
@@ -56,7 +57,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 /// The registered egui texture for the current engine frame.
 pub(crate) struct MonitorTexture {
     pub id: egui::TextureId,
-    /// Physical (pool-bucket-padded) size of the presented texture.
+    /// Actual presentation allocation: exact logical size for Native SDR,
+    /// the original pool-bucket size for Legacy SDR.
     pub physical: (u32, u32),
 }
 
@@ -118,6 +120,7 @@ pub struct EngineBridge {
     trim_stills: Option<TrimStills>,
     retired_trim_textures: Vec<egui::TextureId>,
     sent_playing: Option<bool>,
+    pending_pause_seek: Option<Tick>,
     sent_loop: Option<Option<(Tick, Tick)>>,
     sent_sequence: Option<SequenceId>,
     sent_preview_cache_dir: Option<std::path::PathBuf>,
@@ -195,6 +198,7 @@ impl EngineBridge {
             trim_stills: None,
             retired_trim_textures: Vec::new(),
             sent_playing: None,
+            pending_pause_seek: None,
             sent_loop: None,
             sent_sequence: None,
             sent_preview_cache_dir: None,
@@ -297,6 +301,29 @@ impl EngineBridge {
                 EngineCmd::Pause
             }) {
                 self.sent_playing = Some(playing);
+            }
+        }
+    }
+
+    /// Freeze program playback at the GUI's last agreed time, rather than
+    /// letting the asynchronously processed Pause drift several frames ahead.
+    /// Keep a rejected settling seek pending until command admission succeeds.
+    pub(crate) fn set_program_playing(&mut self, playing: bool, at: Tick) {
+        if playing {
+            self.pending_pause_seek = None;
+            self.set_playing(true);
+            return;
+        }
+        if self.sent_playing != Some(false) || self.pending_pause_seek.is_some() {
+            self.pending_pause_seek = Some(at);
+        }
+        self.set_playing(false);
+        if self.sent_playing == Some(false) {
+            if let Some(time) = self.pending_pause_seek {
+                if self.session.send(EngineCmd::Seek(time)) {
+                    self.agreed_playhead = Some(time);
+                    self.pending_pause_seek = None;
+                }
             }
         }
     }
@@ -581,13 +608,14 @@ impl EngineBridge {
         let Some(frame) = self.session.latest_frame() else {
             return;
         };
-        if matches!(
+        let target_size = monitor_presentation_size(
             frame.output_encoding,
-            FrameColorEncoding::MatteWeight
-                | FrameColorEncoding::SceneLinearAcescg
-                | FrameColorEncoding::Acescct
-                | FrameColorEncoding::Bt709Video
-        ) {
+            frame.logical_size,
+            (frame.texture.width(), frame.texture.height()),
+        );
+        if target_size.is_none()
+            || frame.texture.format() != photonic_render::pipeline::WORKING_FORMAT
+        {
             // Managed frames require an explicit view transform before the
             // existing sRGB monitor target can display them.
             for old in [self.target.take(), self.compare_target.take()]
@@ -641,7 +669,7 @@ impl EngineBridge {
         if self.presented == Some(key) && capture.is_none() {
             return;
         }
-        let size = (frame.texture.width(), frame.texture.height());
+        let size = target_size.expect("validated monitor dimensions");
         self.ensure_target(device, egui_renderer, size, false);
         if frame.compare_clean.is_some()
             && frame.output_encoding == FrameColorEncoding::LegacyLinearRec709
@@ -682,14 +710,17 @@ impl EngineBridge {
                     &target.view,
                     channel,
                 ),
-                FrameColorEncoding::SrgbDisplay => presenter.present_encoded_engine_frame_channel(
-                    device,
-                    &mut encoder,
-                    &src_view,
-                    &target.view,
-                    channel,
-                ),
-                FrameColorEncoding::MatteWeight
+                FrameColorEncoding::SrgbDisplay => presenter
+                    .present_encoded_engine_frame_logical_channel(
+                        device,
+                        &mut encoder,
+                        &frame.texture,
+                        &target.texture,
+                        channel,
+                    )
+                    .expect("validated native monitor source and target"),
+                FrameColorEncoding::ScalarChannel
+                | FrameColorEncoding::MatteWeight
                 | FrameColorEncoding::SceneLinearAcescg
                 | FrameColorEncoding::Acescct
                 | FrameColorEncoding::Bt709Video => {
@@ -849,6 +880,24 @@ impl EngineBridge {
     }
 }
 
+/// Native display targets end at the logical image edge; Legacy retains its
+/// existing padded presentation. Reject invalid metadata rather than stretching
+/// a whole pool bucket or showing a stale unsupported color-domain texture.
+fn monitor_presentation_size(
+    encoding: FrameColorEncoding,
+    logical: (u32, u32),
+    physical: (u32, u32),
+) -> Option<(u32, u32)> {
+    if logical.0 == 0 || logical.1 == 0 || logical.0 > physical.0 || logical.1 > physical.1 {
+        return None;
+    }
+    match encoding {
+        FrameColorEncoding::SrgbDisplay => Some(logical),
+        FrameColorEncoding::LegacyLinearRec709 => Some(physical),
+        _ => None,
+    }
+}
+
 /// UV rect cropping a pool-bucket-padded engine texture down to the logical
 /// (sequence-format) content that sits at its top-left (facade note: physical
 /// size is the pool's 64 px bucket, logical content is format-sized).
@@ -963,6 +1012,32 @@ mod tests {
         wait(&bridge, live_generation);
         assert_eq!(bridge.status().doc_revision, history.revision());
         assert_eq!(doc.timeline, original);
+    }
+
+    #[test]
+    fn native_monitor_dimensions_are_exact_and_invalid_metadata_refuses() {
+        assert_eq!(
+            monitor_presentation_size(FrameColorEncoding::SrgbDisplay, (3, 2), (64, 64)),
+            Some((3, 2))
+        );
+        assert_eq!(
+            monitor_presentation_size(FrameColorEncoding::LegacyLinearRec709, (3, 2), (64, 64)),
+            Some((64, 64))
+        );
+        for logical in [(0, 2), (3, 0), (65, 2), (3, 65)] {
+            assert_eq!(
+                monitor_presentation_size(FrameColorEncoding::SrgbDisplay, logical, (64, 64)),
+                None
+            );
+        }
+        for encoding in [
+            FrameColorEncoding::SceneLinearAcescg,
+            FrameColorEncoding::Acescct,
+            FrameColorEncoding::MatteWeight,
+            FrameColorEncoding::Bt709Video,
+        ] {
+            assert_eq!(monitor_presentation_size(encoding, (3, 2), (64, 64)), None);
+        }
     }
 
     #[test]

@@ -104,10 +104,27 @@ impl CaptionWord {
     }
 }
 
+/// Paragraph direction is stored explicitly; old documents retain Auto behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextDirection {
+    #[default]
+    Auto,
+    Ltr,
+    Rtl,
+}
+impl TextDirection {
+    pub fn is_auto(&self) -> bool {
+        *self == Self::Auto
+    }
+}
+
 /// Caption styling. Applied at track / cue / word scope; the cascade resolves
 /// word → cue → track (01 §7, 06 §4).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CaptionStyle {
+    #[serde(default, skip_serializing_if = "TextDirection::is_auto")]
+    pub direction: TextDirection,
     pub font_family: String,
     pub font_size: f32,
     pub weight: u16,
@@ -129,6 +146,7 @@ pub struct CaptionStyle {
 impl Default for CaptionStyle {
     fn default() -> Self {
         CaptionStyle {
+            direction: TextDirection::Auto,
             font_family: "sans-serif".to_string(),
             font_size: 48.0,
             weight: 700,
@@ -261,5 +279,26 @@ mod tests {
         let j = serde_json::to_string(&style).unwrap();
         let back: CaptionStyle = serde_json::from_str(&j).unwrap();
         assert_eq!(style, back);
+    }
+    #[test]
+    fn caption_direction_is_explicit_and_old_auto_files_roundtrip_unchanged() {
+        let style = CaptionStyle::default();
+        let old = serde_json::to_value(&style).unwrap();
+        assert!(old.get("direction").is_none());
+        let restored: CaptionStyle = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(restored.direction, TextDirection::Auto);
+        assert_eq!(serde_json::to_value(restored).unwrap(), old);
+        for direction in [TextDirection::Ltr, TextDirection::Rtl] {
+            let mut changed = style.clone();
+            changed.direction = direction;
+            let value = serde_json::to_value(&changed).unwrap();
+            assert_eq!(
+                serde_json::from_value::<CaptionStyle>(value).unwrap(),
+                changed
+            );
+        }
+        let mut invalid = old;
+        invalid["direction"] = serde_json::json!("sideways");
+        assert!(serde_json::from_value::<CaptionStyle>(invalid).is_err());
     }
 }

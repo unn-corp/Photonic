@@ -29,6 +29,7 @@
 
 use egui::{pos2, vec2, Color32, Pos2, Rect, RichText, Sense, Stroke, TextureOptions, Ui, Vec2};
 use egui_phosphor::regular as ph;
+use photonic_core::timeline::GradeInspectionStage;
 
 use photonic_core::document::Document;
 use photonic_core::history::{Command, CommandHistory};
@@ -39,7 +40,7 @@ use photonic_core::timeline::{
     },
     ops, AssetId, AssetKind, AssetSource, CdlParams, ClipId, ClipLook, Grade, GradeGraph,
     GradeGraphNode, GradeMask, GradeOp, GradeOpId, GradeOpKind, GradeOpParams, LutInterp,
-    QualifierKey, SequenceId, TrackId, VfxOwner, WindowShape, MAX_QUALIFIER_KEYS,
+    QualifierKey, SequenceId, Tick, TrackId, VfxOwner, WindowShape, MAX_QUALIFIER_KEYS,
 };
 use photonic_render::scopes::ScopeScale;
 
@@ -127,6 +128,33 @@ fn locate_clip(doc: &Document, selection: &[ClipId]) -> Option<(SequenceId, Trac
         }
     }
     None
+}
+
+/// Match the compiler's grade clock; shared/member grades use this selected
+/// clip's local timeline time, while track/master use sequence time.
+fn grade_animation_clock(
+    doc: &Document,
+    seq: SequenceId,
+    track: TrackId,
+    clip: ClipId,
+    owner: VfxOwner,
+    playhead: Option<Tick>,
+) -> Option<Tick> {
+    let at = playhead?;
+    if at.0 < 0 {
+        return None;
+    }
+    let project = doc.timeline.as_ref()?;
+    if project.active_sequence != Some(seq) {
+        return None;
+    }
+    let sequence = project.sequences.get(&seq)?;
+    if matches!(owner, VfxOwner::Track(_) | VfxOwner::Master(_)) {
+        return Some(at);
+    }
+    let clip = sequence.track(track)?.clips.iter().find(|c| c.id == clip)?;
+    let dt = at.0.checked_sub(clip.start.0)?;
+    (dt >= 0 && dt < clip.duration.0).then_some(Tick(dt))
 }
 
 /// Chronological neighbours on the selected clip's own video track. Sorting
@@ -722,6 +750,31 @@ fn commit_grade_scoped(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn commit_look_stage_grade(
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    seq: SequenceId,
+    track: TrackId,
+    clip: ClipId,
+    stage: GradeInspectionStage,
+    new: Grade,
+    discrete: bool,
+) {
+    let Some(project) = doc.timeline.as_ref() else {
+        return;
+    };
+    let Ok(cmd) = ops::set_clip_stage_grade(project, seq, track, clip, stage, new) else {
+        return;
+    };
+    if discrete {
+        history.execute_discrete(Command::Timeline(cmd), doc);
+    } else {
+        history.execute(Command::Timeline(cmd), doc);
+    }
+}
+
+#[cfg(test)]
 fn commit_shared_look_grade(
     doc: &mut Document,
     history: &mut CommandHistory,
@@ -776,7 +829,7 @@ fn asset_name(source: &AssetSource) -> String {
 // Grade-op defaults + labels
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn kind_label(kind: GradeOpKind) -> &'static str {
+pub(super) fn kind_label(kind: GradeOpKind) -> &'static str {
     match kind {
         GradeOpKind::Exposure => "Exposure",
         GradeOpKind::LinearOffset => "Linear Offset",
@@ -785,6 +838,8 @@ fn kind_label(kind: GradeOpKind) -> &'static str {
         GradeOpKind::SaturationVibrance => "Saturation & Vibrance",
         GradeOpKind::Contrast => "Contrast",
         GradeOpKind::WhiteBalance => "White Balance",
+        GradeOpKind::WhiteBalanceCct => "Kelvin White Balance",
+        GradeOpKind::TonalExposure => "Tonal Exposure",
         GradeOpKind::Cdl => "CDL",
         GradeOpKind::Wheels => "Wheels",
         GradeOpKind::Curves => "Curves",
@@ -815,6 +870,15 @@ fn default_op(kind: GradeOpKind, luts: &[(AssetId, String)]) -> GradeOp {
         GradeOpKind::Contrast => GradeOpParams::Contrast {
             pivot: 0.5,
             amount: 0.0,
+        },
+        GradeOpKind::TonalExposure => GradeOpParams::TonalExposure {
+            stops: [0.0; 3],
+            boundaries: [-2.0, 2.0],
+            softness: 1.0,
+        },
+        GradeOpKind::WhiteBalanceCct => GradeOpParams::WhiteBalanceCct {
+            source_kelvin: 6500.0,
+            target_kelvin: 6500.0,
         },
         GradeOpKind::WhiteBalance => GradeOpParams::WhiteBalance {
             temp: 0.0,
@@ -857,7 +921,7 @@ fn default_op(kind: GradeOpKind, luts: &[(AssetId, String)]) -> GradeOp {
             intensity: 1.0,
             interp: LutInterp::Trilinear,
         },
-        // The add-corrector menu (`ALL_KINDS`) only offers the eight known
+        // The add-corrector menu (`ALL_KINDS`) only offers known
         // kinds, and an unknown op is a load-only state that is never created
         // from the UI (39 §2.2 rule 4: never guess). This arm is unreachable.
         _ => unreachable!("default_op is only called for user-selectable known kinds"),
@@ -866,8 +930,10 @@ fn default_op(kind: GradeOpKind, luts: &[(AssetId, String)]) -> GradeOp {
 }
 
 /// Full add-corrector catalog, in the 07 §4.4 seed order.
-const ALL_KINDS: [GradeOpKind; 12] = [
+const ALL_KINDS: [GradeOpKind; 14] = [
     GradeOpKind::WhiteBalance,
+    GradeOpKind::WhiteBalanceCct,
+    GradeOpKind::TonalExposure,
     GradeOpKind::Exposure,
     GradeOpKind::LinearOffset,
     GradeOpKind::PrinterLights,
@@ -910,7 +976,57 @@ pub(crate) fn draw_color_controls(
     selected_op: &mut Option<GradeOpId>,
     tab: &mut ColorPageTab,
     scopes_open: &mut bool,
+    playhead: Option<Tick>,
 ) {
+    let salt = ui.make_persistent_id(("color_controls_target", doc.id, selection));
+    ui.push_id(salt, |ui| {
+        draw_color_controls_contents(
+            ui,
+            doc,
+            history,
+            actions,
+            selection,
+            selected_op,
+            tab,
+            scopes_open,
+            playhead,
+        )
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_color_controls_contents(
+    ui: &mut Ui,
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    actions: &mut Vec<PanelAction>,
+    selection: &[ClipId],
+    selected_op: &mut Option<GradeOpId>,
+    tab: &mut ColorPageTab,
+    scopes_open: &mut bool,
+    playhead: Option<Tick>,
+) {
+    if let Some(sequence) = doc
+        .timeline
+        .as_ref()
+        .and_then(|p| p.active_sequence.and_then(|id| p.sequences.get(&id)))
+    {
+        if ui
+            .add_enabled(
+                !sequence.color.is_legacy(),
+                egui::Button::new("Measure program / output"),
+            )
+            .on_hover_text(
+                "Read-only paired AP1 and SDR measurements: exact paused capture or bounded live sampling",
+            )
+            .clicked()
+        {
+            actions.push(PanelAction::ShowProgramMeasurements {
+                sequence: sequence.id,
+            });
+        }
+        ui.separator();
+    }
     let Some((seq, track, clip)) = locate_clip(doc, selection) else {
         ui.add_space(8.0);
         ui.label(RichText::new("Select a clip in the timeline to grade it.").color(muted(ui)));
@@ -978,17 +1094,21 @@ pub(crate) fn draw_color_controls(
                     );
                 }
                 ui.selectable_value(&mut owner, VfxOwner::Track(track), "Track · all clips");
-                for (depth, group) in groups.iter().rev().enumerate() {
-                    let label = if depth == 0 { "Group" } else { "Parent group" };
+                for (depth, group) in groups.iter().enumerate() {
+                    let label = if depth == 0 {
+                        "Group"
+                    } else {
+                        "Ancestor group"
+                    };
                     ui.selectable_value(
                         &mut owner,
                         VfxOwner::GroupPre(*group),
-                        format!("{label} pre · shared balance"),
+                        format!("{label} pre · {} · shared balance", &group.to_string()[..8]),
                     );
                     ui.selectable_value(
                         &mut owner,
                         VfxOwner::GroupPost(*group),
-                        format!("{label} post · shared look"),
+                        format!("{label} post · {} · shared look", &group.to_string()[..8]),
                     );
                 }
                 ui.selectable_value(
@@ -1004,6 +1124,7 @@ pub(crate) fn draw_color_controls(
             .unwrap_or(VfxOwner::Clip(clip))
     {
         *selected_op = None;
+        actions.push(PanelAction::CancelGradeSampling);
     }
     ui.data_mut(|data| data.insert_temp(scope_id, owner));
 
@@ -1194,6 +1315,121 @@ pub(crate) fn draw_color_controls(
     });
     ui.data_mut(|data| data.insert_temp(mode_id, advanced));
 
+    // These selectors always use this clip's actual stage, independently of
+    // which shared-library item is being edited. Inspection is read-only on locks.
+    if matches!(
+        owner,
+        VfxOwner::Clip(_) | VfxOwner::GroupPre(_) | VfxOwner::GroupPost(_)
+    ) {
+        if let Some(project) = doc.timeline.as_ref() {
+            if let Some(sequence) = project.sequences.get(&seq).filter(|s| {
+                matches!(
+                    s.color,
+                    photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
+                )
+            }) {
+                if let Some(selected) = sequence
+                    .track(track)
+                    .and_then(|t| t.clips.iter().find(|c| c.id == clip))
+                {
+                    use photonic_core::timeline::{ClipLook, GradeInspectionStage};
+                    let chain = selected
+                        .group
+                        .map(|id| sequence.group_chain(id))
+                        .unwrap_or_default();
+                    let mut stages: Vec<_> = chain
+                        .iter()
+                        .rev()
+                        .map(|id| {
+                            (
+                                GradeInspectionStage::GroupPre { id: *id },
+                                format!("Group pre {} · selected member", &id.to_string()[..8]),
+                            )
+                        })
+                        .collect();
+                    stages.push((
+                        GradeInspectionStage::Clip,
+                        if matches!(
+                            selected.source,
+                            photonic_core::timeline::ClipSource::NestedSequence { .. }
+                        ) {
+                            "Compound clip".into()
+                        } else {
+                            "Clip".into()
+                        },
+                    ));
+                    match selected.look.as_ref() {
+                        Some(ClipLook::Local(_)) => {
+                            stages.push((GradeInspectionStage::LocalLook, "Local look".into()))
+                        }
+                        Some(ClipLook::Shared(id)) => {
+                            if let Some(look) = project.shared_looks.get(id) {
+                                stages.push((
+                                    GradeInspectionStage::SharedLook { id: *id },
+                                    format!("Linked look: {}", look.name),
+                                ));
+                            }
+                        }
+                        None => {}
+                    }
+                    stages.extend(chain.iter().map(|id| {
+                        (
+                            GradeInspectionStage::GroupPost { id: *id },
+                            format!("Group post {} · selected member", &id.to_string()[..8]),
+                        )
+                    }));
+                    if let VfxOwner::GroupPre(id) = owner {
+                        stages.retain(|(stage, _)| *stage == GradeInspectionStage::GroupPre { id });
+                    } else if let VfxOwner::GroupPost(id) = owner {
+                        stages
+                            .retain(|(stage, _)| *stage == GradeInspectionStage::GroupPost { id });
+                    }
+                    for (stage, label) in stages {
+                        let Some(grade) = stage.resolve_grade(project, selected) else {
+                            continue;
+                        };
+                        ui.push_id((clip, stage), |ui| {
+                            ui.label(label);
+                            for qualifier in [false,true] {
+                                ui.menu_button(if qualifier { "Inspect qualifier key" } else { "Inspect correction input" }, |ui| {
+                                    for (op_index,op) in grade.ops.iter().enumerate().filter(|(_,op)| !grade.bypass && op.enabled && (op.kind==GradeOpKind::HslQualifier || (!qualifier && op.kind==GradeOpKind::Curves))) {
+                                        let mut nodes=Vec::new();
+                                        if grade.has_grade_input(op.id,None) { nodes.push(None); }
+                                        if let Some(graph)=grade.graph.as_ref() {
+                                            for &node in graph.nodes.keys() { if grade.has_grade_input(op.id,Some(node)) { nodes.push(Some(node)); } }
+                                        }
+                                        for node in nodes {
+                                            let label=format!("{} · {} · {}",op_index+1,kind_label(op.kind),node.map(|n| format!("node {n}")).unwrap_or_else(|| "automatic corrector".into()));
+                                            if ui.button(label).clicked() { actions.push(PanelAction::ToggleGradeInput {seq,track,clip,stage,op:op.id,node,qualifier});ui.close_menu(); }
+                                        }
+                                    }
+                                    ui.label("Read-only input/key inspection. Select again to exit.");
+                                });
+                            }
+                            let Some(graph)=grade.graph.as_ref() else { return; };
+                            for image in [false, true] {
+                                ui.menu_button(if image { "Inspect image output" } else { "Inspect matte output" }, |ui| {
+                                    for &node in graph.nodes.keys() {
+                                        let valid = if image { grade.has_image_output(node) } else { grade.has_matte_output(node) };
+                                        if valid && ui.button(graph_node_label(graph, grade, node)).clicked() {
+                                            actions.push(if image {
+                                                PanelAction::ToggleGradeImage { seq, track, clip, stage, node }
+                                            } else {
+                                                PanelAction::ToggleGradeMatte { seq, track, clip, stage, node }
+                                            });
+                                            ui.close_menu();
+                                        }
+                                    }
+                                    ui.label("Select again to exit. Only active reachable outputs can be inspected.");
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     if doc.timeline.as_ref().is_some_and(|project| {
         ops::grade_scope_locked(project, owner) || ops::scope_grade(project, owner).is_err()
     }) {
@@ -1202,12 +1438,17 @@ pub(crate) fn draw_color_controls(
     }
 
     if advanced && matches!(owner, VfxOwner::Clip(_)) {
-        if draw_shared_looks(ui, doc, history, seq, track, clip, selected_op) {
+        if draw_shared_looks(ui, doc, history, seq, track, clip, selected_op, actions) {
             return;
         }
         let editing_shared = ui
             .data(|d| d.get_temp::<bool>(shared_look_editor_id(clip)))
             .unwrap_or(false);
+        if editing_shared && draw_shared_look_versions(ui, doc, history, seq, track, clip) {
+            *selected_op = None;
+            actions.push(PanelAction::CancelGradeSampling);
+            return;
+        }
         if !editing_shared && draw_grade_versions(ui, doc, history, seq, track, clip) {
             return; // reload the selected grade from the edited document next frame
         }
@@ -1216,7 +1457,7 @@ pub(crate) fn draw_color_controls(
         }
     }
 
-    let shared_id = if advanced
+    let look_stage = if advanced
         && matches!(owner, VfxOwner::Clip(_))
         && ui
             .data(|d| d.get_temp::<bool>(shared_look_editor_id(clip)))
@@ -1228,11 +1469,21 @@ pub(crate) fn draw_color_controls(
             .and_then(|sequence| sequence.track(track))
             .and_then(|track| track.clips.iter().find(|candidate| candidate.id == clip))
             .and_then(|clip| match clip.look {
-                Some(ClipLook::Shared(id)) => Some(id),
-                _ => None,
+                Some(ClipLook::Shared(id)) => Some(GradeInspectionStage::SharedLook { id }),
+                Some(ClipLook::Local(_)) => Some(GradeInspectionStage::LocalLook),
+                None => None,
             })
     } else {
         None
+    };
+    let sampling_stage = match owner {
+        VfxOwner::GroupPre(id) => GradeInspectionStage::GroupPre { id },
+        VfxOwner::GroupPost(id) => GradeInspectionStage::GroupPost { id },
+        _ => look_stage.unwrap_or_default(),
+    };
+    let shared_id = match look_stage {
+        Some(GradeInspectionStage::SharedLook { id }) => Some(id),
+        _ => None,
     };
     if let Some(id) = shared_id {
         let locked = doc.timeline.as_ref().is_some_and(|project| {
@@ -1253,19 +1504,23 @@ pub(crate) fn draw_color_controls(
     // Read-only snapshot up front so the later `&mut doc` commit doesn't collide
     // with the media-pool borrow.
     let luts = lut_assets(doc);
-    let orig = shared_id
-        .and_then(|id| {
-            doc.timeline
-                .as_ref()?
-                .shared_looks
-                .get(&id)
-                .map(|look| look.grade.clone())
+    let orig = look_stage
+        .and_then(|stage| {
+            let project = doc.timeline.as_ref()?;
+            let current = project
+                .sequences
+                .get(&seq)?
+                .track(track)?
+                .clips
+                .iter()
+                .find(|c| c.id == clip)?;
+            stage.resolve_grade(project, current).cloned()
         })
         .unwrap_or_else(|| current_grade_scoped(doc, owner));
     let mut g = orig.clone();
     let mut graph_active = g.graph.is_some();
     let mut topology_changed = false;
-    let multi_id = grade_multi_selection_id(owner);
+    let multi_id = grade_multi_selection_id(owner).with(look_stage);
     let mut selected_ops: Vec<GradeOpId> =
         ui.data(|data| data.get_temp(multi_id).unwrap_or_default());
     selected_ops.retain(|id| g.ops.iter().any(|op| op.id == *id));
@@ -1274,6 +1529,23 @@ pub(crate) fn draw_color_controls(
     }
     if !selected_ops.is_empty() && !selected_op.is_some_and(|id| selected_ops.contains(&id)) {
         *selected_op = selected_ops.last().copied();
+    }
+
+    if look_stage.is_none() && matches!(owner, VfxOwner::Clip(_)) && !graph_active && !g.bypass {
+        if let Some(op) = selected_op.and_then(|id| g.ops.iter().find(|op| op.id == id)) {
+            if op.enabled
+                && matches!(
+                    op.mask,
+                    Some(GradeMask::PowerWindow {
+                        shape: WindowShape::Ellipse | WindowShape::Rectangle,
+                        ..
+                    })
+                )
+                && ui.button("Track window translation...").clicked()
+            {
+                actions.push(PanelAction::ShowWindowTracking { clip, op: op.id });
+            }
+        }
     }
 
     // ── Pinned header: global bypass (= before/after, 07 §5) + scopes toggle ──
@@ -1332,6 +1604,10 @@ pub(crate) fn draw_color_controls(
                 photonic_core::timeline::color::SequenceColorConfig::NativeManaged(_)
             )
         });
+    let can_sample_stage = matches!(
+        owner,
+        VfxOwner::Clip(_) | VfxOwner::GroupPre(_) | VfxOwner::GroupPost(_)
+    ) && (sampling_stage == GradeInspectionStage::Clip || native);
     section_header(ui, "QUICK GRADE");
     {
         let saturation_kind = if native {
@@ -1360,15 +1636,17 @@ pub(crate) fn draw_color_controls(
                 _ => continue,
             };
             let mut changed = false;
-            labelled(ui, label, |ui| {
-                changed = ui
-                    .add_enabled(
-                        !graph_active,
-                        egui::Slider::new(value, range)
-                            .clamping(egui::SliderClamping::Edits)
-                            .step_by(0.01),
-                    )
-                    .changed();
+            ui.push_id(("quick_grade_numeric", owner, look_stage, kind), |ui| {
+                labelled(ui, label, |ui| {
+                    changed = ui
+                        .add_enabled_ui(!graph_active, |ui| {
+                            param_expr::numeric_slider(ui, value, range, |slider| {
+                                slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+                            })
+                        })
+                        .inner
+                        .changed();
+                });
             });
             if changed {
                 match index {
@@ -1402,8 +1680,8 @@ pub(crate) fn draw_color_controls(
         }
         if g != orig {
             let discrete = g.bypass != orig.bypass;
-            if let Some(id) = shared_id {
-                commit_shared_look_grade(doc, history, id, g, discrete);
+            if let Some(stage) = look_stage {
+                commit_look_stage_grade(doc, history, seq, track, clip, stage, g, discrete);
             } else {
                 commit_grade_scoped(doc, history, owner, g, discrete);
             }
@@ -1563,6 +1841,11 @@ pub(crate) fn draw_color_controls(
             }
         });
     }
+    // Capture discrete stack changes before the graph controls. Continuous
+    // graph parameters and path handles must use the open pointer gesture;
+    // comparing the whole grade afterward incorrectly made every drag frame
+    // its own Undo step. The graph editor separately reports topology edits.
+    let mut discrete = topology_changed || g != quick_grade || g.bypass != orig.bypass;
     if graph_active {
         let before_graph_selection = *selected_op;
         topology_changed |= draw_grade_graph_editor(
@@ -1570,14 +1853,15 @@ pub(crate) fn draw_color_controls(
             &mut g,
             &luts,
             selected_op,
-            egui::Id::new(("grade_graph_canvas", owner, shared_id)),
+            egui::Id::new(("grade_graph_canvas", owner, look_stage)),
+            grade_animation_clock(doc, seq, track, clip, owner, playhead),
         );
         if *selected_op != before_graph_selection {
             selected_ops = (*selected_op).into_iter().collect();
         }
     }
 
-    let mut discrete = topology_changed || g != quick_grade || g.bypass != orig.bypass;
+    discrete |= topology_changed;
 
     // ── Selected-op editor ───────────────────────────────────────────────────
     ui.separator();
@@ -1587,7 +1871,7 @@ pub(crate) fn draw_color_controls(
     {
         Some(idx) => {
             let op = g.ops[idx].id;
-            let input_id = ui.id().with(("grade_input_node", op));
+            let input_id = ui.id().with(("grade_input_node", sampling_stage, op));
             let mut graph_node = ui
                 .data(|data| data.get_temp::<Option<u32>>(input_id).flatten())
                 .filter(|node| g.has_grade_input(op, Some(*node)));
@@ -1639,19 +1923,34 @@ pub(crate) fn draw_color_controls(
             }
             ui.data_mut(|data| data.insert_temp(input_id, graph_node));
             let qualified_input = !graph_active || (native && g.has_grade_input(op, graph_node));
-            discrete |= draw_op_editor(
-                ui,
-                &mut g.ops[idx],
-                &luts,
-                actions,
-                seq,
-                track,
-                clip,
-                matches!(owner, VfxOwner::Clip(_)) && shared_id.is_none(),
-                qualified_input,
-                graph_node,
-                native,
-            );
+            if matches!(owner, VfxOwner::Clip(_)) && look_stage.is_none() {
+                ui.label(
+                    RichText::new("Animate scalar controls in Clip Inspector / Keyframes")
+                        .small()
+                        .color(muted(ui)),
+                );
+            }
+            if sampling_stage != GradeInspectionStage::Clip {
+                ui.label(RichText::new("Animate the matching stage in Clip Inspector / Keyframes. Shared/group keys use each member clip's local time.").small().color(muted(ui)));
+            }
+            discrete |= ui
+                .push_id(("existing_grade_parameters", owner, look_stage, op), |ui| {
+                    draw_op_editor(
+                        ui,
+                        &mut g.ops[idx],
+                        &luts,
+                        actions,
+                        seq,
+                        track,
+                        clip,
+                        sampling_stage,
+                        can_sample_stage,
+                        qualified_input,
+                        graph_node,
+                        native,
+                    )
+                })
+                .inner;
         }
         None => {
             if selected_ops.len() > 1 {
@@ -1667,19 +1966,27 @@ pub(crate) fn draw_color_controls(
                 let mut draft = default_op(tab_kind(*tab), &luts);
                 let identity = draft.clone();
                 let action_count = actions.len();
-                discrete |= draw_op_editor(
-                    ui,
-                    &mut draft,
-                    &luts,
-                    actions,
-                    seq,
-                    track,
-                    clip,
-                    matches!(owner, VfxOwner::Clip(_)) && shared_id.is_none(),
-                    !graph_active,
-                    None,
-                    native,
-                );
+                discrete |= ui
+                    .push_id(
+                        ("draft_grade_parameters", owner, look_stage, tab_kind(*tab)),
+                        |ui| {
+                            draw_op_editor(
+                                ui,
+                                &mut draft,
+                                &luts,
+                                actions,
+                                seq,
+                                track,
+                                clip,
+                                sampling_stage,
+                                can_sample_stage,
+                                !graph_active,
+                                None,
+                                native,
+                            )
+                        },
+                    )
+                    .inner;
                 if draft != identity || actions.len() != action_count {
                     discrete |= actions.len() != action_count;
                     *selected_op = Some(draft.id);
@@ -1693,8 +2000,8 @@ pub(crate) fn draw_color_controls(
 
     // ── Commit one SetGrade if anything changed this frame ───────────────────
     if g != orig {
-        if let Some(id) = shared_id {
-            commit_shared_look_grade(doc, history, id, g, discrete);
+        if let Some(stage) = look_stage {
+            commit_look_stage_grade(doc, history, seq, track, clip, stage, g, discrete);
         } else {
             commit_grade_scoped(doc, history, owner, g, discrete);
         }
@@ -1724,6 +2031,30 @@ fn graph_node_label(graph: &GradeGraph, grade: &Grade, id: u32) -> String {
                 format!("{id} · {label}")
             }
         }
+        Some(GradeGraphNode::AnimatedBezierMatte { label, .. }) => format!(
+            "{id} · {}",
+            if label.is_empty() {
+                "Animated Bézier key"
+            } else {
+                label
+            }
+        ),
+        Some(GradeGraphNode::BezierMatte { label, .. }) => format!(
+            "{id} · {}",
+            if label.is_empty() {
+                "Bézier key"
+            } else {
+                label
+            }
+        ),
+        Some(GradeGraphNode::WindowMatte { label, .. }) => format!(
+            "{id} · {}",
+            if label.is_empty() {
+                "Window key"
+            } else {
+                label
+            }
+        ),
         Some(GradeGraphNode::QualifierMatte { label, .. }) => format!(
             "{id} · {}",
             if label.is_empty() {
@@ -1968,6 +2299,7 @@ fn draw_grade_graph_canvas(
                 on_surface(ui),
             );
             if let GradeGraphNode::Corrector { op, .. }
+            | GradeGraphNode::WindowMatte { op, .. }
             | GradeGraphNode::QualifierMatte { op, .. } = node
             {
                 if ui
@@ -2053,6 +2385,7 @@ fn draw_grade_graph_editor(
     luts: &[(AssetId, String)],
     selected_op: &mut Option<GradeOpId>,
     canvas_id: egui::Id,
+    clock: Option<Tick>,
 ) -> bool {
     section_header(ui, "GRADE GRAPH");
     let mut structural = false;
@@ -2074,8 +2407,43 @@ fn draw_grade_graph_editor(
     });
     ui.menu_button("Add key utility", |ui| {
         if let Some(graph) = grade.graph.clone() {
+            if let Some(input) = graph
+                .nodes
+                .iter()
+                .find_map(|(&id, node)| matches!(node, GradeGraphNode::Input).then_some(id))
+            {
+                if ui.button("Bézier window").clicked() {
+                    structural |= grade
+                        .add_graph_utility(GradeGraphNode::BezierMatte {
+                            input,
+                            window: Default::default(),
+                            label: String::new(),
+                        })
+                        .is_ok();
+                    ui.close_menu();
+                }
+            }
             for (&id, node) in &graph.nodes {
                 if let GradeGraphNode::Corrector { input, op, .. } = node {
+                    if grade.ops.iter().any(|candidate| {
+                        candidate.id == *op
+                            && matches!(candidate.mask, Some(GradeMask::PowerWindow { .. }))
+                    }) && ui
+                        .button(format!(
+                            "Window from {}",
+                            graph_node_label(&graph, grade, id)
+                        ))
+                        .clicked()
+                    {
+                        structural |= grade
+                            .add_graph_utility(GradeGraphNode::WindowMatte {
+                                input: *input,
+                                op: *op,
+                                label: String::new(),
+                            })
+                            .is_ok();
+                        ui.close_menu();
+                    }
                     if grade.ops.iter().any(|candidate| {
                         candidate.id == *op && candidate.kind == GradeOpKind::HslQualifier
                     }) && ui
@@ -2143,7 +2511,7 @@ fn draw_grade_graph_editor(
                     ui.close_menu();
                 }
             } else {
-                ui.label("Add a qualifier key before mixing or applying mattes.");
+                ui.label("Add a window or qualifier key before mixing or applying mattes.");
             }
         }
     });
@@ -2183,10 +2551,11 @@ fn draw_grade_graph_editor(
     let mut remove_node = None;
     for (&id, node) in &snapshot.nodes {
         let mut edited = node.clone();
-        ui.group(|ui| {
+        ui.push_id(("grade_graph_node_controls", canvas_id, id), |ui| ui.group(|ui| {
             ui.horizontal(|ui| {
                 ui.label(graph_node_label(&snapshot, grade, id));
                 if let GradeGraphNode::Corrector { op, .. }
+                | GradeGraphNode::WindowMatte { op, .. }
                 | GradeGraphNode::QualifierMatte { op, .. } = node
                 {
                     if ui.small_button("Edit").clicked() {
@@ -2197,6 +2566,9 @@ fn draw_grade_graph_editor(
                     node,
                     GradeGraphNode::Corrector { .. }
                         | GradeGraphNode::LayerMixer { .. }
+                        | GradeGraphNode::WindowMatte { .. }
+                        | GradeGraphNode::BezierMatte { .. }
+                        | GradeGraphNode::AnimatedBezierMatte { .. }
                         | GradeGraphNode::QualifierMatte { .. }
                         | GradeGraphNode::KeyMixer { .. }
                         | GradeGraphNode::MatteApply { .. }
@@ -2213,7 +2585,24 @@ fn draw_grade_graph_editor(
             });
             match &mut edited {
                 GradeGraphNode::Input => {}
+                GradeGraphNode::BezierMatte {input,window,label} => {
+                    ui.horizontal(|ui|{ui.label("Image in");structural |= graph_input_picker(ui,grade,&snapshot,id,"image",input);});
+                    ui.add(egui::TextEdit::singleline(label).hint_text("Window label"));
+                    structural |= super::bezier_window::draw(ui,window);
+                    if ui.add_enabled(clock.is_some(),egui::Button::new("Animate at playhead")).on_disabled_hover_text("Move the playhead onto this grade's scope").clicked() {
+                        if let Some(at)=clock {if let Ok(track)=photonic_core::timeline::BezierWindowTrack::new(at,window.clone()) {
+                            edited=GradeGraphNode::AnimatedBezierMatte{input:*input,track,label:label.clone()};structural=true;
+                        }}
+                    }
+                }
+                GradeGraphNode::AnimatedBezierMatte {input,track,label} => {
+                    ui.horizontal(|ui|{ui.label("Image in");structural |= graph_input_picker(ui,grade,&snapshot,id,"image",input);});
+                    ui.add(egui::TextEdit::singleline(label).hint_text("Window label"));
+                    let (changed,freeze)=super::bezier_animation::draw(ui,track,clock);structural|=changed;
+                    if let Some(window)=freeze {edited=GradeGraphNode::BezierMatte{input:*input,window,label:label.clone()};structural=true;}
+                }
                 GradeGraphNode::Corrector { input, label, .. }
+                | GradeGraphNode::WindowMatte { input, label, .. }
                 | GradeGraphNode::QualifierMatte { input, label, .. } => {
                     ui.horizontal(|ui| {
                         ui.label("Image in");
@@ -2236,20 +2625,20 @@ fn draw_grade_graph_editor(
                         structural |=
                             graph_input_picker(ui, grade, &snapshot, id, "bottom", bottom);
                     });
-                    ui.add(egui::Slider::new(opacity, 0.0..=1.0).text("Top strength"));
+                    param_expr::numeric_slider(ui, opacity, 0.0..=1.0, |slider| slider.text("Top strength"));
                     ui.add(egui::TextEdit::singleline(label).hint_text("Mixer label"));
                 }
                 GradeGraphNode::MatteRefine { input, refinement, label } => {
                     ui.horizontal(|ui| { ui.label("Matte in"); structural |= graph_input_picker(ui,grade,&snapshot,id,"matte",input); });
                     ui.checkbox(&mut refinement.denoise,"Remove isolated pixels").on_hover_text("3×3 median at the current processing resolution. Full-quality export uses final resolution.");
                     let mut grow=refinement.grow*100.0;
-                    if ui.add(egui::Slider::new(&mut grow,-2.0..=2.0).text("Grow / shrink (%)")).on_hover_text("Fraction of the frame's shorter dimension. Positive expands and negative shrinks using a square neighborhood.").changed() { refinement.grow=grow/100.0; }
+                    if param_expr::numeric_slider(ui, &mut grow, -2.0..=2.0, |slider| slider.text("Grow / shrink (%)")).on_hover_text("Fraction of the frame's shorter dimension. Positive expands and negative shrinks using a square neighborhood.").changed() { refinement.grow=grow/100.0; }
                     let mut blur=refinement.blur*100.0;
-                    if ui.add(egui::Slider::new(&mut blur,0.0..=2.0).text("Blur (%)")).on_hover_text("Gaussian sigma as a percentage of the frame's shorter dimension.").changed() { refinement.blur=blur/100.0; }
+                    if param_expr::numeric_slider(ui, &mut blur, 0.0..=2.0, |slider| slider.text("Blur (%)")).on_hover_text("Gaussian sigma as a percentage of the frame's shorter dimension.").changed() { refinement.blur=blur/100.0; }
                     let white=refinement.matte_levels[1];
-                    ui.add(egui::Slider::new(&mut refinement.matte_levels[0],0.0..=(1.0-white-0.001).max(0.0)).text("Clean black"));
+                    param_expr::numeric_slider(ui, &mut refinement.matte_levels[0], 0.0..=(1.0-white-0.001).max(0.0), |slider| slider.text("Clean black"));
                     let black=refinement.matte_levels[0];
-                    ui.add(egui::Slider::new(&mut refinement.matte_levels[1],0.0..=(1.0-black-0.001).max(0.0)).text("Clean white"));
+                    param_expr::numeric_slider(ui, &mut refinement.matte_levels[1], 0.0..=(1.0-black-0.001).max(0.0), |slider| slider.text("Clean white"));
                     ui.add(egui::TextEdit::singleline(label).hint_text("Refinement label"));
                 }
                 GradeGraphNode::KeyMixer {
@@ -2306,7 +2695,7 @@ fn draw_grade_graph_editor(
                     });
                 }
             }
-        });
+        }));
         if edited != *node {
             candidate.nodes.insert(id, edited);
         }
@@ -2340,6 +2729,7 @@ fn draw_grade_graph_editor(
 
 /// Project looks run after the ordinary clip grade. Keeping that stage separate
 /// lets a shot detach from a shared look without changing its current output.
+#[allow(clippy::too_many_arguments)]
 fn draw_shared_looks(
     ui: &mut Ui,
     doc: &mut Document,
@@ -2348,6 +2738,7 @@ fn draw_shared_looks(
     track: TrackId,
     clip: ClipId,
     selected_op: &mut Option<GradeOpId>,
+    actions: &mut Vec<PanelAction>,
 ) -> bool {
     enum Action {
         Create(String),
@@ -2471,8 +2862,23 @@ fn draw_shared_looks(
             .changed()
         {
             *selected_op = None;
+            actions.push(PanelAction::CancelGradeSampling);
         }
         ui.data_mut(|d| d.insert_temp(key, editing));
+    }
+    if matches!(current.look, Some(ClipLook::Local(_))) {
+        let key = shared_look_editor_id(clip);
+        let mut editing = ui.data(|d| d.get_temp::<bool>(key)).unwrap_or(false);
+        if ui
+            .checkbox(&mut editing, "Edit independent look correctors")
+            .changed()
+        {
+            *selected_op = None;
+            actions.push(PanelAction::CancelGradeSampling);
+        }
+        ui.data_mut(|d| d.insert_temp(key, editing));
+    } else if linked.is_none() {
+        ui.data_mut(|d| d.insert_temp(shared_look_editor_id(clip), false));
     }
     ui.data_mut(|d| {
         if let Some(id) = selected {
@@ -2530,6 +2936,118 @@ fn draw_shared_looks(
 
 /// Named clip looks are structural edits and therefore stay separate from a
 /// continuous wheel or curve gesture in history.
+fn draw_shared_look_versions(
+    ui: &mut Ui,
+    doc: &mut Document,
+    history: &mut CommandHistory,
+    seq: SequenceId,
+    track: TrackId,
+    clip: ClipId,
+) -> bool {
+    use photonic_core::timeline::shared_look_versions::{
+        edit_shared_look_version, SharedLookVersionEdit as E,
+    };
+    let Some(project) = doc.timeline.as_ref() else {
+        return false;
+    };
+    let Some(current) = project
+        .sequences
+        .get(&seq)
+        .and_then(|s| s.track(track))
+        .and_then(|t| t.clips.iter().find(|c| c.id == clip))
+    else {
+        return false;
+    };
+    let Some(ClipLook::Shared(id)) = current.look else {
+        return false;
+    };
+    let Some(look) = project.shared_looks.get(&id) else {
+        return false;
+    };
+    let locked = project
+        .sequences
+        .values()
+        .flat_map(|s| s.tracks())
+        .any(|t| t.locked && t.clips.iter().any(|c| c.look == Some(ClipLook::Shared(id))));
+    let versions: Vec<_> = look
+        .versions
+        .iter()
+        .map(|v| (v.id, v.name.clone()))
+        .collect();
+    let active = look.active_version;
+    let label = versions
+        .iter()
+        .find(|(id, _)| Some(*id) == active)
+        .map(|(_, n)| n.as_str())
+        .unwrap_or("Unsaved shared look");
+    let name_id = ui.id().with(("shared_look_version_name", clip, id));
+    let mut name = ui
+        .data(|d| d.get_temp::<String>(name_id))
+        .unwrap_or_else(|| format!("Version {}", versions.len() + 1));
+    let mut action = None;
+    section_header(ui, "SHARED LOOK VERSIONS");
+    ui.label("Activating a version changes every shot linked to this look.");
+    if locked {
+        ui.label("A linked track is locked. Version edits are disabled.");
+    }
+    ui.add_enabled_ui(!locked, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            egui::ComboBox::from_id_salt(("shared_look_versions", clip, id))
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    for (version, label) in &versions {
+                        if ui
+                            .selectable_label(Some(*version) == active, label)
+                            .clicked()
+                            && Some(*version) != active
+                        {
+                            action = Some(E::Activate(*version));
+                        }
+                    }
+                });
+            ui.add(
+                egui::TextEdit::singleline(&mut name)
+                    .desired_width(110.0)
+                    .hint_text("Version name"),
+            );
+            if ui.button("Save version").clicked() {
+                action = Some(E::Add(name.clone()));
+            }
+            if let Some(version) = active {
+                if ui.button("Rename version").clicked() {
+                    action = Some(E::Rename(version, name.clone()));
+                }
+                if ui
+                    .button("Delete version")
+                    .on_hover_text("Remove this snapshot; keep the current rendered look")
+                    .clicked()
+                {
+                    action = Some(E::Remove(version));
+                }
+            }
+        })
+    });
+    ui.data_mut(|d| d.insert_temp(name_id, name));
+    let Some(action) = action else { return false };
+    let added = matches!(action, E::Add(_));
+    match edit_shared_look_version(project, id, action) {
+        Ok(cmd) => {
+            history.execute_discrete(Command::Timeline(cmd), doc);
+            if added {
+                ui.data_mut(|d| d.remove::<String>(name_id));
+            }
+            true
+        }
+        Err(error) => {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                format!("Shared version edit rejected: {error}"),
+            );
+            false
+        }
+    }
+}
+
 fn draw_grade_versions(
     ui: &mut Ui,
     doc: &mut Document,
@@ -2746,6 +3264,7 @@ fn draw_op_editor(
     seq: SequenceId,
     track: TrackId,
     clip: ClipId,
+    stage: GradeInspectionStage,
     can_sample: bool,
     qualified_input: bool,
     graph_node: Option<u32>,
@@ -2757,11 +3276,9 @@ fn draw_op_editor(
     match &mut op.params.base {
         GradeOpParams::Exposure { stops } => {
             labelled(ui, "Stops", |ui| {
-                ui.add(
-                    egui::Slider::new(stops, -6.0..=6.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.01),
-                );
+                param_expr::numeric_slider(ui, stops, -6.0..=6.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+                });
             });
         }
         GradeOpParams::LinearOffset { rgb } => {
@@ -2772,11 +3289,9 @@ fn draw_op_editor(
             );
             for (label, channel) in ["Red", "Green", "Blue"].into_iter().zip(rgb.iter_mut()) {
                 labelled(ui, label, |ui| {
-                    ui.add(
-                        egui::Slider::new(channel, -2.0..=2.0)
-                            .clamping(egui::SliderClamping::Edits)
-                            .step_by(0.001),
-                    );
+                    param_expr::numeric_slider(ui, channel, -2.0..=2.0, |slider| {
+                        slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+                    });
                 });
             }
         }
@@ -2788,29 +3303,23 @@ fn draw_op_editor(
             );
             for (label, channel) in ["Red", "Green", "Blue"].into_iter().zip(points.iter_mut()) {
                 labelled(ui, label, |ui| {
-                    ui.add(
-                        egui::Slider::new(channel, -48.0..=48.0)
-                            .clamping(egui::SliderClamping::Edits)
-                            .step_by(0.1),
-                    );
+                    param_expr::numeric_slider(ui, channel, -48.0..=48.0, |slider| {
+                        slider.clamping(egui::SliderClamping::Edits).step_by(0.1)
+                    });
                 });
             }
         }
         GradeOpParams::HighlightRolloff { knee, strength } => {
             ui.label(RichText::new("Scene-linear highlight compression; hue ratios and negative detail are preserved.").small().color(muted(ui)));
             labelled(ui, "Knee", |ui| {
-                ui.add(
-                    egui::Slider::new(knee, 0.0..=8.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.01),
-                );
+                param_expr::numeric_slider(ui, knee, 0.0..=8.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+                });
             });
             labelled(ui, "Strength", |ui| {
-                ui.add(
-                    egui::Slider::new(strength, 0.0..=8.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.01),
-                );
+                param_expr::numeric_slider(ui, strength, 0.0..=8.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+                });
             });
         }
         GradeOpParams::SaturationVibrance {
@@ -2825,18 +3334,14 @@ fn draw_op_editor(
                 .color(muted(ui)),
             );
             labelled(ui, "Saturation", |ui| {
-                ui.add(
-                    egui::Slider::new(saturation, 0.0..=2.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.01),
-                );
+                param_expr::numeric_slider(ui, saturation, 0.0..=2.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+                });
             });
             labelled(ui, "Vibrance", |ui| {
-                ui.add(
-                    egui::Slider::new(vibrance, -1.0..=1.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.01),
-                );
+                param_expr::numeric_slider(ui, vibrance, -1.0..=1.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+                });
             });
         }
         GradeOpParams::Contrast { pivot, amount } => {
@@ -2850,17 +3355,102 @@ fn draw_op_editor(
                 );
             }
             labelled(ui, if native { "Log₂ slope" } else { "Amount" }, |ui| {
-                ui.add(
-                    egui::Slider::new(amount, if native { -4.0..=4.0 } else { -1.0..=1.0 })
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.001),
+                param_expr::numeric_slider(
+                    ui,
+                    amount,
+                    if native { -4.0..=4.0 } else { -1.0..=1.0 },
+                    |slider| slider.clamping(egui::SliderClamping::Edits).step_by(0.001),
                 );
             });
             labelled(ui, "Pivot", |ui| {
+                param_expr::numeric_slider(ui, pivot, 0.0..=1.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+                });
+            });
+        }
+        GradeOpParams::TonalExposure {
+            stops,
+            boundaries,
+            softness,
+        } => {
+            ui.label(RichText::new("Linked RGB exposure by linear luminance. Boundaries are stops relative to Y=0.18; softness is the transition half-width. Negative/zero luminance uses Shadows. This is a creative primary, not a display tone mapper.").small().color(muted(ui)));
+            for (index, label) in ["Shadows", "Midtones", "Highlights"].iter().enumerate() {
+                labelled(ui, label, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut stops[index])
+                            .update_while_editing(false)
+                            .speed(0.01)
+                            .range(-8.0..=8.0)
+                            .clamp_existing_to_range(false)
+                            .update_while_editing(false)
+                            .suffix(" stops"),
+                    );
+                });
+            }
+            for (index, label) in ["Shadow boundary", "Highlight boundary"].iter().enumerate() {
+                let range = if boundaries[1 - index].is_finite() {
+                    if index == 0 {
+                        -12.0..=(boundaries[1] - 0.01).clamp(-12.0, 12.0)
+                    } else {
+                        (boundaries[0] + 0.01).clamp(-12.0, 12.0)..=12.0
+                    }
+                } else {
+                    -12.0..=12.0
+                };
+                labelled(ui, label, |ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut boundaries[index])
+                            .update_while_editing(false)
+                            .speed(0.01)
+                            .range(range)
+                            .clamp_existing_to_range(false)
+                            .update_while_editing(false)
+                            .suffix(" stops"),
+                    );
+                });
+            }
+            labelled(ui, "Softness", |ui| {
                 ui.add(
-                    egui::Slider::new(pivot, 0.0..=1.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.001),
+                    egui::DragValue::new(softness)
+                        .update_while_editing(false)
+                        .speed(0.01)
+                        .range(0.01..=6.0)
+                        .clamp_existing_to_range(false)
+                        .update_while_editing(false)
+                        .suffix(" stops"),
+                );
+            });
+            if let Err(error) =
+                photonic_core::timeline::validate_tonal_exposure(*stops, *boundaries, *softness)
+            {
+                ui.colored_label(ui.visuals().warn_fg_color, error);
+            }
+        }
+        GradeOpParams::WhiteBalanceCct {
+            source_kelvin,
+            target_kelvin,
+        } => {
+            ui.label(RichText::new("Bradford adaptation between approximate Planckian whites. Equal temperatures are identity; this is not a RAW camera setting or daylight-white model.").small().color(muted(ui)));
+            labelled(ui, "Source white", |ui| {
+                ui.add(
+                    egui::DragValue::new(source_kelvin)
+                        .update_while_editing(false)
+                        .speed(25.0)
+                        .range(1667.0..=25000.0)
+                        .clamp_existing_to_range(false)
+                        .update_while_editing(false)
+                        .suffix(" K"),
+                );
+            });
+            labelled(ui, "Target white", |ui| {
+                ui.add(
+                    egui::DragValue::new(target_kelvin)
+                        .update_while_editing(false)
+                        .speed(25.0)
+                        .range(1667.0..=25000.0)
+                        .clamp_existing_to_range(false)
+                        .update_while_editing(false)
+                        .suffix(" K"),
                 );
             });
         }
@@ -2869,18 +3459,14 @@ fn draw_op_editor(
                 ui.label("Normalized temperature/tint trim in scene-linear ACEScg. Neutral is zero; these controls do not represent Kelvin.");
             }
             labelled(ui, "Temp", |ui| {
-                ui.add(
-                    egui::Slider::new(temp, -1.0..=1.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.001),
-                );
+                param_expr::numeric_slider(ui, temp, -1.0..=1.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+                });
             });
             labelled(ui, "Tint", |ui| {
-                ui.add(
-                    egui::Slider::new(tint, -1.0..=1.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.001),
-                );
+                param_expr::numeric_slider(ui, tint, -1.0..=1.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+                });
             });
         }
         GradeOpParams::Cdl {
@@ -2909,11 +3495,9 @@ fn draw_op_editor(
                 wheel_dial(ui, "Gain", gain, 1.0);
             });
             labelled(ui, "Saturation", |ui| {
-                ui.add(
-                    egui::Slider::new(sat, 0.0..=2.0)
-                        .clamping(egui::SliderClamping::Edits)
-                        .step_by(0.001),
-                );
+                param_expr::numeric_slider(ui, sat, 0.0..=2.0, |slider| {
+                    slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+                });
             });
         }
         GradeOpParams::Curves {
@@ -2943,6 +3527,7 @@ fn draw_op_editor(
             seq,
             track,
             clip,
+            stage,
             op_id,
             graph_node,
             can_sample && (!native || qualified_input),
@@ -2970,6 +3555,7 @@ fn draw_op_editor(
                 seq,
                 track,
                 clip,
+                stage,
                 op_id,
                 graph_node,
                 can_sample && (!native || qualified_input),
@@ -2993,7 +3579,76 @@ fn draw_op_editor(
         }
     }
 
-    structural_change | draw_window_mask_editor(ui, &mut op.mask)
+    if matches!(op.params.base, GradeOpParams::HslQualifier { .. }) {
+        structural_change |= draw_qualifier_spatial_editor(ui, &mut op.qualifier_spatial, native);
+    }
+    if op.has_mask_animation() {
+        ui.label(if stage == GradeInspectionStage::Clip { "Animated window: these are base values. Edit geometry and feather in Clip Inspector / Keyframes." } else { "Animated stage: edit the matching look/group rows in Clip Inspector / Keyframes. Shared keys use each member clip’s local time." });
+        ui.add_enabled_ui(false, |ui| {
+            draw_window_mask_editor(ui, &mut op.mask);
+        });
+        structural_change
+    } else {
+        structural_change | draw_window_mask_editor(ui, &mut op.mask)
+    }
+}
+
+fn draw_qualifier_spatial_editor(
+    ui: &mut Ui,
+    stored: &mut Option<photonic_core::timeline::GradeQualifierSpatial>,
+    native: bool,
+) -> bool {
+    section_header(ui, "SPATIAL KEY CLEANUP");
+    ui.label(RichText::new("Static cleanup after key levels and window: denoise → grow/shrink → blur. Lengths are % of the shorter frame dimension. Source coverage is applied afterward.").small().color(muted(ui)));
+    if !native {
+        ui.label(
+            RichText::new("Requires Native Managed; existing settings are preserved.")
+                .small()
+                .color(muted(ui)),
+        );
+    }
+    let mut value = stored.unwrap_or_default();
+    let before = value;
+    let mut discrete = false;
+    ui.add_enabled_ui(native, |ui| {
+        discrete |= ui
+            .checkbox(&mut value.denoise, "Denoise (3×3 processing pixels)")
+            .changed();
+        let mut grow = value.grow * 100.0;
+        let mut blur = value.blur * 100.0;
+        if param_expr::numeric_slider(ui, &mut grow, -2.0..=2.0, |slider| {
+            slider
+                .clamping(egui::SliderClamping::Edits)
+                .suffix("%")
+                .text("Grow / shrink")
+        })
+        .changed()
+        {
+            value.grow = grow / 100.0;
+        }
+        if param_expr::numeric_slider(ui, &mut blur, 0.0..=2.0, |slider| {
+            slider
+                .clamping(egui::SliderClamping::Edits)
+                .suffix("%")
+                .text("Blur sigma")
+        })
+        .changed()
+        {
+            value.blur = blur / 100.0;
+        }
+        if ui.button("Reset spatial cleanup").clicked() {
+            value = Default::default();
+            discrete = true;
+        }
+    });
+    if value != before && value.validate().is_ok() {
+        *stored = if value.is_neutral() {
+            None
+        } else {
+            Some(value)
+        };
+    }
+    discrete
 }
 
 fn default_window(shape: WindowShape) -> GradeMask {
@@ -3083,34 +3738,29 @@ fn draw_window_mask_editor(ui: &mut Ui, mask: &mut Option<GradeMask>) -> bool {
             &mut size[index]
         };
         labelled(ui, label, |ui| {
-            ui.add(
-                egui::Slider::new(value, 0.0..=1.0)
-                    .clamping(egui::SliderClamping::Edits)
-                    .step_by(0.001),
-            );
+            param_expr::numeric_slider(ui, value, 0.0..=1.0, |slider| {
+                slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+            });
         });
     }
     let mut degrees = rotation.to_degrees();
     labelled(ui, "Rotation", |ui| {
-        if ui
-            .add(
-                egui::Slider::new(&mut degrees, -180.0..=180.0)
-                    .suffix("°")
-                    .clamping(egui::SliderClamping::Edits)
-                    .step_by(0.1),
-            )
-            .changed()
+        if param_expr::numeric_slider(ui, &mut degrees, -180.0..=180.0, |slider| {
+            slider
+                .suffix("°")
+                .clamping(egui::SliderClamping::Edits)
+                .step_by(0.1)
+        })
+        .changed()
         {
             *rotation = degrees.to_radians();
         }
     });
     if *shape != WindowShape::Gradient {
         labelled(ui, "Feather", |ui| {
-            ui.add(
-                egui::Slider::new(softness, 0.0..=1.0)
-                    .clamping(egui::SliderClamping::Edits)
-                    .step_by(0.001),
-            );
+            param_expr::numeric_slider(ui, softness, 0.0..=1.0, |slider| {
+                slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+            });
         });
     }
     discrete |= ui.checkbox(invert, "Invert window").changed();
@@ -3170,11 +3820,9 @@ fn cdl_editor(
         }
     });
     labelled(ui, "Saturation", |ui| {
-        ui.add(
-            egui::Slider::new(sat, 0.0..=2.0)
-                .clamping(egui::SliderClamping::Edits)
-                .step_by(0.001),
-        );
+        param_expr::numeric_slider(ui, sat, 0.0..=2.0, |slider| {
+            slider.clamping(egui::SliderClamping::Edits).step_by(0.001)
+        });
     });
 }
 
@@ -3204,11 +3852,9 @@ fn lut_editor(
             });
     }
     labelled(ui, "Intensity", |ui| {
-        ui.add(
-            egui::Slider::new(intensity, 0.0..=1.0)
-                .clamping(egui::SliderClamping::Edits)
-                .step_by(0.01),
-        );
+        param_expr::numeric_slider(ui, intensity, 0.0..=1.0, |slider| {
+            slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+        });
     });
     labelled(ui, "Interp", |ui| {
         if ui
@@ -3231,7 +3877,7 @@ fn lut_editor(
 // Wheels dial (13 §9.1.1) — 2D chroma disc + precise numeric readouts (kbd path)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Draw one lift/gamma/gain dial: a chroma disc plus three numeric readouts (the
+/// Draw one lift/gamma/gain dial: a chroma disc, linked master and RGB readouts (the
 /// keyboard fallback, 13 §9.6). `neutral` is the per-channel identity (0.0 for
 /// lift, 1.0 for gamma/gain). Mutates `v` in place.
 fn wheel_dial(ui: &mut Ui, label: &str, v: &mut [f32; 3], neutral: f32) {
@@ -3287,6 +3933,23 @@ fn wheel_dial(ui: &mut Ui, label: &str, v: &mut [f32; 3], neutral: f32) {
             painter.circle_filled(tip, 2.5, accent(ui));
         }
 
+        // A linked RGB mean is an authoring convenience, not a measurement of
+        // scene luminance. A common additive shift preserves channel differences.
+        let limits = if neutral == 0.0 { [-0.5, 0.5] } else { [0.0, 2.0] };
+        let mean = wheel_channel_mean(*v);
+        let permitted = wheel_linked_range(*v, limits);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("All").small().color(muted(ui)));
+            let mut edited = mean;
+            let range = permitted.unwrap_or([mean, mean]);
+            let response = ui.add_enabled(permitted.is_some(),
+                egui::DragValue::new(&mut edited).update_while_editing(false).speed(0.002)
+                    .range(range[0]..=range[1]).clamp_existing_to_range(false)
+                    .update_while_editing(false));
+            if response.changed() { wheel_set_linked_mean(v, edited, limits); }
+            response.on_hover_text("Linked RGB channel mean. Shifts all three values equally, preserving their differences within the wheel edit limits. This is not measured luminance. Adjust individual channels first if the loaded spread exceeds those limits.");
+        });
+
         let ch = ["R", "G", "B"];
         for c in 0..3 {
             ui.horizontal(|ui| {
@@ -3296,10 +3959,48 @@ fn wheel_dial(ui: &mut Ui, label: &str, v: &mut [f32; 3], neutral: f32) {
                 } else {
                     0.0..=2.0
                 };
-                ui.add(egui::DragValue::new(&mut v[c]).speed(0.002).range(range));
+                ui.add(egui::DragValue::new(&mut v[c]).update_while_editing(false).speed(0.002).range(range)
+                    .clamp_existing_to_range(false).update_while_editing(false));
             });
         }
     });
+}
+
+fn wheel_channel_mean(values: [f32; 3]) -> f32 {
+    ((f64::from(values[0]) + f64::from(values[1]) + f64::from(values[2])) / 3.0) as f32
+}
+
+/// Feasible mean interval for a common RGB shift, without per-channel clipping.
+fn wheel_linked_range(values: [f32; 3], limits: [f32; 2]) -> Option<[f32; 2]> {
+    if values.iter().chain(limits.iter()).any(|v| !v.is_finite()) || limits[0] > limits[1] {
+        return None;
+    }
+    let mean = wheel_channel_mean(values);
+    let min = values.into_iter().fold(f32::INFINITY, f32::min);
+    let max = values.into_iter().fold(f32::NEG_INFINITY, f32::max);
+    let low = mean + limits[0] - min;
+    let high = mean + limits[1] - max;
+    (low.is_finite() && high.is_finite() && low <= high).then_some([low, high])
+}
+
+fn wheel_set_linked_mean(values: &mut [f32; 3], requested: f32, limits: [f32; 2]) -> bool {
+    if !requested.is_finite() {
+        return false;
+    }
+    let Some([low, high]) = wheel_linked_range(*values, limits) else {
+        return false;
+    };
+    let mean = wheel_channel_mean(*values);
+    let shift = requested.clamp(low, high) - mean;
+    if shift == 0.0 {
+        return false;
+    }
+    // No channel-wise clamp: preserve the opponent differences. Floating-point
+    // roundoff at a limit is tolerated by the numerical tests.
+    for value in values.iter_mut() {
+        *value += shift;
+    }
+    true
 }
 
 /// Full-scale chroma radius in RGB-delta space that maps to the disc edge.
@@ -3365,6 +4066,7 @@ fn curves_editor(
     seq: SequenceId,
     track: TrackId,
     clip: ClipId,
+    stage: GradeInspectionStage,
     op: GradeOpId,
     graph_node: Option<u32>,
     can_sample: bool,
@@ -3441,6 +4143,7 @@ fn curves_editor(
             crate::color_popup::ColorPopup::swatch_f32(ui, &mut sample);
             if ui.add_enabled_ui(can_sample, eyedropper_btn).inner {
                 actions.push(PanelAction::StartEyedropper(EyedropperTarget::GradeCurve {
+                    stage,
                     graph_node,
                     seq,
                     track,
@@ -3464,6 +4167,7 @@ fn curves_editor(
         ui.horizontal(|ui| {
             if ui.add_enabled_ui(can_sample, eyedropper_btn).inner {
                 actions.push(PanelAction::StartEyedropper(EyedropperTarget::GradeCurve {
+                    stage,
                     graph_node,
                     seq,
                     track,
@@ -3731,6 +4435,7 @@ fn qualifier_editor(
     seq: SequenceId,
     track: TrackId,
     clip: ClipId,
+    stage: GradeInspectionStage,
     op: GradeOpId,
     graph_node: Option<u32>,
     can_sample: bool,
@@ -3747,6 +4452,7 @@ fn qualifier_editor(
         if ui.add_enabled_ui(can_sample, eyedropper_btn).inner {
             actions.push(PanelAction::StartEyedropper(
                 EyedropperTarget::GradeQualifier {
+                    stage,
                     graph_node,
                     seq,
                     track,
@@ -3771,6 +4477,7 @@ fn qualifier_editor(
         {
             actions.push(PanelAction::StartEyedropper(
                 EyedropperTarget::GradeQualifier {
+                    stage,
                     graph_node,
                     seq,
                     track,
@@ -3790,6 +4497,7 @@ fn qualifier_editor(
         {
             actions.push(PanelAction::StartEyedropper(
                 EyedropperTarget::GradeQualifier {
+                    stage,
                     graph_node,
                     seq,
                     track,
@@ -3832,11 +4540,9 @@ fn qualifier_editor(
     range_gate(ui, "Sat", sat);
     range_gate(ui, "Lum", lum);
     labelled(ui, "Softness", |ui| {
-        ui.add(
-            egui::Slider::new(softness, 0.0..=1.0)
-                .clamping(egui::SliderClamping::Edits)
-                .step_by(0.01),
-        );
+        param_expr::numeric_slider(ui, softness, 0.0..=1.0, |slider| {
+            slider.clamping(egui::SliderClamping::Edits).step_by(0.01)
+        });
     });
 
     if !keys.is_empty() {
@@ -3861,7 +4567,7 @@ fn qualifier_editor(
             range_gate(ui, "Sat", &mut key.sat);
             range_gate(ui, "Lum", &mut key.lum);
             labelled(ui, "Softness", |ui| {
-                ui.add(egui::Slider::new(&mut key.softness, 0.0..=1.0));
+                param_expr::numeric_slider(ui, &mut key.softness, 0.0..=1.0, |slider| slider);
             });
         }
         if let Some(index) = remove {
@@ -3877,33 +4583,36 @@ fn qualifier_editor(
             .color(muted(ui)),
     );
     labelled(ui, "Clean black", |ui| {
-        ui.add(egui::Slider::new(&mut matte_levels[0], 0.0..=0.49).step_by(0.01));
+        param_expr::numeric_slider(ui, &mut matte_levels[0], 0.0..=0.49, |slider| {
+            slider.step_by(0.01)
+        });
     });
     labelled(ui, "Clean white", |ui| {
-        ui.add(egui::Slider::new(&mut matte_levels[1], 0.0..=0.49).step_by(0.01));
+        param_expr::numeric_slider(ui, &mut matte_levels[1], 0.0..=0.49, |slider| {
+            slider.step_by(0.01)
+        });
     });
 
     let target = (seq, clip, op, graph_node);
-    let active = ui.data(|data| {
-        data.get_temp::<Option<(SequenceId, ClipId, GradeOpId, Option<u32>)>>(egui::Id::new(
-            "qualifier_matte_target",
-        ))
-        .flatten()
-    }) == Some(target);
+    let active = stage == GradeInspectionStage::Clip
+        && ui.data(|data| {
+            data.get_temp::<Option<(SequenceId, ClipId, GradeOpId, Option<u32>)>>(egui::Id::new(
+                "qualifier_matte_target",
+            ))
+            .flatten()
+        }) == Some(target);
     if ui
         .add_enabled(
             can_sample && qualified_input,
-            egui::SelectableLabel::new(active, "Highlight matte"),
+            egui::SelectableLabel::new(active, if stage == GradeInspectionStage::Clip { "Highlight matte" } else { "Inspect key coverage" }),
         )
         .on_disabled_hover_text("Matte preview requires an unambiguous clip corrector input; graph inspection requires Native Managed")
         .clicked()
     {
-        actions.push(PanelAction::ToggleQualifierMatte {
-            seq,
-            track,
-            clip,
-            op,
-            graph_node,
+        actions.push(if stage == GradeInspectionStage::Clip {
+            PanelAction::ToggleQualifierMatte { seq, track, clip, op, graph_node }
+        } else {
+            PanelAction::ToggleGradeInput { seq, track, clip, stage, op, node: graph_node, qualifier: true }
         });
     }
 
@@ -3935,6 +4644,7 @@ fn range_gate_with_bounds(
         changed |= ui
             .add(
                 egui::DragValue::new(&mut range[0])
+                    .update_while_editing(false)
                     .speed(0.005)
                     .range(bounds.clone())
                     .clamp_existing_to_range(false),
@@ -3944,6 +4654,7 @@ fn range_gate_with_bounds(
         changed |= ui
             .add(
                 egui::DragValue::new(&mut range[1])
+                    .update_while_editing(false)
                     .speed(0.005)
                     .range(bounds)
                     .clamp_existing_to_range(false),
@@ -4019,7 +4730,51 @@ pub(crate) fn requested_tap(mode: TapMode, selection: &[ClipId]) -> ScopeTapPoin
 /// not claim to be scoping a clip it is not.
 pub(crate) fn scope_tap_label(doc: &Document, want: ScopeTapPoint, got: ScopeTapPoint) -> String {
     match got {
-        ScopeTapPoint::GradeGraphMatteOutput { clip, node } => format!("{} · matte node {node}", clip_name(doc, clip)),
+        ScopeTapPoint::NativeSceneProgram => "Program · scene-linear AP1".into(),
+        ScopeTapPoint::GradeStageInput { clip, stage, .. } => {
+            let label = match stage {
+                photonic_core::timeline::GradeInspectionStage::Clip => "clip".to_owned(),
+                photonic_core::timeline::GradeInspectionStage::LocalLook => "local look".to_owned(),
+                photonic_core::timeline::GradeInspectionStage::GroupPre { id } => {
+                    format!("group pre {} · member", &id.to_string()[..8])
+                }
+                photonic_core::timeline::GradeInspectionStage::GroupPost { id } => {
+                    format!("group post {} · member", &id.to_string()[..8])
+                }
+                photonic_core::timeline::GradeInspectionStage::SharedLook { .. } => {
+                    "linked shared look".to_owned()
+                }
+            };
+            format!("{} · {label} correction input", clip_name(doc, clip))
+        }
+        ScopeTapPoint::GradeGraphImageOutput { clip, node } => {
+            format!("{} · image node {node}", clip_name(doc, clip))
+        }
+        ScopeTapPoint::GradeGraphMatteOutput { clip, node } => {
+            format!("{} · matte node {node}", clip_name(doc, clip))
+        }
+        ScopeTapPoint::GradeStageGraphImageOutput { clip, stage, node }
+        | ScopeTapPoint::GradeStageGraphMatteOutput { clip, stage, node } => {
+            let label = match stage {
+                photonic_core::timeline::GradeInspectionStage::Clip => "clip".to_owned(),
+                photonic_core::timeline::GradeInspectionStage::LocalLook => "local look".to_owned(),
+                photonic_core::timeline::GradeInspectionStage::GroupPre { id } => {
+                    format!("group pre {} · member", &id.to_string()[..8])
+                }
+                photonic_core::timeline::GradeInspectionStage::GroupPost { id } => {
+                    format!("group post {} · member", &id.to_string()[..8])
+                }
+                photonic_core::timeline::GradeInspectionStage::SharedLook { .. } => {
+                    "linked shared look".to_owned()
+                }
+            };
+            let kind = if matches!(got, ScopeTapPoint::GradeStageGraphImageOutput { .. }) {
+                "image"
+            } else {
+                "matte"
+            };
+            format!("{} · {label} · {kind} node {node}", clip_name(doc, clip))
+        }
         ScopeTapPoint::Clip(clip) => clip_name(doc, clip),
         ScopeTapPoint::ClipPreGrade(clip) => format!("{} · pre-grade", clip_name(doc, clip)),
         ScopeTapPoint::NativeGraphQualifierInput { clip, .. }
@@ -4064,8 +4819,10 @@ pub(crate) fn draw_scopes_panel(
     let want = requested_tap(mode, selection);
     let got = frame.map(|f| f.scope_tap_point).unwrap_or(want);
 
+    let restore_geometry = settings.restore_geometry;
     let was_docked = settings.docked;
     let floating_rect = settings.rect;
+    let floating_body_size = settings.body_size;
     let dock_height = settings.dock_height;
     let mut close_requested = false;
     let content = |ui: &mut Ui| {
@@ -4107,7 +4864,8 @@ pub(crate) fn draw_scopes_panel(
                 if matches!(
                     *kind,
                     ScopeKind::Waveform | ScopeKind::Parade | ScopeKind::RgbWaveform
-                ) {
+                ) && !scene_scope_frame(frame)
+                {
                     let display_signal = frame.is_some_and(|f| {
                         f.scope_tap_encoding
                             == Some(photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay)
@@ -4157,7 +4915,7 @@ pub(crate) fn draw_scopes_panel(
                 &mut settings.vectorscope_601,
                 &mut settings.vectorscope_targets,
             );
-            return;
+            return ui.min_size();
         }
 
         ui.horizontal_wrapped(|ui| {
@@ -4203,7 +4961,8 @@ pub(crate) fn draw_scopes_panel(
         if matches!(
             *kind,
             ScopeKind::Waveform | ScopeKind::Parade | ScopeKind::RgbWaveform
-        ) {
+        ) && !scene_scope_frame(frame)
+        {
             let display_signal = frame.is_some_and(|frame| {
                 frame.scope_tap_encoding
                     == Some(photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay)
@@ -4238,7 +4997,9 @@ pub(crate) fn draw_scopes_panel(
             &mut settings.vectorscope_601,
             &mut settings.vectorscope_targets,
         );
+        ui.min_size()
     };
+    let mut floating_content_size = None;
     let shown_rect = if was_docked {
         Some(
             egui::TopBottomPanel::bottom("scopes_dock")
@@ -4260,9 +5021,17 @@ pub(crate) fn draw_scopes_panel(
         {
             window = window
                 .default_pos([left, top])
-                .default_size([width, height]);
+                .default_size(scope_content_size(ctx, floating_body_size, [width, height]));
+            if restore_geometry {
+                window = window
+                    .current_pos([left, top])
+                    .fixed_size(scope_content_size(ctx, floating_body_size, [width, height]));
+            }
         }
-        window.show(ctx, content).map(|shown| shown.response.rect)
+        window.show(ctx, content).map(|shown| {
+            floating_content_size = shown.inner;
+            shown.response.rect
+        })
     };
     if let Some(rect) = shown_rect {
         if ctx.input(|input| input.pointer.any_released()) {
@@ -4270,6 +5039,7 @@ pub(crate) fn draw_scopes_panel(
                 settings.dock_height = rect.height().clamp(160.0, 560.0);
             } else {
                 settings.rect = Some([rect.left(), rect.top(), rect.width(), rect.height()]);
+                settings.body_size = floating_content_size.map(|size| [size.x, size.y]);
             }
         }
     }
@@ -4291,7 +5061,12 @@ pub(crate) fn draw_scopes_panel(
         {
             window = window
                 .default_pos([left, top])
-                .default_size([width, height]);
+                .default_size(scope_content_size(ctx, extra.body_size, [width, height]));
+            if restore_geometry {
+                window = window
+                    .current_pos([left, top])
+                    .fixed_size(scope_content_size(ctx, extra.body_size, [width, height]));
+            }
         }
         let shown = window.show(ctx, |ui| {
             egui::ComboBox::from_id_salt("scope_kind")
@@ -4311,7 +5086,8 @@ pub(crate) fn draw_scopes_panel(
             if matches!(
                 extra.kind,
                 ScopeKind::Waveform | ScopeKind::Parade | ScopeKind::RgbWaveform
-            ) {
+            ) && !scene_scope_frame(frame)
+            {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut extra.scale, ScopeScale::Full, "Full");
                     ui.selectable_value(&mut extra.scale, ScopeScale::VideoLegal, "Video legal");
@@ -4332,11 +5108,13 @@ pub(crate) fn draw_scopes_panel(
                 &mut extra.vectorscope_601,
                 &mut extra.vectorscope_targets,
             );
+            ui.min_size()
         });
         if let Some(shown) = shown {
             if ctx.input(|input| input.pointer.any_released()) {
                 let rect = shown.response.rect;
                 extra.rect = Some([rect.left(), rect.top(), rect.width(), rect.height()]);
+                extra.body_size = shown.inner.map(|size| [size.x, size.y]);
             }
         }
         if !extra_open {
@@ -4350,6 +5128,7 @@ pub(crate) fn draw_scopes_panel(
     settings.tap = mode;
     settings.scale = scale;
     settings.open = is_open;
+    settings.restore_geometry = false;
     *open = is_open;
     requested_tap(mode, selection)
 }
@@ -4367,6 +5146,28 @@ fn scope_kind_name(kind: ScopeKind) -> &'static str {
 
 /// Restore a saved floating panel onto the current monitor, including when its
 /// former monitor was unplugged or the desktop resolution became smaller.
+fn scope_content_size(ctx: &egui::Context, saved: Option<[f32; 2]>, outer: [f32; 2]) -> egui::Vec2 {
+    saved
+        .filter(|size| size.iter().all(|v| v.is_finite() && *v > 0.0))
+        .map(|size| egui::vec2(size[0], size[1]).min(egui::vec2(outer[0], outer[1])))
+        .unwrap_or_else(|| scope_inner_size(ctx, outer))
+}
+
+fn scope_inner_size(ctx: &egui::Context, outer: [f32; 2]) -> egui::Vec2 {
+    // Stored rectangles include title and frame. Passing them as content sizes
+    // would grow the window every time a named arrangement was restored.
+    let style = ctx.style();
+    let frame = egui::Frame::window(&style);
+    let title = ctx.fonts(|fonts| fonts.row_height(&egui::TextStyle::Heading.resolve(&style)));
+    let margins = frame.outer_margin.sum()
+        + frame.inner_margin.sum()
+        + egui::vec2(
+            0.0,
+            title + frame.inner_margin.top + frame.inner_margin.bottom,
+        );
+    (egui::vec2(outer[0], outer[1]) - margins).max(egui::vec2(96.0, 32.0))
+}
+
 fn restored_scope_rect(saved: Option<[f32; 4]>, screen: egui::Rect) -> Option<[f32; 4]> {
     let [left, top, width, height] = saved?;
     if ![left, top, width, height]
@@ -4429,6 +5230,9 @@ fn draw_scope_signal(
                 "BT.709 video signal"
             }
             Some(photonic_video::graph::ir::FrameColorEncoding::MatteWeight) => "matte weight",
+            Some(photonic_video::graph::ir::FrameColorEncoding::ScalarChannel) => {
+                "unassociated scalar channel"
+            }
             None => "unresolved tap interpretation",
         };
         ui.label(format!(
@@ -4453,6 +5257,7 @@ fn draw_scope_signal(
             Some(
                 photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709
                     | photonic_video::graph::ir::FrameColorEncoding::SrgbDisplay
+                    | photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg
             )
         )
     }) {
@@ -4507,9 +5312,16 @@ fn draw_scope_signal(
                 tap_encoding: frame.scope_tap_encoding,
                 tap: frame.scope_tap_point,
                 requested: want,
+                quality: frame.preview_quality,
+                proxy_policy: frame.proxy_mode,
+                logical_size: (w, h),
             },
         )
     });
+    if scene_scope_frame(Some(frame)) {
+        draw_scene_scope(ui, device, queue, tex, w, h, kind);
+        return;
+    }
     match kind {
         ScopeKind::Histogram => draw_histogram(ui, device, queue, tex, w, h),
         ScopeKind::Parade => draw_parade(ui, device, queue, tex, (w, h), false, scale),
@@ -4529,6 +5341,165 @@ fn draw_scope_signal(
     }
 }
 
+fn scene_scope_frame(frame: Option<&EngineFrame>) -> bool {
+    frame.is_some_and(|f| {
+        f.scope_tap_encoding
+            == Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_scene_scope(
+    ui: &mut Ui,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    w: u32,
+    h: u32,
+    kind: ScopeKind,
+) {
+    ui.label("AP1 relative stops · −12 to +12 · reference 0.18 · not nits or IRE");
+    if kind == ScopeKind::Vectorscope {
+        ui.label("AP1 chroma vectorscope is not qualified. Select Program for the sRGB display vectorscope.");
+        return;
+    }
+    let len = match photonic_render::scene_scopes::output_len(w, h) {
+        Ok(len) => len,
+        Err(error) => {
+            ui.colored_label(ui.visuals().warn_fg_color, error);
+            return;
+        }
+    };
+    let Some(data) = scope_bins(
+        ui,
+        device,
+        queue,
+        tex,
+        photonic_render::scene_scopes::SHADER,
+        "cs_scene",
+        len,
+        (w, h),
+        0,
+    ) else {
+        return;
+    };
+    let Ok(scene) = photonic_render::scene_scopes::SceneScopes::from_bins(&data, w, h) else {
+        return;
+    };
+    ui.collapsing("Excluded samples (Y / R / G / B)", |ui| {
+        ui.label(format!(
+            "Transparent: {} · invalid: {}",
+            scene.transparent, scene.invalid
+        ));
+        ui.label(format!("Nonpositive: {:?}", scene.nonpositive));
+        ui.label(format!(
+            "Below −12: {:?} · at/above +12: {:?}",
+            scene.below, scene.above
+        ));
+    });
+    let histogram = kind == ScopeKind::Histogram;
+    let channels: &[usize] = match kind {
+        ScopeKind::Waveform => &[0],
+        ScopeKind::Histogram => &[0, 1, 2, 3],
+        _ => &[1, 2, 3],
+    };
+    let parade = kind == ScopeKind::Parade;
+    let width = if parade { 768 } else { 256 };
+    let height = 256;
+    let mut pixels = vec![Color32::from_rgb(7, 7, 11); width * height];
+    let colors = [
+        [190u8, 190, 190],
+        [220, 60, 60],
+        [60, 200, 80],
+        [70, 110, 230],
+    ];
+    let peak = channels
+        .iter()
+        .flat_map(|&c| {
+            if histogram {
+                &scene.histogram[c]
+            } else {
+                &scene.waveform[c].data
+            }
+        })
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32;
+    for (channel_slot, &c) in channels.iter().enumerate() {
+        if histogram {
+            for (x, &count) in scene.histogram[c].iter().enumerate() {
+                let high = (count as f32 / peak * 255.0).round() as usize;
+                for row in 0..high {
+                    let i = (255 - row) * width + x;
+                    let old = pixels[i];
+                    let color = colors[c];
+                    pixels[i] = Color32::from_rgb(
+                        old.r().max(color[0]),
+                        old.g().max(color[1]),
+                        old.b().max(color[2]),
+                    );
+                }
+            }
+        } else {
+            let waveform = &scene.waveform[c];
+            for x in 0..256 {
+                let sx = x * waveform.width / 256;
+                for bin in 0..256 {
+                    let count = waveform.count(sx, bin);
+                    if count == 0 {
+                        continue;
+                    }
+                    let intensity = (count as f32 / peak).sqrt();
+                    let color = colors[c].map(|v| (v as f32 * intensity).round() as u8);
+                    let i = (255 - bin) * width + x + if parade { channel_slot * 256 } else { 0 };
+                    let old = pixels[i];
+                    pixels[i] = Color32::from_rgb(
+                        old.r().max(color[0]),
+                        old.g().max(color[1]),
+                        old.b().max(color[2]),
+                    );
+                }
+            }
+        }
+    }
+    ui.label(if histogram {
+        "Horizontal: relative stops · vertical: sample count"
+    } else {
+        "Vertical: relative stops · horizontal: source position"
+    });
+    scope_image(
+        ui,
+        "scope_scene",
+        width,
+        height,
+        pixels,
+        Some(&|ui, painter, rect| {
+            for stop in [-12, -6, 0, 6, 12] {
+                let f = (stop as f32 + 12.0) / 24.0;
+                let pos = if histogram {
+                    pos2(rect.left() + f * rect.width(), rect.bottom() - 12.0)
+                } else {
+                    pos2(rect.left() + 3.0, rect.bottom() - f * rect.height())
+                };
+                let pos = pos2(
+                    pos.x
+                        .clamp(rect.left(), (rect.right() - 26.0).max(rect.left())),
+                    pos.y
+                        .clamp(rect.top(), (rect.bottom() - 12.0).max(rect.top())),
+                );
+                painter.text(
+                    pos,
+                    egui::Align2::LEFT_TOP,
+                    format!("{stop:+}"),
+                    egui::FontId::proportional(10.0),
+                    on_surface(ui),
+                );
+            }
+        }),
+    );
+}
+
 #[derive(Clone, PartialEq)]
 struct ScopeFrameStamp {
     revision: u64,
@@ -4540,9 +5511,29 @@ struct ScopeFrameStamp {
     tap_encoding: Option<photonic_video::graph::ir::FrameColorEncoding>,
     tap: ScopeTapPoint,
     requested: ScopeTapPoint,
+    quality: photonic_video::session::PreviewQuality,
+    proxy_policy: photonic_video::session::ProxyMode,
+    logical_size: (u32, u32),
 }
 
 impl ScopeFrameStamp {
+    /// Provenance belongs to the measured frame, not newer monitor settings.
+    /// Proxy policy is intentionally not a claim that proxy media was used.
+    fn sampling_label(&self) -> String {
+        let quality = match self.quality {
+            photonic_video::session::PreviewQuality::Draft => "Draft",
+            photonic_video::session::PreviewQuality::Full => "Full",
+        };
+        let policy = match self.proxy_policy {
+            photonic_video::session::ProxyMode::Auto => "auto",
+            photonic_video::session::ProxyMode::ForceProxy => "prefer proxy",
+            photonic_video::session::ProxyMode::ForceOriginal => "original",
+        };
+        format!(
+            "Measured sampling: {quality} · {}×{} logical pixels · proxy policy: {policy}",
+            self.logical_size.0, self.logical_size.1
+        )
+    }
     fn same_context(&self, other: &Self) -> bool {
         self.revision == other.revision
             && self.generation == other.generation
@@ -4551,12 +5542,17 @@ impl ScopeFrameStamp {
             && self.requested == other.requested
             && self.output_encoding == other.output_encoding
             && self.tap_encoding == other.tap_encoding
+            && self.quality == other.quality
+            && self.proxy_policy == other.proxy_policy
+            && self.logical_size == other.logical_size
     }
 }
 
 #[derive(Default)]
 struct ScopeAnalysisState {
-    signature: Option<(String, (u32, u32), u32)>,
+    signature: Option<(&'static str, &'static str, (u32, u32), u32, usize)>,
+    device_id: Option<wgpu::Id<wgpu::Device>>,
+    kernel: Option<photonic_render::scopes::ScopeKernel>,
     pending: Option<(ScopeFrameStamp, photonic_render::scopes::ScopeReadback)>,
     measured: Option<(ScopeFrameStamp, Vec<u32>)>,
 }
@@ -4569,8 +5565,8 @@ fn scope_bins(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     tex: &wgpu::Texture,
-    shader: &str,
-    entry: &str,
+    shader: &'static str,
+    entry: &'static str,
     len: usize,
     size: (u32, u32),
     matrix: u32,
@@ -4584,10 +5580,11 @@ fn scope_bins(
             .clone()
     });
     let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
-    let signature = (entry.to_owned(), size, matrix);
-    if state.signature.as_ref() != Some(&signature) {
+    let signature = (shader, entry, size, matrix, len);
+    if state.signature.as_ref() != Some(&signature) || state.device_id != Some(device.global_id()) {
         *state = ScopeAnalysisState {
             signature: Some(signature),
+            device_id: Some(device.global_id()),
             ..Default::default()
         };
     }
@@ -4626,12 +5623,11 @@ fn scope_bins(
         } else {
             photonic_render::scopes::ScopeSignal::LegacyLinearRec709
         };
-        state.pending = Some((
-            stamp,
-            photonic_render::scopes::begin_scope_readback_signal(
-                device, queue, tex, shader, entry, len, size, matrix, signal,
-            ),
-        ));
+        let kernel = state.kernel.get_or_insert_with(|| {
+            photonic_render::scopes::ScopeKernel::new(device, shader, entry)
+        });
+        let request = kernel.readback(device, queue, tex, len, size, matrix, signal);
+        state.pending = Some((stamp, request));
     }
     if state.pending.is_some() {
         ui.ctx()
@@ -4647,9 +5643,16 @@ fn scope_bins(
             {
                 "sRGB display components"
             } else {
-                "Legacy SDR / BT.709 signal"
+                if measured.tap_encoding
+                    == Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg)
+                {
+                    "AP1 scene-relative stops"
+                } else {
+                    "Legacy SDR / BT.709 signal"
+                }
             }
         ));
+        ui.label(measured.sampling_label());
         Some(bins.clone())
     } else {
         ui.label("Measuring…");
@@ -5447,6 +6450,218 @@ mod tests {
     }
 
     #[test]
+    fn bezier_handle_drag_is_one_complete_color_panel_history_step() {
+        bezier_color_panel_gesture_case(false);
+    }
+    #[test]
+    fn animated_bezier_add_key_and_handle_drag_are_separate_complete_history_steps() {
+        bezier_color_panel_gesture_case(true);
+    }
+    #[test]
+    fn animated_bezier_authoring_clock_matches_selected_member_and_sequence_scopes() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, GroupId, Sequence, TimelineProject, Track, TrackKind,
+        };
+        let mut doc = Document::new("Clock", 32.0, 32.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Clock", FrameRate::FPS_30, 32, 32);
+        let sid = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let tid = track.id;
+        let clip = Clip::new(ClipSource::Adjustment, Tick(100), Tick(100));
+        let cid = clip.id;
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        project.active_sequence = Some(sid);
+        doc.timeline = Some(project);
+        for owner in [
+            VfxOwner::Clip(cid),
+            VfxOwner::Asset(AssetId::new()),
+            VfxOwner::GroupPre(GroupId::new()),
+            VfxOwner::GroupPost(GroupId::new()),
+        ] {
+            assert_eq!(
+                grade_animation_clock(&doc, sid, tid, cid, owner, Some(Tick(150))),
+                Some(Tick(50))
+            );
+            for at in [99, 200] {
+                assert_eq!(
+                    grade_animation_clock(&doc, sid, tid, cid, owner, Some(Tick(at))),
+                    None
+                );
+            }
+            assert_eq!(
+                grade_animation_clock(&doc, sid, tid, cid, owner, None),
+                None
+            );
+        }
+        for owner in [VfxOwner::Track(tid), VfxOwner::Master(sid)] {
+            assert_eq!(
+                grade_animation_clock(&doc, sid, tid, cid, owner, Some(Tick(150))),
+                Some(Tick(150))
+            );
+        }
+    }
+
+    fn bezier_color_panel_gesture_case(animated: bool) {
+        use photonic_core::timeline::{
+            BezierWindow, Clip, ClipSource, FrameRate, Sequence, Tick, TimelineProject, Track,
+            TrackKind,
+        };
+        let mut doc = Document::new("Bezier gesture", 32.0, 32.0);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Test", FrameRate::FPS_30, 32, 32);
+        let sid = sequence.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+        let cid = clip.id;
+        let mut grade = Grade::new();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 1.0 },
+        ));
+        grade.convert_to_graph();
+        grade
+            .add_graph_utility(if animated {
+                GradeGraphNode::AnimatedBezierMatte {
+                    input: 0,
+                    track: photonic_core::timeline::BezierWindowTrack::new(
+                        Tick(0),
+                        BezierWindow::default(),
+                    )
+                    .unwrap(),
+                    label: "Animated".into(),
+                }
+            } else {
+                GradeGraphNode::BezierMatte {
+                    input: 0,
+                    window: BezierWindow::default(),
+                    label: "Editable".into(),
+                }
+            })
+            .unwrap();
+        clip.grade = Some(grade);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        project.active_sequence = Some(sid);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::new(100);
+        let ctx = egui::Context::default();
+        let mut selected = None;
+        let mut tab = ColorPageTab::Wheels;
+        let mut scopes = false;
+        let mut frame =
+            |doc: &mut Document, history: &mut CommandHistory, events: Vec<egui::Event>| {
+                let _ = ctx.run(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(900.0, 4000.0))),
+                        events,
+                        ..Default::default()
+                    },
+                    |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            draw_color_controls(
+                                ui,
+                                doc,
+                                history,
+                                &mut Vec::new(),
+                                &[cid],
+                                &mut selected,
+                                &mut tab,
+                                &mut scopes,
+                                animated.then_some(Tick(50)),
+                            )
+                        });
+                    },
+                );
+            };
+        frame(&mut doc, &mut history, vec![]);
+        frame(&mut doc, &mut history, vec![]);
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        if animated {
+            let add = ctx
+                .data(|d| d.get_temp::<Rect>(egui::Id::new("bezier_add_key_test_rect")))
+                .unwrap()
+                .center();
+            frame(
+                &mut doc,
+                &mut history,
+                vec![egui::Event::PointerMoved(add), button(add, true)],
+            );
+            frame(&mut doc, &mut history, vec![button(add, false)]);
+            frame(&mut doc, &mut history, vec![]);
+            assert_ne!(
+                serde_json::to_value(&doc).unwrap(),
+                before,
+                "add at playhead must author a key"
+            );
+        }
+        let before_drag = serde_json::to_value(&doc).unwrap();
+        let rect = ctx
+            .data(|d| d.get_temp::<Rect>(egui::Id::new("bezier_editor_test_rect")))
+            .expect("actual editor was drawn");
+        let initial = pos2(
+            rect.left() + rect.width() * 0.6380712,
+            rect.top() + rect.height() * 0.25,
+        );
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        history.begin_coalescing();
+        frame(
+            &mut doc,
+            &mut history,
+            vec![egui::Event::PointerMoved(initial), button(initial, true)],
+        );
+        for delta in [vec2(12.0, -8.0), vec2(24.0, -16.0), vec2(36.0, -24.0)] {
+            frame(
+                &mut doc,
+                &mut history,
+                vec![egui::Event::PointerMoved(initial + delta)],
+            );
+        }
+        frame(
+            &mut doc,
+            &mut history,
+            vec![button(initial + vec2(36.0, -24.0), false)],
+        );
+        history.end_coalescing();
+        let edited = serde_json::to_value(&doc).unwrap();
+        assert_ne!(
+            edited, before,
+            "pointer gesture must edit the actual window"
+        );
+        assert!(history.undo(&mut doc));
+        assert_eq!(
+            serde_json::to_value(&doc).unwrap(),
+            before_drag,
+            "one Undo must restore the complete drag"
+        );
+        if animated {
+            assert!(history.undo(&mut doc));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        }
+        assert!(!history.undo(&mut doc));
+        if animated {
+            assert!(history.redo(&mut doc));
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before_drag);
+        }
+        assert!(history.redo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), edited);
+    }
+
+    #[test]
     fn viewing_grading_graph_does_not_edit_its_topology() {
         let mut grade = Grade::new();
         grade.ops.push(GradeOp::new(
@@ -5467,12 +6682,166 @@ mod tests {
                     &mut grade,
                     &[],
                     &mut selected,
-                    egui::Id::new("test_graph")
+                    egui::Id::new("test_graph"),
+                    None
                 ));
             });
         });
         assert_eq!(grade, before);
         assert_eq!(selected, None);
+    }
+
+    #[test]
+    fn grade_catalog_scalar_paths_share_read_write_and_render_mapping() {
+        for kind in ALL_KINDS {
+            let op = default_op(kind, &[]);
+            for entry in photonic_core::timeline::prop_registry::entries(kind.target_kind()) {
+                let initial = op
+                    .params
+                    .base
+                    .scalar_property(entry.path)
+                    .expect("registered grade scalar has a base value");
+                let mut params = op.params.base.clone();
+                *params.scalar_property_mut(entry.path).unwrap() = initial + 0.125;
+                assert_eq!(params.scalar_property(entry.path), Some(initial + 0.125));
+                assert!(params.scalar_property("params.unknown").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn tonal_controls_are_neutral_and_preserve_loaded_values() {
+        let default = default_op(GradeOpKind::TonalExposure, &[]);
+        assert_eq!(
+            default.params.base,
+            GradeOpParams::TonalExposure {
+                stops: [0.0; 3],
+                boundaries: [-2.0, 2.0],
+                softness: 1.0
+            }
+        );
+        assert!(ALL_KINDS.contains(&GradeOpKind::TonalExposure));
+        for native in [false, true] {
+            for params in [
+                default.params.base.clone(),
+                GradeOpParams::TonalExposure {
+                    stops: [9.0, -10.0, 0.0],
+                    boundaries: [5.0, -5.0],
+                    softness: 0.0,
+                },
+            ] {
+                let mut op = default.clone();
+                op.params.base = params;
+                let before = op.clone();
+                let ctx = egui::Context::default();
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            draw_op_editor(
+                                ui,
+                                &mut op,
+                                &[],
+                                &mut actions,
+                                SequenceId::new(),
+                                TrackId::new(),
+                                ClipId::new(),
+                                GradeInspectionStage::Clip,
+                                false,
+                                true,
+                                None,
+                                native,
+                            );
+                        });
+                    });
+                }
+                assert_eq!(op, before);
+                assert!(actions.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn kelvin_controls_preserve_loaded_values_and_have_identity_defaults() {
+        let default = default_op(GradeOpKind::WhiteBalanceCct, &[]);
+        assert_eq!(
+            default.params.base,
+            GradeOpParams::WhiteBalanceCct {
+                source_kelvin: 6500.0,
+                target_kelvin: 6500.0
+            }
+        );
+        assert!(ALL_KINDS.contains(&GradeOpKind::WhiteBalanceCct));
+        for native in [false, true] {
+            for (source_kelvin, target_kelvin) in
+                [(6500.0, 6500.0), (3200.0, 6500.0), (0.0, 30000.0)]
+            {
+                let mut op = default.clone();
+                op.params.base = GradeOpParams::WhiteBalanceCct {
+                    source_kelvin,
+                    target_kelvin,
+                };
+                let before = op.clone();
+                let ctx = egui::Context::default();
+                let mut actions = Vec::new();
+                let seq = SequenceId::new();
+                let track = TrackId::new();
+                let clip = ClipId::new();
+                for _ in 0..2 {
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            assert!(!draw_op_editor(
+                                ui,
+                                &mut op,
+                                &[],
+                                &mut actions,
+                                seq,
+                                track,
+                                clip,
+                                GradeInspectionStage::Clip,
+                                false,
+                                true,
+                                None,
+                                native
+                            ));
+                        });
+                    });
+                }
+                assert_eq!(op, before);
+                assert!(actions.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn qualifier_spatial_controls_preserve_absent_loaded_and_legacy_values() {
+        use photonic_core::timeline::GradeQualifierSpatial;
+        for native in [false, true] {
+            for mut stored in [
+                None,
+                Some(GradeQualifierSpatial {
+                    denoise: true,
+                    grow: -0.0123,
+                    blur: 0.0045,
+                }),
+                Some(GradeQualifierSpatial {
+                    denoise: false,
+                    grow: 0.03,
+                    blur: -0.01,
+                }),
+            ] {
+                let before = stored;
+                let ctx = egui::Context::default();
+                for _ in 0..3 {
+                    let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            assert!(!draw_qualifier_spatial_editor(ui, &mut stored, native));
+                        });
+                    });
+                }
+                assert_eq!(stored, before);
+            }
+        }
     }
 
     #[test]
@@ -5709,6 +7078,7 @@ mod tests {
                         SequenceId::new(),
                         TrackId::new(),
                         ClipId::new(),
+                        GradeInspectionStage::Clip,
                         GradeOpId::new(),
                         None,
                         false,
@@ -5766,6 +7136,9 @@ mod tests {
             tap_encoding: Some(photonic_video::graph::ir::FrameColorEncoding::LegacyLinearRec709),
             tap: ScopeTapPoint::Program,
             requested: ScopeTapPoint::Program,
+            quality: photonic_video::session::PreviewQuality::Draft,
+            proxy_policy: photonic_video::session::ProxyMode::Auto,
+            logical_size: (128, 80),
         };
         let mut next = stamp.clone();
         next.time = photonic_core::timeline::Tick(100);
@@ -5784,6 +7157,101 @@ mod tests {
         next = stamp.clone();
         next.tap_encoding = Some(photonic_video::graph::ir::FrameColorEncoding::SceneLinearAcescg);
         assert!(!stamp.same_context(&next));
+        next = stamp.clone();
+        next.quality = photonic_video::session::PreviewQuality::Full;
+        assert!(!stamp.same_context(&next));
+        next = stamp.clone();
+        next.proxy_policy = photonic_video::session::ProxyMode::ForceOriginal;
+        assert!(!stamp.same_context(&next));
+        next = stamp.clone();
+        next.logical_size = (64, 40);
+        assert!(!stamp.same_context(&next));
+        assert_eq!(
+            stamp.sampling_label(),
+            "Measured sampling: Draft · 128×80 logical pixels · proxy policy: auto"
+        );
+        for (quality, quality_label) in [
+            (photonic_video::session::PreviewQuality::Draft, "Draft"),
+            (photonic_video::session::PreviewQuality::Full, "Full"),
+        ] {
+            for (policy, policy_label) in [
+                (photonic_video::session::ProxyMode::Auto, "auto"),
+                (
+                    photonic_video::session::ProxyMode::ForceProxy,
+                    "prefer proxy",
+                ),
+                (
+                    photonic_video::session::ProxyMode::ForceOriginal,
+                    "original",
+                ),
+            ] {
+                next = stamp.clone();
+                next.quality = quality;
+                next.proxy_policy = policy;
+                assert_eq!(next.sampling_label(), format!("Measured sampling: {quality_label} · 128×80 logical pixels · proxy policy: {policy_label}"));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_look_versions_panel_view_is_readonly_even_when_locked() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, SharedLook, SharedLookId, Tick, TimelineProject,
+            Track, TrackKind,
+        };
+        let mut doc = Document::new("shared versions panel", 16., 16.);
+        let mut p = TimelineProject::new();
+        let id = SharedLookId::new();
+        p.shared_looks.insert(
+            id,
+            SharedLook {
+                id,
+                name: "Shared".into(),
+                grade: Grade::new(),
+                versions: vec![],
+                active_version: None,
+            },
+        );
+        let mut seq = Sequence::new("S", FrameRate::FPS_24, 16, 16);
+        let sid = seq.id;
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let tid = track.id;
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick::ZERO, Tick::from_seconds(1));
+        let cid = clip.id;
+        clip.look = Some(ClipLook::Shared(id));
+        track.clips.push(clip);
+        seq.video_tracks.push(track);
+        p.insert_sequence(seq);
+        doc.timeline = Some(p);
+        let mut history = CommandHistory::new(8);
+        let ctx = egui::Context::default();
+        for locked in [false, true] {
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&sid)
+                .unwrap()
+                .track_mut(tid)
+                .unwrap()
+                .locked = locked;
+            let before = serde_json::to_value(&doc).unwrap();
+            let revision = history.revision();
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    assert!(!draw_shared_look_versions(
+                        ui,
+                        &mut doc,
+                        &mut history,
+                        sid,
+                        tid,
+                        cid
+                    ));
+                });
+            });
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            assert_eq!(history.revision(), revision);
+        }
     }
 
     #[test]
@@ -5859,6 +7327,7 @@ mod tests {
                         &mut selected,
                         &mut tab,
                         &mut scopes,
+                        None,
                     );
                 });
             });
@@ -5877,6 +7346,7 @@ mod tests {
                     &mut selected,
                     &mut ColorPageTab::Wheels,
                     &mut scopes,
+                    None,
                 );
             });
         });
@@ -5913,6 +7383,7 @@ mod tests {
                     &mut selected,
                     &mut ColorPageTab::Wheels,
                     &mut scopes,
+                    None,
                 );
             });
         });
@@ -5935,6 +7406,7 @@ mod tests {
                     &mut selected,
                     &mut ColorPageTab::Wheels,
                     &mut scopes,
+                    None,
                 );
             });
         });
@@ -5954,6 +7426,8 @@ mod tests {
         project.shared_looks.insert(
             id,
             SharedLook {
+                versions: Vec::new(),
+                active_version: None,
                 id,
                 name: "Scene".into(),
                 grade: Grade::default(),
@@ -5991,6 +7465,66 @@ mod tests {
             Grade::default()
         );
         assert!(!history.undo(&mut doc));
+    }
+
+    #[test]
+    fn independent_look_grade_edits_coalesce_without_touching_clip_grade() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, Tick, TimelineProject, Track, TrackKind,
+        };
+        let mut doc = Document::new("independent grade", 16., 16.);
+        let mut project = TimelineProject::new();
+        let mut sequence = Sequence::new("Test", FrameRate::FPS_30, 16, 16);
+        let mut track = Track::new(TrackKind::Video, "V1");
+        let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+        clip.grade = Some(Grade {
+            bypass: true,
+            ..Grade::default()
+        });
+        clip.look = Some(ClipLook::Local(Box::default()));
+        let (seq_id, track_id, clip_id) = (sequence.id, track.id, clip.id);
+        track.clips.push(clip);
+        sequence.video_tracks.push(track);
+        project.insert_sequence(sequence);
+        doc.timeline = Some(project);
+        let before = serde_json::to_value(&doc).unwrap();
+        let mut history = CommandHistory::new(100);
+        history.begin_coalescing();
+        let mut grade = Grade::default();
+        grade.ops.push(GradeOp::new(
+            GradeOpKind::Exposure,
+            GradeOpParams::Exposure { stops: 0.5 },
+        ));
+        commit_look_stage_grade(
+            &mut doc,
+            &mut history,
+            seq_id,
+            track_id,
+            clip_id,
+            GradeInspectionStage::LocalLook,
+            grade.clone(),
+            false,
+        );
+        grade.ops[0].params.base = GradeOpParams::Exposure { stops: 1.0 };
+        commit_look_stage_grade(
+            &mut doc,
+            &mut history,
+            seq_id,
+            track_id,
+            clip_id,
+            GradeInspectionStage::LocalLook,
+            grade.clone(),
+            false,
+        );
+        history.end_coalescing();
+        let current = &doc.timeline.as_ref().unwrap().sequences[&seq_id].video_tracks[0].clips[0];
+        assert_eq!(current.look, Some(ClipLook::Local(Box::new(grade))));
+        assert!(current.grade.as_ref().unwrap().bypass);
+        assert!(history.undo(&mut doc));
+        assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+        assert!(!history.undo(&mut doc));
+        assert!(history.redo(&mut doc));
+        assert_ne!(serde_json::to_value(&doc).unwrap(), before);
     }
 
     #[test]
@@ -6038,6 +7572,7 @@ mod tests {
                         &mut None,
                         &mut ColorPageTab::Wheels,
                         &mut false,
+                        None,
                     );
                 });
             });
@@ -6094,6 +7629,190 @@ mod tests {
             "Program",
             "an honest program request carries no fallback note"
         );
+    }
+
+    #[test]
+    fn linked_wheel_mean_preserves_chroma_and_obeys_common_limits() {
+        for (original, limits) in [
+            ([0.0, 0.0, 0.0], [-0.5, 0.5]),
+            ([-0.2, 0.1, 0.3], [-0.5, 0.5]),
+            ([0.8, 1.0, 1.3], [0.0, 2.0]),
+            ([-0.1, 0.2, 0.3], [0.0, 2.0]),
+        ] {
+            for requested in [-10.0, -0.25, 0.0, 0.5, 1.0, 1.5, 10.0] {
+                let mut v = original;
+                let before = deltas_to_chroma_xy(v);
+                let range = wheel_linked_range(v, limits).unwrap();
+                wheel_set_linked_mean(&mut v, requested, limits);
+                assert!((wheel_channel_mean(v) - requested.clamp(range[0], range[1])).abs() < 1e-6);
+                assert!((deltas_to_chroma_xy(v) - before).length() < 1e-6);
+                for c in 0..3 {
+                    assert!(v[c] >= limits[0] - 1e-6 && v[c] <= limits[1] + 1e-6);
+                    for d in 0..3 {
+                        assert!(((v[c] - v[d]) - (original[c] - original[d])).abs() < 1e-6);
+                    }
+                }
+            }
+        }
+        let mut v = [0.8, 1.0, 1.2];
+        let original = v;
+        assert!(!wheel_set_linked_mean(&mut v, 1.0, [0.0, 2.0]));
+        assert_eq!(v, original);
+        assert!(wheel_set_linked_mean(&mut v, 1.2, [0.0, 2.0]));
+        assert!(wheel_set_linked_mean(&mut v, 1.0, [0.0, 2.0]));
+        for c in 0..3 {
+            assert!((v[c] - original[c]).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn linked_wheel_rejects_invalid_or_impossible_spreads_without_mutation() {
+        for original in [
+            [-1.0, 0.0, 3.0],
+            [f32::NAN, 1.0, 1.0],
+            [f32::INFINITY, 0.0, 1.0],
+        ] {
+            let mut v = original;
+            assert!(wheel_linked_range(v, [0.0, 2.0]).is_none());
+            assert!(!wheel_set_linked_mean(&mut v, 1.0, [0.0, 2.0]));
+            assert_eq!(v.map(f32::to_bits), original.map(f32::to_bits));
+        }
+        for request in [f32::NAN, f32::INFINITY] {
+            let mut v = [1.0; 3];
+            assert!(!wheel_set_linked_mean(&mut v, request, [0.0, 2.0]));
+            assert_eq!(v, [1.0; 3]);
+        }
+    }
+
+    #[test]
+    fn loaded_wheel_panel_is_read_only_and_linked_edit_undo_is_exact() {
+        use photonic_core::timeline::{
+            Clip, ClipSource, FrameRate, Sequence, Tick, TimelineProject, Track, TrackKind,
+        };
+        for native in [false, true] {
+            let mut doc = Document::new("wheel review", 100., 100.);
+            let mut project = TimelineProject::new();
+            let mut sequence = Sequence::new("Test", FrameRate::FPS_30, 16, 16);
+            if native {
+                sequence.color = photonic_core::timeline::color::SequenceColorConfig::NativeManaged(
+                    Box::new(photonic_core::timeline::color::NativeManagedColorConfig::sdr_draft()),
+                );
+            }
+            let seq = sequence.id;
+            let mut track = Track::new(TrackKind::Video, "V1");
+            let track_id = track.id;
+            let mut clip = Clip::new(ClipSource::Adjustment, Tick(0), Tick(100));
+            let clip_id = clip.id;
+            let op = GradeOp::new(
+                GradeOpKind::Wheels,
+                GradeOpParams::Wheels {
+                    lift: [-0.7, 0.15, 0.8],
+                    gamma: [0.8, 1.0, 1.2],
+                    gain: [1.0, 1.0, 2.7],
+                    sat: 1.0,
+                },
+            );
+            let mut selected = Some(op.id);
+            let original = Grade {
+                ops: vec![op],
+                bypass: false,
+                graph: None,
+            };
+            clip.grade = Some(original.clone());
+            track.clips.push(clip);
+            sequence.video_tracks.push(track);
+            project.insert_sequence(sequence);
+            doc.timeline = Some(project);
+            let mut history = CommandHistory::new(100);
+            let before = serde_json::to_value(&doc).unwrap();
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut scopes = false;
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        draw_color_controls(
+                            ui,
+                            &mut doc,
+                            &mut history,
+                            &mut actions,
+                            &[clip_id],
+                            &mut selected,
+                            &mut ColorPageTab::Wheels,
+                            &mut scopes,
+                            None,
+                        );
+                    });
+                });
+            }
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            assert_eq!(history.revision(), 0);
+            assert!(actions.is_empty());
+            let mut edited = original.clone();
+            let GradeOpParams::Wheels { ref mut gamma, .. } = edited.ops[0].params.base else {
+                panic!()
+            };
+            assert!(wheel_set_linked_mean(gamma, 1.2, [0.0, 2.0]));
+            commit_grade(
+                &mut doc,
+                &mut history,
+                seq,
+                track_id,
+                clip_id,
+                edited.clone(),
+                true,
+            );
+            assert_eq!(current_grade(&doc, seq, track_id, clip_id), edited);
+            let saved = serde_json::to_value(&doc).unwrap();
+            let reloaded: Document = serde_json::from_value(saved).unwrap();
+            assert_eq!(current_grade(&reloaded, seq, track_id, clip_id), edited);
+            assert!(history.undo(&mut doc));
+            assert_eq!(current_grade(&doc, seq, track_id, clip_id), original);
+            assert!(!history.undo(&mut doc));
+            assert!(history.redo(&mut doc));
+            assert_eq!(current_grade(&doc, seq, track_id, clip_id), edited);
+            doc.timeline
+                .as_mut()
+                .unwrap()
+                .sequences
+                .get_mut(&seq)
+                .unwrap()
+                .track_mut(track_id)
+                .unwrap()
+                .locked = true;
+            let before = serde_json::to_value(&doc).unwrap();
+            let revision = history.revision();
+            commit_grade(
+                &mut doc,
+                &mut history,
+                seq,
+                track_id,
+                clip_id,
+                original,
+                true,
+            );
+            assert_eq!(serde_json::to_value(&doc).unwrap(), before);
+            assert_eq!(history.revision(), revision);
+        }
+    }
+
+    #[test]
+    fn viewing_wheel_dials_preserves_loaded_channel_values() {
+        for (neutral, original) in [(0.0, [-0.7, 0.15, 0.8]), (1.0, [-0.2, 1.0, 2.7])] {
+            let mut values = original;
+            let ctx = egui::Context::default();
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        wheel_dial(ui, "Loaded wheel", &mut values, neutral);
+                    });
+                });
+            }
+            assert_eq!(
+                values, original,
+                "opening a wheel cannot rewrite a loaded grade"
+            );
+        }
     }
 
     #[test]
@@ -6220,5 +7939,84 @@ mod tests {
         let (high_hue, _, _) = seed_qualifier(0.99, 0.8, 0.5);
         assert!(low_hue[0] < 0.0, "red seed crosses zero: {low_hue:?}");
         assert!(high_hue[1] > 1.0, "red seed crosses one: {high_hue:?}");
+    }
+}
+
+#[cfg(test)]
+mod named_scope_restore_tests {
+    #[test]
+    fn repeated_scope_restore_does_not_accumulate_frame_and_title_size() {
+        let ctx = egui::Context::default();
+        let expected = egui::Rect::from_min_size(egui::pos2(40.0, 50.0), egui::vec2(320.0, 420.0));
+        for _ in 0..5 {
+            let mut actual = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    actual = egui::Window::new("Scope restore test")
+                        .current_pos(expected.min)
+                        .fixed_size(super::scope_inner_size(
+                            ctx,
+                            [expected.width(), expected.height()],
+                        ))
+                        .show(ctx, |ui| {
+                            ui.allocate_space(ui.available_size());
+                        })
+                        .map(|r| r.response.rect);
+                },
+            );
+            let actual = actual.unwrap();
+            assert!(
+                (actual.width() - expected.width()).abs() <= 3.0,
+                "{actual:?} vs {expected:?}"
+            );
+            assert!(
+                (actual.height() - expected.height()).abs() <= 3.0,
+                "{actual:?} vs {expected:?}"
+            );
+        }
+    }
+    #[test]
+    fn saved_scope_client_size_roundtrips_without_margin_accumulation() {
+        let ctx = egui::Context::default();
+        let mut saved = Some([310.0, 360.0]);
+        let mut expected: Option<egui::Vec2> = None;
+        for _ in 0..6 {
+            let mut actual = None;
+            let _ = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1280.0, 720.0),
+                    )),
+                    ..Default::default()
+                },
+                |ctx| {
+                    actual = egui::Window::new("Saved client test")
+                        .current_pos(egui::pos2(40.0, 50.0))
+                        .fixed_size(super::scope_content_size(ctx, saved, [1000.0, 700.0]))
+                        .show(ctx, |ui| {
+                            ui.allocate_space(ui.available_size());
+                            ui.min_size()
+                        });
+                },
+            );
+            let shown = actual.unwrap();
+            let size = shown.response.rect.size();
+            if let Some(expected) = expected {
+                assert!(
+                    (size - expected).length() < 0.01,
+                    "{size:?} vs {expected:?}"
+                );
+            }
+            expected = Some(size);
+            saved = shown.inner.map(|v| [v.x, v.y]);
+        }
     }
 }

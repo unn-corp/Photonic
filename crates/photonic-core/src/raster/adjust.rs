@@ -197,6 +197,40 @@ pub fn brightness_contrast(
     });
 }
 
+/// Shared levels math. Managed video keeps the normalized out-of-range
+/// residual as linear tails around the bounded gamma correction. Raster retains
+/// its original input/output clamps; no byte quantization enters native video.
+pub fn levels_rgb(
+    rgb: [f32; 3],
+    black_white: [f32; 2],
+    gamma: f32,
+    output: [f32; 2],
+    extended: bool,
+) -> [f32; 3] {
+    let ib = clamp01(black_white[0]);
+    let iw = clamp01(black_white[1]);
+    let ob = clamp01(output[0]);
+    let ow = clamp01(output[1]);
+    let span = (iw - ib).max(1e-4);
+    let inv_gamma = 1.0 / gamma.clamp(0.01, 9.99);
+    rgb.map(|c| {
+        let v = (c - ib) / span;
+        let b = clamp01(v);
+        let corrected = b.powf(inv_gamma);
+        let mapped = if extended {
+            corrected + (v - b)
+        } else {
+            corrected
+        };
+        let result = ob + mapped * (ow - ob);
+        if extended {
+            result
+        } else {
+            clamp01(result)
+        }
+    })
+}
+
 /// Levels. Maps input range `[in_black, in_white]` (0..1) through a midtone
 /// `gamma` (~0.1..9.99) onto output range `[out_black, out_white]` (0..1).
 pub fn levels(
@@ -216,23 +250,143 @@ pub fn levels(
     {
         return; // non-finite input → no-op
     }
-    let ib = clamp01(in_black);
-    let iw = clamp01(in_white);
-    let out_black = clamp01(out_black);
-    let out_white = clamp01(out_white);
-    let span = (iw - ib).max(1e-4);
-    let inv_gamma = 1.0 / gamma.clamp(0.01, 9.99);
     map_point(img, sel, move |rgb| {
-        let mut out = [0.0; 3];
-        for i in 0..3 {
-            let v = clamp01((rgb[i] - ib) / span);
-            let v = v.powf(inv_gamma);
-            out[i] = clamp01(out_black + v * (out_white - out_black));
-        }
-        out
+        levels_rgb(
+            rgb,
+            [in_black, in_white],
+            gamma,
+            [out_black, out_white],
+            false,
+        )
     });
 }
 
+/// Prepared floating Hermite curve shared by raster and managed video.
+#[derive(Clone, Debug)]
+pub struct TransferCurve {
+    coefficients: Vec<[f32; 3]>,
+}
+impl TransferCurve {
+    pub fn new(points: &[(f32, f32)]) -> Self {
+        // Sanitize: finite-only, clamp to 0..1, sort by x, drop coincident x's.
+        let mut pts: Vec<(f32, f32)> = points
+            .iter()
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|(x, y)| (clamp01(*x), clamp01(*y)))
+            .collect();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
+
+        let n = pts.len();
+        if n < 2 {
+            return Self {
+                coefficients: Vec::new(),
+            };
+        }
+
+        // Secant slopes between consecutive knots.
+        let mut d = vec![0.0f32; n - 1];
+        for i in 0..n - 1 {
+            d[i] = (pts[i + 1].1 - pts[i].1) / (pts[i + 1].0 - pts[i].0);
+        }
+
+        // Initial Hermite tangents.
+        let mut m = vec![0.0f32; n];
+        m[0] = d[0];
+        m[n - 1] = d[n - 2];
+        for i in 1..n - 1 {
+            if d[i - 1] * d[i] <= 0.0 {
+                // Local extremum (or flat) — force a flat tangent to preserve monotonicity.
+                m[i] = 0.0;
+            } else {
+                m[i] = (d[i - 1] + d[i]) / 2.0;
+            }
+        }
+
+        // Fritsch–Carlson monotonicity limiting on each interval.
+        for i in 0..n - 1 {
+            if d[i].abs() < 1e-12 {
+                m[i] = 0.0;
+                m[i + 1] = 0.0;
+                continue;
+            }
+            let alpha = m[i] / d[i];
+            let beta = m[i + 1] / d[i];
+            let s = alpha * alpha + beta * beta;
+            if s > 9.0 {
+                let tau = 3.0 / s.sqrt();
+                m[i] = tau * alpha * d[i];
+                m[i + 1] = tau * beta * d[i];
+            }
+        }
+
+        Self {
+            coefficients: pts
+                .into_iter()
+                .zip(m)
+                .map(|((x, y), slope)| [x, y, slope])
+                .collect(),
+        }
+    }
+    pub fn coefficients(&self) -> &[[f32; 3]] {
+        &self.coefficients
+    }
+    pub fn is_identity(&self) -> bool {
+        self.coefficients.iter().all(|k| k[0] == k[1])
+    }
+    pub fn sample(&self, x: f32, extend: bool) -> f32 {
+        let pts = &self.coefficients;
+        let n = pts.len();
+        if n < 2 {
+            return x;
+        }
+        if x <= pts[0][0] {
+            return pts[0][1]
+                + if extend {
+                    (x - pts[0][0]) * pts[0][2]
+                } else {
+                    0.0
+                };
+        }
+        if x >= pts[n - 1][0] {
+            return pts[n - 1][1]
+                + if extend {
+                    (x - pts[n - 1][0]) * pts[n - 1][2]
+                } else {
+                    0.0
+                };
+        }
+        for k in 0..n - 1 {
+            let [x0, y0, m0] = pts[k];
+            let [x1, y1, m1] = pts[k + 1];
+            if x >= x0 && x <= x1 {
+                let h = x1 - x0;
+                let t = (x - x0) / h;
+                let t2 = t * t;
+                let t3 = t2 * t;
+                let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+                let h10 = t3 - 2.0 * t2 + t;
+                let h01 = -2.0 * t3 + 3.0 * t2;
+                let h11 = t3 - t2;
+                return h00 * y0 + h10 * h * m0 + h01 * y1 + h11 * h * m1;
+            }
+        }
+        pts[n - 1][1]
+    }
+}
+/// Catalog knot ordering, duplicate policy and midtone convenience control.
+pub fn catalog_curve_points(knots: [[f32; 2]; 5], contrast: f32) -> Vec<(f32, f32)> {
+    let mut pts: Vec<_> = knots.into_iter().map(|[x, y]| (x, y)).collect();
+    if contrast.abs() > 1e-6 {
+        pts[2].1 = (0.5 + contrast * 0.25).clamp(0.05, 0.95);
+    }
+    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-6);
+    if pts.len() < 2 {
+        pts = vec![(0.0, 0.0), (1.0, 1.0)];
+    }
+    pts
+}
 /// Build a 256-entry LUT from control points (0..1) using a **smooth
 /// monotone-cubic (Fritsch–Carlson) Hermite spline**, mapping input index
 /// `i/255` to an output 0..255 byte.
@@ -246,90 +400,10 @@ pub fn levels(
 /// to 0..1 and sorted by x (with coincident x's collapsed). Fewer than two valid
 /// points yields an **identity** LUT, so a NaN-poisoned channel is a safe no-op.
 fn curve_lut(points: &[(f32, f32)]) -> [u8; 256] {
-    // Default to identity.
-    let mut lut = [0u8; 256];
-    for (i, l) in lut.iter_mut().enumerate() {
-        *l = i as u8;
-    }
-
-    // Sanitize: finite-only, clamp to 0..1, sort by x, drop coincident x's.
-    let mut pts: Vec<(f32, f32)> = points
-        .iter()
-        .filter(|(x, y)| x.is_finite() && y.is_finite())
-        .map(|(x, y)| (clamp01(*x), clamp01(*y)))
-        .collect();
-    pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
-
-    let n = pts.len();
-    if n < 2 {
-        return lut; // identity — also the NaN/degenerate-input safe path
-    }
-
-    // Secant slopes between consecutive knots.
-    let mut d = vec![0.0f32; n - 1];
-    for i in 0..n - 1 {
-        d[i] = (pts[i + 1].1 - pts[i].1) / (pts[i + 1].0 - pts[i].0);
-    }
-
-    // Initial Hermite tangents.
-    let mut m = vec![0.0f32; n];
-    m[0] = d[0];
-    m[n - 1] = d[n - 2];
-    for i in 1..n - 1 {
-        if d[i - 1] * d[i] <= 0.0 {
-            // Local extremum (or flat) — force a flat tangent to preserve monotonicity.
-            m[i] = 0.0;
-        } else {
-            m[i] = (d[i - 1] + d[i]) / 2.0;
-        }
-    }
-
-    // Fritsch–Carlson monotonicity limiting on each interval.
-    for i in 0..n - 1 {
-        if d[i].abs() < 1e-12 {
-            m[i] = 0.0;
-            m[i + 1] = 0.0;
-            continue;
-        }
-        let alpha = m[i] / d[i];
-        let beta = m[i + 1] / d[i];
-        let s = alpha * alpha + beta * beta;
-        if s > 9.0 {
-            let tau = 3.0 / s.sqrt();
-            m[i] = tau * alpha * d[i];
-            m[i + 1] = tau * beta * d[i];
-        }
-    }
-
+    let curve = TransferCurve::new(points);
+    let mut lut = [0; 256];
     for (i, slot) in lut.iter_mut().enumerate() {
-        let x = i as f32 / 255.0;
-        let y = if x <= pts[0].0 {
-            pts[0].1
-        } else if x >= pts[n - 1].0 {
-            pts[n - 1].1
-        } else {
-            let mut yy = pts[n - 1].1;
-            for k in 0..n - 1 {
-                let (x0, y0) = pts[k];
-                let (x1, y1) = pts[k + 1];
-                if x >= x0 && x <= x1 {
-                    let h = x1 - x0;
-                    let t = (x - x0) / h;
-                    let t2 = t * t;
-                    let t3 = t2 * t;
-                    // Cubic Hermite basis functions.
-                    let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
-                    let h10 = t3 - 2.0 * t2 + t;
-                    let h01 = -2.0 * t3 + 3.0 * t2;
-                    let h11 = t3 - t2;
-                    yy = h00 * y0 + h10 * h * m[k] + h01 * y1 + h11 * h * m[k + 1];
-                    break;
-                }
-            }
-            yy
-        };
-        *slot = (clamp01(y) * 255.0).round() as u8;
+        *slot = (clamp01(curve.sample(i as f32 / 255.0, false)) * 255.0).round() as u8;
     }
     lut
 }
@@ -420,6 +494,39 @@ fn tonal_weights(l: f32) -> (f32, f32, f32) {
     (shadow, mid, highlight)
 }
 
+/// Shared transfer-space tonal color shifts. Native video disables only the
+/// raster RGB clamps; tonal masks retain their bounded mathematical definition.
+pub fn color_balance_rgb(
+    rgb: [f32; 3],
+    shifts: [[f32; 3]; 3],
+    preserve: bool,
+    raster_clamp: bool,
+) -> [f32; 3] {
+    let (sw, mw, hw) = tonal_weights(luma(rgb));
+    let mut out = [0.0; 3];
+    for i in 0..3 {
+        let shift = shifts[0][i] * sw + shifts[1][i] * mw + shifts[2][i] * hw;
+        out[i] = rgb[i] + 0.5 * shift;
+        if raster_clamp {
+            out[i] = clamp01(out[i]);
+        }
+    }
+    if preserve {
+        let original = luma(rgb);
+        let after = luma(out);
+        if after > 1e-4 {
+            let factor = original / after;
+            for v in &mut out {
+                *v *= factor;
+                if raster_clamp {
+                    *v = clamp01(*v);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Color Balance. Per-channel shifts (-1..1 each) for `shadows`, `midtones` and
 /// `highlights`, weighted by where each pixel falls in the tonal range. When
 /// `preserve_luminosity` is set, each pixel's original luma is restored after the
@@ -447,24 +554,12 @@ pub fn color_balance(
     let midtones = clamp3(midtones);
     let highlights = clamp3(highlights);
     map_point(img, sel, move |rgb| {
-        let (sw, mw, hw) = tonal_weights(luma(rgb));
-        let mut out = [0.0; 3];
-        for i in 0..3 {
-            let shift = shadows[i] * sw + midtones[i] * mw + highlights[i] * hw;
-            // Scale by 0.5 so a full ±1 setting is a strong but non-clipping push.
-            out[i] = clamp01(rgb[i] + 0.5 * shift);
-        }
-        if preserve_luminosity {
-            let orig = luma(rgb);
-            let new = luma(out);
-            if new > 1e-4 {
-                let f = orig / new;
-                for i in 0..3 {
-                    out[i] = clamp01(out[i] * f);
-                }
-            }
-        }
-        out
+        color_balance_rgb(
+            rgb,
+            [shadows, midtones, highlights],
+            preserve_luminosity,
+            true,
+        )
     });
 }
 
@@ -488,13 +583,16 @@ pub fn vibrance(img: &mut RasterImage, amount: f32, sel: Option<&Mask>) {
 /// `(max + min) / 2` — this matches Photoshop's *Image > Adjustments >
 /// Desaturate*, which uses the HSL lightness midpoint rather than a perceptual
 /// (Rec. 601) luma. (Weighted luma still backs `black_and_white`.)
+/// Shared encoded-space HSL-lightness math. No clamp: the raster caller owns
+/// its u8 boundary, while native video preserves extended floating values.
+pub fn desaturate_rgb(rgb: [f32; 3]) -> [f32; 3] {
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    let g = (max + min) / 2.0;
+    [g, g, g]
+}
 pub fn desaturate(img: &mut RasterImage, sel: Option<&Mask>) {
-    map_point(img, sel, |rgb| {
-        let max = rgb[0].max(rgb[1]).max(rgb[2]);
-        let min = rgb[0].min(rgb[1]).min(rgb[2]);
-        let g = (max + min) / 2.0;
-        [g, g, g]
-    });
+    map_point(img, sel, desaturate_rgb);
 }
 
 /// Black & White. Mixes channels into a gray using normalized `weights`.
@@ -502,16 +600,16 @@ pub fn black_and_white(img: &mut RasterImage, weights: [f32; 3], sel: Option<&Ma
     if !finite3(weights) {
         return; // non-finite input → no-op
     }
-    let sum = weights[0] + weights[1] + weights[2];
-    let w = if sum.abs() < 1e-9 {
-        [1.0 / 3.0; 3]
-    } else {
-        [weights[0] / sum, weights[1] / sum, weights[2] / sum]
-    };
+    let w = normalized_gray_weights(weights);
     map_point(img, sel, move |rgb| {
-        let g = clamp01(rgb[0] * w[0] + rgb[1] * w[1] + rgb[2] * w[2]);
-        [g, g, g]
+        channel_mix_rgb(rgb, [w; 3]).map(clamp01)
     });
+}
+
+/// Floating encoded-channel negative; callers own color-space/storage boundaries.
+/// The Legacy byte fast path below stays unchanged and is exhaustively checked.
+pub fn invert_channel(value: f32) -> f32 {
+    1.0 - value
 }
 
 /// Invert (negative). `v -> 1 - v` per channel.
@@ -522,19 +620,21 @@ pub fn invert(img: &mut RasterImage, sel: Option<&Mask>) {
 }
 
 /// Posterize. Quantizes each channel into `levels` (2..=255) evenly-spaced steps.
+/// Shared positive-code-value quantization; callers own input-space conversion.
+pub fn posterize_channel(value: f32, levels: u32) -> f32 {
+    let steps = (levels.clamp(2, 255) - 1) as f32;
+    (value * steps).round() / steps
+}
 pub fn posterize(img: &mut RasterImage, levels: u32, sel: Option<&Mask>) {
     let n = levels.clamp(2, 255);
-    let steps = (n - 1) as f32;
-    map_point(img, sel, move |rgb| {
-        let mut out = [0.0; 3];
-        for i in 0..3 {
-            out[i] = (rgb[i] * steps).round() / steps;
-        }
-        out
-    });
+    map_point(img, sel, move |rgb| rgb.map(|v| posterize_channel(v, n)));
 }
 
 /// Threshold. Pixels with luma >= `level` (0..1) become white, otherwise black.
+/// Shared encoded Rec601 threshold decision; preserves the raster comparison.
+pub fn threshold_rgb(rgb: [f32; 3], level: f32) -> bool {
+    luma(rgb) >= level
+}
 pub fn threshold(img: &mut RasterImage, level: f32, sel: Option<&Mask>) {
     let t = match san(level, 0.0, 1.0) {
         Some(l) => l,
@@ -542,9 +642,39 @@ pub fn threshold(img: &mut RasterImage, level: f32, sel: Option<&Mask>) {
     };
     apply_point(img, sel, move |px| {
         let (rgb, a) = to_f(px);
-        let v: u8 = if luma(rgb) >= t { 255 } else { 0 };
+        let v: u8 = if threshold_rgb(rgb, t) { 255 } else { 0 };
         [v, v, v, a]
     });
+}
+
+/// Shared transfer-space Photo Filter. The explicit raster_clamp retains the
+/// original raster-only rescale clamp; native video keeps extended values.
+pub fn photo_filter_rgb(
+    rgb: [f32; 3],
+    color: [f32; 3],
+    density: f32,
+    preserve: bool,
+    raster_clamp: bool,
+) -> [f32; 3] {
+    let mut out = [0.0; 3];
+    for i in 0..3 {
+        let tinted = rgb[i] * color[i];
+        out[i] = rgb[i] * (1.0 - density) + tinted * density;
+    }
+    if preserve {
+        let original = luma(rgb);
+        let tinted = luma(out);
+        if tinted > 1e-4 {
+            let factor = original / tinted;
+            for v in &mut out {
+                *v *= factor;
+                if raster_clamp {
+                    *v = clamp01(*v);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Photo Filter. Tints the image toward `color` (0..1 RGB) by `density` (0..1)
@@ -562,23 +692,23 @@ pub fn photo_filter(
     }
     let d = clamp01(density);
     map_point(img, sel, move |rgb| {
-        let mut out = [0.0; 3];
-        for i in 0..3 {
-            let tinted = rgb[i] * color[i];
-            out[i] = rgb[i] * (1.0 - d) + tinted * d;
-        }
-        if preserve_luminosity {
-            let orig = luma(rgb);
-            let new = luma(out);
-            if new > 1e-4 {
-                let f = orig / new;
-                for i in 0..3 {
-                    out[i] = clamp01(out[i] * f);
-                }
-            }
-        }
-        out
+        photo_filter_rgb(rgb, color, d, preserve_luminosity, true)
     });
+}
+
+/// Shared unclamped transfer-coordinate matrix math. The raster caller keeps
+/// its legacy clamp; native video preserves signed/HDR floating values.
+pub fn channel_mix_rgb(rgb: [f32; 3], matrix: [[f32; 3]; 3]) -> [f32; 3] {
+    matrix.map(|r| r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2])
+}
+/// Existing Black & White normalization, including the zero-sum fallback.
+pub fn normalized_gray_weights(weights: [f32; 3]) -> [f32; 3] {
+    let sum = weights[0] + weights[1] + weights[2];
+    if sum.abs() < 1e-9 {
+        [1.0 / 3.0; 3]
+    } else {
+        weights.map(|v| v / sum)
+    }
 }
 
 /// Channel Mixer. Each output channel is the dot product of its weight vector
@@ -594,11 +724,7 @@ pub fn channel_mixer(
         return; // non-finite input → no-op
     }
     map_point(img, sel, move |rgb| {
-        [
-            clamp01(r[0] * rgb[0] + r[1] * rgb[1] + r[2] * rgb[2]),
-            clamp01(g[0] * rgb[0] + g[1] * rgb[1] + g[2] * rgb[2]),
-            clamp01(b[0] * rgb[0] + b[1] * rgb[1] + b[2] * rgb[2]),
-        ]
+        channel_mix_rgb(rgb, [r, g, b]).map(clamp01)
     });
 }
 
@@ -1610,6 +1736,508 @@ mod tests {
             for i in 0..3 {
                 assert!((back[i] - rgb[i]).abs() < 0.01, "{:?} -> {:?}", rgb, back);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_perceptual_kernel_tests {
+    use super::*;
+    #[test]
+    fn shared_perceptual_kernels_keep_raster_rounding_and_extended_gray() {
+        for levels in 2..=255 {
+            for code in 0..=255 {
+                let actual = posterize_channel(code as f32 / 255.0, levels);
+                let expected = ((code as f64 / 255.0 * (levels - 1) as f64).round()
+                    / (levels - 1) as f64) as f32;
+                assert!((actual - expected).abs() < 1e-6);
+            }
+        }
+        assert_eq!(desaturate_rgb([-2.0, 4.0, 1.0]), [1.0; 3]);
+        assert_eq!(desaturate_rgb([-4.0, -2.0, -3.0]), [-3.0; 3]);
+        assert_eq!(desaturate_rgb([8.0, 16.0, 4.0]), [10.0; 3]);
+        assert!(threshold_rgb([1.0; 3], 1.0));
+        assert!(threshold_rgb([0.0; 3], 0.0));
+        assert!(threshold_rgb([0.5; 3], 0.5));
+        assert!(!threshold_rgb([1.0, 0.0, 0.0], 0.5));
+        assert!(threshold_rgb([0.0, 1.0, 0.0], 0.5));
+    }
+}
+
+#[cfg(test)]
+mod shared_channel_matrix_tests {
+    use super::*;
+    #[test]
+    fn shared_channel_matrix_preserves_legacy_clamp_and_extended_native_math() {
+        let matrix = [[2.0, -1.0, 0.5], [0.0, 1.0, 0.0], [-1.0, 0.0, 2.0]];
+        assert_eq!(channel_mix_rgb([-2.0, 4.0, 3.0], matrix), [-6.5, 4.0, 8.0]);
+        assert_eq!(normalized_gray_weights([0.0; 3]), [1.0 / 3.0; 3]);
+        assert_eq!(normalized_gray_weights([1.0, 0.0, 1.0]), [0.5, 0.0, 0.5]);
+        for code in 0..=255 {
+            let rgb = [code as f32 / 255.0, 0.5, 1.0];
+            let expected = [
+                (2.0 * rgb[0] - rgb[1] + 0.5 * rgb[2]).clamp(0.0, 1.0),
+                rgb[1],
+                (-rgb[0] + 2.0 * rgb[2]).clamp(0.0, 1.0),
+            ];
+            assert_eq!(channel_mix_rgb(rgb, matrix).map(clamp01), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod shared_photo_filter_tests {
+    use super::*;
+    #[test]
+    fn shared_photo_filter_retains_raster_order_clamp_and_extended_math() {
+        for rgb in [
+            [0.2, 0.4, 0.8],
+            [-2.0, 4.0, 3.0],
+            [0.000001; 3],
+            [8.0, 16.0, 4.0],
+        ] {
+            for color in [[1.0, 0.5, 0.2], [0.0; 3], [0.2, 0.6, 1.0]] {
+                for density in [0.0, 0.25, 1.0] {
+                    for preserve in [false, true] {
+                        let mut expected = [0.0; 3];
+                        for i in 0..3 {
+                            expected[i] = rgb[i] * (1.0 - density) + (rgb[i] * color[i]) * density;
+                        }
+                        if preserve {
+                            let original = luma(rgb);
+                            let new = luma(expected);
+                            if new > 1e-4 {
+                                let factor = original / new;
+                                for c in &mut expected {
+                                    *c = (*c * factor).clamp(0.0, 1.0);
+                                }
+                            }
+                        }
+                        assert_eq!(
+                            photo_filter_rgb(rgb, color, density, preserve, true),
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            photo_filter_rgb([-2.0, 4.0, 3.0], [1.0; 3], 0.5, false, false),
+            [-2.0, 4.0, 3.0]
+        );
+        assert_eq!(
+            photo_filter_rgb([0.0; 3], [0.0; 3], 1.0, true, false),
+            [0.0; 3]
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_color_balance_tests {
+    use super::*;
+    #[test]
+    fn shared_color_balance_retains_legacy_order_and_extended_native_output() {
+        for rgb in [
+            [0.2, 0.4, 0.8],
+            [-2.0, 4.0, 3.0],
+            [0.000001; 3],
+            [8.0, 16.0, 4.0],
+        ] {
+            for shifts in [
+                [[0.0; 3]; 3],
+                [[0.4, -0.2, 0.1], [-0.3, 0.4, 0.2], [0.1, -0.4, 0.3]],
+                [[1.0, -1.0, 0.0]; 3],
+            ] {
+                for preserve in [false, true] {
+                    let (sw, mw, hw) = tonal_weights(luma(rgb));
+                    let mut expected = [0.0; 3];
+                    for i in 0..3 {
+                        let shift = shifts[0][i] * sw + shifts[1][i] * mw + shifts[2][i] * hw;
+                        expected[i] = (rgb[i] + 0.5 * shift).clamp(0.0, 1.0);
+                    }
+                    if preserve {
+                        let original = luma(rgb);
+                        let after = luma(expected);
+                        if after > 1e-4 {
+                            let factor = original / after;
+                            for c in &mut expected {
+                                *c = (*c * factor).clamp(0.0, 1.0);
+                            }
+                        }
+                    }
+                    assert_eq!(color_balance_rgb(rgb, shifts, preserve, true), expected);
+                }
+            }
+        }
+        assert_eq!(
+            color_balance_rgb([-2.0, 4.0, 3.0], [[0.0; 3]; 3], false, false),
+            [-2.0, 4.0, 3.0]
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_transfer_curve_tests {
+    use super::*;
+    fn prior_curve_lut(points: &[(f32, f32)]) -> [u8; 256] {
+        // Default to identity.
+        let mut lut = [0u8; 256];
+        for (i, l) in lut.iter_mut().enumerate() {
+            *l = i as u8;
+        }
+
+        // Sanitize: finite-only, clamp to 0..1, sort by x, drop coincident x's.
+        let mut pts: Vec<(f32, f32)> = points
+            .iter()
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|(x, y)| (clamp01(*x), clamp01(*y)))
+            .collect();
+        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9);
+
+        let n = pts.len();
+        if n < 2 {
+            return lut; // identity — also the NaN/degenerate-input safe path
+        }
+
+        // Secant slopes between consecutive knots.
+        let mut d = vec![0.0f32; n - 1];
+        for i in 0..n - 1 {
+            d[i] = (pts[i + 1].1 - pts[i].1) / (pts[i + 1].0 - pts[i].0);
+        }
+
+        // Initial Hermite tangents.
+        let mut m = vec![0.0f32; n];
+        m[0] = d[0];
+        m[n - 1] = d[n - 2];
+        for i in 1..n - 1 {
+            if d[i - 1] * d[i] <= 0.0 {
+                // Local extremum (or flat) — force a flat tangent to preserve monotonicity.
+                m[i] = 0.0;
+            } else {
+                m[i] = (d[i - 1] + d[i]) / 2.0;
+            }
+        }
+
+        // Fritsch–Carlson monotonicity limiting on each interval.
+        for i in 0..n - 1 {
+            if d[i].abs() < 1e-12 {
+                m[i] = 0.0;
+                m[i + 1] = 0.0;
+                continue;
+            }
+            let alpha = m[i] / d[i];
+            let beta = m[i + 1] / d[i];
+            let s = alpha * alpha + beta * beta;
+            if s > 9.0 {
+                let tau = 3.0 / s.sqrt();
+                m[i] = tau * alpha * d[i];
+                m[i + 1] = tau * beta * d[i];
+            }
+        }
+
+        for (i, slot) in lut.iter_mut().enumerate() {
+            let x = i as f32 / 255.0;
+            let y = if x <= pts[0].0 {
+                pts[0].1
+            } else if x >= pts[n - 1].0 {
+                pts[n - 1].1
+            } else {
+                let mut yy = pts[n - 1].1;
+                for k in 0..n - 1 {
+                    let (x0, y0) = pts[k];
+                    let (x1, y1) = pts[k + 1];
+                    if x >= x0 && x <= x1 {
+                        let h = x1 - x0;
+                        let t = (x - x0) / h;
+                        let t2 = t * t;
+                        let t3 = t2 * t;
+                        // Cubic Hermite basis functions.
+                        let h00 = 2.0 * t3 - 3.0 * t2 + 1.0;
+                        let h10 = t3 - 2.0 * t2 + t;
+                        let h01 = -2.0 * t3 + 3.0 * t2;
+                        let h11 = t3 - t2;
+                        yy = h00 * y0 + h10 * h * m[k] + h01 * y1 + h11 * h * m[k + 1];
+                        break;
+                    }
+                }
+                yy
+            };
+            *slot = (clamp01(y) * 255.0).round() as u8;
+        }
+        lut
+    }
+
+    #[test]
+    fn shared_transfer_curve_exact_legacy_lut_and_extended_endpoints() {
+        for points in [
+            vec![],
+            vec![(0.5, 0.25)],
+            vec![
+                (0.0, 0.0),
+                (0.25, 0.25),
+                (0.5, 0.5),
+                (0.75, 0.75),
+                (1.0, 1.0),
+            ],
+            vec![(1.0, 0.0), (0.0, 1.0), (0.5, 0.3)],
+            vec![(0.2, 0.4), (0.4, 0.1), (0.6, 0.8), (0.9, 0.5)],
+            vec![(0.0, 0.0), (0.0, 1.0), (1.0, 0.2)],
+            vec![(f32::NAN, 0.0), (-1.0, 2.0), (2.0, -1.0)],
+            vec![(0.0, 0.0), (0.000002, 1.0), (0.5, 0.4), (1.0, 1.0)],
+        ] {
+            assert_eq!(curve_lut(&points), prior_curve_lut(&points));
+        }
+        let curve = TransferCurve::new(&[(0.0, 0.1), (1.0, 0.9)]);
+        assert!((curve.sample(-1.0, true) + 0.7).abs() < 1e-6);
+        assert!((curve.sample(2.0, true) - 1.7).abs() < 1e-6);
+        assert_eq!(curve.sample(-1.0, false), 0.1);
+        assert_eq!(curve.sample(2.0, false), 0.9);
+        for contrast in [-1.0, 0.0, 0.0000005, 0.5, 1.0] {
+            let points = catalog_curve_points(
+                [
+                    [0.0, 0.0],
+                    [0.25, 0.25],
+                    [0.5, 0.8],
+                    [0.75, 0.75],
+                    [1.0, 1.0],
+                ],
+                contrast,
+            );
+            assert_eq!(
+                points[2].1,
+                if contrast.abs() > 1e-6 {
+                    0.5 + contrast * 0.25
+                } else {
+                    0.8
+                }
+            );
+        }
+        assert_eq!(
+            catalog_curve_points([[0.5, 0.2]; 5], 0.0),
+            vec![(0.0, 0.0), (1.0, 1.0)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_levels_tests {
+    use super::*;
+    #[test]
+    fn shared_levels_retains_legacy_math_and_native_residual() {
+        for bw in [[0.0f32, 1.0], [0.1, 0.8], [0.5, 0.5], [0.8, 0.2]] {
+            for gamma in [0.01f32, 0.5, 1.0, 2.2, 9.99] {
+                for output in [[0.0, 1.0], [0.1, 0.9], [1.0, 0.0], [0.3, 0.3]] {
+                    for rgb in [[0.0, 0.1, 0.5], [0.2, 0.8, 1.0], [-2.0, 4.0, 16.0]] {
+                        let expected = rgb.map(|v| {
+                            let n = ((v - bw[0]) / (bw[1] - bw[0]).max(1e-4)).clamp(0.0, 1.0);
+                            (output[0]
+                                + n.powf(1.0 / gamma.clamp(0.01, 9.99)) * (output[1] - output[0]))
+                                .clamp(0.0, 1.0)
+                        });
+                        assert_eq!(levels_rgb(rgb, bw, gamma, output, false), expected);
+                    }
+                    let px = [51u8, 128, 230, 77];
+                    let mut image = RasterImage::filled(1, 1, px);
+                    levels(&mut image, bw[0], bw[1], gamma, output[0], output[1], None);
+                    let expected = std::array::from_fn(|i| {
+                        if i == 3 {
+                            px[3]
+                        } else {
+                            let n = ((px[i] as f32 / 255.0 - bw[0]) / (bw[1] - bw[0]).max(1e-4))
+                                .clamp(0.0, 1.0);
+                            ((output[0]
+                                + n.powf(1.0 / gamma.clamp(0.01, 9.99)) * (output[1] - output[0]))
+                                .clamp(0.0, 1.0)
+                                * 255.0)
+                                .round() as u8
+                        }
+                    });
+                    assert_eq!(image.pixel(0, 0), expected);
+                }
+            }
+        }
+        assert_eq!(
+            levels_rgb([-2.0, 4.0, 16.0], [0.0, 1.0], 0.01, [0.0, 1.0], true),
+            [-2.0, 4.0, 16.0]
+        );
+        assert_eq!(
+            levels_rgb([-2.0, 4.0, 16.0], [0.0, 1.0], 9.99, [0.0, 1.0], true),
+            [-2.0, 4.0, 16.0]
+        );
+    }
+}
+
+/// Photonic's extended HSL component transform, for straight linear Rec.709.
+/// The adaptive envelope is exactly [0,1] on bounded input and continuous at
+/// its boundaries. It avoids clipping signed/HDR values or mistaking all HDR
+/// colors for fully saturated ones. Legacy raster HSL remains unchanged.
+/// Lightness endpoints target nominal black/white while extended residuals
+/// fade with the lightness adjustment. Achromatic vibrance has no hue to boost.
+pub fn extended_linear_hsl_rgb(
+    rgb: [f32; 3],
+    hue_deg: f32,
+    saturation: f32,
+    lightness: f32,
+    vibrance_amount: Option<f32>,
+) -> [f32; 3] {
+    if vibrance_amount == Some(0.0)
+        || (vibrance_amount.is_none() && hue_deg == 0.0 && saturation == 0.0 && lightness == 0.0)
+    {
+        return rgb;
+    }
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let relative_chroma = (max - min) / min.abs().max(max.abs()).max(1.0);
+    if vibrance_amount.is_some() && relative_chroma <= 1e-6 {
+        return rgb;
+    }
+    let low = 2.0 * min.min(0.0);
+    let high = 1.0 + 2.0 * (max - 1.0).max(0.0);
+    let span = high - low;
+    let mut hsl = rgb_to_hsl(rgb.map(|v| (v - low) / span));
+    hsl[0] = (hsl[0] + hue_deg).rem_euclid(360.0);
+    hsl[1] = match vibrance_amount {
+        Some(amount) => {
+            // Smoothly suppress the arbitrary hue near achromatic input. All
+            // non-neutral 8-bit bounded RGB lies above this tiny transition.
+            let t = ((relative_chroma - 1e-6) / (1e-4 - 1e-6)).clamp(0.0, 1.0);
+            let gate = t * t * (3.0 - 2.0 * t);
+            (hsl[1] + amount * (1.0 - hsl[1]) * gate).clamp(0.0, 1.0)
+        }
+        None => (hsl[1] * (1.0 + saturation)).clamp(0.0, 1.0),
+    };
+    let t = lightness.abs();
+    let keep = 1.0 - t;
+    let physical_lightness =
+        keep * (max + min) * 0.5 + t * if lightness >= 0.0 { 1.0 } else { 0.0 };
+    if hsl[1] == 0.0 {
+        return [physical_lightness; 3];
+    }
+    let new_low = keep * low;
+    let new_high = 1.0 + keep * (high - 1.0);
+    hsl[2] = (physical_lightness - new_low) / (new_high - new_low);
+    hsl_to_rgb(hsl).map(|v| new_low + v * (new_high - new_low))
+}
+
+#[cfg(test)]
+mod extended_linear_hsl_tests {
+    use super::*;
+    #[test]
+    fn native_linear_hsl_bounded_legacy_byte_agreement() {
+        for rgb in [
+            [20u8, 100, 230],
+            [230, 60, 30],
+            [10, 200, 50],
+            [200, 170, 210],
+            [0, 128, 255],
+            [255, 0, 128],
+        ] {
+            let f = rgb.map(|v| v as f32 / 255.0);
+            for (h, s, l) in [
+                (-180.0, -1.0, 0.0),
+                (60.0, 0.5, 0.4),
+                (30.0, 0.3, -0.6),
+                (0.0, 0.0, 1.0),
+                (0.0, 0.0, -1.0),
+            ] {
+                let mut image = RasterImage::new(1, 1);
+                image.set_pixel(0, 0, [rgb[0], rgb[1], rgb[2], 128]);
+                hue_saturation(&mut image, h, s, l, None);
+                let expected = extended_linear_hsl_rgb(f, h, s, l, None)
+                    .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                assert_eq!(
+                    image.pixel(0, 0),
+                    [expected[0], expected[1], expected[2], 128]
+                );
+            }
+            for amount in [-1.0, 0.0, 0.5, 1.0] {
+                let mut image = RasterImage::new(1, 1);
+                image.set_pixel(0, 0, [rgb[0], rgb[1], rgb[2], 128]);
+                vibrance(&mut image, amount, None);
+                let expected = extended_linear_hsl_rgb(f, 0.0, 0.0, 0.0, Some(amount))
+                    .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+                assert_eq!(
+                    image.pixel(0, 0),
+                    [expected[0], expected[1], expected[2], 128]
+                );
+            }
+        }
+    }
+    #[test]
+    fn native_linear_hsl_extended_endpoints_neutrals_and_continuity() {
+        for rgb in [
+            [2.0, 2.1, 2.05],
+            [-3.0, -2.9, -2.95],
+            [-0.5, 3.0, 0.25],
+            [0.2, 0.4, 0.6],
+            [65504.0, -65504.0, 1.0],
+        ] {
+            assert_eq!(extended_linear_hsl_rgb(rgb, 0.0, 0.0, 0.0, None), rgb);
+            let gray = extended_linear_hsl_rgb(rgb, 0.0, -1.0, 0.0, None);
+            assert!((gray[0] - gray[1]).abs() < 0.001 && (gray[1] - gray[2]).abs() < 0.001);
+            assert_eq!(
+                gray[0],
+                (rgb[0].max(rgb[1]).max(rgb[2]) + rgb[0].min(rgb[1]).min(rgb[2])) * 0.5
+            );
+            for light in [-1.0, 1.0] {
+                let p = extended_linear_hsl_rgb(rgb, 30.0, 0.5, light, None);
+                let goal = if light > 0.0 { 1.0 } else { 0.0 };
+                assert!(p.iter().all(|v| (*v - goal).abs() < 0.00001));
+            }
+        }
+        for v in [-8.0, 0.0, 0.18, 1.0, 8.0, 65504.0] {
+            for amount in [-1.0, 0.5, 1.0] {
+                assert_eq!(
+                    extended_linear_hsl_rgb([v; 3], 0.0, 0.0, 0.0, Some(amount)),
+                    [v; 3]
+                );
+            }
+        }
+        for rgb in [[2.0, 2.1, 2.05], [-3.0, -2.9, -2.95]] {
+            let p = extended_linear_hsl_rgb(rgb, 0.0, 0.0, 0.0, Some(0.5));
+            let spread = |x: [f32; 3]| x[0].max(x[1]).max(x[2]) - x[0].min(x[1]).min(x[2]);
+            assert!(spread(p) > spread(rgb));
+        }
+        for edge in [0.0f32, 1.0] {
+            for vib in [None, Some(0.5)] {
+                let a = extended_linear_hsl_rgb([edge - 0.000001, 0.25, 0.75], 30.0, 0.3, 0.2, vib);
+                let b = extended_linear_hsl_rgb([edge + 0.000001, 0.25, 0.75], 30.0, 0.3, 0.2, vib);
+                assert!(a.iter().zip(b).all(|(a, b)| (*a - b).abs() < 0.00002));
+            }
+        }
+        let mut previous = extended_linear_hsl_rgb([0.1; 3], 0.0, 0.0, 0.0, Some(1.0));
+        for i in 1..=200 {
+            let d = i as f32 * 0.000001;
+            let p =
+                extended_linear_hsl_rgb([0.1, 0.1 + d, 0.1 + d * 0.5], 0.0, 0.0, 0.0, Some(1.0));
+            assert!(p.iter().zip(previous).all(|(a, b)| (*a - b).abs() < 0.01));
+            previous = p;
+        }
+    }
+}
+
+#[cfg(test)]
+mod floating_invert_tests {
+    use super::*;
+    #[test]
+    fn native_transfer_invert_exhaustive_legacy_byte_agreement() {
+        for channel in 0..=255u8 {
+            for alpha in [0, 128, 255] {
+                let mut image = RasterImage::new(1, 1);
+                let rgb = [channel, 255 - channel, channel / 2];
+                image.set_pixel(0, 0, [rgb[0], rgb[1], rgb[2], alpha]);
+                invert(&mut image, None);
+                let expected =
+                    rgb.map(|v| (invert_channel(v as f32 / 255.0) * 255.0).round() as u8);
+                assert_eq!(
+                    image.pixel(0, 0),
+                    [expected[0], expected[1], expected[2], alpha]
+                );
+            }
+        }
+        for value in [-4.0, -1.0, 0.0, 0.25, 1.0, 4.0] {
+            assert_eq!(invert_channel(invert_channel(value)), value);
         }
     }
 }
