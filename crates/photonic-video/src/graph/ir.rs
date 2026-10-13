@@ -1129,6 +1129,7 @@ impl FrameGraph {
                 }
                 IrOp::NativeInvert | IrOp::NativeChromaKey { .. } | IrOp::NativeLumaKey { .. }
                 | IrOp::NativeGaussianBlur { .. } | IrOp::NativeUnsharp { .. } | IrOp::NativeGlow { .. }
+                | IrOp::Crop { .. } | IrOp::Transform2DTransparent { .. }
                     if incoming.is_some() && node.inputs.len() == 1 => incoming,
                 IrOp::Merge { .. }
                     if incoming.is_some() && node.inputs.len() == 2

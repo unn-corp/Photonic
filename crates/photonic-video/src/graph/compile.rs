@@ -6664,7 +6664,7 @@ fn lower_native_graph_with_sources(
     let mut retimed_programs = HashMap::new();
     let mut retimed_clips = HashMap::new();
     let mut lowered = HashMap::new();
-    let mut native_extents = HashSet::new();
+    let mut native_extents = HashMap::new();
     let mut extent_hashes = HashSet::new();
     let mut extent_texels = 0_u64;
     for (id, tick) in order {
@@ -6696,7 +6696,7 @@ fn lower_native_graph_with_sources(
                 let raw = *lowered
                     .get(&(source.0, input_tick, source.1))
                     .ok_or("native graph producer port was not lowered")?;
-                if native_extents.contains(&raw) {
+                if native_extents.contains_key(&raw) {
                     if !matches!(
                         node.op,
                         GraphOp::Resize { .. }
@@ -6708,6 +6708,8 @@ fn lower_native_graph_with_sources(
                             | GraphOp::Sharpen
                             | GraphOp::Glow
                             | GraphOp::Merge { .. }
+                            | GraphOp::Crop
+                            | GraphOp::Transform2D
                     ) {
                         return Err("native MediaIn with different source dimensions requires an explicit Resize before this processing".into());
                     }
@@ -6856,7 +6858,7 @@ fn lower_native_graph_with_sources(
                 };
                 let output = b.push(op, vec![]);
                 if let Some((w, h)) = extent {
-                    native_extents.insert(output);
+                    native_extents.insert(output, (w, h));
                     if extent_hashes.insert(b.nodes[output.0 as usize].content_hash) {
                         let (bw, bh) = super::ir::TextureDesc {
                             width: w,
@@ -7008,7 +7010,14 @@ fn lower_native_graph_with_sources(
                     anchor_space: AnchorSpace::CenterOffset,
                     opacity: 1.0,
                 };
-                let mat = clip_transform_matrix(&transform, format);
+                // Before explicit Resize, transforms use source-pixel coordinates
+                // and the logical source center, independently of Draft scaling.
+                let mut transform_format = format.clone();
+                if let Some((w, h)) = primary.and_then(|input| native_extents.get(&input)) {
+                    transform_format.width = *w;
+                    transform_format.height = *h;
+                }
+                let mat = clip_transform_matrix(&transform, &transform_format);
                 if !mat.is_finite() || mat.determinant().abs() < 1e-12 {
                     return Err("native graph transform must be finite and invertible".into());
                 }
@@ -7251,16 +7260,26 @@ fn lower_native_graph_with_sources(
                 | GraphOp::Blur
                 | GraphOp::Sharpen
                 | GraphOp::Glow
-        ) && primary.is_some_and(|input| native_extents.contains(&input))
-        {
-            native_extents.insert(output);
+                | GraphOp::Crop
+                | GraphOp::Transform2D
+        ) {
+            if let Some(extent) = primary
+                .and_then(|input| native_extents.get(&input))
+                .copied()
+            {
+                native_extents.insert(output, extent);
+            }
         }
-        if matches!(node.op, GraphOp::Merge { .. })
-            && resolved_inputs
+        if matches!(node.op, GraphOp::Merge { .. }) {
+            if let Some(extent) = resolved_inputs
                 .values()
-                .any(|input| native_extents.contains(input))
-        {
-            native_extents.insert(output);
+                .find_map(|input| native_extents.get(input))
+                .copied()
+            {
+                // Whole-graph validation below still requires both inputs to
+                // retain exactly the same native extent.
+                native_extents.insert(output, extent);
+            }
         }
         lowered.insert((id, tick, 0), output);
         if tick == root_tick {
@@ -12889,7 +12908,8 @@ mod tests {
                 (GraphOp::Blur, true),
                 (GraphOp::Sharpen, true),
                 (GraphOp::Glow, true),
-                (GraphOp::Crop, false),
+                (GraphOp::Crop, true),
+                (GraphOp::Transform2D, true),
                 (
                     GraphOp::Merge {
                         mode: BlendMode::Normal,
@@ -12899,7 +12919,18 @@ mod tests {
             ] {
                 let mut routed = project.clone();
                 let graph = routed.graphs.get_mut(&gid).unwrap();
-                let route = GraphNode::new(op);
+                let is_transform = matches!(op, GraphOp::Transform2D);
+                let mut route = GraphNode::new(op);
+                if is_transform {
+                    for (path, value) in [
+                        ("transform.x", 3.0),
+                        ("transform.y", -1.0),
+                        ("transform.scale_x", 0.5),
+                        ("transform.scale_y", 0.5),
+                    ] {
+                        route.params.base.0.set(path, PropValue::Float(value));
+                    }
+                }
                 let route_id = route.id;
                 graph.nodes.insert(route_id, route);
                 graph.edges[0].to = (route_id, InPort(0));
@@ -12914,6 +12945,37 @@ mod tests {
                     "{:?}",
                     result.diagnostics
                 );
+                if is_transform {
+                    for quality in [Quality::FULL, Quality::PREVIEW] {
+                        let frame = compile_native_preview(&routed, seq, 0, Tick::ZERO, quality);
+                        assert!(frame.diagnostics.is_empty());
+                        let mat = frame
+                            .graph
+                            .nodes
+                            .iter()
+                            .find_map(|node| {
+                                let IrOp::Transform2DTransparent { mat, .. } = node.op else {
+                                    return None;
+                                };
+                                let producer = &frame.graph.nodes[node.inputs[0].0 .0 as usize];
+                                matches!(
+                                    producer.op,
+                                    IrOp::NativeMediaVideo {
+                                        native_extent: true,
+                                        ..
+                                    }
+                                )
+                                .then_some(mat)
+                            })
+                            .expect("source-pixel transform");
+                        // Source is 32x8: its center is (16,4), independent
+                        // of the sequence canvas and preview quality.
+                        let expected = [0.5, 0.0, 0.0, 0.0, 0.5, 0.0, 11.0, 1.0, 1.0];
+                        for (actual, expected) in mat.to_cols_array().into_iter().zip(expected) {
+                            assert!((actual - expected).abs() < 1e-6, "{mat:?}");
+                        }
+                    }
+                }
             }
             let mut merged = project.clone();
             let graph = merged.graphs.get_mut(&gid).unwrap();

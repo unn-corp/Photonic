@@ -288,9 +288,42 @@ The focused workflow passes in 112.85 seconds. The complete all-feature
 workspace regression passes 3,757 tests, zero failures and 24 intentional ignores
 across 84 executables. That aggregate excludes the separately run focused
 refusal test. Full-workspace Clippy and formatting pass with existing warnings.
-Publication and remote CI remain pending for this increment.
+Published as `316d75fc` on the feature branch; GitHub run `38389572829`
+is green, including 3,757 full-workspace passes, zero failures and 24 ignores
+across 84 executables. Strict video, lint and PDF gates pass; advisory nightly
+is skipped.
 Broader variable-extent geometry and the complete professional roadmap remain
 unfinished.
+
+## Cloud continuation — source-pixel crop and affine transform (checkpoint 145, 2026-10-13)
+
+Native source paths now retain their logical canvas through Crop and Transform2D
+before explicit Resize. Crop clears normalized margins without shrinking the
+canvas. Transform uses source-pixel translation and a source-centered anchor;
+rotation/scale retain transparent-border, premultiplied bilinear sampling.
+The compiler records native dimensions instead of only a native-extent flag, so
+a 32×8 source's center stays (16,4) even in a differently sized sequence. Fixed
+sequence-canvas paths retain their existing coordinate contract. Resize remains
+the explicit normalization boundary; no automatic expanded bounding box or
+region-of-interest processing is introduced.
+
+Focused GPU/CPU tests pass identity, translation and centered rotation/scale,
+both Crop/Transform orders and a chained Invert, source taps, still/video,
+three fit modes, five intermediate sizes and Full → Draft → Full reuse.
+Compiler tests independently assert the source-centered matrix under Full and
+proxy preview selection. The actual MCP authoring/history/save/reload workflow
+passes Crop → Transform → Resize for three fit modes, preview, ProRes decode/
+manifest and relink recovery. Its independent binary64 inverse affine and
+transparent-border sampling oracle uses normalized crop bounds and preserves
+premultiplied alpha. This focused workflow passes in 59.88 seconds.
+
+Affected-suite qualification passes all 182 native-managed integration tests,
+all 1,030 video library tests (three intentional ignores), and eight distinct
+affected MCP source/mixed-resolution workflows (one source-end fixture remains
+explicitly ignored in this invocation). Full-workspace Clippy and formatting
+pass with existing warnings. These are targeted local results; the prior 3,757
+full-workspace aggregate belongs to checkpoint 144. Publication and fresh full
+GitHub acceptance remain pending for checkpoint 145.
 
 ## Current roadmap checkpoint — 2026-10-13
 
@@ -299,10 +332,10 @@ qualification counts below. The chronological entries remain evidence for their
 individual increments, not a claim that the full roadmap is finished.
 
 - Branch: `feat/professional-color-foundation`.
-- Published implementation checkpoint: `724db819`, committed and pushed to the
-  same branch on `origin`, with green GitHub CI (3,754 passes, zero failures,
-  24 ignores). Checkpoint 144 is a local equal-native-extent Merge extension;
-  full regression passes 3,757 tests and publication is pending.
+- Published implementation checkpoint: `316d75fc`, committed and pushed to the
+  same branch on `origin`, with 3,757 local and GitHub all-feature passes,
+  zero failures and 24 ignores. Checkpoint 145 is local source Crop/Transform
+  qualification.
 - Goal: **resumed at the user's request on 2026-10-05** in a cloud checkout of
   documentation checkpoint `30f221c`. The full end-to-end roadmap remains
   incomplete; no completion percentage is asserted. Work is being performed
@@ -349,7 +382,7 @@ individual increments, not a claim that the full roadmap is finished.
 
 | Area | Work still required |
 | --- | --- |
-| Managed pipeline | General effects beyond Gaussian/box/directional/catalog Surface and Lens blur/Median/Dust & Scratches, bounded measured Deflicker across asset/clip/track/master and multiple instances, native detail/unsharp/glow/vignette/mosaic and fixed-canvas Pinch/Spherize/Ripple/Perspective, Emboss/Find Edges/Chromatic Aberration and Drop Shadow, bounded transfer-space Posterize/Threshold and extended Desaturate/Channel Mixer/Black & White/Photo Filter/Color Balance/catalog Curves/Levels and Alpha View/Unpremultiply diagnostics/coverage Outline/linear Hue-Saturation/Vibrance/transfer Invert, spatial bilateral denoise, deterministic uniform grain, bounded Invert and AP1 luma/chroma keys, general variable-extent graph geometry beyond the qualified source-pixel Invert/chroma/luma-key/Gaussian/unsharp/glow chains and matching-native-extent Merge, explicit MediaIn intermediate Resize and fixed-canvas normalization path, high-resolution and long-soak multi-offset playback and broader subject-mask footage qualification, plus broader geometry beyond the qualified fixed-canvas nodes and static polygon generator, unqualified nonadjacent incoming transition edges (all six known outgoing kinds now follow the existing eased opacity-fade contract), remaining vector/logo features beyond the bounded whole-document solid-path source, title-style animation beyond the qualified whole-title 200ms SlideUp entrance, and per-word decorations and independent layout/animation beyond the qualified mixed font-size/family/weight/color caption spans and bounded decorated title/caption paths; mixed-source/conversion and proxy/cache precision qualification; full stage-order and independent-reference acceptance. |
+| Managed pipeline | General effects beyond Gaussian/box/directional/catalog Surface and Lens blur/Median/Dust & Scratches, bounded measured Deflicker across asset/clip/track/master and multiple instances, native detail/unsharp/glow/vignette/mosaic and fixed-canvas Pinch/Spherize/Ripple/Perspective, Emboss/Find Edges/Chromatic Aberration and Drop Shadow, bounded transfer-space Posterize/Threshold and extended Desaturate/Channel Mixer/Black & White/Photo Filter/Color Balance/catalog Curves/Levels and Alpha View/Unpremultiply diagnostics/coverage Outline/linear Hue-Saturation/Vibrance/transfer Invert, spatial bilateral denoise, deterministic uniform grain, bounded Invert and AP1 luma/chroma keys, general variable-extent graph geometry beyond the qualified source-pixel Invert/chroma/luma-key/Gaussian/unsharp/glow chains, matching-native-extent Merge and source-canvas Crop/Transform2D, explicit MediaIn intermediate Resize and fixed-canvas normalization path, high-resolution and long-soak multi-offset playback and broader subject-mask footage qualification, plus broader geometry beyond the qualified fixed-canvas nodes and static polygon generator, unqualified nonadjacent incoming transition edges (all six known outgoing kinds now follow the existing eased opacity-fade contract), remaining vector/logo features beyond the bounded whole-document solid-path source, title-style animation beyond the qualified whole-title 200ms SlideUp entrance, and per-word decorations and independent layout/animation beyond the qualified mixed font-size/family/weight/color caption spans and bounded decorated title/caption paths; mixed-source/conversion and proxy/cache precision qualification; full stage-order and independent-reference acceptance. |
 | Color workspace/scopes | Broader workspace/view arrangements beyond the qualified local Color presets; live shared reference ownership beyond qualified immutable cross-sequence gallery copies, and local/group version arrangements beyond qualified explicit project-shared-look named versions; broader cross-sequence inspection arrangements beyond qualified selected-member group/compound and local/shared workflows; HDR absolute scopes/scales and broader high-resolution qualification beyond bounded continuous AP1 relative-stop waveform/RGB parade/RGB waveform/histogram, paired MCP measurement and live AP1/SDR statistics; safe asset/cache cleanup and portable color dependencies. |
 | Primaries/secondaries | Further white-balance models beyond explicit Planckian source/target Kelvin adaptation; additional tonal-range workflows beyond the qualified linked three-range exposure and RGB wheel mean; broader multiple-window UX beyond qualified static and fixed-topology animated Bézier graph keys and primitive/Bézier Boolean combinations; broader compound/stabilization coordinate contracts beyond qualified clip-relative, post-transform primitive animation. |
 | Tracking/graph | Qualify broader footage, occlusion recovery, scale/rotation/perspective and Bézier/compound/stabilization tracking beyond the bounded ordinary-clip fixed-reference and opt-in bidirectional short-term translation proposals; extend the qualified synthetic and short real-footage static-target balance/match/tracked-version/export/reimport/archive regressions to broader representative footage and grading workflows; broader cross-sequence tracking and structural/non-scalar look/group animation beyond the qualified scalar, primitive-window and fixed-topology Bézier lanes (selected-member group/compound image, matte and input inspection, local/shared outputs, native eyedroppers and checked static edits are implemented). |

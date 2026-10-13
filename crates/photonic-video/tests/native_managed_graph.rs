@@ -7782,6 +7782,34 @@ fn native_source_detail_filters_preserve_source_radius_alpha_and_quality_cache()
 }
 
 #[test]
+fn native_source_geometry_preserves_source_canvas_alpha_and_quality_cache() {
+    use photonic_video::graph::ir::Sampling;
+    let crop = IrOp::Crop {
+        left: 0.25,
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.25,
+    };
+    let center = glam::Vec2::new(2.0, 1.0);
+    for mat in [
+        glam::Mat3::IDENTITY,
+        glam::Mat3::from_translation(glam::Vec2::new(0.5, -0.25)),
+        glam::Mat3::from_translation(center)
+            * glam::Mat3::from_angle(0.35)
+            * glam::Mat3::from_scale(glam::Vec2::new(0.75, 1.25))
+            * glam::Mat3::from_translation(-center),
+    ] {
+        let transform = IrOp::Transform2DTransparent {
+            mat,
+            sampling: Sampling::Bilinear,
+        };
+        check_native_mixed_resolution_chain(&[transform.clone()]);
+        check_native_mixed_resolution_chain(&[crop.clone(), transform.clone(), IrOp::NativeInvert]);
+        check_native_mixed_resolution_chain(&[transform, crop.clone()]);
+    }
+}
+
+#[test]
 fn native_same_extent_merge_preserves_source_geometry_alpha_and_quality_cache() {
     for mode in [
         BlendMode::Normal,

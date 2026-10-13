@@ -23796,9 +23796,15 @@ mod tests {
         output_source
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum NativeSourceTailFixture {
+        Merge,
+        Geometry,
+    }
+
     async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
         Box::pin(check_native_media_in_import_sized(
-            mode, None, None, false, false, None, false,
+            mode, None, None, false, false, None, None,
         ))
         .await;
     }
@@ -23817,7 +23823,7 @@ mod tests {
                 false,
                 false,
                 None,
-                false,
+                None,
             ))
             .await;
         }
@@ -23837,7 +23843,7 @@ mod tests {
                 false,
                 false,
                 None,
-                false,
+                None,
             ))
             .await;
         }
@@ -23857,7 +23863,7 @@ mod tests {
                 true,
                 false,
                 None,
-                false,
+                None,
             ))
             .await;
         }
@@ -23877,7 +23883,7 @@ mod tests {
                 false,
                 true,
                 None,
-                false,
+                None,
             ))
             .await;
         }
@@ -23897,7 +23903,7 @@ mod tests {
                 true,
                 true,
                 None,
-                false,
+                None,
             ))
             .await;
         }
@@ -23927,7 +23933,7 @@ mod tests {
                     false,
                     false,
                     Some(detail),
-                    false,
+                    None,
                 ))
                 .await;
             }
@@ -23948,7 +23954,27 @@ mod tests {
                 true,
                 true,
                 None,
-                true,
+                Some(NativeSourceTailFixture::Merge),
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_source_crop_transform_mcp_preview_prores_and_relink() {
+        for fit in [
+            photonic_core::timeline::FitMode::Contain,
+            photonic_core::timeline::FitMode::Cover,
+            photonic_core::timeline::FitMode::Stretch,
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                Some([21, 7]),
+                false,
+                false,
+                None,
+                Some(NativeSourceTailFixture::Geometry),
             ))
             .await;
         }
@@ -23961,8 +23987,10 @@ mod tests {
         invert_before_resize: bool,
         blur_before_resize: bool,
         detail_before_resize: Option<NativeSourceDetailFixture>,
-        merge_with_source: bool,
+        tail: Option<NativeSourceTailFixture>,
     ) {
+        let merge_with_source = matches!(tail, Some(NativeSourceTailFixture::Merge));
+        let source_geometry = matches!(tail, Some(NativeSourceTailFixture::Geometry));
         let output_width = if resize_fit.is_some() { 16_usize } else { 32 };
         let output_height = 16_usize;
         let temporal_echo = mode == NativeMediaFixtureMode::FourOffsets;
@@ -24345,6 +24373,41 @@ mod tests {
                 Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":detailed}}))).await;
                 output_source = detailed;
             }
+            if source_geometry {
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":GraphOp::Crop}),
+                ))
+                .await;
+                let cropped = data(&added)["node_id"].clone();
+                for (path, value) in [
+                    ("params.left", 0.125),
+                    ("params.top", 0.125),
+                    ("params.right", 0.0625),
+                ] {
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"set_graph_node_param",json!({"graph_id":graph_id,"node_id":cropped,"path":path,"value":photonic_core::timeline::PropValue::Float(value)}))).await;
+                }
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":cropped}}))).await;
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":GraphOp::Transform2D}),
+                ))
+                .await;
+                let transformed = data(&added)["node_id"].clone();
+                for (path, value) in [
+                    ("transform.x", 2.5),
+                    ("transform.y", -0.75),
+                    ("transform.scale_x", 0.75),
+                    ("transform.scale_y", 1.25),
+                    ("transform.rotation", 0.2),
+                ] {
+                    Box::pin(graph_authoring_edit_roundtrip(&state,"set_graph_node_param",json!({"graph_id":graph_id,"node_id":transformed,"path":path,"value":photonic_core::timeline::PropValue::Float(value)}))).await;
+                }
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":cropped},"to":{"node_id":transformed}}))).await;
+                output_source = transformed;
+            }
             if merge_with_source {
                 let added=Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_node",json!({"graph_id":graph_id,"op":GraphOp::Merge { mode:photonic_core::layer::BlendMode::Normal }}))).await;
                 let merged = data(&added)["node_id"].clone();
@@ -24506,7 +24569,7 @@ mod tests {
                 }
                 pointwise_pixel(frame, index)
             };
-            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+            let composited_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
                 let (top, a) = processed_pixel(frame, index);
                 if !merge_with_source {
                     return (top, a);
@@ -24526,6 +24589,49 @@ mod tests {
                     }),
                     alpha,
                 )
+            };
+            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                if !source_geometry {
+                    return composited_pixel(frame, index);
+                }
+                // Independent inverse affine transform around the 32x16 source
+                // center, followed by transparent-border premultiplied bilinear
+                // sampling of the normalized crop mask. No renderer helpers.
+                let dx = (index % 32) as f64 + 0.5 - 16.0 - 2.5;
+                let dy = (index / 32) as f64 + 0.5 - 8.0 + 0.75;
+                let (sin, cos) = 0.2_f64.sin_cos();
+                let x = (cos * dx + sin * dy) / 0.75 + 16.0 - 0.5;
+                let y = (-sin * dx + cos * dy) / 1.25 + 8.0 - 0.5;
+                let x0 = x.floor() as i32;
+                let y0 = y.floor() as i32;
+                let tx = x - x0 as f64;
+                let ty = y - y0 as f64;
+                let mut premult = [0.0; 3];
+                let mut alpha = 0.0;
+                for (xx, wx) in [(x0, 1.0 - tx), (x0 + 1, tx)] {
+                    for (yy, wy) in [(y0, 1.0 - ty), (y0 + 1, ty)] {
+                        if !(0..32).contains(&xx) || !(0..16).contains(&yy) {
+                            continue;
+                        }
+                        let px = xx as f64 + 0.5;
+                        let py = yy as f64 + 0.5;
+                        if !(4.0..30.0).contains(&px) || !(2.0..16.0).contains(&py) {
+                            continue;
+                        }
+                        let (rgb, a) = composited_pixel(frame, yy as usize * 32 + xx as usize);
+                        let w = wx * wy;
+                        alpha += a * w;
+                        for c in 0..3 {
+                            premult[c] += rgb[c] * a * w;
+                        }
+                    }
+                }
+                if alpha > 0.0 {
+                    for c in &mut premult {
+                        *c /= alpha;
+                    }
+                }
+                (premult, alpha)
             };
             // Independent f64 premultiplied bilinear reference for both
             // authored Resize and its fixed-canvas normalization. Sampling
