@@ -23797,7 +23797,10 @@ mod tests {
     }
 
     async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
-        Box::pin(check_native_media_in_import_sized(mode, None, None, false)).await;
+        Box::pin(check_native_media_in_import_sized(
+            mode, None, None, false, false,
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -23811,6 +23814,7 @@ mod tests {
                 NativeMediaFixtureMode::Plain,
                 Some(fit),
                 None,
+                false,
                 false,
             ))
             .await;
@@ -23829,6 +23833,7 @@ mod tests {
                 Some(fit),
                 Some(dimensions),
                 false,
+                false,
             ))
             .await;
         }
@@ -23846,6 +23851,25 @@ mod tests {
                 Some(fit),
                 Some([21, 7]),
                 true,
+                false,
+            ))
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_source_gaussian_before_resize_mcp_preview_prores_and_relink() {
+        for fit in [
+            photonic_core::timeline::FitMode::Contain,
+            photonic_core::timeline::FitMode::Cover,
+            photonic_core::timeline::FitMode::Stretch,
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                Some([21, 7]),
+                false,
+                true,
             ))
             .await;
         }
@@ -23856,6 +23880,7 @@ mod tests {
         resize_fit: Option<photonic_core::timeline::FitMode>,
         intermediate_dimensions: Option<[usize; 2]>,
         invert_before_resize: bool,
+        blur_before_resize: bool,
     ) {
         let output_width = if resize_fit.is_some() { 16_usize } else { 32 };
         let output_height = 16_usize;
@@ -24170,6 +24195,24 @@ mod tests {
                 .await;
                 output_source = inverted;
             }
+            if blur_before_resize {
+                let added = Box::pin(graph_authoring_edit_roundtrip(
+                    &state,
+                    "add_graph_node",
+                    json!({"graph_id":graph_id,"op":GraphOp::Blur}),
+                ))
+                .await;
+                let blurred = data(&added)["node_id"].clone();
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state, "set_graph_node_param",
+                    json!({"graph_id":graph_id,"node_id":blurred,"path":"params.radius","value":photonic_core::timeline::PropValue::Float(1.25)}),
+                )).await;
+                Box::pin(graph_authoring_edit_roundtrip(
+                    &state, "add_graph_edge",
+                    json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":blurred}}),
+                )).await;
+                output_source = blurred;
+            }
             if let Some(fit) = resize_fit {
                 let added = Box::pin(graph_authoring_edit_roundtrip(
                     &state,
@@ -24242,6 +24285,36 @@ mod tests {
                 }
             };
             let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                if blur_before_resize {
+                    // Independent binary64 2D Gaussian, sigma 1.25, radius
+                    // ceil(3*sigma)=4. Clamp samples to the source image edge,
+                    // average premultiplied RGBA, then recover straight color.
+                    let sigma = 1.25_f64;
+                    let weights: Vec<f64> = (-4..=4)
+                        .map(|i: i32| (-(i * i) as f64 / (2.0 * sigma * sigma)).exp())
+                        .collect();
+                    let norm = weights.iter().sum::<f64>().powi(2);
+                    let (x, y) = ((index % 32) as i32, (index / 32) as i32);
+                    let mut value = [0.0; 4];
+                    for dy in -4..=4 {
+                        for dx in -4..=4 {
+                            let j = (y + dy).clamp(0, 15) as usize * 32
+                                + (x + dx).clamp(0, 31) as usize;
+                            let (rgb, a) = raw_source_pixel(frame, j);
+                            let weight =
+                                weights[(dx + 4) as usize] * weights[(dy + 4) as usize] / norm;
+                            for c in 0..3 {
+                                value[c] += rgb[c] * a * weight;
+                            }
+                            value[3] += a * weight;
+                        }
+                    }
+                    let a = value[3];
+                    return (
+                        std::array::from_fn(|c| if a > 0.0 { value[c] / a } else { 0.0 }),
+                        a,
+                    );
+                }
                 let (rgb, alpha) = raw_source_pixel(frame, index);
                 if invert_before_resize {
                     (rgb.map(|c| 1.0 - c.clamp(0.0, 1.0)), alpha)

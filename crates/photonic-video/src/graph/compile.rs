@@ -6704,6 +6704,7 @@ fn lower_native_graph_with_sources(
                             | GraphOp::Invert
                             | GraphOp::ChromaKey
                             | GraphOp::LumaKey
+                            | GraphOp::Blur
                     ) {
                         return Err("native MediaIn with different source dimensions requires an explicit Resize before this processing".into());
                     }
@@ -7241,7 +7242,7 @@ fn lower_native_graph_with_sources(
         };
         if matches!(
             node.op,
-            GraphOp::Invert | GraphOp::ChromaKey | GraphOp::LumaKey
+            GraphOp::Invert | GraphOp::ChromaKey | GraphOp::LumaKey | GraphOp::Blur
         ) && primary.is_some_and(|input| native_extents.contains(&input))
         {
             native_extents.insert(output);
@@ -12763,7 +12764,8 @@ mod tests {
                 (GraphOp::Invert, true),
                 (GraphOp::ChromaKey, true),
                 (GraphOp::LumaKey, true),
-                (GraphOp::Blur, false),
+                (GraphOp::Blur, true),
+                (GraphOp::Sharpen, false),
             ] {
                 let mut routed = project.clone();
                 let graph = routed.graphs.get_mut(&gid).unwrap();

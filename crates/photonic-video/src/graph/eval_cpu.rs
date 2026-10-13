@@ -110,9 +110,15 @@ pub fn evaluate_at(
     }
     let canvas_scale = graph.canvas_scale((cw, ch));
     let native = graph.native_video_sources();
+    let Ok(native_extents) = graph.native_processing_extents() else {
+        return Image::new(cw, ch);
+    };
     let mut results: Vec<Option<Image>> = (0..graph.nodes.len()).map(|_| None).collect();
 
     for (i, node) in graph.nodes.iter().enumerate() {
+        let (width, height, scale) = native_extents[i]
+            .map(|(w, h)| (w, h, glam::Vec2::ONE))
+            .unwrap_or((cw, ch, canvas_scale));
         let mut img = {
             let inputs: Vec<&Image> = node
                 .inputs
@@ -149,10 +155,10 @@ pub fn evaluate_at(
                 _ => eval_op(
                     &node
                         .op
-                        .at_evaluation_scale(canvas_scale, graph.working_color_domain),
+                        .at_evaluation_scale(scale, graph.working_color_domain),
                     &inputs,
-                    cw,
-                    ch,
+                    width,
+                    height,
                     provider,
                     native[i],
                 ),

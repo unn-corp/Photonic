@@ -1102,7 +1102,7 @@ impl FrameGraph {
     }
 
     /// Logical source-pixel dimensions for explicitly native-resolution paths.
-    /// Only qualified pointwise operations may retain these dimensions before
+    /// Only qualified operations may retain these dimensions before
     /// an explicit Resize normalizes the graph. Count every source/intermediate
     /// allocation, including duplicate hashes, against the resident texel bound.
     pub(crate) fn native_processing_extents(
@@ -1128,6 +1128,7 @@ impl FrameGraph {
                     Some((w, h))
                 }
                 IrOp::NativeInvert | IrOp::NativeChromaKey { .. } | IrOp::NativeLumaKey { .. }
+                | IrOp::NativeGaussianBlur { .. }
                     if incoming.is_some() && node.inputs.len() == 1 => incoming,
                 IrOp::Resize { .. } => None,
                 _ if incoming.is_some() => return Err(
@@ -1141,7 +1142,14 @@ impl FrameGraph {
                     height: h,
                 }
                 .bucket();
-                texels = texels.saturating_add(u64::from(bw) * u64::from(bh));
+                // Gaussian reserves its output plus three same-sized temporary
+                // textures. Charge all four even for its identity fast path.
+                let allocations = if matches!(node.op, IrOp::NativeGaussianBlur { .. }) {
+                    4
+                } else {
+                    1
+                };
+                texels = texels.saturating_add(u64::from(bw) * u64::from(bh) * allocations);
                 if texels > 16_777_216 {
                     return Err(
                         "native mixed-resolution graph exceeds its padded-extent-texel budget",

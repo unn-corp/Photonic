@@ -7723,6 +7723,13 @@ fn native_mixed_resolution_pointwise_processing_preserves_source_extent_and_taps
     }
 }
 
+#[test]
+fn native_source_resolution_gaussian_preserves_sigma_draft_cache_and_taps() {
+    for sigma in [0.0, 0.49, 0.5, 1.25, 3.0, 50.0] {
+        check_native_mixed_resolution_resize(Some(IrOp::NativeGaussianBlur { sigma }));
+    }
+}
+
 fn check_native_mixed_resolution_resize(pointwise: Option<IrOp>) {
     use photonic_core::timeline::color::{
         InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
@@ -8140,6 +8147,45 @@ fn native_source_extent_budget_includes_pointwise_intermediates() {
             unnormalized.output = Some(input);
             assert!(unnormalized.validate_working_color_domain().is_err());
         }
+    }
+}
+
+#[test]
+fn native_source_gaussian_budget_counts_three_temporaries() {
+    use photonic_core::timeline::AssetId;
+    use photonic_video::graph::ir::FitMode;
+    for (width, allowed) in [(1024, true), (2048, false)] {
+        let graph = FrameGraph {
+            nodes: vec![
+                IrNode {
+                    op: IrOp::NativeMediaStill {
+                        asset: AssetId::new(),
+                        w: width,
+                        h: 2048,
+                        native_extent: true,
+                    },
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: IrOp::NativeGaussianBlur { sigma: 2.0 },
+                    inputs: vec![(IrNodeId(0), OutPort(0))],
+                    content_hash: ContentHash(2),
+                },
+                IrNode {
+                    op: IrOp::Resize {
+                        w: 16,
+                        h: 16,
+                        fit: FitMode::Stretch,
+                    },
+                    inputs: vec![(IrNodeId(1), OutPort(0))],
+                    content_hash: ContentHash(3),
+                },
+            ],
+            output: Some(IrNodeId(2)),
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+        };
+        assert_eq!(graph.validate_working_color_domain().is_ok(), allowed);
     }
 }
 
