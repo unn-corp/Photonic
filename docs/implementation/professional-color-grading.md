@@ -184,7 +184,29 @@ against an independent binary64 2D Gaussian over premultiplied source pixels
 before the independent resize oracle. The complete current-tree all-feature
 regression passed 3,748 tests, zero failures and 24 intentional ignores across
 84 executables. Full-workspace Clippy and formatting pass with existing warnings.
-Checkpoint 140 awaits publication and remote CI verification.
+Checkpoint 140 was published as `c02bf6c9`; GitHub run `38367577595` passed
+full workspace, lint, PDF and strict video acceptance. Scheduled nightly was
+correctly skipped on push.
+
+## Cloud continuation — composed source processing qualification (checkpoint 141, 2026-10-13)
+
+This test-only increment verifies the bounded source-pixel operators together.
+An Invert → Gaussian → ChromaKey → LumaKey chain and its reverse order are
+compared against CPU evaluation for still/video sources, all three resize fits,
+five intermediate sizes and Full → Draft → Full reuse. Every intermediate
+scope tap must retain source dimensions and match its stage's reference,
+including changes to alpha. Existing single-operation cases use the same
+expanded harness.
+
+The MCP fixture now also authors Invert → Gaussian → Resize, compares the
+composed result with its independent binary64 oracle, verifies preview and
+ProRes decode/manifest, and exercises undo/redo/save/reload and relink recovery.
+The complete native graph integration executable passes all 177 tests, and all
+eight distinct affected MCP workflows pass (one ran twice through overlapping
+filters). Full-workspace Clippy and formatting pass with existing warnings.
+No production implementation or document schema changed in this increment.
+The 3,748-test full local aggregate above belongs to checkpoint 140; checkpoint
+141's full aggregate acceptance will be verified by GitHub CI after publication.
 
 ## Current roadmap checkpoint — 2026-10-13
 
@@ -193,9 +215,10 @@ qualification counts below. The chronological entries remain evidence for their
 individual increments, not a claim that the full roadmap is finished.
 
 - Branch: `feat/professional-color-foundation`.
-- Published implementation checkpoint: `b0b628ec`, committed and pushed to the
-  same branch on `origin`, with green GitHub CI. Previous checkpoint
-  `21096975` also has green CI. Checkpoint 140 above remains local continuation.
+- Published implementation checkpoint: `c02bf6c9`, committed and pushed to the
+  same branch on `origin`, with green GitHub CI. Previous checkpoints
+  `b0b628ec` and `21096975` also have green CI. Checkpoint 141 is local qualification
+  continuation until publication and remote acceptance are recorded.
 - Goal: **resumed at the user's request on 2026-10-05** in a cloud checkout of
   documentation checkpoint `30f221c`. The full end-to-end roadmap remains
   incomplete; no completion percentage is asserted. Work is being performed

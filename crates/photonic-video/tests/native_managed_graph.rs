@@ -7730,7 +7730,32 @@ fn native_source_resolution_gaussian_preserves_sigma_draft_cache_and_taps() {
     }
 }
 
+#[test]
+fn native_source_processing_chains_preserve_order_alpha_and_quality_cache() {
+    let chain = [
+        IrOp::NativeInvert,
+        IrOp::NativeGaussianBlur { sigma: 1.25 },
+        IrOp::NativeChromaKey {
+            key: [0.0, 1.0, 0.0],
+            tolerance: 0.3,
+            softness: 0.2,
+            spill: 0.0,
+        },
+        IrOp::NativeLumaKey {
+            threshold: 0.2,
+            softness: 0.1,
+            invert: false,
+        },
+    ];
+    check_native_mixed_resolution_chain(&chain);
+    check_native_mixed_resolution_chain(&chain.into_iter().rev().collect::<Vec<_>>());
+}
+
 fn check_native_mixed_resolution_resize(pointwise: Option<IrOp>) {
+    check_native_mixed_resolution_chain(&pointwise.into_iter().collect::<Vec<_>>());
+}
+
+fn check_native_mixed_resolution_chain(processing: &[IrOp]) {
     use photonic_core::timeline::color::{
         InputMatrix, InputSignalRange, NativeInputColorInterpretation, NativeInputStandard,
     };
@@ -7957,28 +7982,25 @@ fn check_native_mixed_resolution_resize(pointwise: Option<IrOp>) {
                     ],
                     output: Some(IrNodeId(3)),
                 };
-                let tap_id = if let Some(op) = &pointwise {
-                    for node in &mut graph.nodes[1..] {
-                        for (id, _) in &mut node.inputs {
-                            if id.0 >= 1 {
-                                id.0 += 1;
-                            }
+                let count = processing.len() as u32;
+                for node in &mut graph.nodes[1..] {
+                    for (id, _) in &mut node.inputs {
+                        if id.0 >= 1 {
+                            id.0 += count;
                         }
                     }
-                    graph.nodes.insert(
-                        1,
-                        IrNode {
-                            op: op.clone(),
-                            inputs: vec![(IrNodeId(0), OutPort(0))],
-                            content_hash: ContentHash(hash + 5),
-                        },
-                    );
-                    graph.nodes[2].inputs[0].0 = IrNodeId(1);
-                    graph.output.as_mut().unwrap().0 += 1;
-                    IrNodeId(1)
-                } else {
-                    IrNodeId(0)
-                };
+                }
+                graph.nodes[1].inputs[0].0 = IrNodeId(count);
+                graph.nodes.splice(
+                    1..1,
+                    processing.iter().enumerate().map(|(i, op)| IrNode {
+                        op: op.clone(),
+                        inputs: vec![(IrNodeId(i as u32), OutPort(0))],
+                        content_hash: ContentHash(hash + 5 + i as u128),
+                    }),
+                );
+                graph.output.as_mut().unwrap().0 += count;
+                let tap_id = IrNodeId(count);
                 assert!(graph.validate_working_color_domain().is_ok());
                 for size in [8, 4, 8] {
                     let mut cpu = Cpu(Image {
@@ -8008,7 +8030,7 @@ fn check_native_mixed_resolution_resize(pointwise: Option<IrOp>) {
                         let inside = !matches!(fit, FitMode::Fit)
                             || (i / (size as usize) >= size as usize / 4
                                 && i / (size as usize) < size as usize * 3 / 4);
-                        if (iw, ih) == (8, 8) && pointwise.is_none() {
+                        if (iw, ih) == (8, 8) && processing.is_empty() {
                             assert!(
                                 (p[3] - if inside { 0.5 } else { 0. }).abs() < 0.002,
                                 "explicit fit coverage"
@@ -8016,13 +8038,32 @@ fn check_native_mixed_resolution_resize(pointwise: Option<IrOp>) {
                         }
                     }
                     let scope = read_texture_rgba16f(&gpu, &tap.texture, 4, 2);
-                    if pointwise.is_some() {
+                    if !processing.is_empty() {
                         let reference =
                             eval_cpu::evaluate_at(&graph, (size, size), &mut cpu, Some(tap_id));
                         assert_eq!((reference.width, reference.height), (4, 2));
                         for (actual, expected) in scope.iter().zip(&reference.pixels) {
                             for c in 0..4 {
                                 assert!((actual[c] - expected[c]).abs() < 0.003);
+                            }
+                        }
+                        for id in 0..count {
+                            let id = IrNodeId(id);
+                            let (_, stage) = eval.evaluate_with_tap_frame(
+                                &graph,
+                                (size, size),
+                                &mut source,
+                                Some(id),
+                            );
+                            let stage = stage.expect("intermediate source-pixel scope");
+                            assert_eq!((stage.width, stage.height), (4, 2));
+                            let actual = read_texture_rgba16f(&gpu, &stage.texture, 4, 2);
+                            let reference =
+                                eval_cpu::evaluate_at(&graph, (size, size), &mut cpu, Some(id));
+                            for (p, q) in actual.iter().zip(&reference.pixels) {
+                                for c in 0..4 {
+                                    assert!((p[c] - q[c]).abs() < 0.003);
+                                }
                             }
                         }
                         continue;

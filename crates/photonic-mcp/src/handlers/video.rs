@@ -23875,6 +23875,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn native_source_invert_gaussian_chain_mcp_preview_prores_and_relink() {
+        for fit in [
+            photonic_core::timeline::FitMode::Contain,
+            photonic_core::timeline::FitMode::Cover,
+            photonic_core::timeline::FitMode::Stretch,
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                Some([21, 7]),
+                true,
+                true,
+            ))
+            .await;
+        }
+    }
+
     async fn check_native_media_in_import_sized(
         mode: NativeMediaFixtureMode,
         resize_fit: Option<photonic_core::timeline::FitMode>,
@@ -24284,6 +24302,14 @@ mod tests {
                     (average, 1.)
                 }
             };
+            let pointwise_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                let (rgb, alpha) = raw_source_pixel(frame, index);
+                if invert_before_resize {
+                    (rgb.map(|c| 1.0 - c.clamp(0.0, 1.0)), alpha)
+                } else {
+                    (rgb, alpha)
+                }
+            };
             let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
                 if blur_before_resize {
                     // Independent binary64 2D Gaussian, sigma 1.25, radius
@@ -24300,7 +24326,7 @@ mod tests {
                         for dx in -4..=4 {
                             let j = (y + dy).clamp(0, 15) as usize * 32
                                 + (x + dx).clamp(0, 31) as usize;
-                            let (rgb, a) = raw_source_pixel(frame, j);
+                            let (rgb, a) = pointwise_pixel(frame, j);
                             let weight =
                                 weights[(dx + 4) as usize] * weights[(dy + 4) as usize] / norm;
                             for c in 0..3 {
@@ -24315,12 +24341,7 @@ mod tests {
                         a,
                     );
                 }
-                let (rgb, alpha) = raw_source_pixel(frame, index);
-                if invert_before_resize {
-                    (rgb.map(|c| 1.0 - c.clamp(0.0, 1.0)), alpha)
-                } else {
-                    (rgb, alpha)
-                }
+                pointwise_pixel(frame, index)
             };
             // Independent f64 premultiplied bilinear reference for both
             // authored Resize and its fixed-canvas normalization. Sampling
