@@ -206,7 +206,31 @@ eight distinct affected MCP workflows pass (one ran twice through overlapping
 filters). Full-workspace Clippy and formatting pass with existing warnings.
 No production implementation or document schema changed in this increment.
 The 3,748-test full local aggregate above belongs to checkpoint 140; checkpoint
-141's full aggregate acceptance will be verified by GitHub CI after publication.
+141 was published as `0b4dfe0d`. GitHub run `38372674928` passed all applicable
+jobs. Its full workspace log records 3,750 passes, zero failures and 24 ignores
+across 84 executables; this is the current remote aggregate, not a new local run.
+
+## Cloud continuation — catalogue-wide native compiler audit (checkpoint 142, 2026-10-13)
+
+An exhaustive regression now enumerates every shipped manifest instead of a
+hand-maintained sample. All 45 effects have native compiler routes across asset,
+clip, track and master ownership: 180 default-parameter cases validate their
+working-color domain and reject any Legacy `IrOp::Effect` fallback. This audits
+compiler routing, not every parameter combination or rendered pixel of every
+effect; the earlier independent numerical/export tests remain separate evidence.
+
+Deflicker is the explicit temporal prerequisite: all four unmeasured owner cases
+must refuse with the missing-analysis diagnostic. The positive compiler fixture
+provides an explicitly synthetic measurement keyed to that exact owner/context;
+it is not footage analysis. The first exploratory audit failed because it omitted
+that required measurement. The final test checks both refusal and the supplied
+measurement route without changing production behavior.
+
+The complete video library passes 1,030 tests with zero failures and three
+intentional ignores. Full-workspace Clippy and formatting pass with existing
+warnings. This is a test/documentation-only increment; publication and full
+remote aggregate acceptance remain pending. Broader effects, source/parameter
+coverage, precision/performance and the full professional roadmap remain open.
 
 ## Current roadmap checkpoint — 2026-10-13
 
@@ -215,10 +239,10 @@ qualification counts below. The chronological entries remain evidence for their
 individual increments, not a claim that the full roadmap is finished.
 
 - Branch: `feat/professional-color-foundation`.
-- Published implementation checkpoint: `c02bf6c9`, committed and pushed to the
-  same branch on `origin`, with green GitHub CI. Previous checkpoints
-  `b0b628ec` and `21096975` also have green CI. Checkpoint 141 is local qualification
-  continuation until publication and remote acceptance are recorded.
+- Published implementation checkpoint: `0b4dfe0d`, committed and pushed to the
+  same branch on `origin`, with green GitHub CI (3,750 passes, zero failures,
+  24 ignores). Checkpoint 142 remains local catalogue qualification until
+  publication and remote acceptance are recorded.
 - Goal: **resumed at the user's request on 2026-10-05** in a cloud checkout of
   documentation checkpoint `30f221c`. The full end-to-end roadmap remains
   incomplete; no completion percentage is asserted. Work is being performed

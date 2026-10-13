@@ -11235,6 +11235,113 @@ mod tests {
     }
 
     #[test]
+    fn native_entire_effect_catalog_defaults_and_analysis_contracts_cover_every_owner() {
+        struct SyntheticMeasurement(super::super::deflicker::NativeDeflickerKey);
+        impl DeflickerGains for SyntheticMeasurement {
+            fn gain(&self, _: ClipId, _: Tick) -> Option<[f32; 3]> {
+                None
+            }
+            fn native_gain(
+                &self,
+                key: &super::super::deflicker::NativeDeflickerKey,
+                _: Tick,
+            ) -> Option<[f32; 3]> {
+                (*key == self.0).then_some([1.1; 3])
+            }
+        }
+        let mut failures = Vec::new();
+        for manifest in timeline::effect_manifest::MANIFESTS {
+            for owner in ["asset", "clip", "track", "master"] {
+                let (mut project, seq, _, _) = native_group_look_fixture();
+                let fx = ClipEffect::from_manifest(manifest.id.clone()).unwrap();
+                if owner == "asset" {
+                    let asset = *project.media.assets.keys().next().unwrap();
+                    project
+                        .media
+                        .assets
+                        .get_mut(&asset)
+                        .unwrap()
+                        .effects
+                        .push(fx);
+                } else {
+                    let sequence = project.sequences.get_mut(&seq).unwrap();
+                    match owner {
+                        "clip" => sequence.video_tracks[0].clips[0].effects.push(fx),
+                        "track" => sequence.video_tracks[0].effects.push(fx),
+                        "master" => sequence.master_effects.push(fx),
+                        _ => unreachable!(),
+                    }
+                }
+                let mut frame = compile_native_preview(&project, seq, 0, Tick::ZERO, Quality::FULL);
+                if manifest.id.as_str() == "color.deflicker" {
+                    // Temporal measurement is a prerequisite, not a catalog
+                    // implementation gap. Verify refusal before providing an
+                    // explicitly synthetic, exact-owner compiler fixture.
+                    assert!(frame
+                        .diagnostics
+                        .iter()
+                        .any(|d| d.code == Some(CompileCode::ColorPipelineUnavailable)
+                            && d.message.contains("analysis is unavailable or incomplete")));
+                    let sequence = &project.sequences[&seq];
+                    let track = &sequence.video_tracks[0];
+                    let clip = track.clips[0].id;
+                    let key = super::super::deflicker::NativeDeflickerKey {
+                        sequence: seq,
+                        owner: match owner {
+                            "asset" => {
+                                VfxOwner::Asset(*project.media.assets.keys().next().unwrap())
+                            }
+                            "clip" => VfxOwner::Clip(clip),
+                            "track" => VfxOwner::Track(track.id),
+                            "master" => VfxOwner::Master(seq),
+                            _ => unreachable!(),
+                        },
+                        clip_context: (owner != "master").then_some(clip),
+                        effect_index: 0,
+                    };
+                    frame = compile_native_sequence_impl(
+                        &project,
+                        seq,
+                        0,
+                        Tick::ZERO,
+                        Quality::FULL,
+                        false,
+                        false,
+                        None,
+                        None,
+                        Some(&SyntheticMeasurement(key)),
+                        &[],
+                    );
+                    assert_eq!(
+                        frame
+                            .graph
+                            .nodes
+                            .iter()
+                            .filter(|n| matches!(n.op, IrOp::NativeDeflicker { .. }))
+                            .count(),
+                        1
+                    );
+                }
+                if !frame.diagnostics.is_empty()
+                    || frame.graph.validate_working_color_domain().is_err()
+                    || frame
+                        .graph
+                        .nodes
+                        .iter()
+                        .any(|n| matches!(n.op, IrOp::Effect { .. }))
+                {
+                    failures.push(format!(
+                        "{} at {owner}: {:?}",
+                        manifest.id.as_str(),
+                        frame.diagnostics
+                    ));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
     fn native_gaussian_stacks_preserve_scope_order_and_fail_closed() {
         let (mut project, seq, _, _) = native_group_look_fixture();
         let blur = |radius| {
