@@ -7782,6 +7782,22 @@ fn native_source_detail_filters_preserve_source_radius_alpha_and_quality_cache()
 }
 
 #[test]
+fn native_same_extent_merge_preserves_source_geometry_alpha_and_quality_cache() {
+    for mode in [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+    ] {
+        check_native_mixed_resolution_chain(&[
+            IrOp::NativeInvert,
+            IrOp::NativeGaussianBlur { sigma: 1.25 },
+            IrOp::Merge { mode, opacity: 0.5 },
+        ]);
+    }
+}
+
+#[test]
 fn native_source_processing_chains_preserve_order_alpha_and_quality_cache() {
     let chain = [
         IrOp::NativeInvert,
@@ -8046,7 +8062,11 @@ fn check_native_mixed_resolution_chain(processing: &[IrOp]) {
                     1..1,
                     processing.iter().enumerate().map(|(i, op)| IrNode {
                         op: op.clone(),
-                        inputs: vec![(IrNodeId(i as u32), OutPort(0))],
+                        inputs: if matches!(op, IrOp::Merge { .. }) {
+                            vec![(IrNodeId(i as u32), OutPort(0)), (IrNodeId(0), OutPort(0))]
+                        } else {
+                            vec![(IrNodeId(i as u32), OutPort(0))]
+                        },
                         content_hash: ContentHash(hash + 5 + i as u128),
                     }),
                 );
@@ -8358,6 +8378,86 @@ fn native_source_detail_budget_counts_all_scratch_textures() {
             allowed,
             "width {width}"
         );
+    }
+}
+
+#[test]
+fn native_source_merge_refuses_mismatched_or_canvas_inputs() {
+    use photonic_core::timeline::AssetId;
+    use photonic_video::graph::ir::FitMode;
+    for (w, native_extent, allowed) in [(4, true, true), (5, true, false), (4, false, false)] {
+        let source = |width, native| IrOp::NativeMediaStill {
+            asset: AssetId::new(),
+            w: width,
+            h: 2,
+            native_extent: native,
+        };
+        let graph = FrameGraph {
+            nodes: vec![
+                IrNode {
+                    op: source(4, true),
+                    inputs: vec![],
+                    content_hash: ContentHash(1),
+                },
+                IrNode {
+                    op: source(w, native_extent),
+                    inputs: vec![],
+                    content_hash: ContentHash(2),
+                },
+                IrNode {
+                    op: IrOp::Merge {
+                        mode: BlendMode::Normal,
+                        opacity: 0.5,
+                    },
+                    inputs: vec![(IrNodeId(0), OutPort(0)), (IrNodeId(1), OutPort(0))],
+                    content_hash: ContentHash(3),
+                },
+                IrNode {
+                    op: IrOp::Resize {
+                        w: 16,
+                        h: 16,
+                        fit: FitMode::Stretch,
+                    },
+                    inputs: vec![(IrNodeId(2), OutPort(0))],
+                    content_hash: ContentHash(4),
+                },
+            ],
+            output: Some(IrNodeId(3)),
+            working_color_domain: WorkingColorDomain::SceneLinearAcescg,
+        };
+        assert_eq!(
+            graph.validate_working_color_domain().is_ok(),
+            allowed,
+            "width{w} native{native_extent}"
+        );
+        let mut swapped = graph.clone();
+        swapped.nodes[2].inputs.reverse();
+        assert_eq!(swapped.validate_working_color_domain().is_ok(), allowed);
+        if allowed {
+            let mut height_mismatch = graph.clone();
+            if let IrOp::NativeMediaStill { h, .. } = &mut height_mismatch.nodes[1].op {
+                *h = 3;
+            }
+            assert!(height_mismatch.validate_working_color_domain().is_err());
+            // Two resident sources plus the merge output must all count.
+            // These adjacent 64-pixel buckets straddle the 16M-texel limit.
+            for (width, fits) in [(2688, true), (2752, false)] {
+                let mut bounded = graph.clone();
+                for source in &mut bounded.nodes[..2] {
+                    if let IrOp::NativeMediaStill { w, h, .. } = &mut source.op {
+                        *w = width;
+                        *h = 2048;
+                    }
+                }
+                assert_eq!(bounded.validate_working_color_domain().is_ok(), fits);
+            }
+        }
+        let mut missing = graph.clone();
+        missing.nodes[2].inputs.pop();
+        assert!(missing.validate_working_color_domain().is_err());
+        let mut unnormalized = graph.clone();
+        unnormalized.output = Some(IrNodeId(2));
+        assert!(unnormalized.validate_working_color_domain().is_err());
     }
 }
 

@@ -6707,6 +6707,7 @@ fn lower_native_graph_with_sources(
                             | GraphOp::Blur
                             | GraphOp::Sharpen
                             | GraphOp::Glow
+                            | GraphOp::Merge { .. }
                     ) {
                         return Err("native MediaIn with different source dimensions requires an explicit Resize before this processing".into());
                     }
@@ -7251,6 +7252,13 @@ fn lower_native_graph_with_sources(
                 | GraphOp::Sharpen
                 | GraphOp::Glow
         ) && primary.is_some_and(|input| native_extents.contains(&input))
+        {
+            native_extents.insert(output);
+        }
+        if matches!(node.op, GraphOp::Merge { .. })
+            && resolved_inputs
+                .values()
+                .any(|input| native_extents.contains(input))
         {
             native_extents.insert(output);
         }
@@ -12882,6 +12890,12 @@ mod tests {
                 (GraphOp::Sharpen, true),
                 (GraphOp::Glow, true),
                 (GraphOp::Crop, false),
+                (
+                    GraphOp::Merge {
+                        mode: BlendMode::Normal,
+                    },
+                    false,
+                ),
             ] {
                 let mut routed = project.clone();
                 let graph = routed.graphs.get_mut(&gid).unwrap();
@@ -12901,6 +12915,29 @@ mod tests {
                     result.diagnostics
                 );
             }
+            let mut merged = project.clone();
+            let graph = merged.graphs.get_mut(&gid).unwrap();
+            let route = GraphNode::new(GraphOp::Merge {
+                mode: BlendMode::Normal,
+            });
+            let route_id = route.id;
+            graph.nodes.insert(route_id, route);
+            graph.edges[0].to = (route_id, InPort(0));
+            graph.edges.push(GraphEdge {
+                from: (media_id, GOut(0)),
+                to: (route_id, InPort(1)),
+            });
+            graph.edges.push(GraphEdge {
+                from: (route_id, GOut(0)),
+                to: (resize_id, InPort(0)),
+            });
+            let frame = compile_native_preview(&merged, seq, 0, Tick::ZERO, Quality::FULL);
+            assert!(
+                frame.diagnostics.is_empty(),
+                "equal-extent merge: {:?}",
+                frame.diagnostics
+            );
+            assert!(frame.graph.validate_working_color_domain().is_ok());
             for (width, height) in [(8., 16.), (3., 7.), (1., 1.), (32., 8.)] {
                 let mut resized_project = project.clone();
                 let params = &mut resized_project

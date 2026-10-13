@@ -23798,7 +23798,7 @@ mod tests {
 
     async fn check_native_media_in_import(mode: NativeMediaFixtureMode) {
         Box::pin(check_native_media_in_import_sized(
-            mode, None, None, false, false, None,
+            mode, None, None, false, false, None, false,
         ))
         .await;
     }
@@ -23817,6 +23817,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             ))
             .await;
         }
@@ -23836,6 +23837,7 @@ mod tests {
                 false,
                 false,
                 None,
+                false,
             ))
             .await;
         }
@@ -23855,6 +23857,7 @@ mod tests {
                 true,
                 false,
                 None,
+                false,
             ))
             .await;
         }
@@ -23874,6 +23877,7 @@ mod tests {
                 false,
                 true,
                 None,
+                false,
             ))
             .await;
         }
@@ -23893,6 +23897,7 @@ mod tests {
                 true,
                 true,
                 None,
+                false,
             ))
             .await;
         }
@@ -23922,9 +23927,30 @@ mod tests {
                     false,
                     false,
                     Some(detail),
+                    false,
                 ))
                 .await;
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_source_same_extent_merge_mcp_preview_prores_and_relink() {
+        for fit in [
+            photonic_core::timeline::FitMode::Contain,
+            photonic_core::timeline::FitMode::Cover,
+            photonic_core::timeline::FitMode::Stretch,
+        ] {
+            Box::pin(check_native_media_in_import_sized(
+                NativeMediaFixtureMode::Plain,
+                Some(fit),
+                Some([21, 7]),
+                true,
+                true,
+                None,
+                true,
+            ))
+            .await;
         }
     }
 
@@ -23935,6 +23961,7 @@ mod tests {
         invert_before_resize: bool,
         blur_before_resize: bool,
         detail_before_resize: Option<NativeSourceDetailFixture>,
+        merge_with_source: bool,
     ) {
         let output_width = if resize_fit.is_some() { 16_usize } else { 32 };
         let output_height = 16_usize;
@@ -24318,6 +24345,14 @@ mod tests {
                 Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":detailed}}))).await;
                 output_source = detailed;
             }
+            if merge_with_source {
+                let added=Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_node",json!({"graph_id":graph_id,"op":GraphOp::Merge { mode:photonic_core::layer::BlendMode::Normal }}))).await;
+                let merged = data(&added)["node_id"].clone();
+                Box::pin(graph_authoring_edit_roundtrip(&state,"set_graph_node_param",json!({"graph_id":graph_id,"node_id":merged,"path":"params.opacity","value":photonic_core::timeline::PropValue::Float(0.35)}))).await;
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":output_source},"to":{"node_id":merged,"port":0}}))).await;
+                Box::pin(graph_authoring_edit_roundtrip(&state,"add_graph_edge",json!({"graph_id":graph_id,"from":{"node_id":node},"to":{"node_id":merged,"port":1}}))).await;
+                output_source = merged;
+            }
             if let Some(fit) = resize_fit {
                 let added = Box::pin(graph_authoring_edit_roundtrip(
                     &state,
@@ -24397,7 +24432,7 @@ mod tests {
                     (rgb, alpha)
                 }
             };
-            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+            let processed_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
                 if blur_before_resize || detail_before_resize.is_some() {
                     // Independent binary64 2D Gaussian, sigma 1.25, radius
                     // ceil(3*sigma)=4. Clamp samples to the source image edge,
@@ -24470,6 +24505,27 @@ mod tests {
                     );
                 }
                 pointwise_pixel(frame, index)
+            };
+            let source_pixel = |frame: usize, index: usize| -> ([f64; 3], f64) {
+                let (top, a) = processed_pixel(frame, index);
+                if !merge_with_source {
+                    return (top, a);
+                }
+                let (bottom, b) = raw_source_pixel(frame, index);
+                // Avoid the exact 50% inverse/original cancellation: the
+                // source-time regression must retain visible frame changes.
+                let top_alpha = a * 0.35;
+                let alpha = top_alpha + b * (1.0 - top_alpha);
+                (
+                    std::array::from_fn(|c| {
+                        if alpha > 0.0 {
+                            (top[c] * top_alpha + bottom[c] * b * (1.0 - top_alpha)) / alpha
+                        } else {
+                            0.0
+                        }
+                    }),
+                    alpha,
+                )
             };
             // Independent f64 premultiplied bilinear reference for both
             // authored Resize and its fixed-canvas normalization. Sampling
