@@ -50,6 +50,9 @@ use glyphon::{
 /// carries no time, only resolved state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptionWordRun {
+    /// Optional resolved `[font_size, line_height]` in physical pixels.
+    /// None preserves the original cue-level shaping path exactly.
+    pub metrics: Option<[f32; 2]>,
     pub text: String,
     pub font_family: String,
     pub font_weight: u16,
@@ -58,9 +61,9 @@ pub struct CaptionWordRun {
 }
 
 /// One caption cue to render: its resolved words plus cue-level layout. Metrics
-/// (`font_size`, `line_height_mul`) are cue-level because glyphon shapes one
-/// buffer per cue with a single [`Metrics`]; per-word variation is limited to
-/// family / weight / colour (06 §5.3).
+/// (`font_size`, `line_height_mul`) provide buffer defaults. Managed captions
+/// may override individual word metrics through rich-text span attributes;
+/// Legacy callers retain their original cue-level metrics (06 §5.3).
 #[derive(Clone, Debug, PartialEq)]
 pub struct CaptionCueRun {
     pub direction: photonic_core::timeline::TextDirection,
@@ -74,6 +77,19 @@ pub struct CaptionCueRun {
     pub anchor: [f32; 2],
     /// Normalized max text width for wrapping (`0..1` of frame width).
     pub max_width: f32,
+}
+
+impl CaptionCueRun {
+    /// Scale both default and explicit word metrics once for a preview canvas.
+    pub fn scale_metrics(&mut self, scale: f32) {
+        self.font_size *= scale;
+        for word in &mut self.words {
+            if let Some(metrics) = &mut word.metrics {
+                metrics[0] *= scale;
+                metrics[1] *= scale;
+            }
+        }
+    }
 }
 
 /// One shaped word segment on one wrapped line, in target pixel coordinates.
@@ -292,6 +308,11 @@ impl CaptionCompositor {
         if cues.is_empty() {
             return Ok(());
         }
+        for cue in cues {
+            if cue.words.iter().any(|word| word.metrics.is_some()) {
+                validate_caption_layout(cue, w, h)?;
+            }
+        }
         let mut st = self
             .inner
             .lock()
@@ -426,6 +447,13 @@ fn validate_caption_layout(cue: &CaptionCueRun, w: u32, h: u32) -> Result<(), St
         || !(0.0..=2048.0).contains(&cue.font_size)
         || !cue.line_height_mul.is_finite()
         || cue.line_height_mul <= 0.0
+        || cue.words.iter().any(|word| {
+            word.metrics.is_some_and(|metrics| {
+                metrics
+                    .iter()
+                    .any(|value| !value.is_finite() || *value <= 0.0 || *value > 4096.0)
+            })
+        })
         || !cue.max_width.is_finite()
         || cue.anchor.iter().any(|v| !v.is_finite())
     {
@@ -515,6 +543,11 @@ fn build_caption_spans_indexed(words: &[CaptionWordRun], indexed: bool) -> Vec<(
                 word.color[2],
                 word.color[3],
             ));
+        let attrs = if let Some([font_size, line_height]) = word.metrics {
+            attrs.metrics(Metrics::new(font_size, line_height))
+        } else {
+            attrs
+        };
         let attrs = if indexed {
             attrs.metadata(index)
         } else {
@@ -542,8 +575,34 @@ fn build_caption_spans_indexed(words: &[CaptionWordRun], indexed: bool) -> Vec<(
 mod tests {
     use super::*;
 
+    #[test]
+    fn word_metrics_are_explicit_and_shared_by_geometry_and_render_spans() {
+        let mut words = vec![word("small"), word("large")];
+        words[1].metrics = Some([40.0, 48.0]);
+        let regular = build_caption_spans_direction(
+            &words,
+            false,
+            photonic_core::timeline::TextDirection::Auto,
+        );
+        let indexed = build_caption_spans_direction(
+            &words,
+            true,
+            photonic_core::timeline::TextDirection::Auto,
+        );
+        assert!(regular[0].1.metrics_opt.is_none());
+        assert_eq!(
+            regular.last().unwrap().1.metrics_opt,
+            Some(Metrics::new(40.0, 48.0).into())
+        );
+        for (paint, bounds) in regular.iter().zip(&indexed) {
+            assert_eq!(paint.0, bounds.0);
+            assert_eq!(paint.1.metrics_opt, bounds.1.metrics_opt);
+        }
+    }
+
     fn word(text: &str) -> CaptionWordRun {
         CaptionWordRun {
+            metrics: None,
             text: text.to_string(),
             font_family: "sans-serif".to_string(),
             font_weight: 400,

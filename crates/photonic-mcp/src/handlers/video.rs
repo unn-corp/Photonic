@@ -23181,6 +23181,15 @@ mod tests {
 
     #[tokio::test]
     async fn native_caption_mcp_author_undo_save_preview_and_prores() {
+        Box::pin(check_native_caption_export(false)).await;
+    }
+
+    #[tokio::test]
+    async fn native_caption_mixed_metrics_mcp_author_undo_save_preview_and_prores() {
+        Box::pin(check_native_caption_export(true)).await;
+    }
+
+    async fn check_native_caption_export(mixed_metrics: bool) {
         use photonic_core::timeline::color::{NativeManagedColorConfig, SequenceColorConfig};
         let state = test_state();
         assert!(engine_available(&state).await, "GPU required");
@@ -23216,11 +23225,19 @@ mod tests {
         let inserted = Box::pin(graph_authoring_edit_roundtrip(
             &state,
             "set_caption_cue",
-            json!({"track_id":captions,"text":"HI","start_ticks":0,"end_ticks":ticks*3}),
+            json!({"track_id":captions,"text":if mixed_metrics {"HI HI"} else {"HI"},"start_ticks":0,"end_ticks":ticks*3}),
         ))
         .await;
         let clip = data(&inserted)["cue_id"].clone();
         Box::pin(graph_authoring_edit_roundtrip(&state,"set_caption_style",json!({"track_id":captions,"style":{"font_size":40,"fill":"#ff000080","position":[0.5,0.2],"max_width":0.9,"clear_stroke":true}}))).await;
+        if mixed_metrics {
+            Box::pin(graph_authoring_edit_roundtrip(
+                &state,
+                "set_caption_style",
+                json!({"cue_id":clip,"word_index":0,"style":{"font_size":20}}),
+            ))
+            .await;
+        }
         let saved = state.document.lock().await.to_json().unwrap();
         let reloaded = photonic_core::Document::from_json(&saved).unwrap();
         assert_eq!(
@@ -23265,6 +23282,11 @@ mod tests {
         let dir = retained.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("photonic-native-caption-{}", uuid::Uuid::new_v4()))
         });
+        let dir = if mixed_metrics {
+            dir.join("mixed-metrics")
+        } else {
+            dir
+        };
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("caption.mov");
         let started=call(&state,"export_sequence",json!({"sequence_id":sequence,"out_path":out,"preset":"ProRes Mezzanine","write_manifest":true})).await;

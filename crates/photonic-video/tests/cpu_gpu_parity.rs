@@ -1125,6 +1125,7 @@ fn title_bounds_match_between_draft_and_full_on_padded_canvas() {
     let cue = photonic_render::caption::CaptionCueRun {
         direction: photonic_core::timeline::TextDirection::Auto,
         words: vec![photonic_render::caption::CaptionWordRun {
+            metrics: None,
             text: "Hello".into(),
             font_family: "Inter".into(),
             font_weight: 700,

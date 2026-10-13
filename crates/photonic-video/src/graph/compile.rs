@@ -7950,7 +7950,6 @@ fn resolve_native_caption_batch(
                     || !(1.0..=512.0).contains(&style.font_size)
                     || (style.direction != timeline::TextDirection::Auto
                         && style.direction != base.direction)
-                    || style.font_size != base.font_size
                     || style.position != base.position
                     || style.max_width != base.max_width
                 {
@@ -7979,6 +7978,15 @@ fn resolve_native_caption_batch(
                 1.0
             };
             if let Some(mut run) = resolve_cue(track, cue, tick, format) {
+                // Only the native-managed path opts into mixed word metrics.
+                // Legacy caption shaping retains its established cue defaults.
+                for (word, authored) in run.words.iter_mut().zip(&cue.words) {
+                    let style = authored.style_override.as_ref().unwrap_or(base);
+                    if style.font_size != base.font_size {
+                        word.metrics =
+                            Some([style.font_size, style.font_size * run.line_height_mul]);
+                    }
+                }
                 // A decorated SlideUp fades the complete cue once, not each overlapping paint layer.
                 if grouped_slide {
                     for (word, authored) in run.words.iter_mut().zip(&cue.words) {
@@ -8010,7 +8018,7 @@ fn resolve_native_caption_batch(
                         }
                         let (color, width) = style.stroke.unwrap_or((
                             highlight.active_color,
-                            (base.font_size * 0.05).clamp(1.0, 8.0),
+                            (style.font_size * 0.05).clamp(1.0, 8.0),
                         ));
                         let mut color = color_to_srgb_bytes(color);
                         if base.animation == CaptionAnim::FadeWords {
@@ -8186,6 +8194,7 @@ fn resolve_cue(
         }
         color[3] = (color[3] as f32 * opacity).round().clamp(0.0, 255.0) as u8;
         words.push(CaptionWordRun {
+            metrics: None,
             text,
             font_family: eff.font_family.clone(),
             font_weight: eff.weight,
@@ -8224,6 +8233,7 @@ fn resolve_text_block(content: &TextClipContent) -> ResolvedTextBlock {
         cue: Some(CaptionCueRun {
             direction: style.direction,
             words: vec![CaptionWordRun {
+                metrics: None,
                 text: content.text.clone(),
                 font_family: style.font_family.clone(),
                 font_weight: style.weight,
@@ -9548,6 +9558,11 @@ fn hash_caption_cue(h: &mut xxhash_rust::xxh3::Xxh3, cue: &CaptionCueRun) {
         h.update(w.font_family.as_bytes());
         h.update(&w.font_weight.to_le_bytes());
         h.update(&w.color);
+        if let Some([font_size, line_height]) = w.metrics {
+            h.update(&[0xd2]);
+            f32b(h, font_size);
+            f32b(h, line_height);
+        }
     }
 }
 
@@ -11795,6 +11810,67 @@ mod tests {
     }
 
     #[test]
+    fn native_caption_word_metrics_preserve_legacy_and_invalidate_cache() {
+        let (mut project, seq, _, _) = native_group_look_fixture();
+        let mut track = CaptionTrack::new("Mixed metrics");
+        track.style.stroke = None;
+        track.style.font_size = 40.0;
+        let mut big = CaptionWord::new("BIG", Tick(0), Tick(200));
+        let mut style = track.style.clone();
+        style.font_size = 80.0;
+        style.highlight = Some(KaraokeStyle {
+            mode: KaraokeMode::Underline,
+            active_color: Color::WHITE,
+            inactive_color: Color::WHITE,
+        });
+        big.style_override = Some(style);
+        track.cues.push(CaptionCue::new(
+            Tick(0),
+            Tick(200),
+            vec![CaptionWord::new("small", Tick(0), Tick(200)), big],
+        ));
+        let format = &project.sequences[&seq].formats[0];
+        let legacy = resolve_cue(&track, &track.cues[0], Tick(50), format).unwrap();
+        assert!(legacy.words.iter().all(|word| word.metrics.is_none()));
+        project
+            .sequences
+            .get_mut(&seq)
+            .unwrap()
+            .caption_tracks
+            .push(track);
+        let first = compile_native_preview(&project, seq, 0, Tick(50), Quality::FULL);
+        assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
+        let node = &first.graph.nodes[first.graph.output.unwrap().0 as usize];
+        let IrOp::NativeCaptionOutput {
+            cue_batch, paints, ..
+        } = &node.op
+        else {
+            panic!("caption output")
+        };
+        assert_eq!(paints[0].underlines[0].word, 1);
+        assert_eq!(paints[0].underlines[0].width, 4.0);
+        assert_eq!(cue_batch.cues[0].words[0].metrics, None);
+        assert_eq!(cue_batch.cues[0].words[1].metrics, Some([80.0, 96.0]));
+        let scaled = node.op.at_canvas_scale(glam::Vec2::splat(0.5));
+        let IrOp::NativeCaptionOutput { cue_batch, .. } = scaled.as_ref() else {
+            panic!("scaled caption")
+        };
+        assert_eq!(cue_batch.cues[0].font_size, 20.0);
+        assert_eq!(cue_batch.cues[0].words[1].metrics, Some([40.0, 48.0]));
+        project.sequences.get_mut(&seq).unwrap().caption_tracks[0].cues[0].words[1]
+            .style_override
+            .as_mut()
+            .unwrap()
+            .font_size = 60.0;
+        let second = compile_native_preview(&project, seq, 0, Tick(50), Quality::FULL);
+        assert!(second.diagnostics.is_empty());
+        assert_ne!(
+            node.content_hash,
+            second.graph.nodes[second.graph.output.unwrap().0 as usize].content_hash
+        );
+    }
+
+    #[test]
     fn native_caption_boundary_preserves_scopes_and_validates_effective_styles() {
         let (mut project, seq, _, _) = native_group_look_fixture();
         let mut track = CaptionTrack::new("Native captions");
@@ -11836,7 +11912,7 @@ mod tests {
                 4 => track.style.fill.r = f32::INFINITY,
                 5 => {
                     let mut st = track.style.clone();
-                    st.font_size += 1.0;
+                    st.font_size = 513.0;
                     track.cues[0].words[0].style_override = Some(st);
                 }
                 6 => {

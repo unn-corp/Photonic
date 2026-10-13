@@ -16,7 +16,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 fn repo_root() -> PathBuf {
@@ -35,10 +35,17 @@ fn gen_acceptance() -> PathBuf {
     repo_root().join("tools").join("gen-acceptance-index.py")
 }
 
+// The throughput criterion measures one extraction, not two complete parsers
+// competing for the same hosted-runner cores. Rust runs tests concurrently;
+// serialize only the two real-workspace extraction sites, leaving all fixture
+// and structural checks parallel. The timing starts after acquiring this lock.
+static WORKSPACE_EXTRACTION: Mutex<()> = Mutex::new(());
+
 /// Build the real workspace index once and reuse it across cases.
 fn real_index() -> &'static Path {
     static IDX: OnceLock<PathBuf> = OnceLock::new();
     IDX.get_or_init(|| {
+        let _extraction = WORKSPACE_EXTRACTION.lock().unwrap();
         let out = std::env::temp_dir().join(format!("spec-index-{}.json", std::process::id()));
         let status = Command::new(env!("CARGO_BIN_EXE_spec-extract"))
             .arg("--root")
@@ -364,6 +371,7 @@ fn ci_wires_the_drift_gate() {
 #[test]
 fn checker_runs_under_ten_seconds() {
     // ACC-40-06-06: extract + check over the whole workspace stays under budget.
+    let _extraction = WORKSPACE_EXTRACTION.lock().unwrap();
     let start = Instant::now();
     let idx = std::env::temp_dir().join(format!("spec-index-timed-{}.json", std::process::id()));
     let status = Command::new(env!("CARGO_BIN_EXE_spec-extract"))

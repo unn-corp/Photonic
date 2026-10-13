@@ -5278,6 +5278,7 @@ fn native_title_raster_converts_srgb_glyph_color_to_ap1_without_losing_coverage(
             cue: Some(CaptionCueRun {
                 direction: photonic_core::timeline::TextDirection::Auto,
                 words: vec![CaptionWordRun {
+                    metrics: None,
                     text: "HI".into(),
                     font_family: "sans-serif".into(),
                     font_weight: 700,
@@ -5399,6 +5400,7 @@ fn native_captions_are_display_authored_and_draft_cache_safe() {
                 cues: vec![CaptionCueRun {
                     direction: photonic_core::timeline::TextDirection::Auto,
                     words: vec![CaptionWordRun {
+                        metrics: None,
                         text: "HI".into(),
                         font_family: "sans-serif".into(),
                         font_weight: 700,
@@ -5659,6 +5661,7 @@ fn native_caption_alpha_over_uses_display_linear_light_and_keeps_program_tap() {
             cues: vec![CaptionCueRun {
                 direction: photonic_core::timeline::TextDirection::Auto,
                 words: vec![CaptionWordRun {
+                    metrics: None,
                     text: "HI".into(),
                     font_family: "sans-serif".into(),
                     font_weight: 700,
@@ -5951,6 +5954,7 @@ fn managed_decorated_titles_preserve_transparent_fill_and_match_linear_ap1_compo
     let base = CaptionCueRun {
         direction: photonic_core::timeline::TextDirection::Auto,
         words: vec![CaptionWordRun {
+            metrics: None,
             text: "HI".into(),
             font_family: "sans-serif".into(),
             font_weight: 700,
@@ -6346,6 +6350,7 @@ fn native_caption_word_bounds_follow_shaping_wrapping_and_exclude_separators() {
         words: ["Wide", "i", "OK"]
             .into_iter()
             .map(|s| CaptionWordRun {
+                metrics: None,
                 text: s.into(),
                 font_family: "sans-serif".into(),
                 font_weight: 400,
@@ -6405,6 +6410,7 @@ fn native_caption_underline_pixels_follow_word_geometry_alpha_and_draft_cache() 
         words: ["HI", "OK"]
             .into_iter()
             .map(|s| CaptionWordRun {
+                metrics: None,
                 text: s.into(),
                 font_family: "sans-serif".into(),
                 font_weight: 400,
@@ -6597,6 +6603,7 @@ fn explicit_caption_direction_keeps_the_authored_anchor_and_word_geometry() {
             words: ["Brand", "שלום"]
                 .into_iter()
                 .map(|text| CaptionWordRun {
+                    metrics: None,
                     text: text.into(),
                     font_family: "sans-serif".into(),
                     font_weight: 400,
@@ -6674,12 +6681,14 @@ fn explicit_caption_direction_changes_visual_order_without_changing_auto_pixels(
             direction,
             words: vec![
                 CaptionWordRun {
+                    metrics: None,
                     text: "Brand".into(),
                     font_family: "sans-serif".into(),
                     font_weight: 400,
                     color: [255, 0, 0, 255],
                 },
                 CaptionWordRun {
+                    metrics: None,
                     text: "שלום".into(),
                     font_family: "sans-serif".into(),
                     font_weight: 400,
@@ -6925,6 +6934,7 @@ fn spatial_caption_sweep_preserves_actual_glyph_alpha_wrapping_draft_and_group_o
         let cue = CaptionCueRun {
             direction: TextDirection::Ltr,
             words: vec![CaptionWordRun {
+                metrics: None,
                 text: text.into(),
                 font_family: "sans-serif".into(),
                 font_weight: 400,
@@ -14559,4 +14569,102 @@ fn native_all_blends_agree_at_exact_half_alpha_cutoff_neighbors() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn mixed_caption_word_metrics_shape_render_and_scale_together() {
+    use photonic_core::timeline::TextDirection;
+    use photonic_render::caption::{CaptionCompositor, CaptionCueRun, CaptionWordRun};
+    let gpu = GpuContext::request_blocking().expect("GPU required for mixed caption metrics");
+    let compositor =
+        CaptionCompositor::new(gpu.device(), gpu.queue(), wgpu::TextureFormat::Rgba16Float);
+    let original = CaptionCueRun {
+        direction: TextDirection::Ltr,
+        words: vec![
+            CaptionWordRun {
+                text: "MMMM".into(),
+                font_family: "sans-serif".into(),
+                font_weight: 400,
+                color: [255, 0, 0, 255],
+                metrics: None,
+            },
+            CaptionWordRun {
+                text: "MMMM".into(),
+                font_family: "sans-serif".into(),
+                font_weight: 400,
+                color: [0, 255, 0, 255],
+                metrics: Some([40.0, 48.0]),
+            },
+        ],
+        font_size: 20.0,
+        line_height_mul: 1.2,
+        anchor: [0.5, 0.1],
+        max_width: 0.95,
+    };
+    for scale in [1.0, 0.5] {
+        let mut cue = original.clone();
+        cue.scale_metrics(scale);
+        let (w, h) = ((480.0 * scale) as u32, (160.0 * scale) as u32);
+        let bounds = compositor.word_bounds_checked(&cue, w, h).unwrap();
+        assert_eq!(bounds.len(), 2);
+        let small_width = bounds[0].bounds[2] - bounds[0].bounds[0];
+        let big_width = bounds[1].bounds[2] - bounds[1].bounds[0];
+        assert!((big_width / small_width - 2.0).abs() < 0.05, "{bounds:?}");
+        let target = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("mixed word metrics"),
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        gpu.queue().write_texture(
+            target.as_image_copy(),
+            &vec![0; (w * h * 8) as usize],
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 8),
+                rows_per_image: Some(h),
+            },
+            target.size(),
+        );
+        compositor
+            .composite_checked(
+                gpu.device(),
+                gpu.queue(),
+                &target,
+                std::slice::from_ref(&cue),
+                w,
+                h,
+            )
+            .unwrap();
+        let pixels = read_texture_rgba16f(&gpu, &target, w, h);
+        let height = |channel: usize| {
+            let ys: Vec<_> = pixels
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p[channel] > 0.2)
+                .map(|(i, _)| i as u32 / w)
+                .collect();
+            assert!(!ys.is_empty());
+            ys.iter().max().unwrap() - ys.iter().min().unwrap() + 1
+        };
+        assert!(height(1) as f32 > height(0) as f32 * 1.7);
+        for bad in [f32::NAN, f32::INFINITY, -1.0, 0.0, 5000.0] {
+            let mut invalid = cue.clone();
+            invalid.words[1].metrics = Some([bad, 48.0]);
+            assert!(compositor.word_bounds_checked(&invalid, w, h).is_err());
+            assert!(compositor
+                .composite_checked(gpu.device(), gpu.queue(), &target, &[invalid], w, h)
+                .is_err());
+        }
+    }
 }

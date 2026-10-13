@@ -2453,6 +2453,12 @@ pub(crate) fn validate_native_text_block(block: &ResolvedTextBlock) -> Result<()
             w.font_family.is_empty()
                 || w.font_family.len() > 128
                 || !(1..=1000).contains(&w.font_weight)
+                || w.metrics.is_some_and(|[size, height]| {
+                    !size.is_finite()
+                        || !(1.0..=512.0).contains(&size)
+                        || !height.is_finite()
+                        || !(0.5..=2048.0).contains(&height)
+                })
         })
     {
         return Err("native title has unsupported text length, font or layout bounds");
@@ -2491,7 +2497,7 @@ impl IrOp {
             } if scale != glam::Vec2::ONE => {
                 let mut cue_batch = cue_batch.clone();
                 for cue in &mut cue_batch.cues {
-                    cue.font_size *= scale.y;
+                    cue.scale_metrics(scale.y);
                 }
                 std::borrow::Cow::Owned(Self::NativeCaptionOutput {
                     cue_batch,
@@ -2502,7 +2508,7 @@ impl IrOp {
             Self::NativeDecoratedTextGen { block, decoration } if scale != glam::Vec2::ONE => {
                 let mut block = block.clone();
                 if let Some(cue) = &mut block.cue {
-                    cue.font_size *= scale.y;
+                    cue.scale_metrics(scale.y);
                 }
                 std::borrow::Cow::Owned(Self::NativeDecoratedTextGen {
                     block,
@@ -2512,7 +2518,7 @@ impl IrOp {
             Self::NativeTextGen { block } if scale != glam::Vec2::ONE => {
                 let mut block = block.clone();
                 if let Some(cue) = &mut block.cue {
-                    cue.font_size *= scale.y;
+                    cue.scale_metrics(scale.y);
                 }
                 std::borrow::Cow::Owned(Self::NativeTextGen { block })
             }
@@ -2680,14 +2686,14 @@ impl IrOp {
             Self::TextGen { block } if scale != glam::Vec2::ONE => {
                 let mut block = block.clone();
                 if let Some(cue) = &mut block.cue {
-                    cue.font_size *= scale.y;
+                    cue.scale_metrics(scale.y);
                 }
                 std::borrow::Cow::Owned(Self::TextGen { block })
             }
             Self::CaptionOverlay { cue_batch } if scale != glam::Vec2::ONE => {
                 let mut cue_batch = cue_batch.clone();
                 for cue in &mut cue_batch.cues {
-                    cue.font_size *= scale.y;
+                    cue.scale_metrics(scale.y);
                 }
                 std::borrow::Cow::Owned(Self::CaptionOverlay { cue_batch })
             }
