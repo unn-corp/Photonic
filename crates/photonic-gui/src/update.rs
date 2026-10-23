@@ -50,27 +50,19 @@ pub fn check_latest() -> Receiver<UpdateCheck> {
 }
 
 fn check() -> UpdateCheck {
-    let mut builder = self_update::backends::github::Update::configure();
-    builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .bin_name(BIN_NAME)
-        .current_version(CURRENT_VERSION);
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            builder.auth_token(&token);
-        }
-    }
-    let updater = match builder.build() {
+    let updater = match configured_builder().build() {
         Ok(u) => u,
         Err(e) => return UpdateCheck::Error(e.to_string()),
     };
-    let release = match updater.get_latest_release() {
+    let releases = match updater.get_latest_release() {
         Ok(r) => r,
         Err(e) => return UpdateCheck::Error(e.to_string()),
     };
-    match self_update::version::bump_is_greater(CURRENT_VERSION, &release.version) {
-        Ok(true) => UpdateCheck::Available(release.version),
+    let Some(release) = releases.latest() else {
+        return UpdateCheck::Error("No release found".into());
+    };
+    match self_update::version::bump_is_greater(CURRENT_VERSION, release.version()) {
+        Ok(true) => UpdateCheck::Available(release.version().to_owned()),
         Ok(false) => UpdateCheck::UpToDate,
         Err(e) => UpdateCheck::Error(e.to_string()),
     }
@@ -88,30 +80,63 @@ pub fn check_and_update() -> Receiver<UpdateStatus> {
     rx
 }
 
-fn run() -> UpdateStatus {
+fn configured_builder() -> self_update::backends::github::UpdateBuilder {
     let mut builder = self_update::backends::github::Update::configure();
     builder
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
-        .current_version(CURRENT_VERSION)
-        .show_download_progress(false)
-        .no_confirm(true)
-        // Only apply updates whose archive is signed by our release key.
-        .verifying_keys([*SIGNING_PUBKEY]);
-    // Use a token for private repos / to avoid the 60/hr anonymous API limit.
+        .current_version(CURRENT_VERSION);
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         if !token.is_empty() {
             builder.auth_token(&token);
         }
     }
+    builder
+}
+
+fn install_builder() -> self_update::backends::github::UpdateBuilder {
+    let mut builder = configured_builder();
+    builder
+        .show_download_progress(false)
+        .no_confirm(true)
+        // Only apply updates whose archive is signed by our release key.
+        .verifying_keys([*SIGNING_PUBKEY]);
+    builder
+}
+
+fn run() -> UpdateStatus {
+    let builder = install_builder();
     let updater = match builder.build() {
         Ok(u) => u,
         Err(e) => return UpdateStatus::Error(e.to_string()),
     };
     match updater.update() {
-        Ok(self_update::Status::UpToDate(v)) => UpdateStatus::UpToDate(v),
-        Ok(self_update::Status::Updated(v)) => UpdateStatus::Updated(v),
+        Ok(status) => {
+            let version = status.version().to_owned();
+            if status.is_updated() {
+                UpdateStatus::Updated(version)
+            } else {
+                UpdateStatus::UpToDate(version)
+            }
+        }
         Err(e) => UpdateStatus::Error(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use self_update::UpdateConfig;
+
+    #[test]
+    fn updater_keeps_version_target_and_ui_settings() {
+        // Building a config performs no HTTP request or installation.
+        let updater = install_builder().build().unwrap();
+        assert_eq!(updater.bin_name(), "photonic");
+        assert_eq!(updater.current_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(updater.target(), self_update::get_target());
+        assert!(updater.no_confirm());
+        assert!(!updater.show_download_progress());
     }
 }
