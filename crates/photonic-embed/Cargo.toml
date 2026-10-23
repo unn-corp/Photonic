@@ -5,5 +5,10 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-fastembed = "4"
+# Preserve ONNX downloads and online model caching with the patched Rustls verifier.
+fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 anyhow = { workspace = true }
+
+# Preserve system/SSL_CERT_FILE trust for the existing hf-hub 0.4 sync client.
+# This selects root loading only; verification remains patched Rustls/WebPKI.
+ureq = { version = "2.12", default-features = false, features = ["native-certs"] }
