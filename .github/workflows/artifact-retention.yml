@@ -4,7 +4,8 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '27 */6 * * *'
-  workflow_run:
+  # Reviewed metadata-only cleanup: pinned reusable code; no PR checkout or execution.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: ["CI", "release"]
     types: [completed]
 
