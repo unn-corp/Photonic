@@ -48,6 +48,6 @@ windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
 winresource = "0.1"
 
 [dev-dependencies]
-hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+hf-hub = { version = "0.4", default-features = false, features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 webpki-roots = "1"

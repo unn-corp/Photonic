@@ -10,6 +10,6 @@ fastembed = { version = "4", default-features = false, features = ["ort-download
 anyhow = { workspace = true }
 # The supported async model downloader uses the same Hugging Face disk cache
 # through Reqwest, whose maintained root loader honors OS/SSL_CERT_FILE trust.
-hf-hub = { version = "0.4", default-features = false, features = ["tokio", "rustls-tls"] }
+hf-hub = { version = "0.4", default-features = false, features = ["tokio"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 tokio = { workspace = true }
