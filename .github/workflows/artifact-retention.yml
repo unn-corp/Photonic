@@ -1,0 +1,16 @@
+name: Retain two artifact builds
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '27 */6 * * *'
+  workflow_run:
+    workflows: ["CI", "release"]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  prune:
+    uses: unn-corp/.github/.github/workflows/artifact-retention.yml@859abab5c6f470cb6f97a64e6cfe52d41107b23c # tested two-build retention
