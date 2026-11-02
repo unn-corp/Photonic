@@ -133,7 +133,13 @@ mod tests {
     fn updater_keeps_version_target_and_ui_settings() {
         // Building a config performs no HTTP request or installation.
         let updater = install_builder().build().unwrap();
-        assert_eq!(updater.bin_name(), "photonic");
+        let expected_binary = if cfg!(windows) {
+            "photonic.exe"
+        } else {
+            "photonic"
+        };
+        assert_eq!(updater.bin_name(), expected_binary);
+        assert_eq!(updater.bin_path_in_archive(), expected_binary);
         assert_eq!(updater.current_version(), env!("CARGO_PKG_VERSION"));
         assert_eq!(updater.target(), self_update::get_target());
         assert!(updater.no_confirm());
