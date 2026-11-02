@@ -35,7 +35,8 @@ arboard = { version = "3.6", features = ["wayland-data-control"] }
 # Cross-platform deps. These power modules compiled on every OS — mlua/uuid
 # (repl.rs, script.rs, cli.rs) and reqwest (mcp_proxy.rs) —
 # so they must NOT live under [target.'cfg(windows)'.dependencies].
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+# Load OS/custom roots while keeping verification on patched Rustls/WebPKI.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset", "http2", "system-proxy", "rustls-tls-native-roots"] }
 uuid = { workspace = true }
 mlua = { workspace = true }
 
@@ -45,3 +46,8 @@ windows-sys = { version = "0.59", features = ["Win32_UI_Shell"] }
 
 [build-dependencies]
 winresource = "0.1"
+
+[dev-dependencies]
+hf-hub = { version = "0.4", default-features = false, features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"

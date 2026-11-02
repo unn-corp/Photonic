@@ -64,3 +64,34 @@ self-updater backed by GitHub Releases.
 ## Effort estimate
 
 **M** — HTTP call + UI notification is small; safe binary replace + Windows handling + edge-case error UX is the majority of work.
+
+## TLS trust and signed archive compatibility (October 2026)
+
+The in-app updater uses `self_update` 1.3.1 with its blocking `ureq` client,
+Rustls/WebPKI, ZIP 9 and zipsign-api 0.2.2. It still selects the Photonic release
+for the current target/version and fixed executable name, verifies the archive
+against `release/photonic-signing.pub` **before extraction**, and binds the
+signature to the release filename. Windows ZIP and Linux/macOS tar.gz remain
+supported. The release workflow pins the zipsign 0.2.2 crate and its SHA-256;
+the signing key and release identity are unchanged. The updater retains public
+WebPKI roots and environment proxy discovery. It has no application custom-CA
+setting. The transport uses HTTP/1.1; HTTP/2 is not required for GitHub updates.
+
+The Anthropic client uses the fixed public API endpoint. Model downloads use
+fastembed's HuggingFace client, which honors `HF_ENDPOINT` and `HF_HOME`.
+These application/model clients load OS roots through Rustls, preserving
+enterprise roots and Unix `SSL_CERT_FILE`/`SSL_CERT_DIR` configuration while
+verifying chains and hostnames with patched WebPKI. The application has no
+separate CA-file preference. Reqwest retains system proxy discovery; the
+HuggingFace client retains its environment proxy discovery. Local regression
+fixtures exercise default clients with an untrusted CA, an explicitly configured
+Unix CA, hostname mismatches and an owned HTTPS CONNECT proxy. They do not
+contact Anthropic, HuggingFace or GitHub, or install an update.
+
+Compromised eMudhra keys remain explicitly distrusted, including when presented
+as trust anchors from a custom store. Invalid certificates and mismatched
+hostnames are refused; adding a root does not bypass these checks. Root loading
+preserves custom trust support, but Rustls/WebPKI performs verification rather
+than the OS TLS engine, so this is not a claim of identical native-platform
+certificate-policy semantics. Live enterprise proxy/platform acceptance and
+installed release artifacts require separate validation.

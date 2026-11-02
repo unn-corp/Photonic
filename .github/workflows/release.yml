@@ -19,8 +19,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  ZIPSIGN_VERSION: "0.2.1"
-  ZIPSIGN_SHA256: bc5d02b6a44b677c4c412fca9eb5c9b08f255692b30f6943248437b6add1f5c6
+  ZIPSIGN_VERSION: "0.2.2"
+  ZIPSIGN_SHA256: de8b0a0ec4d91bf8a14574b8aac050ddf6204ae8fa573c90f2bd47c9f8113925
   PHOTONIC_PUBLIC_KEY_SHA256: 34642dd944fd2940db6f08843aa8a2c31e66e5df16901b6d9be52c8509b1243d
 
 jobs:
@@ -78,12 +78,12 @@ jobs:
             archive: photonic-x86_64-unknown-linux-gnu.tar.gz
             archive_kind: tar
             archive_member: photonic
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: photonic-x86_64-apple-darwin.tar.gz
             archive_kind: tar
             archive_member: photonic
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: photonic-aarch64-apple-darwin.tar.gz
             archive_kind: tar
@@ -170,12 +170,12 @@ jobs:
             archive: photonic-x86_64-unknown-linux-gnu.tar.gz
             archive_kind: tar
             archive_member: photonic
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             archive: photonic-x86_64-apple-darwin.tar.gz
             archive_kind: tar
             archive_member: photonic
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             archive: photonic-aarch64-apple-darwin.tar.gz
             archive_kind: tar

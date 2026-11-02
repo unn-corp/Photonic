@@ -25,7 +25,7 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
-rfd = "0.15"
+rfd = "0.17.2"
 regex = "1"
 pollster = { workspace = true }
 # `photonic_video::captions::provider::ProgressSink` is a
@@ -36,11 +36,13 @@ pollster = { workspace = true }
 # channel of that exact type. Already resolved elsewhere in the workspace
 # (photonic-video) at 0.5.15; MIT/Apache-2.0, zero-cost MPMC/SPSC channel.
 crossbeam-channel = "0.5"
-self_update = { version = "0.42", default-features = false, features = [
+self_update = { version = "1.3.1", default-features = false, features = [
+    "ureq",
+    "github",
     "rustls",
     "archive-tar",
     "archive-zip",
-    "compression-flate2",
+    "compression-tar-gz",
     "compression-zip-deflate",
     "signatures",
 ] }
