@@ -1,16 +1,8 @@
 //! Atomic file writes for cache and export outputs (37 §2.3).
 //!
-//! Every job that writes a file writes it to a `<path>.part` sibling first,
-//! fsyncs, then renames onto the final path. Because the staging file lives in
-//! the same directory as the target, the rename is same-filesystem and atomic:
-//! after a crash at any instant, a non-`.part` file in a cache directory is
-//! always complete and valid, and a `.part` file is never read, never served,
-//! and never registered as ready.
-//!
-//! This is the pattern `media::proxy` already used for transcodes, lifted here
-//! so every cache writer (thumbnails, keyframe index, waveform) and the export
-//! encoder share one implementation. `proxy` re-exports [`staging_path`] from
-//! this module.
+//! Cache writers sync their bytes to a private `.part` sibling before
+//! renaming it onto the final path. The same-filesystem rename publishes a
+//! complete entry atomically, even when multiple writers target the same file.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,23 +16,22 @@ pub fn staging_path(output: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Write `bytes` to `output` atomically: write to the `.part` staging path,
-/// fsync, then rename onto `output`. The staging file is removed on any error,
-/// so a failed write leaves neither a `.part` nor a partial `output`.
+/// Write `bytes` to `output` atomically. Each writer uses its own `.part`
+/// sibling and removes it if writing, syncing, or renaming fails.
 ///
 /// The parent directory of `output` is created if needed.
 pub fn write_atomic(output: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = output.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = staging_path(output);
+    let tmp = output.with_file_name(format!(".photonic-{}.part", uuid::Uuid::new_v4()));
+    let mut file = std::fs::File::create_new(&tmp)?;
 
     // A closure so any early error path funnels through the cleanup below.
     let write = || -> std::io::Result<()> {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
         std::fs::rename(&tmp, output)
     };
 
@@ -123,6 +114,42 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writes_publish_complete_outputs() {
+        const WRITERS: u8 = 8;
+        let dir = tmp_dir();
+        let output = dir.join("shared-cache.bin");
+        let start = std::sync::Barrier::new(WRITERS as usize);
+        let errors = std::thread::scope(|scope| {
+            let mut writers = Vec::new();
+            for byte in 1..=WRITERS {
+                let output = &output;
+                let start = &start;
+                writers.push(scope.spawn(move || {
+                    let payload = vec![byte; 8192];
+                    start.wait();
+                    (0..12)
+                        .filter_map(|_| write_atomic(output, &payload).err())
+                        .count()
+                }));
+            }
+            writers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .sum::<usize>()
+        });
+        let contents = std::fs::read(&output).unwrap();
+        let files = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(errors, 0, "all writers must be able to publish");
+        assert_eq!(contents.len(), 8192);
+        let winner = contents[0];
+        assert!((1..=WRITERS).contains(&winner));
+        assert!(contents.iter().all(|byte| *byte == winner));
+        assert_eq!(files, 1, "only the final cache entry should remain");
+    }
+
+    #[test]
     fn write_atomic_failure_leaves_neither_part_nor_output() {
         // Target a path whose parent is a *file*, so create_dir_all/create fail.
         let dir = tmp_dir();
@@ -133,6 +160,11 @@ mod tests {
         assert!(err.is_err(), "write into a non-directory should fail");
         assert!(!out.exists());
         assert!(!staging_path(&out).exists());
+
+        let destination_dir = dir.join("destination");
+        std::fs::create_dir(&destination_dir).unwrap();
+        assert!(write_atomic(&destination_dir, b"payload").is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 
