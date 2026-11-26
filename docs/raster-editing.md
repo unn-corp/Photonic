@@ -168,9 +168,10 @@ diffable while staying compact.
 All encoded raster inputs — including persisted PNG data and the GUI/MCP image
 and pattern tools — pass through `RasterImage::from_encoded`. To keep a
 compressed image from expanding into an unbounded pixel buffer, Photonic
-rejects imports wider or taller than **16,384 px** or whose decoder allocation
-budget exceeds **256 MiB**. The policy applies before Photonic materializes the
-RGBA8 raster buffer.
+rejects encoded inputs larger than **64 MiB**, imports wider or taller than
+**16,384 px**, or imports exceeding **67,108,864 pixels**. The image decoder
+also has a **256 MiB** allocation budget. These checks run before Photonic
+materializes the RGBA8 raster buffer.
 
 ### `Mask` (`raster/mask.rs`)
 ```rust
