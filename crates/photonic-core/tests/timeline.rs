@@ -332,6 +332,29 @@ fn direct_timing_edits_respect_source_and_destination_track_locks() {
 }
 
 #[test]
+fn trimming_and_slipping_reject_negative_positions() {
+    let f = fixture();
+    let timing = ClipTiming {
+        start: Tick::ZERO,
+        duration: Tick(500),
+        source_in: Tick::ZERO,
+    };
+    for invalid in [
+        ClipTiming {
+            start: Tick(-1),
+            ..timing
+        },
+        ClipTiming {
+            source_in: Tick(-1),
+            ..timing
+        },
+    ] {
+        assert!(ops::trim_clip(f.project(), f.seq, f.vtrack, f.clip_a, invalid).is_err());
+    }
+    assert!(ops::slip_clip(f.project(), f.seq, f.vtrack, f.clip_a, Tick(-1)).is_err());
+}
+
+#[test]
 fn undo_roundtrip_adding_first_active_sequence() {
     let mut doc = Document::new("t", 100.0, 100.0);
     doc.timeline = Some(TimelineProject::new());

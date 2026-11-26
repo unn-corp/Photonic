@@ -1600,6 +1600,9 @@ pub fn trim_clip(
     if new.duration.0 <= 0 {
         return Err(EditError::NonPositiveDuration);
     }
+    if new.start.0 < 0 || new.source_in.0 < 0 {
+        return Err(EditError::Overlap);
+    }
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
     if t.locked {
@@ -1722,6 +1725,9 @@ pub fn slip_clip(
     clip_id: ClipId,
     new_source_in: Tick,
 ) -> Result<TimelineCmd, EditError> {
+    if new_source_in.0 < 0 {
+        return Err(EditError::Overlap);
+    }
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
     if t.locked {
