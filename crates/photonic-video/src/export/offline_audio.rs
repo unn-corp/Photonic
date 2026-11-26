@@ -24,8 +24,7 @@ use crate::audio::mixer::{first_clip_sample, ClipVoice, Mixer, PcmSource, TrackV
 use crate::audio::{BLOCK_FRAMES, CHANNELS};
 use crate::graph::analysis::{self, AnalysisCache, AnalysisResult};
 use crate::media::ffmpeg_locate::FfmpegTools;
-use crate::playback::pcm::{read_pcm_window, TimeWarpPcmSource};
-use crate::playback::FfmpegPcmSource;
+use crate::playback::pcm::{read_pcm_window, PcmDecoderControl, TimeWarpPcmSource};
 
 /// Default export mix rate when a sequence does not declare one (48 kHz).
 pub const DEFAULT_EXPORT_SAMPLE_RATE: u32 = 48_000;
@@ -60,6 +59,72 @@ pub fn render_export_audio_filtered(
     loudness: Option<&LoudnessTarget>,
     only_track: Option<photonic_core::timeline::TrackId>,
 ) -> Result<Vec<f32>, ExportError> {
+    mix_export_audio(
+        project,
+        sequence,
+        start,
+        end,
+        tools,
+        loudness,
+        only_track,
+        &PcmDecoderControl::default(),
+    )
+}
+
+/// Keep watching the export's cancel flag while the mixer may be in a pipe read.
+pub(super) fn render_export_audio_cancellable(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    start: Tick,
+    end: Tick,
+    tools: &FfmpegTools,
+    loudness: Option<&LoudnessTarget>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<f32>, ExportError> {
+    use crossbeam_channel::RecvTimeoutError;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let control = &PcmDecoderControl::default();
+    std::thread::scope(|scope| {
+        let (done, finished) = crossbeam_channel::bounded::<()>(0);
+        scope.spawn(move || {
+            while !cancel.load(Ordering::Relaxed) {
+                if !matches!(
+                    finished.recv_timeout(Duration::from_millis(10)),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+            }
+            control.cancel();
+        });
+        let result = mix_export_audio(
+            project,
+            sequence,
+            start,
+            end,
+            Some(tools),
+            loudness,
+            None,
+            control,
+        );
+        drop(done);
+        result
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mix_export_audio(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    start: Tick,
+    end: Tick,
+    tools: Option<&FfmpegTools>,
+    loudness: Option<&LoudnessTarget>,
+    only_track: Option<photonic_core::timeline::TrackId>,
+    control: &PcmDecoderControl,
+) -> Result<Vec<f32>, ExportError> {
     if end <= start {
         return Ok(Vec::new());
     }
@@ -89,7 +154,7 @@ pub fn render_export_audio_filtered(
     let mut t = start;
     let mut frames_left = total_frames;
 
-    while frames_left > 0 {
+    while frames_left > 0 && !control.is_cancelled() {
         let frames_this = frames_left.min(BLOCK_FRAMES);
         let block_end = t.saturating_add(block_ticks);
         // Match the interactive feeder's half-open block coverage.
@@ -139,8 +204,8 @@ pub fn render_export_audio_filtered(
                         clip.start,
                         offset,
                     );
-                    if let Ok(source) =
-                        FfmpegPcmSource::spawn_stream(tools, path, src_pos, sample_rate, stream)
+                    if let Some(source) =
+                        control.spawn_stream(tools, path, src_pos, sample_rate, stream)
                     {
                         pcm.insert(clip.id, Box::new(source));
                     }
@@ -154,13 +219,9 @@ pub fn render_export_audio_filtered(
                         / TICKS_PER_SECOND as f64)
                         .ceil() as usize
                         + 2;
-                    if let Ok(mut decoder) = FfmpegPcmSource::spawn_stream(
-                        tools,
-                        path,
-                        source_start,
-                        sample_rate,
-                        stream,
-                    ) {
+                    if let Some(mut decoder) =
+                        control.spawn_stream(tools, path, source_start, sample_rate, stream)
+                    {
                         let window = read_pcm_window(&mut decoder, frames);
                         pcm.insert(
                             clip.id,
@@ -216,6 +277,9 @@ pub fn render_export_audio_filtered(
         t = t + block_ticks;
     }
 
+    if control.is_cancelled() {
+        return Ok(Vec::new());
+    }
     if let Some(target) = loudness {
         // Analyse (cached, E-2) → apply. Two statements, in that order, because
         // 31 §6.2 says the measurement is a job and the gain is what the render
