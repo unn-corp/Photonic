@@ -47,6 +47,11 @@ impl CommandHistory {
         self.revision
     }
 
+    /// Notify renderers of a transient document edit outside command execution.
+    pub fn record_preview_change(&mut self) {
+        self.record_revision_change(SmallVec::new());
+    }
+
     /// Bump `revision` and record `affected` in the ring under the new
     /// revision number. Shared by every mutation site (`execute`'s two exit
     /// paths, `undo`, `redo`).

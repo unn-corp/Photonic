@@ -906,6 +906,61 @@ mod tests {
     }
 
     #[test]
+    fn canceling_live_preview_changes_render_revision_without_an_undo_step() {
+        let mut doc = Document::new("Trace", 20.0, 20.0);
+        let layer = doc.layer_order[0];
+        let image = RasterImage::filled(10, 10, [20, 30, 40, 255]);
+        let raster = SceneNode::new(
+            "source",
+            layer,
+            SceneNodeKind::Raster(photonic_core::node::RasterNode::new(image)),
+        );
+        let source = doc.add_node(raster, Some(layer));
+        let mut app = PhotonicApp {
+            active_tool: Tool::AreaTrace,
+            last_tool: Tool::AreaTrace,
+            recovery_scanned: true,
+            ..PhotonicApp::default()
+        };
+        assert!(app.begin_area_trace_preview(
+            &mut doc,
+            source,
+            Point::ZERO,
+            Point::new(10.0, 10.0)
+        ));
+        assert_eq!(doc.nodes.len(), 2);
+
+        let mut history = CommandHistory::new(20);
+        let revision = history.revision();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let doc_arc = Arc::new(tokio::sync::Mutex::new(doc.clone()));
+        let Some(mut renderer) =
+            pollster::block_on(PhotonicRenderer::new_offscreen(20, 20, doc_arc, rx))
+        else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        app.pending_panel_actions.push(PanelAction::CancelAreaTrace);
+        let ctx = egui::Context::default();
+        let mut view = CanvasView::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            assert!(!app.draw(ctx, &mut doc, &mut view, &mut renderer, false, &mut history));
+        });
+
+        assert!(app.area_trace_session.is_none());
+        assert_eq!(doc.nodes.len(), 1);
+        assert_eq!(history.undo_depth(), 0);
+        assert_ne!(
+            history.revision(),
+            revision,
+            "the windowed renderer would reuse the preview geometry"
+        );
+    }
+
+    #[test]
     fn empty_preview_can_become_visible_from_live_setting_change() {
         let mut doc = Document::new("t", 20.0, 20.0);
         let layer = doc.layer_order[0];
