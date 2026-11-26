@@ -697,6 +697,11 @@ where
             .name("photonic-thumbnail-worker".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
+                    // Invalidation clears bookkeeping for jobs that are still
+                    // queued, so they can be discarded before doing I/O.
+                    if job.generation != worker_shared.state.lock().unwrap().generation {
+                        continue;
+                    }
                     // Run the (possibly slow) producer OUTSIDE the lock.
                     let produced = producer(&job.key);
                     let mut st = worker_shared.state.lock().unwrap();
@@ -1030,6 +1035,51 @@ mod tests {
         cache.block_until_idle();
         assert!(cache.request(asset, Tick(1_000), 8).is_some());
         assert_eq!(decodes.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn invalidation_skips_queued_decodes_from_older_generations() {
+        let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::clone(&decoded);
+        let deadline = Duration::from_secs(5);
+        let store = AsyncStore::new(
+            8,
+            Duration::ZERO,
+            8,
+            Box::new(move |key: &u32| {
+                if *key == 0 {
+                    started_tx.send(()).ok()?;
+                    release_rx.recv_timeout(deadline).ok()?;
+                }
+                history.lock().unwrap().push(*key);
+                Some(Arc::new(*key))
+            }),
+        );
+
+        store.get(0);
+        started_rx
+            .recv_timeout(deadline)
+            .expect("first decode started");
+        for first in (1..129).step_by(4) {
+            for key in first..first + 4 {
+                store.get(key);
+            }
+            store.invalidate();
+        }
+        store.get(129);
+        release_tx.send(()).unwrap();
+        store.block_until_idle();
+
+        let decoded = decoded.lock().unwrap();
+        assert_eq!(
+            decoded.len(),
+            2,
+            "{} obsolete decodes ran",
+            decoded.len().saturating_sub(2)
+        );
+        assert_eq!(*decoded, [0, 129]);
     }
 
     #[test]
