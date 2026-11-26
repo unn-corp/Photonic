@@ -98,6 +98,14 @@ fn clip(t: &Track, id: ClipId) -> Result<&Clip, EditError> {
         .ok_or(EditError::NoClip(id))
 }
 
+fn checked_clip_end(start: Tick, duration: Tick) -> Result<Tick, EditError> {
+    start
+        .0
+        .checked_add(duration.0)
+        .map(Tick)
+        .ok_or(EditError::Overlap)
+}
+
 /// True if `[start, end)` would overlap any clip on `t` other than `ignore`.
 fn overlaps_other(t: &Track, start: Tick, end: Tick, ignore: Option<ClipId>) -> bool {
     t.clips
@@ -1552,6 +1560,7 @@ pub fn move_clip_to_track(
         return Err(EditError::TrackLocked);
     }
     let c = clip(src, clip_id)?;
+    let new_end = checked_clip_end(new_start, c.duration)?;
 
     // Normalize: a `Some(same)` destination is really a same-track move.
     let dest_id = match new_track {
@@ -1561,7 +1570,7 @@ pub fn move_clip_to_track(
 
     match dest_id {
         None => {
-            if overlaps_other(src, new_start, new_start + c.duration, Some(clip_id)) {
+            if overlaps_other(src, new_start, new_end, Some(clip_id)) {
                 return Err(EditError::Overlap);
             }
         }
@@ -1574,7 +1583,7 @@ pub fn move_clip_to_track(
                 return Err(EditError::NoTrack(dest));
             }
             // On the destination the clip is new — nothing to ignore.
-            if overlaps_other(dst, new_start, new_start + c.duration, None) {
+            if overlaps_other(dst, new_start, new_end, None) {
                 return Err(EditError::Overlap);
             }
         }
@@ -1609,7 +1618,8 @@ pub fn trim_clip(
         return Err(EditError::TrackLocked);
     }
     let c = clip(t, clip_id)?;
-    if overlaps_other(t, new.start, new.start + new.duration, Some(clip_id)) {
+    let new_end = checked_clip_end(new.start, new.duration)?;
+    if overlaps_other(t, new.start, new_end, Some(clip_id)) {
         return Err(EditError::Overlap);
     }
     Ok(TimelineCmd::TrimClip {
@@ -1665,14 +1675,8 @@ pub fn edit_clip_timing(
     // Ripple duration (end-edge) when the start is held fixed — the dialog's
     // "ripple" checkbox. Start-edge / position changes never ride this path.
     if ripple && new.start == old.start && new.duration != old.duration {
-        let mut cmds = ripple_trim(
-            p,
-            id,
-            track_id,
-            clip_id,
-            ClipEdge::End,
-            new.start + new.duration,
-        )?;
+        let new_end = checked_clip_end(new.start, new.duration)?;
+        let mut cmds = ripple_trim(p, id, track_id, clip_id, ClipEdge::End, new_end)?;
         if new.source_in != old.source_in {
             // Slip against the post-trim project is not available here (pure
             // planner). Emit SlipClip with the desired value — apply order is

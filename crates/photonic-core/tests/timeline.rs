@@ -355,6 +355,50 @@ fn trimming_and_slipping_reject_negative_positions() {
 }
 
 #[test]
+fn moving_and_trimming_reject_unrepresentable_clip_ends() {
+    let f = fixture();
+    let near_end = Tick(i64::MAX - 10);
+    let timing = ClipTiming {
+        start: near_end,
+        duration: Tick(500),
+        source_in: Tick::ZERO,
+    };
+    let p = f.project();
+    let ripple = ClipTiming {
+        start: Tick(1_000),
+        duration: Tick(i64::MAX),
+        source_in: Tick::ZERO,
+    };
+    let probes = [
+        (
+            "trim",
+            std::panic::catch_unwind(|| ops::trim_clip(p, f.seq, f.vtrack, f.clip_a, timing))
+                .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "move",
+            std::panic::catch_unwind(|| ops::move_clip(p, f.seq, f.vtrack, f.clip_a, near_end))
+                .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "ripple duration",
+            std::panic::catch_unwind(|| {
+                ops::edit_clip_timing(p, f.seq, f.vtrack, f.clip_b, ripple, true)
+            })
+            .is_ok_and(|result| result.is_err()),
+        ),
+    ];
+    let failed: Vec<_> = probes
+        .into_iter()
+        .filter_map(|(edit, rejected)| (!rejected).then_some(edit))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "overflow must return an edit error: {failed:?}"
+    );
+}
+
+#[test]
 fn undo_roundtrip_adding_first_active_sequence() {
     let mut doc = Document::new("t", 100.0, 100.0);
     doc.timeline = Some(TimelineProject::new());
