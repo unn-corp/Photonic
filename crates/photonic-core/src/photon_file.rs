@@ -139,22 +139,18 @@ where
 }
 
 fn staging_path(path: &Path) -> io::Result<PathBuf> {
-    use std::ffi::OsString;
-
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "atomic file writes require a destination file name",
-        )
-    })?;
+        ));
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let serial = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut name = OsString::from(".");
-    name.push(file_name);
-    name.push(format!(".photonic-tmp-{}-{serial}", std::process::id()));
+    let name = format!(".photonic-tmp-{}-{serial}", std::process::id());
     Ok(parent.join(name))
 }
 
@@ -495,6 +491,22 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
         assert_eq!(mode, 0o500);
         assert_eq!(bytes, b"updated project");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_replaces_a_project_with_a_long_file_name() {
+        let dir = test_dir("long-name");
+        let path = dir.join(format!("{}.photon", "a".repeat(248)));
+        fs::write(&path, b"old project").unwrap();
+
+        let result = write_atomic_file(&path, b"updated project");
+        let bytes = fs::read(&path).unwrap();
+        let staging = staging_files(&dir);
+        fs::remove_dir_all(dir).unwrap();
+        result.expect("atomic write to a valid 255-byte file name");
+        assert_eq!(bytes, b"updated project");
+        assert!(staging.is_empty());
     }
 
     #[test]
