@@ -240,7 +240,7 @@ impl Timecode {
     /// relative to sequence zero (before adding [`Sequence::start_timecode`]).
     ///
     /// Drop-frame parse only succeeds for 29.97 / 59.94 rates; other rates
-    /// reject `;`. Non-drop always works.
+    /// reject `;`. Unrepresentable ticks yield `None`.
     pub fn parse_to_tick(tc: &str, rate: FrameRate) -> Option<Tick> {
         let sep_pos = tc.rfind([':', ';'])?;
         let drop = tc.as_bytes().get(sep_pos)? == &b';';
@@ -261,35 +261,22 @@ impl Timecode {
         if drop && !rate.is_drop_frame_rate() {
             return None;
         }
-        let total_frames = if drop {
-            Self::drop_components_to_frame_index(h, m, s, ff, nominal)?
-        } else {
-            (h * 3600 + m * 60 + s) * nominal + ff
-        };
-        Some(Tick(total_frames * rate.ticks_per_frame().0))
-    }
-
-    /// Inverse of [`from_frame_index_drop`]: components → 0-based frame index.
-    fn drop_components_to_frame_index(
-        h: i64,
-        m: i64,
-        s: i64,
-        f: i64,
-        nominal_fps: i64,
-    ) -> Option<i64> {
-        let drop = if nominal_fps >= 60 { 4 } else { 2 };
-        // Invalid dropped numbers: :00 and :01 (or :00–:03) at second `:00` of a
-        // non-10th minute. Drop-frame skips those labels only at the minute
-        // boundary — every other second carries the full frame-number range, so
-        // `00:01:05;00` is valid and must parse.
-        if m % 10 != 0 && s == 0 && f < drop {
+        let ticks_per_frame = rate.ticks_per_frame().0;
+        if ticks_per_frame == 0 {
             return None;
         }
-        let total_minutes = h * 60 + m;
-        let raw = ((h * 3600 + m * 60 + s) * nominal_fps) + f;
-        // Subtract the frames that drop-frame skips in the label space.
-        let dropped = drop * (total_minutes - total_minutes / 10);
-        Some(raw - dropped)
+        let total_seconds = h.checked_mul(3600)?.checked_add(m * 60 + s)?;
+        let mut frames = total_seconds.checked_mul(nominal)?.checked_add(ff)?;
+        if drop {
+            let skipped_per_minute = if nominal >= 60 { 4 } else { 2 };
+            // Only second zero of a non-tenth minute skips frame labels.
+            if m % 10 != 0 && s == 0 && ff < skipped_per_minute {
+                return None;
+            }
+            let total_minutes = total_seconds / 60;
+            frames -= skipped_per_minute * (total_minutes - total_minutes / 10);
+        }
+        frames.checked_mul(ticks_per_frame).map(Tick)
     }
 
     /// Format `tick` for UI display at `rate`, optionally drop-frame for NTSC.
@@ -358,6 +345,28 @@ mod tests {
         assert!(!tc.drop_frame);
         let back = Timecode::parse_to_tick(&tc.format(), fr).unwrap();
         assert_eq!(fr.frame_at(back), fr.frame_at(t));
+    }
+
+    #[test]
+    fn timecode_parser_rejects_unrepresentable_ticks() {
+        for (rate, drop) in [(FrameRate::FPS_30, false), (FrameRate::FPS_29_97, true)] {
+            let last_frame = i64::MAX / rate.ticks_per_frame().0;
+            let last_label = Timecode::from_frame_index(last_frame, rate, drop).format();
+            assert_eq!(
+                Timecode::parse_to_tick(&last_label, rate),
+                Some(rate.frame_start(last_frame))
+            );
+            let next_label = Timecode::from_frame_index(last_frame + 1, rate, drop).format();
+            assert_eq!(Timecode::parse_to_tick(&next_label, rate), None);
+
+            let sep = if drop { ';' } else { ':' };
+            let hours_overflow = format!("{}:00:00{sep}00", i64::MAX);
+            assert_eq!(Timecode::parse_to_tick(&hours_overflow, rate), None);
+        }
+        assert_eq!(
+            Timecode::parse_to_tick("00:00:00:00", FrameRate::new(30, 0)),
+            None
+        );
     }
 
     #[test]
