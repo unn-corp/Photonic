@@ -537,7 +537,9 @@ fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
         .map(|(slot, source)| (slot, source, decoder.seek(rate.frame_start(slot))))
         .collect();
     drop(decoder);
-    std::fs::remove_file(&path).unwrap();
+    // Best effort: Windows can hold a freshly written file briefly (scanner or
+    // child teardown), and a leftover temp file does not affect the result.
+    let _ = std::fs::remove_file(&path);
     for (slot, source, frame) in decoded {
         let frame = frame.expect("constant-rate seek");
         let luma = plane_y(&frame.planes);
