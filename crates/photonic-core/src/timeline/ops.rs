@@ -728,7 +728,7 @@ pub fn plan_relink(
 /// in ONE `Command::Batch` so a 200-clip relink is a single undo unit (DoD 4).
 ///
 /// Apply entries only while the asset still points at the path in the preview.
-/// A newer relink supersedes the earlier preview for that asset.
+/// A previously verified match also requires the current asset hash to agree.
 ///
 /// * A [`RelinkHashCheck::Mismatch`] entry is **skipped** unless
 ///   `accept_mismatch`. Binding a clip to the wrong take is a failure the user
@@ -759,6 +759,9 @@ pub fn relink_plan_commands(
             &asset.source,
             super::media::AssetSource::File { path, .. } if path == &e.old_path
         ) {
+            continue;
+        }
+        if e.hash == RelinkHashCheck::Match && asset.content_hash != e.new_hash {
             continue;
         }
         let Ok(relink) = relink_asset(p, e.asset, e.new_path.clone()) else {
@@ -8483,6 +8486,29 @@ mod tests {
         );
         assert!(
             matches!(&assets[&ids[1]].source, AssetSource::File { path, .. } if path == std::path::Path::new("/scanned/b.mp4"))
+        );
+    }
+
+    #[test]
+    fn a_verified_relink_requires_the_current_asset_identity() {
+        let (mut doc, ids) = relink_fixture(&[("/old/a.mp4", Some("h:original"))]);
+        let project = doc.timeline.as_ref().unwrap();
+        let candidate = cand("/scanned/a.mp4", Some("h:original"));
+        let plan = plan_relink(
+            project,
+            &ids,
+            &[candidate],
+            faked(&[("/scanned/a.mp4", "h:original")]),
+        );
+        assert_eq!(plan.entries[0].hash, RelinkHashCheck::Match);
+
+        let metadata =
+            set_asset_meta(project, ids[0], None, Some("h:updated".to_string())).unwrap();
+        Command::Timeline(metadata).apply(&mut doc);
+        let cmds = relink_plan_commands(doc.timeline.as_ref().unwrap(), &plan.entries, false);
+        assert!(
+            cmds.is_empty(),
+            "a match for the old hash cannot relink the updated asset"
         );
     }
 
