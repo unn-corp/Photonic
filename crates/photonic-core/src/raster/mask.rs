@@ -488,8 +488,8 @@ impl Mask {
     pub fn crop(&self, x: i64, y: i64, w: u32, h: u32) -> Mask {
         let x0 = x.clamp(0, self.width as i64);
         let y0 = y.clamp(0, self.height as i64);
-        let x1 = (x + w as i64).clamp(0, self.width as i64);
-        let y1 = (y + h as i64).clamp(0, self.height as i64);
+        let x1 = x.saturating_add(i64::from(w)).clamp(0, self.width as i64);
+        let y1 = y.saturating_add(i64::from(h)).clamp(0, self.height as i64);
         let cw = (x1 - x0).max(1) as u32;
         let ch = (y1 - y0).max(1) as u32;
         let mut out = Mask::empty(cw, ch);

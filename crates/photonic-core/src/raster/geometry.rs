@@ -112,8 +112,8 @@ pub fn scale(img: &RasterImage, factor: f32, filter: Resample) -> RasterImage {
 pub fn crop(img: &RasterImage, x: i64, y: i64, w: u32, h: u32) -> RasterImage {
     let x0 = x.clamp(0, img.width as i64);
     let y0 = y.clamp(0, img.height as i64);
-    let x1 = (x + w as i64).clamp(0, img.width as i64);
-    let y1 = (y + h as i64).clamp(0, img.height as i64);
+    let x1 = x.saturating_add(i64::from(w)).clamp(0, img.width as i64);
+    let y1 = y.saturating_add(i64::from(h)).clamp(0, img.height as i64);
     let cw = (x1 - x0).max(1) as u32;
     let ch = (y1 - y0).max(1) as u32;
     let mut out = RasterImage::new(cw, ch);
@@ -267,6 +267,20 @@ mod tests {
         let c = crop(&img, 1, 1, 2, 3);
         assert_eq!((c.width, c.height), (2, 3));
         assert_eq!(c.pixel(0, 0), img.pixel(1, 1));
+    }
+
+    #[test]
+    fn image_and_mask_crops_clamp_far_positive_coordinates() {
+        let img = ramp(2, 2);
+        let mask = crate::raster::Mask::full(2, 2);
+        for (x, y, expected) in [(i64::MAX, 0, (1, 2)), (0, i64::MAX, (2, 1))] {
+            let cropped_image = crop(&img, x, y, 2, 2);
+            let cropped_mask = mask.crop(x, y, 2, 2);
+            assert_eq!((cropped_image.width, cropped_image.height), expected);
+            assert_eq!((cropped_mask.width, cropped_mask.height), expected);
+            assert!(cropped_image.pixels.iter().all(|&channel| channel == 0));
+            assert!(cropped_mask.is_empty_selection());
+        }
     }
 
     #[test]
