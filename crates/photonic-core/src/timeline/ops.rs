@@ -1548,6 +1548,9 @@ pub fn move_clip_to_track(
     }
     let s = seq(p, id)?;
     let src = track(s, track_id)?;
+    if src.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(src, clip_id)?;
 
     // Normalize: a `Some(same)` destination is really a same-track move.
@@ -1564,6 +1567,9 @@ pub fn move_clip_to_track(
         }
         Some(dest) => {
             let dst = track(s, dest)?;
+            if dst.locked {
+                return Err(EditError::TrackLocked);
+            }
             if dst.kind != src.kind {
                 return Err(EditError::NoTrack(dest));
             }
@@ -1596,6 +1602,9 @@ pub fn trim_clip(
     }
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     if overlaps_other(t, new.start, new.start + new.duration, Some(clip_id)) {
         return Err(EditError::Overlap);
@@ -1689,6 +1698,9 @@ pub fn split_clip(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     if at <= c.start || at >= c.end() {
         return Err(EditError::InvalidSplit);
@@ -1712,6 +1724,9 @@ pub fn slip_clip(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     Ok(TimelineCmd::SlipClip {
         seq: id,

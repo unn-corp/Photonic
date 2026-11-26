@@ -261,6 +261,77 @@ fn sequence_and_track_ops_roundtrip() {
 }
 
 #[test]
+fn direct_timing_edits_respect_source_and_destination_track_locks() {
+    let mut f = fixture();
+    let seq = f
+        .doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap();
+    seq.track_mut(f.vtrack).unwrap().locked = true;
+    let mut destination = Track::new(TrackKind::Video, "Locked destination");
+    destination.locked = true;
+    let destination_id = destination.id;
+    seq.video_tracks.push(destination);
+
+    let p = f.project();
+    let timing = ClipTiming {
+        start: Tick::ZERO,
+        duration: Tick(500),
+        source_in: Tick::ZERO,
+    };
+    let edits = [
+        (
+            "move",
+            ops::move_clip(p, f.seq, f.vtrack, f.clip_b, Tick(2_000)),
+        ),
+        ("trim", ops::trim_clip(p, f.seq, f.vtrack, f.clip_a, timing)),
+        (
+            "split",
+            ops::split_clip(p, f.seq, f.vtrack, f.clip_a, Tick(500)),
+        ),
+        (
+            "slip",
+            ops::slip_clip(p, f.seq, f.vtrack, f.clip_a, Tick(500)),
+        ),
+    ];
+    let bypasses: Vec<_> = edits
+        .into_iter()
+        .filter_map(|(edit, result)| {
+            (!matches!(result, Err(ops::EditError::TrackLocked))).then_some(edit)
+        })
+        .collect();
+    assert!(
+        bypasses.is_empty(),
+        "edits bypassing the source track lock: {bypasses:?}"
+    );
+
+    let seq = f
+        .doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap();
+    seq.track_mut(f.vtrack).unwrap().locked = false;
+    assert!(matches!(
+        ops::move_clip_to_track(
+            f.project(),
+            f.seq,
+            f.vtrack,
+            f.clip_b,
+            Tick(2_000),
+            Some(destination_id)
+        ),
+        Err(ops::EditError::TrackLocked)
+    ));
+}
+
+#[test]
 fn undo_roundtrip_adding_first_active_sequence() {
     let mut doc = Document::new("t", 100.0, 100.0);
     doc.timeline = Some(TimelineProject::new());
