@@ -473,6 +473,10 @@ impl Mask {
                     self.data[i] = acc;
                 }
             }
+            // An unchanged pass is a fixed point, so further passes are no-ops.
+            if self.data == src {
+                break;
+            }
         }
     }
 
