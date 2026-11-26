@@ -89,6 +89,7 @@ pub struct HeadlessRenderer {
     supports_view_formats: bool,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    camera_submission_lock: std::sync::Mutex<()>,
     fill_pipeline: wgpu::RenderPipeline,
     /// One fill-pipeline variant per separable blend mode (matches the windowed
     /// renderer so headless export agrees with the on-canvas result).
@@ -218,6 +219,7 @@ impl HeadlessRenderer {
             supports_view_formats,
             camera_buffer,
             camera_bind_group,
+            camera_submission_lock: std::sync::Mutex::new(()),
             fill_pipeline,
             blend_pipelines,
             fill_pipeline_1spp,
@@ -308,10 +310,6 @@ impl HeadlessRenderer {
             opts.overprint_preview,
             view.zoom,
         );
-
-        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
 
         let clear = match opts.background {
             ExportBackground::Artboard => BG,
@@ -716,7 +714,17 @@ impl HeadlessRenderer {
             drop(doc_tex);
         }
         drop(msaa_tex); // keep alive until submit
-        self.queue.submit([enc.finish()]);
+        let commands = enc.finish();
+        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
+        // A shared renderer can encode in parallel. Pair each camera update
+        // with the draw submission so another render cannot replace it first.
+        let _guard = self
+            .camera_submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
+        self.queue.submit([commands]);
         tex
     }
 
@@ -815,9 +823,6 @@ impl HeadlessRenderer {
         let mut view = CanvasView::new(w, h);
         view.fit_to_rect(0.0, 0.0, document.width, document.height);
         let (verts, idxs, segments, blur_jobs) = build_geometry(document, false, false, view.zoom);
-        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
         let scene = self.render_scene_texture(
             &verts,
             &idxs,
@@ -2046,6 +2051,71 @@ mod blend_tests {
             force_fallback_adapter: false,
         }))?;
         Some(pollster::block_on(HeadlessRenderer::new()))
+    }
+
+    #[test]
+    fn shared_headless_renderer_keeps_each_concurrent_camera() {
+        let Some(renderer) = try_renderer() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 24;
+        let mut doc = Document::new("Camera concurrency", 100.0, 100.0);
+        let layer = doc.layer_order[0];
+        doc.add_node(
+            SceneNode::new(
+                "Offset shape",
+                layer,
+                SceneNodeKind::Path(PathNode::new(PathData::rect(20.0, 27.0, 31.0, 38.0))),
+            ),
+            Some(layer),
+        );
+        let cases: Vec<_> = (0..WORKERS)
+            .map(|i| {
+                let out = (43 + 4 * i as u32, 49 + 2 * i as u32);
+                let opts = ExportOptions {
+                    background: ExportBackground::Transparent,
+                    region: Some((i as f64 * 3.0, i as f64, 70.0, 80.0)),
+                    ..Default::default()
+                };
+                let expected = renderer.render_rgba_with_opts(&doc, out.0, out.1, &opts);
+                assert!(expected.0.chunks_exact(4).any(|p| p[3] > 0));
+                (out, opts, expected)
+            })
+            .collect();
+
+        let barrier = std::sync::Barrier::new(WORKERS);
+        let mismatches: usize = (0..ROUNDS)
+            .map(|_| {
+                std::thread::scope(|scope| {
+                    let jobs: Vec<_> = cases
+                        .iter()
+                        .map(|(size, opts, expected)| {
+                            let (renderer, doc, barrier) = (&renderer, &doc, &barrier);
+                            scope.spawn(move || {
+                                barrier.wait();
+                                let observed =
+                                    renderer.render_rgba_with_opts(doc, size.0, size.1, opts);
+                                usize::from(&observed != expected)
+                            })
+                        })
+                        .collect();
+                    jobs.into_iter()
+                        .map(|job| job.join().unwrap())
+                        .sum::<usize>()
+                })
+            })
+            .sum();
+        assert_eq!(
+            mismatches,
+            0,
+            "{mismatches} of {} renders used the wrong camera",
+            WORKERS * ROUNDS
+        );
     }
 
     /// Decode an IEEE-754 half (`Rgba16Float` storage) to `f32`. Inline to avoid
