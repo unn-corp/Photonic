@@ -575,7 +575,11 @@ fn segment_ratio(a: SpeedKey, b: SpeedKey, at: f64) -> f64 {
 /// `len * ratio`, exact (multiply-before-divide in i128, saturating back to i64).
 #[inline]
 fn scale_ticks(len: i64, r: Ratio) -> i64 {
-    ((len as i128 * r.num as i128) / r.den.max(1) as i128) as i64
+    clamp_tick_delta(i128::from(len) * i128::from(r.num) / i128::from(r.den.max(1)))
+}
+
+fn clamp_tick_delta(delta: i128) -> i64 {
+    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// Integrate a speed ramp over `[0, target]` (or `[target, 0]` when
@@ -641,13 +645,14 @@ fn integrate_hold(sorted: &[SpeedKey], target: i64) -> i64 {
         let b = seg_end.min(hi);
         if b > a {
             let r = sorted[i].ratio;
-            acc += (b - a) as i128 * r.num as i128 / r.den.max(1) as i128;
+            let len = i128::from(b) - i128::from(a);
+            acc += len * i128::from(r.num) / i128::from(r.den.max(1));
         }
     }
     if target < 0 {
         acc = -acc;
     }
-    acc as i64
+    clamp_tick_delta(acc)
 }
 
 /// `f64` integration for a ramp with at least one eased segment. The speed
@@ -673,7 +678,8 @@ fn integrate_eased_f64(sorted: &[SpeedKey], target: i64) -> f64 {
     let a = lo;
     let b = sorted[0].at.0.min(hi);
     if b > a {
-        acc += (b - a) as f64 * sorted[0].ratio.as_f64();
+        let len = i128::from(b) - i128::from(a);
+        acc += len as f64 * sorted[0].ratio.as_f64();
     }
 
     // Inter-key segments `[sorted[i].at, sorted[i+1].at)`.
@@ -1558,6 +1564,48 @@ mod tests {
         assert!(
             (high - 25.0).abs() < 1.0,
             "turnaround should be near 25 ticks: {high}"
+        );
+    }
+
+    #[test]
+    fn speed_delta_saturates_beyond_the_tick_range() {
+        let mut wrong = Vec::new();
+        for multiplier in [2, -2] {
+            let ratio = Ratio::new(multiplier, 1);
+            let maps = [
+                ("constant", SpeedMap::Constant(ratio)),
+                (
+                    "hold",
+                    SpeedMap::Keyframed {
+                        keys: vec![SpeedKey::new(Tick::ZERO, ratio)],
+                    },
+                ),
+                (
+                    "eased",
+                    SpeedMap::Keyframed {
+                        keys: vec![
+                            SpeedKey::eased(Tick::ZERO, ratio, Interp::Linear),
+                            SpeedKey::new(Tick(50), ratio),
+                        ],
+                    },
+                ),
+            ];
+            for (mode, map) in maps {
+                assert_eq!(map.source_delta(Tick(3)), Tick(i64::from(multiplier) * 3));
+                for input in [i64::MIN, i64::MAX] {
+                    let value = i128::from(input) * i128::from(multiplier);
+                    let expected =
+                        Tick(value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64);
+                    let observed = std::panic::catch_unwind(|| map.source_delta(Tick(input)));
+                    if !observed.is_ok_and(|tick| tick == expected) {
+                        wrong.push((mode, multiplier, input));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "bad speed deltas at tick limits: {wrong:?}"
         );
     }
 
