@@ -1517,7 +1517,9 @@ pub async fn ripple_edit(state: &AppState, args: RippleEditArgs) -> ToolResult {
         ClipEdge::In => (photonic_core::timeline::ClipEdge::Start, clip.start),
         ClipEdge::Out => (photonic_core::timeline::ClipEdge::End, clip.end()),
     };
-    let new_boundary = current_boundary + Tick(args.delta_ticks);
+    let Some(new_boundary) = current_boundary.0.checked_add(args.delta_ticks).map(Tick) else {
+        return map_edit_error(EditError::Overlap);
+    };
     match ops::ripple_trim(
         project,
         seq_id,

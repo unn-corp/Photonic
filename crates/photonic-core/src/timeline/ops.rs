@@ -1909,12 +1909,26 @@ pub fn ripple_trim(
             )
         }
         ClipEdge::Start => {
-            let delta = new_boundary - old_start;
-            let new_dur = c.duration - delta;
-            if new_dur.0 <= 0 {
+            let delta = new_boundary
+                .0
+                .checked_sub(old_start.0)
+                .map(Tick)
+                .ok_or(EditError::NonPositiveDuration)?;
+            let new_dur = c
+                .duration
+                .0
+                .checked_sub(delta.0)
+                .ok_or(EditError::NonPositiveDuration)?;
+            if new_dur <= 0 {
                 return Err(EditError::NonPositiveDuration);
             }
-            let new_source_in = c.source_in + c.speed.source_delta(delta);
+            let new_dur = Tick(new_dur);
+            let new_source_in = c
+                .source_in
+                .0
+                .checked_add(c.speed.source_delta(delta).0)
+                .map(Tick)
+                .ok_or(EditError::InvalidSplit)?;
             if new_source_in.0 < 0 {
                 // Cannot pull the in-point before the start of the source media.
                 return Err(EditError::InvalidSplit);
@@ -1930,6 +1944,22 @@ pub fn ripple_trim(
             )
         }
     };
+
+    // The trimmed clip and every clip that rides the ripple (here and on
+    // sync-locked tracks) must keep a representable end. A negative shift
+    // cannot go below zero: riders start at or after `old_end`.
+    checked_clip_end(trimmed.start, trimmed.duration)?;
+    let rides = |t: &Track| t.id != track_id && t.sync_lock && !t.locked;
+    let riders = t
+        .clips
+        .iter()
+        .filter(|other| other.id != clip_id)
+        .chain(s.tracks().filter(|t| rides(t)).flat_map(|t| t.clips.iter()))
+        .filter(|other| other.start >= old_end);
+    for other in riders {
+        checked_clip_end(other.start, other.duration)
+            .and_then(|end| checked_clip_end(end, shift))?;
+    }
 
     let mut changes = vec![(clip_id, ClipTiming::of(c), trimmed)];
     for other in &t.clips {

@@ -387,6 +387,33 @@ fn moving_and_trimming_reject_unrepresentable_clip_ends() {
             })
             .is_ok_and(|result| result.is_err()),
         ),
+        (
+            "ripple shifting a later clip",
+            std::panic::catch_unwind(|| {
+                // A's new end fits, but B (1000..2000) would end past the ceiling.
+                let long = ClipTiming {
+                    start: Tick::ZERO,
+                    duration: Tick(i64::MAX - 500),
+                    source_in: Tick::ZERO,
+                };
+                ops::edit_clip_timing(p, f.seq, f.vtrack, f.clip_a, long, true)
+            })
+            .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "ripple in-point",
+            std::panic::catch_unwind(|| {
+                ops::ripple_trim(
+                    p,
+                    f.seq,
+                    f.vtrack,
+                    f.clip_b,
+                    ClipEdge::Start,
+                    Tick(i64::MIN),
+                )
+            })
+            .is_ok_and(|result| result.is_err()),
+        ),
     ];
     let failed: Vec<_> = probes
         .into_iter()
