@@ -14,6 +14,8 @@
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use photonic_core::timeline::{SpeedMap, Tick, TICKS_PER_SECOND};
 
@@ -22,13 +24,58 @@ use crate::media::ffmpeg_locate::FfmpegTools;
 
 /// Interleaved-stereo f32 PCM decoded by a persistent ffmpeg process.
 pub struct FfmpegPcmSource {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdout: ChildStdout,
     sample_rate: u32,
     /// Byte staging buffer reused across reads (no per-read allocation).
     buf: Vec<u8>,
     /// End-of-stream reached; subsequent reads return 0 frames.
     finished: bool,
+}
+
+/// Lets the mixer owner interrupt decoder reads before it joins the worker.
+#[derive(Default)]
+pub(crate) struct PcmDecoderControl {
+    cancelled: AtomicBool,
+    children: Mutex<Vec<Weak<Mutex<Child>>>>,
+}
+
+impl PcmDecoderControl {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn spawn_stream(
+        &self,
+        tools: &FfmpegTools,
+        input: &Path,
+        start: Tick,
+        sample_rate: u32,
+        stream: Option<u32>,
+    ) -> Option<FfmpegPcmSource> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let source =
+            FfmpegPcmSource::spawn_stream(tools, input, start, sample_rate, stream).ok()?;
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        // Recheck under the cancellation lock to cover a spawn in flight.
+        if self.is_cancelled() {
+            return None;
+        }
+        children.retain(|child| child.strong_count() > 0);
+        children.push(Arc::downgrade(&source.child));
+        Some(source)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        for child in children.iter().filter_map(Weak::upgrade) {
+            let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = child.kill();
+        }
+    }
 }
 
 /// A seekable, in-memory PCM source evaluated through a clip [`SpeedMap`].
@@ -174,7 +221,7 @@ impl FfmpegPcmSource {
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         Ok(FfmpegPcmSource {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdout,
             sample_rate,
             buf: Vec::new(),
@@ -286,8 +333,9 @@ impl Drop for FfmpegPcmSource {
     fn drop(&mut self) {
         // Kill-on-drop, mirroring decode::sidecar: never leave an ffmpeg
         // writing into a dead pipe.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
