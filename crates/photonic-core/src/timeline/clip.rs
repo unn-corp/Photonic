@@ -521,7 +521,10 @@ impl SpeedMap {
                 let lo = pair[0].at.0.max(0);
                 let hi = pair[1].at.0.min(duration.0);
                 if lo < hi && pair[0].ratio.num.signum() != pair[1].ratio.num.signum() {
-                    samples.push(zero_crossing(pair[0], pair[1]).clamp(lo, hi));
+                    // Asymmetric easing can put the extremal tick on either side.
+                    let crossing = zero_crossing(pair[0], pair[1]);
+                    samples.push((crossing.floor() as i64).clamp(lo, hi));
+                    samples.push((crossing.ceil() as i64).clamp(lo, hi));
                 }
             }
         }
@@ -536,7 +539,7 @@ impl SpeedMap {
     }
 }
 
-fn zero_crossing(a: SpeedKey, b: SpeedKey) -> i64 {
+fn zero_crossing(a: SpeedKey, b: SpeedKey) -> f64 {
     let mut lo = a.at.0 as f64;
     let mut hi = b.at.0 as f64;
     let target = 0.0;
@@ -544,7 +547,7 @@ fn zero_crossing(a: SpeedKey, b: SpeedKey) -> i64 {
         let mid = (lo + hi) * 0.5;
         let ratio = segment_ratio(a, b, mid);
         if (ratio - target).abs() < 1e-12 {
-            return mid.round() as i64;
+            return mid;
         }
         if ratio.signum() == a.ratio.as_f64().signum() {
             lo = mid;
@@ -552,7 +555,7 @@ fn zero_crossing(a: SpeedKey, b: SpeedKey) -> i64 {
             hi = mid;
         }
     }
-    ((lo + hi) * 0.5).round() as i64
+    (lo + hi) * 0.5
 }
 
 fn segment_ratio(a: SpeedKey, b: SpeedKey, at: f64) -> f64 {
@@ -1624,5 +1627,24 @@ mod tests {
             "20-tick range included a later excursion up to {hi}"
         );
         assert!(map.source_delta_range(Tick(100)).1 > 66.0);
+    }
+
+    #[test]
+    fn speed_range_checks_both_ticks_beside_an_asymmetric_reversal() {
+        let ease = Interp::Bezier {
+            out_handle: [0.18, 0.90],
+            in_handle: [0.35, 0.62],
+        };
+        let map = SpeedMap::Keyframed {
+            keys: vec![
+                SpeedKey::eased(Tick::ZERO, Ratio::new(5, 3), ease),
+                SpeedKey::eased(Tick(11), Ratio::new(-14, 5), ease),
+                SpeedKey::new(Tick(22), Ratio::new(5, 4)),
+            ],
+        };
+        let expected = (0..=22)
+            .map(|tick| map.source_delta_f64(Tick(tick)))
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(map.source_delta_range(Tick(22)).0, expected);
     }
 }
