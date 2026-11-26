@@ -141,10 +141,21 @@ struct Entry {
     used: u64,
 }
 type Slot = (SequenceId, usize, Tick);
+
+fn slot_for(key: ChunkKey) -> Slot {
+    (key.sequence, key.format_index, key.start)
+}
+
+struct StatusEntry {
+    key: ChunkKey,
+    used: u64,
+    status: ChunkStatus,
+}
+
 struct CacheInner {
     entries: HashMap<ChunkKey, Entry>,
     retired: Vec<Arc<PreviewChunk>>,
-    current: HashMap<Slot, (u64, ChunkStatus)>,
+    current: HashMap<Slot, StatusEntry>,
     zones: HashMap<SequenceId, Vec<(Tick, Tick)>>,
     clock: u64,
     bytes: u64,
@@ -316,6 +327,20 @@ impl PreviewCache {
                 None
             }
         });
+        // A miss does not change the progress or outcome of a job for the same
+        // content. New content and previously rendered files still revalidate.
+        let current = inner.current.get_mut(&slot_for(signature.key));
+        if let Some(entry) = current.filter(|entry| {
+            hit.is_none()
+                && entry.key == signature.key
+                && !matches!(
+                    entry.status.state,
+                    ChunkState::NotRendered | ChunkState::Rendered
+                )
+        }) {
+            entry.used = clock;
+            return None;
+        }
         put_status(
             &mut inner,
             self.config.max_entries,
@@ -355,11 +380,12 @@ impl PreviewCache {
     /// content-based revalidation, including undo. No eager chunk recompilation.
     pub fn invalidate_sequence(&self, sequence: SequenceId) {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        for (_, status) in inner
+        for entry in inner
             .current
             .values_mut()
-            .filter(|(_, status)| status.sequence == sequence)
+            .filter(|entry| entry.status.sequence == sequence)
         {
+            let status = &mut entry.status;
             status.state = ChunkState::NotRendered;
             status.frame = 0;
             status.error = None;
@@ -389,7 +415,7 @@ impl PreviewCache {
         let mut chunks: Vec<_> = inner
             .current
             .values()
-            .map(|(_, status)| status.clone())
+            .map(|entry| entry.status.clone())
             .collect();
         chunks.sort_by_key(|status| (status.sequence.0, status.format_index, status.start));
         PreviewStatusSnapshot {
@@ -429,12 +455,13 @@ impl PreviewCache {
                 inner.retired.push(entry.chunk);
             }
         }
-        for (_, status) in inner.current.values_mut().filter(|(_, status)| {
+        for entry in inner.current.values_mut().filter(|entry| {
+            let status = &entry.status;
             status.sequence == sequence
                 && range.is_none_or(|(start, end)| status.start < end && start < status.end)
         }) {
-            status.state = ChunkState::NotRendered;
-            status.frame = 0;
+            entry.status.state = ChunkState::NotRendered;
+            entry.status.frame = 0;
         }
         collect_retired(&mut inner);
         keys.len()
@@ -635,16 +662,12 @@ fn put_status(
     error: Option<String>,
 ) {
     inner.clock = inner.clock.wrapping_add(1);
-    let key = (
-        signature.context.sequence,
-        signature.context.format_index,
-        signature.span.start,
-    );
+    let key = slot_for(signature.key);
     if !inner.current.contains_key(&key) && inner.current.len() >= capacity {
         if let Some(oldest) = inner
             .current
             .iter()
-            .min_by_key(|(_, (used, _))| used)
+            .min_by_key(|(_, entry)| entry.used)
             .map(|(key, _)| *key)
         {
             inner.current.remove(&oldest);
@@ -652,9 +675,10 @@ fn put_status(
     }
     inner.current.insert(
         key,
-        (
-            inner.clock,
-            ChunkStatus {
+        StatusEntry {
+            key: signature.key,
+            used: inner.clock,
+            status: ChunkStatus {
                 sequence: signature.context.sequence,
                 format_index: signature.context.format_index,
                 start: signature.span.start,
@@ -664,7 +688,7 @@ fn put_status(
                 total: signature.span.frame_count,
                 error,
             },
-        ),
+        },
     );
 }
 fn retire_entry(inner: &mut CacheInner, key: ChunkKey) {
@@ -719,10 +743,9 @@ fn enforce_budget(inner: &mut CacheInner, config: CacheConfig, incoming: u64) {
             inner.bytes = inner.bytes.saturating_sub(entry.chunk.bytes);
             inner.evicted = inner.evicted.saturating_add(1);
             entry.chunk.retired.store(true, Ordering::Relaxed);
-            let slot = (victim.sequence, victim.format_index, victim.start);
-            if let Some((_, status)) = inner.current.get_mut(&slot) {
-                status.state = ChunkState::NotRendered;
-                status.frame = 0;
+            if let Some(entry) = inner.current.get_mut(&slot_for(victim)) {
+                entry.status.state = ChunkState::NotRendered;
+                entry.status.frame = 0;
             }
         }
     }

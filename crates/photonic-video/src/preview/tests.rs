@@ -303,6 +303,33 @@ fn failed_manifest_write_preserves_chunk_needed_for_eviction() {
 }
 
 #[test]
+fn preview_lookup_misses_preserve_job_status_for_the_same_content() {
+    let root = Temp::new();
+    let cache = open_cache(&root, 8, 1_000_000);
+    let sequence = SequenceId::new();
+    let active = signature(sequence, 0);
+    let edited = signature(sequence, 1);
+    assert_eq!(edited.span, active.span);
+    assert_ne!(edited.key, active.key);
+
+    for (state, frame, message) in [
+        (ChunkState::Queued, 0, None),
+        (ChunkState::Rendering, 12, None),
+        (ChunkState::Paused, 12, None),
+        (ChunkState::Failed, 0, Some("encoder stopped".into())),
+        (ChunkState::Cancelled, 0, None),
+    ] {
+        cache.set_status(&active, state, frame, message);
+        let before = cache.status().chunks;
+        assert!(cache.lookup(&active).is_none());
+        assert_eq!(cache.status().chunks, before);
+    }
+
+    assert!(cache.lookup(&edited).is_none());
+    assert_eq!(cache.status().chunks[0].state, ChunkState::NotRendered);
+}
+
+#[test]
 fn changed_media_is_never_served_and_corrupt_reopen_can_rebuild() {
     let root = Temp::new();
     let sig = signature(SequenceId::new(), 0);
