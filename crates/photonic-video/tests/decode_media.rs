@@ -476,9 +476,10 @@ fn decoder_reads_the_same_video_stream_as_the_frame_index() {
 fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
     let tools = tools_or_skip!();
     let path = std::env::temp_dir().join(format!("photonic-cfr-gaps-{}.mp4", uuid::Uuid::new_v4()));
-    // A 30 fps source missing frames 10–12, with luma 16 + 7n identifying
-    // source frame n. Probing treats sources like this as constant rate, so
-    // the reader derives each timestamp from its output ordinal.
+    // A 14 s, 30 fps source missing frames 10–12, with luma 16 + 7n
+    // identifying source frame n below 32. Its average rate stays within the
+    // probe's CFR tolerance, so the reader derives each timestamp from its
+    // output ordinal. MP4's default variable-rate muxing keeps the gap.
     let output = std::process::Command::new(&tools.ffmpeg)
         .args([
             "-nostdin",
@@ -487,11 +488,9 @@ fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
             "-f",
             "lavfi",
             "-i",
-            "nullsrc=size=64x48:rate=30:duration=1,format=yuv420p,geq=lum='16+N*7':cb=128:cr=128",
+            "nullsrc=size=64x48:rate=30:duration=14,format=yuv420p,geq=lum='16+mod(N,32)*7':cb=128:cr=128",
             "-vf",
             "select='not(between(n,10,12))'",
-            "-fps_mode",
-            "passthrough",
             "-c:v",
             "mpeg4",
             "-q:v",
@@ -514,7 +513,10 @@ fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let rate = FrameRate { num: 30, den: 1 };
+    let details = probe_details(&tools, &path).unwrap();
+    assert!(!details.is_vfr, "a few dropped frames still probe as CFR");
+    let rate = details.probe.video.unwrap().frame_rate;
+    assert_eq!(rate, FrameRate { num: 30, den: 1 });
     let keyframes = KeyframeIndex::build(&tools, &path).unwrap();
     let mut decoder = DecodeSource::new(
         tools,
