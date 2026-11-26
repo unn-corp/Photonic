@@ -11,6 +11,7 @@
 //! (`-ac 2` downmixes/duplicates) at the mixer's configured sample rate
 //! (`-ar`), so the mixer never resamples or remaps beyond `ChannelMap`.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -209,10 +210,8 @@ impl FfmpegPcmSource {
         stream: Option<u32>,
     ) -> std::io::Result<FfmpegPcmSource> {
         let mut command = Command::new(&tools.ffmpeg);
-        for a in pcm_ffmpeg_argv(input, start, sample_rate, stream) {
-            command.arg(a);
-        }
         command
+            .args(pcm_ffmpeg_args(input, start, sample_rate, stream))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -230,13 +229,25 @@ impl FfmpegPcmSource {
     }
 }
 
-/// Pure argv for the PCM sidecar (K-D3). Tested without spawning ffmpeg.
+/// Displayable arguments for the PCM sidecar (K-D3).
 pub fn pcm_ffmpeg_argv(
     input: &Path,
     start: Tick,
     sample_rate: u32,
     stream: Option<u32>,
 ) -> Vec<String> {
+    pcm_ffmpeg_args(input, start, sample_rate, stream)
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn pcm_ffmpeg_args(
+    input: &Path,
+    start: Tick,
+    sample_rate: u32,
+    stream: Option<u32>,
+) -> Vec<OsString> {
     // Input seeking alone may snap compressed audio to the next packet on
     // some FFmpeg builds (notably IMA ADPCM on Ubuntu), skipping a short sound
     // immediately after the requested mark. Seek at most one second early for
@@ -249,16 +260,16 @@ pub fn pcm_ffmpeg_argv(
         "error".into(),
         "-accurate_seek".into(),
         "-ss".into(),
-        format!("{:.6}", coarse.as_seconds_f64()),
+        format!("{:.6}", coarse.as_seconds_f64()).into(),
         "-i".into(),
-        input.display().to_string(),
+        input.as_os_str().to_owned(),
         "-ss".into(),
-        format!("{:.6}", residual.as_seconds_f64()),
+        format!("{:.6}", residual.as_seconds_f64()).into(),
     ];
     // K-D3: pick a specific demuxed audio stream when the clip asks for one.
     if let Some(n) = stream {
         args.push("-map".into());
-        args.push(format!("0:a:{n}"));
+        args.push(format!("0:a:{n}").into());
     }
     args.extend([
         "-vn".into(),
@@ -267,7 +278,7 @@ pub fn pcm_ffmpeg_argv(
         "-ac".into(),
         "2".into(),
         "-ar".into(),
-        sample_rate.to_string(),
+        sample_rate.to_string().into(),
         "-f".into(),
         "f32le".into(),
         "pipe:1".into(),
@@ -378,6 +389,32 @@ mod tests {
         assert_eq!(seek2, Tick(200));
         let seek3 = source_seek_with_offset(Tick(0), Tick(200), Tick(100), Tick(0));
         assert_eq!(seek3, Tick(100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pcm_decoder_opens_a_native_non_utf8_filename() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let Some(tools) = locate_for_test() else {
+            eprintln!("ffmpeg not found — skipping FfmpegPcmSource test");
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("photonic-pcm-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let input = directory.join(OsStr::from_bytes(b"source_\xff.wav"));
+        let audio = crate::captions::wav::write_pcm16_wav(48_000, 1, &[16_384; 4_096]);
+        std::fs::write(&input, audio).unwrap();
+        let mut source = FfmpegPcmSource::spawn(&tools, &input, Tick::ZERO, 48_000).unwrap();
+        let mut samples = [0.0; 128];
+        let frames = source.read(&mut samples, 64);
+        drop(source);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(frames, 64);
+        assert!(samples.iter().all(|sample| *sample > 0.1));
     }
 
     #[test]
