@@ -529,7 +529,8 @@ fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
         SharedRing::preview(),
     );
     // Slot 11 decodes across the gap from keyframe 5 and must repeat frame 9.
-    let decoded: Vec<_> = [(11, 9), (20, 20)]
+    // Slot 15 starts from keyframe 13, probed as 0.433333 s (just below 13/30).
+    let decoded: Vec<_> = [(11, 9), (15, 15), (20, 20)]
         .into_iter()
         .map(|(slot, source)| (slot, source, decoder.seek(rate.frame_start(slot))))
         .collect();
