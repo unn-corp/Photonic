@@ -153,10 +153,15 @@ mod tests {
     }
 
     #[test]
-    fn soft_clock_keeps_wall_time_over_an_hour() {
+    fn soft_clock_keeps_fractional_ticks_over_a_minute() {
         use std::time::Duration;
 
-        let anchor = Instant::now() - Duration::from_secs(3600);
+        // Truncating to 705 ticks per microsecond loses 36M ticks per minute.
+        // Windows cannot represent an Instant before boot, so skip when the
+        // machine has been up for less than a minute.
+        let Some(anchor) = Instant::now().checked_sub(Duration::from_secs(60)) else {
+            return;
+        };
         let clock = PlaybackClock {
             origin: Tick::from_seconds(10),
             mode: ClockMode::Soft { anchor },
