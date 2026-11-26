@@ -303,6 +303,7 @@ pub fn write_stems_for_export(
         DEFAULT_EXPORT_SAMPLE_RATE
     };
     let mut written = Vec::new();
+    let mut used_paths = HashSet::new();
     for track in seq
         .audio_tracks
         .iter()
@@ -317,7 +318,15 @@ pub fn write_stems_for_export(
             loudness,
             Some(track.id),
         )?;
-        let path = stem_output_path(main_out, &track.name);
+        let base = stem_output_path(main_out, &track.name);
+        let mut path = base.clone();
+        let mut suffix = 2;
+        while !used_paths.insert(path.as_os_str().to_ascii_lowercase()) {
+            let mut name = base.file_stem().unwrap_or_default().to_owned();
+            name.push(format!("-{suffix}.wav"));
+            path.set_file_name(name);
+            suffix += 1;
+        }
         write_stem_wav(&path, &pcm, sample_rate)?;
         written.push(path);
     }
@@ -491,6 +500,45 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stem_exports_keep_tracks_with_colliding_names_separate() {
+        let (mut project, sid) = empty_audio_seq();
+        let seq = project.sequences.get_mut(&sid).unwrap();
+        seq.audio_tracks = ["Voice Over", "Voice/Over", "voice_over-2", "Music"]
+            .map(|name| Track::new(TrackKind::Audio, name))
+            .into();
+
+        let dir =
+            std::env::temp_dir().join(format!("photonic-stem-collisions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let main = dir.join("show.mp4");
+        let paths = write_stems_for_export(
+            &project,
+            sid,
+            Tick::ZERO,
+            Tick::from_seconds(1),
+            &main,
+            None,
+            None,
+        )
+        .unwrap();
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(paths.len(), 4);
+        assert_eq!(count, 4, "each track needs its own output file");
+        let names: HashSet<_> = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            names.len(),
+            4,
+            "names must also be distinct on case-insensitive volumes"
+        );
+        assert_eq!(paths[3], stem_output_path(&main, "Music"));
     }
 
     #[test]
