@@ -498,32 +498,29 @@ impl PreviewCache {
             retire_entry(&mut inner, staging.signature.key);
             collect_retired(&mut inner);
         }
-        if inner.bytes.saturating_add(external).saturating_add(size) > self.config.max_bytes {
-            // A reader can pin enough bytes that even evicting every unleased
-            // entry would fail admission. Preserve those entries in that case.
-            let reclaimable = inner
+        if inner.bytes.saturating_add(external).saturating_add(size) > self.config.max_bytes
+            || inner.entries.len() >= self.config.max_entries
+        {
+            // Check admission without discarding reusable chunks. Pinned files
+            // count toward the budget until their last reader releases them.
+            let (reclaimable_bytes, reclaimable_entries) = inner
                 .entries
                 .values()
                 .filter(|entry| Arc::strong_count(&entry.chunk) == 1)
-                .map(|entry| entry.chunk.bytes)
-                .fold(0, u64::saturating_add);
+                .fold((0u64, 0usize), |(bytes, count), entry| {
+                    (bytes.saturating_add(entry.chunk.bytes), count + 1)
+                });
             if inner
                 .bytes
-                .saturating_sub(reclaimable)
+                .saturating_sub(reclaimable_bytes)
                 .saturating_add(external)
                 .saturating_add(size)
                 > self.config.max_bytes
+                || inner.entries.len() - reclaimable_entries >= self.config.max_entries
             {
                 inner.rejected = inner.rejected.saturating_add(1);
                 return Err(PreviewError::BudgetExhausted);
             }
-        }
-        enforce_budget(&mut inner, self.config, size);
-        if inner.bytes.saturating_add(external).saturating_add(size) > self.config.max_bytes
-            || inner.entries.len() >= self.config.max_entries
-        {
-            inner.rejected = inner.rejected.saturating_add(1);
-            return Err(PreviewError::BudgetExhausted);
         }
         let manifest_path = staging.directory.join("manifest.json");
         let mut file = std::fs::File::create(&manifest_path)?;
@@ -549,13 +546,23 @@ impl PreviewCache {
                 "unindexed preview destination already exists".into(),
             ));
         }
-        rename_directory_for_publication(&staging.directory, &destination)?;
         let path = destination.join(
             staging
                 .path
                 .file_name()
                 .ok_or_else(|| PreviewError::Invalid("preview path has no filename".into()))?,
         );
+        rename_directory_for_publication(&staging.directory, &destination)?;
+        // The replacement is on disk. Evict only now, after staging, flushing,
+        // cancellation checks, and publication have succeeded.
+        enforce_budget(&mut inner, self.config, size);
+        if inner.bytes.saturating_add(external).saturating_add(size) > self.config.max_bytes
+            || inner.entries.len() >= self.config.max_entries
+        {
+            inner.rejected = inner.rejected.saturating_add(1);
+            std::fs::remove_dir_all(&destination)?;
+            return Err(PreviewError::BudgetExhausted);
+        }
         let chunk = Arc::new(PreviewChunk {
             signature: staging.signature.clone(),
             path,

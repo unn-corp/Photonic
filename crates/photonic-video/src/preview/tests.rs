@@ -277,6 +277,32 @@ fn rejected_publication_preserves_other_chunks_when_a_reader_pins_bytes() {
 }
 
 #[test]
+fn failed_manifest_write_preserves_chunk_needed_for_eviction() {
+    let root = Temp::new();
+    let cache = open_cache(&root, 1, 1_000_000);
+    let sequence = SequenceId::new();
+    let original = signature(sequence, 0);
+    let replacement = signature(sequence, 30);
+    drop(insert(&cache, original.clone(), b"original"));
+
+    let staged = cache.staging(replacement.clone()).unwrap();
+    std::fs::write(&staged.path, b"replacement").unwrap();
+    std::fs::create_dir(staged.directory.join("manifest.json")).unwrap();
+    let staging_dir = staged.directory.clone();
+    assert!(cache.commit(staged, &AtomicBool::new(false)).is_err());
+    assert!(!staging_dir.exists());
+    assert_eq!(cache.status().cache.evicted, 0);
+    let retained = cache.lookup(&original).unwrap();
+    assert_eq!(std::fs::read(retained.path()).unwrap(), b"original");
+    drop(retained);
+
+    drop(insert(&cache, replacement.clone(), b"replacement"));
+    assert_eq!(cache.status().cache.evicted, 1);
+    assert!(cache.lookup(&original).is_none());
+    assert!(cache.lookup(&replacement).is_some());
+}
+
+#[test]
 fn changed_media_is_never_served_and_corrupt_reopen_can_rebuild() {
     let root = Temp::new();
     let sig = signature(SequenceId::new(), 0);
