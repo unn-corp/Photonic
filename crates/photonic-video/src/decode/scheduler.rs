@@ -113,6 +113,8 @@ impl DecodeSource {
             // Probed keyframe times are rounded to microseconds, so 4/30 s
             // arrives as 0.133333. FFmpeg's seek starts on the nearest frame,
             // so a floor would label every following frame one too early.
+            // Known limit: a time base finer than 1 µs can put the rounded
+            // `-ss` just past the keyframe, which FFmpeg then skips.
             PtsKind::Cfr(rate) => {
                 let half_frame = rate.ticks_per_frame().0.max(1) / 2;
                 rate.frame_at(Tick(kf_tick.0.saturating_add(half_frame)))
