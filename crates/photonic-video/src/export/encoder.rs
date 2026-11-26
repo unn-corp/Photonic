@@ -1614,7 +1614,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn encoder_publishes_to_native_non_utf8_filename() {
+    fn encoder_preserves_native_output_paths() {
         use std::ffi::OsStr;
         use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
 
@@ -1622,9 +1622,11 @@ mod tests {
             std::env::temp_dir().join(format!("photonic-encoder-path-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
         let executable = directory.join("encoder.sh");
+        let capture_only = directory.join("encoder.sh.capture-only");
+        let captured = directory.join("encoder.sh.argument");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nfor out; do :; done\nprintf complete > \"$out\"\n",
+            "#!/bin/sh\nfor out; do :; done\nprintf '%s' \"$out\" > \"$0.argument\"\nif [ ! -f \"$0.capture-only\" ]; then printf complete > \"$out\"; fi\n",
         )
         .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1636,6 +1638,26 @@ mod tests {
         preset.audio = None;
         let mut spec = spec(&preset);
         spec.out_path = directory.join(OsStr::from_bytes(b"export_\xff.mp4"));
+        // Capture the real process argument without opening a file at it.
+        std::fs::write(&capture_only, b"").unwrap();
+        let process = EncoderProcess::spawn(&tools, &caps_with(&["libx264"]), &spec, None).unwrap();
+        let native_staging_path = process.output.path.clone();
+        assert_eq!(native_staging_path.file_name(), spec.out_path.file_name());
+        assert!(matches!(process.finish(), Err(EncodeError::Io(_))));
+        assert_eq!(
+            std::fs::read(&captured).unwrap(),
+            native_staging_path.as_os_str().as_bytes()
+        );
+        std::fs::remove_file(capture_only).unwrap();
+
+        match std::fs::File::create_new(&spec.out_path) {
+            Ok(_) => {}
+            // Exercise publication on filesystems that require Unicode names.
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                spec.out_path = directory.join("export é.mp4");
+            }
+            Err(error) => panic!("could not create test output: {error}"),
+        }
         let process = EncoderProcess::spawn(&tools, &caps_with(&["libx264"]), &spec, None).unwrap();
         let staged = process.output.directory.clone();
         let result = process.finish();

@@ -393,7 +393,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pcm_decoder_opens_a_native_non_utf8_filename() {
+    fn pcm_decoder_preserves_native_input_paths() {
         use std::ffi::OsStr;
         use std::os::unix::ffi::OsStrExt;
 
@@ -404,9 +404,23 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("photonic-pcm-path-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&directory).unwrap();
-        let input = directory.join(OsStr::from_bytes(b"source_\xff.wav"));
+        let native = directory.join(OsStr::from_bytes(b"source_\xff.wav"));
+        let args = pcm_ffmpeg_args(&native, Tick::ZERO, 48_000, None);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-i" && pair[1] == native.as_os_str()));
+
         let audio = crate::captions::wav::write_pcm16_wav(48_000, 1, &[16_384; 4_096]);
-        std::fs::write(&input, audio).unwrap();
+        let input = match std::fs::write(&native, &audio) {
+            Ok(()) => native,
+            // Filesystems such as APFS require valid Unicode filenames.
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                let path = directory.join("source é.wav");
+                std::fs::write(&path, &audio).unwrap();
+                path
+            }
+            Err(error) => panic!("could not write test audio: {error}"),
+        };
         let mut source = FfmpegPcmSource::spawn(&tools, &input, Tick::ZERO, 48_000).unwrap();
         let mut samples = [0.0; 128];
         let frames = source.read(&mut samples, 64);
