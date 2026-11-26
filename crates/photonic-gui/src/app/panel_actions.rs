@@ -5959,11 +5959,11 @@ impl PhotonicApp {
                             else {
                                 continue 'actions;
                             };
-                            const GOLDEN_ANGLE: f64 =
-                                std::f64::consts::TAU * (1.0 - 1.0 / 1.618_033_988_749_895);
+                            let golden_ratio = (1.0 + 5.0_f64.sqrt()) / 2.0;
+                            let golden_angle = std::f64::consts::TAU * (1.0 - 1.0 / golden_ratio);
                             for i in 0..count {
                                 let r = spread * ((i as f64 + 0.5) / count as f64).sqrt();
-                                let theta = i as f64 * GOLDEN_ANGLE;
+                                let theta = i as f64 * golden_angle;
                                 let ix = x + r * theta.cos();
                                 let iy = y + r * theta.sin();
                                 let mut instance = master.clone();
