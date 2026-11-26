@@ -330,6 +330,26 @@ fn preview_lookup_misses_preserve_job_status_for_the_same_content() {
 }
 
 #[test]
+fn evicting_an_old_preview_variant_keeps_the_current_one_rendered() {
+    let root = Temp::new();
+    let cache = open_cache(&root, 2, 1_000_000);
+    let sequence = SequenceId::new();
+    let old = signature(sequence, 0);
+    let current = signature(sequence, 1);
+    let next = signature(sequence, 30);
+    assert_eq!(old.span, current.span);
+    drop(insert(&cache, old, b"old"));
+    drop(insert(&cache, current.clone(), b"current"));
+    drop(insert(&cache, next, b"next"));
+
+    let snapshot = cache.status();
+    assert_eq!(snapshot.cache.evicted, 1);
+    assert_eq!(snapshot.chunks[0].start, current.span.start);
+    assert_eq!(snapshot.chunks[0].state, ChunkState::Rendered);
+    assert!(cache.lookup(&current).is_some());
+}
+
+#[test]
 fn changed_media_is_never_served_and_corrupt_reopen_can_rebuild() {
     let root = Temp::new();
     let sig = signature(SequenceId::new(), 0);

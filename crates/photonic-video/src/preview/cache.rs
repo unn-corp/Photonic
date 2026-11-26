@@ -743,7 +743,11 @@ fn enforce_budget(inner: &mut CacheInner, config: CacheConfig, incoming: u64) {
             inner.bytes = inner.bytes.saturating_sub(entry.chunk.bytes);
             inner.evicted = inner.evicted.saturating_add(1);
             entry.chunk.retired.store(true, Ordering::Relaxed);
-            if let Some(entry) = inner.current.get_mut(&slot_for(victim)) {
+            if let Some(entry) = inner
+                .current
+                .get_mut(&slot_for(victim))
+                .filter(|entry| entry.key == victim && entry.status.state == ChunkState::Rendered)
+            {
                 entry.status.state = ChunkState::NotRendered;
                 entry.status.frame = 0;
             }
