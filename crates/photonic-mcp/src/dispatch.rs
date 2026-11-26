@@ -3748,6 +3748,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_document_template_preserves_guide_metadata_and_geometry() {
+        let state = test_state();
+        let mut standard = Guide::new(GuideOrientation::Horizontal, 24.5);
+        standard.color = Some([0.2, 0.4, 0.8, 0.9]);
+        standard.locked = true;
+
+        let mut angled = Guide::new(GuideOrientation::Vertical, -100.0);
+        angled.color = Some([0.9, 0.3, 0.1, 0.75]);
+        angled.locked = true;
+        angled.angle_degrees = Some(37.5);
+        angled.position_x = 123.25;
+        angled.position_y = 45.75;
+
+        let template_guides = vec![standard.clone(), angled.clone()];
+        let mut template = Document::new("guide template", 640.0, 480.0);
+        template.guides = template_guides.clone();
+
+        let result = dispatch_tool(
+            &state,
+            "apply_document_template",
+            json!({ "template_json": template.to_json().unwrap() }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let doc = state.document.lock().await;
+        assert_eq!(doc.guides.len(), template_guides.len());
+        for (applied, source) in doc.guides.iter().zip(template_guides.iter()) {
+            assert_ne!(applied.id, source.id);
+            assert_eq!(applied.orientation, source.orientation);
+            assert_eq!(applied.position, source.position);
+            assert_eq!(applied.color, source.color);
+            assert_eq!(applied.locked, source.locked);
+            assert_eq!(applied.angle_degrees, source.angle_degrees);
+            assert_eq!(applied.position_x, source.position_x);
+            assert_eq!(applied.position_y, source.position_y);
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_document_template_deduplicates_standard_and_angled_guides_separately() {
+        let state = test_state();
+        let mut existing_standard = Guide::new(GuideOrientation::Horizontal, 12.0);
+        existing_standard.color = Some([0.1, 0.2, 0.3, 1.0]);
+
+        let mut existing_angled = Guide::new(GuideOrientation::Vertical, -50.0);
+        existing_angled.angle_degrees = Some(30.0);
+        existing_angled.position_x = 40.0;
+        existing_angled.position_y = 50.0;
+
+        {
+            let mut doc = state.document.lock().await;
+            doc.guides.extend([existing_standard, existing_angled]);
+        }
+
+        let mut duplicate_standard = Guide::new(GuideOrientation::Horizontal, 12.25);
+        duplicate_standard.color = Some([0.9, 0.9, 0.9, 1.0]);
+
+        let mut duplicate_angled = Guide::new(GuideOrientation::Vertical, 999.0);
+        duplicate_angled.angle_degrees = Some(30.25);
+        duplicate_angled.position_x = 40.25;
+        duplicate_angled.position_y = 50.25;
+
+        // This line intentionally shares the standard guide's orientation and
+        // position, but its angle/origin make it a distinct angled guide.
+        let mut distinct_angled = Guide::new(GuideOrientation::Horizontal, 12.25);
+        distinct_angled.angle_degrees = Some(45.0);
+        distinct_angled.position_x = 80.0;
+        distinct_angled.position_y = 90.0;
+
+        let distinct_standard = Guide::new(GuideOrientation::Vertical, 37.0);
+        let template_guides = vec![
+            duplicate_standard,
+            duplicate_angled,
+            distinct_angled.clone(),
+            distinct_standard.clone(),
+        ];
+        let mut template = Document::new("guide template", 640.0, 480.0);
+        template.guides = template_guides;
+
+        let result = dispatch_tool(
+            &state,
+            "apply_document_template",
+            json!({ "template_json": template.to_json().unwrap() }),
+        )
+        .await
+        .unwrap();
+        assert_ne!(result.is_error, Some(true));
+
+        let doc = state.document.lock().await;
+        assert_eq!(doc.guides.len(), 4);
+        assert!(doc.guides.iter().any(|guide| {
+            guide.angle_degrees == distinct_angled.angle_degrees
+                && guide.position_x == distinct_angled.position_x
+                && guide.position_y == distinct_angled.position_y
+        }));
+        assert!(doc.guides.iter().any(|guide| {
+            guide.angle_degrees.is_none()
+                && guide.orientation == distinct_standard.orientation
+                && guide.position == distinct_standard.position
+        }));
+    }
+
+    #[tokio::test]
     async fn undo_and_redo_report_mutation_only_when_history_moves() {
         let state = test_state();
 
