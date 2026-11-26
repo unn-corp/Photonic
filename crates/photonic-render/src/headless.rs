@@ -287,7 +287,7 @@ impl HeadlessRenderer {
         let include_artboard_bg = opts.background == ExportBackground::Artboard;
         let mut view = CanvasView::new(w, h);
         if let Some((rx, ry, rw, rh)) = opts.region {
-            view.fit_to_rect(rx, ry, rw, rh);
+            view.fit_to_rect_exact(rx, ry, rw, rh);
         } else if opts.crop_to_content {
             // The crop bounds require geometry, but the final geometry must use
             // the resulting view scale. This preliminary pass is only for bounds.
@@ -296,7 +296,7 @@ impl HeadlessRenderer {
             if let Some((cx, cy, cw, ch)) =
                 content_bounds(&bounds_verts, include_artboard_bg, document)
             {
-                view.fit_to_rect(cx, cy, cw, ch);
+                view.fit_to_rect_exact(cx, cy, cw, ch);
             } else {
                 view.fit_to_rect(0.0, 0.0, document.width, document.height);
             }
@@ -2051,6 +2051,57 @@ mod blend_tests {
             force_fallback_adapter: false,
         }))?;
         Some(pollster::block_on(HeadlessRenderer::new()))
+    }
+
+    #[test]
+    fn explicit_raster_crop_fills_output_without_canvas_margins() {
+        let Some(renderer) = try_renderer() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        let mut doc = Document::new("Crop", 400.0, 125.0);
+        let layer = doc.layer_order[0];
+        let shape = PathNode::new(PathData::rect(12.0, 17.0, 257.0, 39.0));
+        doc.add_node(
+            SceneNode::new("Black rectangle", layer, SceneNodeKind::Path(shape)),
+            Some(layer),
+        );
+
+        let check_crop = |width: u32, opts: &ExportOptions| {
+            let (pixels, w, h) = renderer.render_rgba_with_opts(&doc, width, 39, opts);
+            assert_eq!((w, h), (width, 39));
+            assert_eq!(pixels.len(), (w * h * 4) as usize);
+            let outside = pixels
+                .chunks_exact(4)
+                .filter(|p| *p != [0, 0, 0, 255])
+                .count();
+            assert_eq!(
+                outside, 0,
+                "{outside} pixels fell outside the shape at {w}×{h}"
+            );
+        };
+        // Include widths on either side of the renderer's aligned row stride.
+        for width in [63, 64, 65, 137, 257] {
+            check_crop(
+                width,
+                &ExportOptions {
+                    background: ExportBackground::Transparent,
+                    region: Some((12.0, 17.0, f64::from(width), 39.0)),
+                    ..Default::default()
+                },
+            );
+        }
+        check_crop(
+            257,
+            &ExportOptions {
+                background: ExportBackground::Transparent,
+                crop_to_content: true,
+                ..Default::default()
+            },
+        );
     }
 
     #[test]
