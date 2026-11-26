@@ -522,14 +522,14 @@ pub async fn spray_symbol_instances(
     };
 
     // Golden-angle spiral: even distribution of N points within a disk.
-    let golden_ratio = (1.0 + 5.0_f64.sqrt()) / 2.0;
-    let golden_angle = std::f64::consts::TAU * (1.0 - 1.0 / golden_ratio);
+    // TAU * (1 - 1/φ), written out so it stays bit-identical to the old expression.
+    const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653_5;
     let mut instance_ids = Vec::with_capacity(count);
     let mut history = state.history.lock().await;
 
     for i in 0..count {
         let r = spread * ((i as f64 + 0.5) / count as f64).sqrt();
-        let theta = i as f64 * golden_angle;
+        let theta = i as f64 * GOLDEN_ANGLE;
         let ix = args.x + r * theta.cos();
         let iy = args.y + r * theta.sin();
 
