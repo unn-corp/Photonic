@@ -24,7 +24,8 @@ pub mod trace;
 pub mod warp;
 
 pub use image::{
-    luma, validate_raster_dimensions, RasterImage, MAX_RASTER_DIMENSION, MAX_RASTER_PIXELS,
+    luma, validate_raster_dimensions, RasterImage, MAX_RASTER_DIMENSION, MAX_RASTER_ENCODED_BYTES,
+    MAX_RASTER_PIXELS,
 };
 pub use mask::Mask;
 

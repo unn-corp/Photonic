@@ -18,6 +18,7 @@ pub mod auth;
 pub mod catalog;
 pub mod handlers;
 pub mod path_guard;
+pub(crate) mod procedural_work;
 pub mod protocol;
 pub mod schema_gen;
 pub mod server;

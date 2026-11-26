@@ -21,6 +21,7 @@ pub mod pipeline;
 pub mod renderer;
 pub mod scopes;
 pub mod tessellator;
+mod text_layout;
 pub mod text_outline;
 pub mod text_path;
 pub mod video;
@@ -45,6 +46,7 @@ pub use renderer::PhotonicRenderer;
 pub use scopes::{
     scopes_from_pixels_cpu, scopes_from_texture_gpu, Histogram, Scopes, Vectorscope, Waveform,
 };
+pub use text_layout::TextLayoutOptions;
 pub use text_outline::{
     layout_text_flat, outline_document_text, resolve_document_font, ResolvedFace,
 };
