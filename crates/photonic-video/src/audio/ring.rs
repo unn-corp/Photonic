@@ -73,8 +73,9 @@ impl RingProducer {
         self.inner.slots() / (BLOCK_FRAMES * CHANNELS)
     }
 
+    /// True when the ring cannot accept another complete block.
     pub fn is_full(&self) -> bool {
-        self.inner.is_full()
+        self.free_blocks() == 0
     }
 }
 
@@ -184,5 +185,27 @@ mod tests {
         assert_eq!(prod.free_blocks(), RING_BLOCKS);
         prod.push_block(&one_block(0.0));
         assert_eq!(prod.free_blocks(), RING_BLOCKS - 1);
+    }
+
+    #[test]
+    fn a_partial_callback_does_not_free_a_producer_block() {
+        let (mut producer, mut consumer, xruns) = audio_ring();
+        let block = one_block(1.0);
+        for _ in 0..RING_BLOCKS {
+            assert!(producer.push_block(&block));
+        }
+        let mut half_block = [0.0; BLOCK_FRAMES * CHANNELS / 2];
+        consumer.fill(&mut half_block);
+        assert_eq!(producer.free_blocks(), 0);
+        assert!(
+            producer.is_full(),
+            "producer needs space for a complete block"
+        );
+
+        consumer.fill(&mut half_block);
+        assert_eq!(producer.free_blocks(), 1);
+        assert!(!producer.is_full());
+        assert!(producer.push_block(&block));
+        assert_eq!(xruns.overrun_blocks(), 0);
     }
 }
