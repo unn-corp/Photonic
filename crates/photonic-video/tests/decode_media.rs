@@ -384,6 +384,94 @@ fn seek_uses_the_container_start_as_its_origin() {
     assert_eq!(index.pts.len(), 24);
 }
 
+#[test]
+fn decoder_reads_the_same_video_stream_as_the_frame_index() {
+    let tools = tools_or_skip!();
+    let path =
+        std::env::temp_dir().join(format!("photonic-two-video-{}.mp4", uuid::Uuid::new_v4()));
+    let output = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:size=16x16:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=48x32:rate=24",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-disposition:v:0",
+            "0",
+            "-disposition:v:1",
+            "default",
+            "-t",
+            "0.5",
+            "-c:v",
+            "mpeg4",
+            "-threads",
+            "1",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first_stream = std::process::Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(&path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(first_stream.status.success());
+    let video = probe_details(&tools, &path).unwrap().probe.video.unwrap();
+    let keyframes = KeyframeIndex::build(&tools, &path).unwrap();
+    let decoded = {
+        let mut decoder = DecodeSource::new(
+            tools,
+            SourceParams {
+                input: path.clone(),
+                width: video.width,
+                height: video.height,
+                pix_fmt: PixFmt::Yuv420p,
+                pts_kind: PtsKind::Cfr(video.frame_rate),
+                keyframes,
+            },
+            SharedRing::preview(),
+        );
+        decoder.seek(Tick::ZERO)
+    };
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!((video.width, video.height), (16, 16));
+    let frame = decoded.expect("the indexed stream can be decoded");
+    let DecodedPlanes::Yuv420 { data, .. } = &frame.planes else {
+        panic!("expected YUV420 frame");
+    };
+    assert!(
+        data == &first_stream.stdout,
+        "decoded pixels must come from the indexed video track"
+    );
+}
+
 // ── 5. Alpha: yuva path, alpha ramps left→right (alpha_gradient.mov) ─────────
 
 #[test]

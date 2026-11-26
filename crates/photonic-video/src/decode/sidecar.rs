@@ -77,6 +77,9 @@ impl Sidecar {
             .arg("-i")
             .arg(&cfg.input)
             .args([
+                // Probe dimensions and frame indexes refer to this stream.
+                "-map",
+                "0:v:0",
                 "-an",
                 // FrameReader assigns one source timestamp to each raw frame.
                 "-fps_mode",
