@@ -78,6 +78,11 @@ impl Sidecar {
             .arg(&cfg.input)
             .args([
                 "-an",
+                // FrameReader assigns one source timestamp to each raw frame.
+                "-fps_mode",
+                "passthrough",
+                "-enc_time_base",
+                "1:1000000",
                 "-f",
                 "rawvideo",
                 "-pix_fmt",

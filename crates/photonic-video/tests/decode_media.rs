@@ -253,14 +253,34 @@ fn decode_vfr_is_pts_true_via_table() {
     let pts_index = Arc::new(PtsIndex::build(&tools, &path).expect("pts index"));
     let kf_index = KeyframeIndex::build(&tools, &path).expect("keyframe index");
 
-    // Target a frame inside the 30fps region (frame 150).
-    let target = pts_index.pts[150];
-    // The pts-true expectation: the smallest table entry >= target.
-    let expected = *pts_index
-        .pts
-        .iter()
-        .find(|t| **t >= target)
-        .expect("a frame at/after target");
+    // Decode sequentially as the pixel reference. A seek can report the
+    // expected timestamp while consuming the wrong frame from the pipe.
+    let reference = std::process::Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(&path)
+        .args([
+            "-an",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "1:1000000",
+            "-threads",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let frame_bytes = PixFmt::Yuv420p.frame_bytes(320, 180);
+    assert_eq!(reference.stdout.len(), pts_index.pts.len() * frame_bytes);
 
     let params = SourceParams {
         input: path,
@@ -271,13 +291,19 @@ fn decode_vfr_is_pts_true_via_table() {
         keyframes: kf_index,
     };
     let mut src = DecodeSource::new(tools, params, SharedRing::preview());
-    let frame = src.seek(target).expect("VFR seek");
-
-    assert_eq!(
-        frame.pts, expected,
-        "VFR decode assigns pts from the ground-truth table (pts-true), not a constant rate"
-    );
-    assert!(frame.pts >= target);
+    for ordinal in [150, pts_index.pts.len() - 1] {
+        let target = pts_index.pts[ordinal];
+        let frame = src.seek(target).expect("VFR seek");
+        assert_eq!(frame.pts, target, "VFR seeks use the frame timestamp table");
+        let DecodedPlanes::Yuv420 { data, .. } = &frame.planes else {
+            panic!("expected YUV420 frame");
+        };
+        let expected = &reference.stdout[ordinal * frame_bytes..(ordinal + 1) * frame_bytes];
+        assert!(
+            data == expected,
+            "VFR seek returned the wrong pixels for frame {ordinal}"
+        );
+    }
 }
 
 #[test]
