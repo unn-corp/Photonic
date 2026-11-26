@@ -24,7 +24,6 @@ use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::document::{Document, CURRENT_FORMAT_VERSION};
 use crate::history::HistorySnapshot;
@@ -36,8 +35,6 @@ pub const PHOTON_FORMAT_VERSION: u32 = 1;
 
 /// Canonical extension for native Photonic documents.
 pub const PHOTON_FILE_EXTENSION: &str = "photon";
-
-static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Write bytes to `path` without exposing a partially written destination.
 ///
@@ -149,8 +146,7 @@ fn staging_path(path: &Path) -> io::Result<PathBuf> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let serial = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!(".photonic-tmp-{}-{serial}", std::process::id());
+    let name = format!(".photonic-tmp-{}", uuid::Uuid::new_v4());
     Ok(parent.join(name))
 }
 
@@ -443,10 +439,9 @@ mod tests {
     }
 
     fn test_dir(label: &str) -> PathBuf {
-        let serial = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "photonic-photon-file-{label}-{}-{serial}",
-            std::process::id()
+            "photonic-photon-file-{label}-{}",
+            uuid::Uuid::new_v4()
         ));
         fs::create_dir(&dir).unwrap();
         dir
@@ -474,6 +469,32 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(staging_files(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_staging_files_do_not_block_an_atomic_save() {
+        let dir = test_dir("stale-staging");
+        let path = dir.join("document.photon");
+        fs::write(&path, b"old document").unwrap();
+        let stale: Vec<_> = (0..256)
+            .map(|serial| dir.join(format!(".photonic-tmp-{}-{serial}", std::process::id())))
+            .collect();
+        for artifact in &stale {
+            fs::write(artifact, b"interrupted earlier save").unwrap();
+        }
+
+        let saved = write_atomic_file(&path, b"new document");
+        let bytes = fs::read(&path).unwrap();
+        let old_artifacts_preserved = stale.iter().all(|artifact| {
+            fs::read(artifact).is_ok_and(|bytes| bytes == b"interrupted earlier save")
+        });
+        let remaining = staging_files(&dir).len();
+        fs::remove_dir_all(dir).unwrap();
+
+        saved.expect("leftover staging files from an earlier lifetime must not block a save");
+        assert_eq!(bytes, b"new document");
+        assert!(old_artifacts_preserved);
+        assert_eq!(remaining, stale.len());
     }
 
     #[cfg(unix)]
