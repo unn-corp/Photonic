@@ -626,7 +626,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "flatten_artwork" => {
-            let a: FlattenArtworkArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FlattenArtworkArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::layers::flatten_artwork(state, a).await,
             ))
@@ -668,7 +668,8 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "find_replace_style" => {
-            let a: FindReplaceStyleArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FindReplaceStyleArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::find_replace_style(state, a).await,
             ))
@@ -706,13 +707,13 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "auto_name_nodes" => {
-            let a: AutoNameNodesArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AutoNameNodesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::auto_name_nodes(state, a).await,
             ))
         }
         "add_anchor_points" => {
-            let a: AddAnchorPointsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AddAnchorPointsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::add_anchor_points(state, a).await,
             ))
@@ -851,31 +852,31 @@ pub(crate) async fn dispatch_tool_inner(
             handlers::nodes::get_selection(state).await,
         )),
         "flatten_group" => {
-            let a: FlattenGroupArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FlattenGroupArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::flatten_group(state, a).await,
             ))
         }
         "center_on_canvas" => {
-            let a: CenterOnCanvasArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: CenterOnCanvasArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::center_on_canvas(state, a).await,
             ))
         }
         "remove_fill" => {
-            let a: RemoveStyleArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: RemoveStyleArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::remove_fill(state, a).await,
             ))
         }
         "remove_stroke" => {
-            let a: RemoveStyleArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: RemoveStyleArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::remove_stroke(state, a).await,
             ))
         }
         "fit_to_canvas" => {
-            let a: FitToCanvasArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: FitToCanvasArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::fit_to_canvas(state, a).await,
             ))
@@ -958,13 +959,13 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_all" => {
-            let a: SelectAllArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SelectAllArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_all(state, a).await,
             ))
         }
         "deselect_all" => {
-            let a: DeselectAllArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: DeselectAllArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::deselect_all(state, a).await,
             ))
@@ -988,7 +989,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "swap_fill_stroke" => {
-            let a: SwapFillStrokeArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SwapFillStrokeArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::swap_fill_stroke(state, a).await,
             ))
@@ -1086,43 +1087,46 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "clean_up" => {
-            let a: CleanUpArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: CleanUpArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::clean_up(state, a).await,
             ))
         }
         "join_paths" => {
-            let a: JoinPathsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: JoinPathsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::join_paths(state, a).await,
             ))
         }
         "pathfinder_crop" => {
-            let a: PathfinderCropArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderCropArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_crop(state, a).await,
             ))
         }
         "pathfinder_minus_back" => {
-            let a: PathfinderMinusBackArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderMinusBackArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_minus_back(state, a).await,
             ))
         }
         "pathfinder_minus_front" => {
-            let a: PathfinderMinusFrontArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderMinusFrontArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_minus_front(state, a).await,
             ))
         }
         "pathfinder_trim" => {
-            let a: PathfinderTrimArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderTrimArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_trim(state, a).await,
             ))
         }
         "pathfinder_outline" => {
-            let a: PathfinderOutlineArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: PathfinderOutlineArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::pathfinder_outline(state, a).await,
             ))
@@ -1148,13 +1152,15 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "reverse_path_direction" => {
-            let a: ReversePathDirectionArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ReversePathDirectionArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::reverse_path_direction(state, a).await,
             ))
         }
         "average_anchor_points" => {
-            let a: AverageAnchorPointsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AverageAnchorPointsArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::average_anchor_points(state, a).await,
             ))
@@ -1174,7 +1180,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_same" => {
-            let a: SelectSameArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SelectSameArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_same(state, a).await,
             ))
@@ -1195,7 +1201,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "undo" => {
-            let a: UndoRedoArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: UndoRedoArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             let (result, moved) = handlers::document::undo(state, a).await;
             Ok(if moved {
                 ToolOutput::mutating(result)
@@ -1204,7 +1210,7 @@ pub(crate) async fn dispatch_tool_inner(
             })
         }
         "redo" => {
-            let a: UndoRedoArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: UndoRedoArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             let (result, moved) = handlers::document::redo(state, a).await;
             Ok(if moved {
                 ToolOutput::mutating(result)
@@ -1380,7 +1386,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "smooth_path" => {
-            let a: SmoothPathArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SmoothPathArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::smooth_path(state, a).await,
             ))
@@ -1467,25 +1473,27 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "adjust_colors" => {
-            let a: AdjustColorsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: AdjustColorsArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::adjust_colors(state, a).await,
             ))
         }
         "make_compound_path" => {
-            let a: MakeCompoundPathArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: MakeCompoundPathArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::make_compound_path(state, a).await,
             ))
         }
         "make_live_boolean" => {
-            let a: MakeLiveBooleanArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: MakeLiveBooleanArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::make_live_boolean(state, a).await,
             ))
         }
         "release_compound_path" => {
-            let a: ReleaseCompoundPathArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ReleaseCompoundPathArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::release_compound_path(state, a).await,
             ))
@@ -1559,7 +1567,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "clear_guides" => {
-            let a: ClearGuidesArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ClearGuidesArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::clear_guides(state, a).await,
             ))
@@ -1571,13 +1579,14 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "convert_anchor_points" => {
-            let a: ConvertAnchorPointsArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ConvertAnchorPointsArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::convert_anchor_points(state, a).await,
             ))
         }
         "lasso_select" => {
-            let a: LassoSelectArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: LassoSelectArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::lasso_select(state, a).await,
             ))
@@ -1597,7 +1606,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_by_kind" => {
-            let a: SelectByKindArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: SelectByKindArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_by_kind(state, a).await,
             ))
@@ -1617,7 +1626,8 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "exit_isolation_mode" => {
-            let a: ExitIsolationModeArgs = serde_json::from_value(args).unwrap_or_default();
+            let a: ExitIsolationModeArgs =
+                serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::exit_isolation_mode(state, a).await,
             ))
@@ -1684,12 +1694,7 @@ pub(crate) async fn dispatch_tool_inner(
             ))
         }
         "select_similar" => {
-            let a: SelectSimilarArgs = serde_json::from_value(args).unwrap_or(SelectSimilarArgs {
-                node_ids: vec![],
-                match_by: None,
-                tolerance: None,
-                additive: false,
-            });
+            let a: SelectSimilarArgs = serde_json::from_value(args).map_err(|e| e.to_string())?;
             Ok(ToolOutput::mutating(
                 handlers::nodes::select_similar(state, a).await,
             ))
@@ -3780,6 +3785,160 @@ mod tests {
             .await
             .unwrap();
         assert!(!output.mutates, "redo at the history tip must be read-only");
+    }
+
+    #[tokio::test]
+    async fn flatten_artwork_rejects_malformed_target_name_without_mutation() {
+        let state = test_state();
+        {
+            let mut doc = state.document.lock().await;
+            let bottom_id = doc.active_layer_id.expect("default layer");
+            doc.layers.get_mut(&bottom_id).unwrap().name = "Bottom".to_string();
+            doc.add_layer(Layer::new("Top"));
+        }
+
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let history_before = {
+            let history = state.history.lock().await;
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth(),
+            )
+        };
+
+        let result = dispatch_tool(&state, "flatten_artwork", json!({ "target_name": 42 })).await;
+        let error = match result {
+            Ok(_) => panic!("malformed target_name must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("string"),
+            "unexpected argument error: {error}"
+        );
+
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before,
+            "invalid arguments must not flatten the document"
+        );
+        let history = state.history.lock().await;
+        assert_eq!(
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth()
+            ),
+            history_before,
+            "invalid arguments must not change history"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_up_rejects_malformed_dry_run_without_mutation() {
+        let state = test_state();
+        let empty_text_id = {
+            let mut doc = state.document.lock().await;
+            let layer_id = doc.active_layer_id.expect("default layer");
+            doc.add_node(
+                SceneNode::new(
+                    "Empty text",
+                    layer_id,
+                    SceneNodeKind::Text(TextNode::new("   ")),
+                ),
+                Some(layer_id),
+            )
+        };
+
+        let before = serde_json::to_value(&*state.document.lock().await).unwrap();
+        let history_before = {
+            let history = state.history.lock().await;
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth(),
+            )
+        };
+
+        let result = dispatch_tool(&state, "clean_up", json!({ "dry_run": "yes" })).await;
+        let error = match result {
+            Ok(_) => panic!("malformed dry_run must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("boolean"),
+            "unexpected argument error: {error}"
+        );
+
+        assert!(
+            state
+                .document
+                .lock()
+                .await
+                .nodes
+                .contains_key(&empty_text_id),
+            "invalid arguments must not delete the removable node"
+        );
+        assert_eq!(
+            serde_json::to_value(&*state.document.lock().await).unwrap(),
+            before,
+            "invalid arguments must not change the document"
+        );
+        let history = state.history.lock().await;
+        assert_eq!(
+            (
+                history.current_node(),
+                history.undo_depth(),
+                history.redo_depth()
+            ),
+            history_before,
+            "invalid arguments must not change history"
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_empty_mutating_arguments_keep_documented_defaults() {
+        let flatten_state = test_state();
+        {
+            let mut doc = flatten_state.document.lock().await;
+            let bottom_id = doc.active_layer_id.expect("default layer");
+            doc.layers.get_mut(&bottom_id).unwrap().name = "Bottom".to_string();
+            doc.add_layer(Layer::new("Top"));
+        }
+
+        let flattened = dispatch_tool(&flatten_state, "flatten_artwork", json!({}))
+            .await
+            .unwrap();
+        assert_ne!(flattened.is_error, Some(true));
+        {
+            let doc = flatten_state.document.lock().await;
+            assert_eq!(doc.layer_order.len(), 1);
+            assert_eq!(doc.layers[&doc.layer_order[0]].name, "Bottom");
+        }
+
+        let cleanup_state = test_state();
+        let empty_text_id = {
+            let mut doc = cleanup_state.document.lock().await;
+            let layer_id = doc.active_layer_id.expect("default layer");
+            doc.add_node(
+                SceneNode::new(
+                    "Empty text",
+                    layer_id,
+                    SceneNodeKind::Text(TextNode::new("")),
+                ),
+                Some(layer_id),
+            )
+        };
+        let cleaned = dispatch_tool(&cleanup_state, "clean_up", json!({}))
+            .await
+            .unwrap();
+        assert_ne!(cleaned.is_error, Some(true));
+        assert!(!cleanup_state
+            .document
+            .lock()
+            .await
+            .nodes
+            .contains_key(&empty_text_id));
     }
 
     #[tokio::test]
