@@ -59,9 +59,28 @@ pub struct RenderQueue {
 
 struct RenderQueueInner {
     pending: VecDeque<QueuedExport>,
-    /// Recently finished jobs (retention for UI/MCP polling).
+    /// The running job and recent terminal jobs for UI/MCP polling.
     finished: Vec<QueuedExport>,
     stop: bool,
+}
+
+impl RenderQueueInner {
+    fn prune_finished(&mut self) {
+        const MAX_FINISHED: usize = 64;
+        let terminal = self
+            .finished
+            .iter()
+            .filter(|job| !matches!(job.status, QueueJobStatus::Running { .. }))
+            .count();
+        let mut excess = terminal.saturating_sub(MAX_FINISHED);
+        self.finished.retain(|job| {
+            if excess == 0 || matches!(job.status, QueueJobStatus::Running { .. }) {
+                return true;
+            }
+            excess -= 1;
+            false
+        });
+    }
 }
 
 impl RenderQueue {
@@ -167,6 +186,7 @@ impl RenderQueue {
             j.cancel.store(true, Ordering::Relaxed);
             j.status = QueueJobStatus::Cancelled;
             g.finished.push(j);
+            g.prune_finished();
             return true;
         }
         false
@@ -201,6 +221,7 @@ impl RenderQueue {
                 j.status = QueueJobStatus::Cancelled;
                 g.finished.push(j);
             }
+            g.prune_finished();
         }
         self.wake.1.notify_one();
         if let Some(join) = self.worker.lock().expect("worker lock").take() {
@@ -260,6 +281,7 @@ fn worker_main(
             if let Some(done) = g.finished.iter_mut().find(|entry| entry.id == job.id) {
                 done.status = QueueJobStatus::Cancelled;
             }
+            g.prune_finished();
             continue;
         }
 
@@ -304,12 +326,7 @@ fn worker_main(
                 },
             };
         }
-        // Cap finished retention.
-        const MAX_FINISHED: usize = 64;
-        if g.finished.len() > MAX_FINISHED {
-            let drop_n = g.finished.len() - MAX_FINISHED;
-            g.finished.drain(0..drop_n);
-        }
+        g.prune_finished();
     }
 }
 
@@ -451,5 +468,66 @@ mod tests {
         assert!(!queue.cancel(pending));
         assert!(queue.status(running).is_some());
         assert!(queue.enqueue("late", project, job).is_err());
+    }
+
+    #[test]
+    fn cancelling_pending_exports_keeps_terminal_history_bounded() {
+        for individual in [true, false] {
+            let queue = RenderQueue::new();
+            let project = tiny_project();
+            let sequence = project.active_sequence.unwrap();
+            let job = ExportJob {
+                sequence,
+                format_index: 0,
+                preset: video_only_preset(),
+                output: PathBuf::from("queued.mp4"),
+                range: None,
+                options: Default::default(),
+            };
+            let running = queue
+                .enqueue("running", project.clone(), job.clone())
+                .unwrap();
+            {
+                let mut inner = queue.inner.lock().unwrap();
+                let mut entry = inner.pending.pop_front().unwrap();
+                entry.status = QueueJobStatus::Running {
+                    frame: 0,
+                    total: 30,
+                    fps: 0.0,
+                };
+                inner.finished.push(entry);
+            }
+            let ids: Vec<_> = (0..96)
+                .map(|_| {
+                    queue
+                        .enqueue("pending", project.clone(), job.clone())
+                        .unwrap()
+                })
+                .collect();
+            let oldest = Arc::downgrade(&queue.list()[0].project);
+            if individual {
+                for id in ids.iter().copied() {
+                    assert!(queue.cancel(id));
+                }
+            } else {
+                queue.shutdown();
+            }
+
+            let retained = queue.list().len();
+            assert!(
+                retained <= 65,
+                "cancelled exports retained {retained} snapshots"
+            );
+            assert!(oldest.upgrade().is_none());
+            assert_eq!(queue.status(ids[0]), None);
+            assert_eq!(
+                queue.status(*ids.last().unwrap()),
+                Some(QueueJobStatus::Cancelled)
+            );
+            assert!(matches!(
+                queue.status(running),
+                Some(QueueJobStatus::Running { .. })
+            ));
+        }
     }
 }
