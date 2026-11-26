@@ -59,6 +59,16 @@ impl CanvasView {
         self.pan_x = -rect_x * self.zoom;
         self.pan_y = -rect_y * self.zoom;
     }
+
+    /// Fit `rect` with no margin like [`fit_to_rect_exact`], but center it on
+    /// the axis with spare room. Used when the output size was chosen
+    /// independently of `rect`, such as cropping to artwork whose aspect ratio
+    /// differs from the export dimensions.
+    pub fn fit_to_rect_centered(&mut self, rect_x: f64, rect_y: f64, rect_w: f64, rect_h: f64) {
+        self.fit_to_rect_exact(rect_x, rect_y, rect_w, rect_h);
+        self.pan_x += (self.screen_width as f64 - rect_w * self.zoom) / 2.0;
+        self.pan_y += (self.screen_height as f64 - rect_h * self.zoom) / 2.0;
+    }
 }
 
 impl Default for CanvasView {

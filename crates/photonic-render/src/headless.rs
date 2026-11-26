@@ -296,7 +296,9 @@ impl HeadlessRenderer {
             if let Some((cx, cy, cw, ch)) =
                 content_bounds(&bounds_verts, include_artboard_bg, document)
             {
-                view.fit_to_rect_exact(cx, cy, cw, ch);
+                // Export dialogs size the output from the document, so the
+                // artwork's aspect ratio can differ from the frame.
+                view.fit_to_rect_centered(cx, cy, cw, ch);
             } else {
                 view.fit_to_rect(0.0, 0.0, document.width, document.height);
             }
@@ -590,7 +592,8 @@ impl HeadlessRenderer {
     /// (`Rgba8UnormSrgb`) texture and return it (submitted, ready to read or
     /// convert). Shared by the RGBA readback path (`render_rgba_with_opts`) and
     /// the §2.5 Tier B GPU-to-GPU working-texture path, so both render identical
-    /// pixels. The caller must have written the camera uniform for `view`.
+    /// pixels. The camera uniform for `view` is written and submitted together
+    /// under `camera_submission_lock`.
     ///
     /// The returned texture carries `COPY_SRC | TEXTURE_BINDING` so it can be
     /// either read back or sampled by the Tier B conversion pass.
@@ -2102,6 +2105,38 @@ mod blend_tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn crop_to_content_centers_artwork_in_a_wider_output() {
+        let Some(renderer) = try_renderer() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        let mut doc = Document::new("Crop", 400.0, 125.0);
+        let layer = doc.layer_order[0];
+        let shape = PathNode::new(PathData::rect(50.0, 30.0, 100.0, 40.0));
+        doc.add_node(
+            SceneNode::new("Black rectangle", layer, SceneNodeKind::Path(shape)),
+            Some(layer),
+        );
+        let opts = ExportOptions {
+            background: ExportBackground::Transparent,
+            crop_to_content: true,
+            ..Default::default()
+        };
+        // 100×40 artwork in a 200×40 frame fills x = 50..150 at unit scale.
+        let (pixels, w, _) = renderer.render_rgba_with_opts(&doc, 200, 40, &opts);
+        let alpha = |x: u32| pixels[((20 * w + x) * 4 + 3) as usize];
+        for x in [5, 45, 155, 195] {
+            assert_eq!(alpha(x), 0, "column {x} lies beside the centered artwork");
+        }
+        for x in [52, 100, 147] {
+            assert_eq!(alpha(x), 255, "column {x} lies inside the centered artwork");
+        }
     }
 
     #[test]
