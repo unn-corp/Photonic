@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use photonic_core::timeline::{FrameRate, TICKS_PER_SECOND};
+use photonic_core::timeline::{FrameRate, Tick, TICKS_PER_SECOND};
 use photonic_video::decode::scheduler::{PtsKind, SourceParams};
 use photonic_video::decode::{DecodeSource, DecodedPlanes, PixFmt, SharedRing};
 use photonic_video::media::ffmpeg_locate::{locate_for_test, FfmpegTools};
@@ -253,14 +253,34 @@ fn decode_vfr_is_pts_true_via_table() {
     let pts_index = Arc::new(PtsIndex::build(&tools, &path).expect("pts index"));
     let kf_index = KeyframeIndex::build(&tools, &path).expect("keyframe index");
 
-    // Target a frame inside the 30fps region (frame 150).
-    let target = pts_index.pts[150];
-    // The pts-true expectation: the smallest table entry >= target.
-    let expected = *pts_index
-        .pts
-        .iter()
-        .find(|t| **t >= target)
-        .expect("a frame at/after target");
+    // Decode sequentially as the pixel reference. A seek can report the
+    // expected timestamp while consuming the wrong frame from the pipe.
+    let reference = std::process::Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(&path)
+        .args([
+            "-an",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "1:1000000",
+            "-threads",
+            "1",
+            "-pix_fmt",
+            "yuv420p",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let frame_bytes = PixFmt::Yuv420p.frame_bytes(320, 180);
+    assert_eq!(reference.stdout.len(), pts_index.pts.len() * frame_bytes);
 
     let params = SourceParams {
         input: path,
@@ -271,13 +291,265 @@ fn decode_vfr_is_pts_true_via_table() {
         keyframes: kf_index,
     };
     let mut src = DecodeSource::new(tools, params, SharedRing::preview());
-    let frame = src.seek(target).expect("VFR seek");
+    for ordinal in [150, pts_index.pts.len() - 1] {
+        let target = pts_index.pts[ordinal];
+        let frame = src.seek(target).expect("VFR seek");
+        assert_eq!(frame.pts, target, "VFR seeks use the frame timestamp table");
+        let DecodedPlanes::Yuv420 { data, .. } = &frame.planes else {
+            panic!("expected YUV420 frame");
+        };
+        let expected = &reference.stdout[ordinal * frame_bytes..(ordinal + 1) * frame_bytes];
+        assert!(
+            data == expected,
+            "VFR seek returned the wrong pixels for frame {ordinal}"
+        );
+    }
+}
 
-    assert_eq!(
-        frame.pts, expected,
-        "VFR decode assigns pts from the ground-truth table (pts-true), not a constant rate"
+#[test]
+fn seek_uses_the_container_start_as_its_origin() {
+    let tools = tools_or_skip!();
+    let dir = std::env::temp_dir().join(format!("photonic-offset-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("offset.mp4");
+    let output = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=48x32:rate=24",
+            "-frames:v",
+            "24",
+            "-c:v",
+            "mpeg4",
+            "-g",
+            "6",
+            "-bf",
+            "0",
+            "-threads",
+            "1",
+            "-output_ts_offset",
+            "5",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(frame.pts >= target);
+    // Old cache entries hold the absolute container timestamp.
+    std::fs::write(
+        dir.join("offset.keyframes.json"),
+        serde_json::to_vec(&KeyframeIndex {
+            keyframes: vec![Tick::from_seconds(5)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("offset.pts.json"),
+        serde_json::to_vec(&PtsIndex {
+            pts: vec![Tick::from_seconds(5)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let index = Arc::new(PtsIndex::load_or_build(&tools, &path, &dir, "offset").unwrap());
+    let keyframes = KeyframeIndex::load_or_build(&tools, &path, &dir, "offset").unwrap();
+    let first_keyframe = keyframes.keyframes[0];
+    let decoded = {
+        let params = SourceParams {
+            input: path.clone(),
+            width: 48,
+            height: 32,
+            pix_fmt: PixFmt::Yuv420p,
+            pts_kind: PtsKind::Vfr(Arc::clone(&index)),
+            keyframes,
+        };
+        let mut source = DecodeSource::new(tools, params, SharedRing::preview());
+        source.seek(Tick::ZERO)
+    };
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(
+        decoded.expect("seek from the start of the file").pts,
+        Tick::ZERO
+    );
+    assert_eq!(first_keyframe, Tick::ZERO);
+    assert_eq!(index.pts[0], Tick::ZERO);
+    assert_eq!(index.pts.len(), 24);
+}
+
+#[test]
+fn decoder_reads_the_same_video_stream_as_the_frame_index() {
+    let tools = tools_or_skip!();
+    let path =
+        std::env::temp_dir().join(format!("photonic-two-video-{}.mp4", uuid::Uuid::new_v4()));
+    let output = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:size=16x16:rate=24",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:size=48x32:rate=24",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-disposition:v:0",
+            "0",
+            "-disposition:v:1",
+            "default",
+            "-t",
+            "0.5",
+            "-c:v",
+            "mpeg4",
+            "-threads",
+            "1",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first_stream = std::process::Command::new(&tools.ffmpeg)
+        .args(["-nostdin", "-v", "error", "-i"])
+        .arg(&path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-an",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ])
+        .output()
+        .unwrap();
+    assert!(first_stream.status.success());
+    let video = probe_details(&tools, &path).unwrap().probe.video.unwrap();
+    let keyframes = KeyframeIndex::build(&tools, &path).unwrap();
+    let decoded = {
+        let mut decoder = DecodeSource::new(
+            tools,
+            SourceParams {
+                input: path.clone(),
+                width: video.width,
+                height: video.height,
+                pix_fmt: PixFmt::Yuv420p,
+                pts_kind: PtsKind::Cfr(video.frame_rate),
+                keyframes,
+            },
+            SharedRing::preview(),
+        );
+        decoder.seek(Tick::ZERO)
+    };
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!((video.width, video.height), (16, 16));
+    let frame = decoded.expect("the indexed stream can be decoded");
+    let DecodedPlanes::Yuv420 { data, .. } = &frame.planes else {
+        panic!("expected YUV420 frame");
+    };
+    assert!(
+        data == &first_stream.stdout,
+        "decoded pixels must come from the indexed video track"
+    );
+}
+
+#[test]
+fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
+    let tools = tools_or_skip!();
+    let path = std::env::temp_dir().join(format!("photonic-cfr-gaps-{}.mp4", uuid::Uuid::new_v4()));
+    // A 14 s, 30 fps source missing frames 10–12, with luma 16 + 7n
+    // identifying source frame n below 32. Its average rate stays within the
+    // probe's CFR tolerance, so the reader derives each timestamp from its
+    // output ordinal. MP4's default variable-rate muxing keeps the gap.
+    let output = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=64x48:rate=30:duration=14,format=yuv420p,geq=lum='16+mod(N,32)*7':cb=128:cr=128",
+            "-vf",
+            "select='not(between(n,10,12))'",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            // Keyframes land on source frames 0, 5, 13, 18, 23 and 28.
+            "-g",
+            "5",
+            "-sc_threshold",
+            "1000000000",
+            "-bf",
+            "0",
+            "-threads",
+            "1",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let details = probe_details(&tools, &path).unwrap();
+    assert!(!details.is_vfr, "a few dropped frames still probe as CFR");
+    let rate = details.probe.video.unwrap().frame_rate;
+    assert_eq!(rate, FrameRate { num: 30, den: 1 });
+    let keyframes = KeyframeIndex::build(&tools, &path).unwrap();
+    let mut decoder = DecodeSource::new(
+        tools,
+        SourceParams {
+            input: path.clone(),
+            width: 64,
+            height: 48,
+            pix_fmt: PixFmt::Yuv420p,
+            pts_kind: PtsKind::Cfr(rate),
+            keyframes,
+        },
+        SharedRing::preview(),
+    );
+    // Slot 11 decodes across the gap from keyframe 5 and must repeat frame 9.
+    // Slot 15 starts from keyframe 13, probed as 0.433333 s (just below 13/30).
+    let decoded: Vec<_> = [(11, 9), (15, 15), (20, 20)]
+        .into_iter()
+        .map(|(slot, source)| (slot, source, decoder.seek(rate.frame_start(slot))))
+        .collect();
+    drop(decoder);
+    // Best effort: Windows can hold a freshly written file briefly (scanner or
+    // child teardown), and a leftover temp file does not affect the result.
+    let _ = std::fs::remove_file(&path);
+    for (slot, source, frame) in decoded {
+        let frame = frame.expect("constant-rate seek");
+        let luma = plane_y(&frame.planes);
+        let mean = luma.iter().map(|&v| f64::from(v)).sum::<f64>() / luma.len() as f64;
+        let expected = f64::from(16 + 7 * source);
+        assert!(
+            (mean - expected).abs() < 3.0,
+            "slot {slot} should show source frame {source} (luma {expected}), got {mean:.1}"
+        );
+    }
 }
 
 // ── 5. Alpha: yuva path, alpha ramps left→right (alpha_gradient.mov) ─────────

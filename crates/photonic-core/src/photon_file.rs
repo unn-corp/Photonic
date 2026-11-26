@@ -24,7 +24,6 @@ use serde::Serialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::document::{Document, CURRENT_FORMAT_VERSION};
 use crate::history::HistorySnapshot;
@@ -37,15 +36,28 @@ pub const PHOTON_FORMAT_VERSION: u32 = 1;
 /// Canonical extension for native Photonic documents.
 pub const PHOTON_FILE_EXTENSION: &str = "photon";
 
-static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 /// Write bytes to `path` without exposing a partially written destination.
 ///
 /// The complete payload is written and synced to a uniquely named sibling before
 /// the sibling replaces the destination. A failed write or replacement leaves an
-/// existing destination untouched and removes the staging file.
+/// existing destination untouched and removes the staging file. Existing regular
+/// files keep their Unix read, write, and execute permission bits.
 pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic_file_with_replacer(path, bytes, None, replace_destination)
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => Some(metadata.permissions().mode() & 0o777),
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+
+    write_atomic_file_with_replacer(path, bytes, mode, replace_destination)
 }
 
 /// Write bytes atomically while applying a Unix permission mode to the staged
@@ -124,22 +136,17 @@ where
 }
 
 fn staging_path(path: &Path) -> io::Result<PathBuf> {
-    use std::ffi::OsString;
-
-    let file_name = path.file_name().ok_or_else(|| {
-        io::Error::new(
+    if path.file_name().is_none() {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "atomic file writes require a destination file name",
-        )
-    })?;
+        ));
+    }
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    let serial = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let mut name = OsString::from(".");
-    name.push(file_name);
-    name.push(format!(".photonic-tmp-{}-{serial}", std::process::id()));
+    let name = format!(".photonic-tmp-{}", uuid::Uuid::new_v4());
     Ok(parent.join(name))
 }
 
@@ -432,10 +439,9 @@ mod tests {
     }
 
     fn test_dir(label: &str) -> PathBuf {
-        let serial = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "photonic-photon-file-{label}-{}-{serial}",
-            std::process::id()
+            "photonic-photon-file-{label}-{}",
+            uuid::Uuid::new_v4()
         ));
         fs::create_dir(&dir).unwrap();
         dir
@@ -463,6 +469,65 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(staging_files(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_staging_files_do_not_block_an_atomic_save() {
+        let dir = test_dir("stale-staging");
+        let path = dir.join("document.photon");
+        fs::write(&path, b"old document").unwrap();
+        let stale: Vec<_> = (0..256)
+            .map(|serial| dir.join(format!(".photonic-tmp-{}-{serial}", std::process::id())))
+            .collect();
+        for artifact in &stale {
+            fs::write(artifact, b"interrupted earlier save").unwrap();
+        }
+
+        let saved = write_atomic_file(&path, b"new document");
+        let bytes = fs::read(&path).unwrap();
+        let old_artifacts_preserved = stale.iter().all(|artifact| {
+            fs::read(artifact).is_ok_and(|bytes| bytes == b"interrupted earlier save")
+        });
+        let remaining = staging_files(&dir).len();
+        fs::remove_dir_all(dir).unwrap();
+
+        saved.expect("leftover staging files from an earlier lifetime must not block a save");
+        assert_eq!(bytes, b"new document");
+        assert!(old_artifacts_preserved);
+        assert_eq!(remaining, stale.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_unix_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("preserve-mode");
+        let path = dir.join("project.photon");
+        write_atomic_file_with_mode(&path, b"old project", 0o500).unwrap();
+
+        write_atomic_file(&path, b"updated project").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(mode, 0o500);
+        assert_eq!(bytes, b"updated project");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_replaces_a_project_with_a_long_file_name() {
+        let dir = test_dir("long-name");
+        let path = dir.join(format!("{}.photon", "a".repeat(248)));
+        fs::write(&path, b"old project").unwrap();
+
+        let result = write_atomic_file(&path, b"updated project");
+        let bytes = fs::read(&path).unwrap();
+        let staging = staging_files(&dir);
+        fs::remove_dir_all(dir).unwrap();
+        result.expect("atomic write to a valid 255-byte file name");
+        assert_eq!(bytes, b"updated project");
+        assert!(staging.is_empty());
     }
 
     #[test]

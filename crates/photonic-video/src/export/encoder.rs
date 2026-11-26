@@ -957,9 +957,8 @@ impl EncoderProcess {
             audio_path.as_deref(),
         )?;
         let output = StagedOutput::new(&spec.out_path, spec.preset.container)?;
-        if let Some(destination) = args.last_mut() {
-            *destination = output.path.to_string_lossy().into_owned();
-        }
+        // Replace the argument builder's final destination with the native staging path.
+        args.pop();
         let audio_sidecar = audio_path.map(|path| AudioSidecar { path });
         if let Some(sidecar) = &audio_sidecar {
             #[cfg(unix)]
@@ -971,6 +970,7 @@ impl EncoderProcess {
         let mut command = Command::new(&tools.ffmpeg);
         command
             .args(&args)
+            .arg(&output.path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -1610,5 +1610,63 @@ mod tests {
         assert_eq!(std::fs::read(&spec.out_path).unwrap(), b"previous");
         assert!(!staged.exists());
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn encoder_preserves_native_output_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::{ffi::OsStrExt, fs::PermissionsExt};
+
+        let directory =
+            std::env::temp_dir().join(format!("photonic-encoder-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let executable = directory.join("encoder.sh");
+        let capture_only = directory.join("encoder.sh.capture-only");
+        let captured = directory.join("encoder.sh.argument");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nfor out; do :; done\nprintf '%s' \"$out\" > \"$0.argument\"\nif [ ! -f \"$0.capture-only\" ]; then printf complete > \"$out\"; fi\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = FfmpegTools {
+            ffmpeg: executable,
+            ffprobe: PathBuf::from("ffprobe"),
+        };
+        let mut preset = base_preset();
+        preset.audio = None;
+        let mut spec = spec(&preset);
+        spec.out_path = directory.join(OsStr::from_bytes(b"export_\xff.mp4"));
+        // Capture the real process argument without opening a file at it.
+        std::fs::write(&capture_only, b"").unwrap();
+        let process = EncoderProcess::spawn(&tools, &caps_with(&["libx264"]), &spec, None).unwrap();
+        let native_staging_path = process.output.path.clone();
+        assert_eq!(native_staging_path.file_name(), spec.out_path.file_name());
+        assert!(matches!(process.finish(), Err(EncodeError::Io(_))));
+        assert_eq!(
+            std::fs::read(&captured).unwrap(),
+            native_staging_path.as_os_str().as_bytes()
+        );
+        std::fs::remove_file(capture_only).unwrap();
+
+        match std::fs::File::create_new(&spec.out_path) {
+            Ok(_) => {}
+            // Exercise publication on filesystems that require Unicode names.
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                spec.out_path = directory.join("export é.mp4");
+            }
+            Err(error) => panic!("could not create test output: {error}"),
+        }
+        let process = EncoderProcess::spawn(&tools, &caps_with(&["libx264"]), &spec, None).unwrap();
+        let staged = process.output.directory.clone();
+        let result = process.finish();
+        let published = std::fs::read(&spec.out_path);
+        let staging_cleaned = !staged.exists();
+        std::fs::remove_dir_all(directory).unwrap();
+
+        result.unwrap();
+        assert_eq!(published.unwrap(), b"complete");
+        assert!(staging_cleaned);
     }
 }

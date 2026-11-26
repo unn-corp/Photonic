@@ -43,17 +43,17 @@ fn run() -> Result<(), String> {
     let mut out_path: Option<PathBuf> = None;
     let mut stdin_fragment = false;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args_os().skip(1);
     while let Some(a) = args.next() {
-        match a.as_str() {
-            "--root" => {
+        match a.to_str() {
+            Some("--root") => {
                 root = Some(PathBuf::from(args.next().ok_or("--root needs a value")?));
             }
-            "--out" => {
+            Some("--out") => {
                 out_path = Some(PathBuf::from(args.next().ok_or("--out needs a value")?));
             }
-            "--stdin-fragment" => stdin_fragment = true,
-            other => return Err(format!("unknown argument: {other}")),
+            Some("--stdin-fragment") => stdin_fragment = true,
+            _ => return Err(format!("unknown argument: {}", a.to_string_lossy())),
         }
     }
 

@@ -40,7 +40,7 @@ use photonic_render::color::{Colorimetry, Matrix, Range};
 use photonic_render::video::YuvConverter;
 use photonic_render::{ExportBackground, ExportOptions, HeadlessRenderer};
 
-use crate::audio::mixer::PcmSource;
+use crate::audio::mixer::{first_clip_sample, PcmSource};
 use crate::audio::{
     audio_ring, AudioEngine, ClipVoice, Mixer, RingProducer, TrackVoice, XrunCounters,
     BLOCK_FRAMES, CHANNELS,
@@ -62,11 +62,11 @@ use crate::media::keyframe_index::{KeyframeIndex, PtsIndex};
 use crate::media::probe::{content_hash, probe_details, ProbeDetails};
 use crate::media::proxy_policy::{AdaptiveProxyPolicy, PreviewMediaChoice, PreviewPressure};
 use crate::media::stills::{resample_linear_premult, still_target_size, StillCache};
-use crate::playback::pcm::{read_pcm_window, TimeWarpPcmSource};
+use crate::playback::pcm::{read_pcm_window, PcmDecoderControl, TimeWarpPcmSource};
 use crate::playback::prefetch::{
     cut_ahead_targets, lru_eviction_victims, CUT_AHEAD_LEAD_FRAMES, MAX_LIVE_SOURCES,
 };
-use crate::playback::{FfmpegPcmSource, PlaybackController, PresentDecision};
+use crate::playback::{PlaybackController, PresentDecision};
 
 /// While playing, wake often enough for 60–120 Hz present opportunities without
 /// spinning at 500 Hz (2 ms). 4 ms ≈ 250 Hz upper bound; PresentDecision still
@@ -837,10 +837,22 @@ impl EngineSession {
         let generation = self
             .next_snapshot_generation
             .fetch_add(1, Ordering::Relaxed);
-        self.snapshot_input.store(Some(Arc::new(PublishedSnapshot {
+        let published = Arc::new(PublishedSnapshot {
             generation,
             value: snapshot,
-        })));
+        });
+        // A publisher can be interrupted between reserving its generation and
+        // installing the snapshot. Keep a newer publication if it won the race.
+        self.snapshot_input.rcu(|current| {
+            if current
+                .as_ref()
+                .is_none_or(|value| value.generation < generation)
+            {
+                Some(Arc::clone(&published))
+            } else {
+                current.clone()
+            }
+        });
         let _ = self.mailbox.wake_tx.try_send(());
         generation
     }
@@ -4129,7 +4141,7 @@ fn f32_to_f16_bits(v: f32) -> u16 {
 /// Handle to the mixer worker thread; dropping stops + joins it.
 pub(crate) struct AudioFeeder {
     project: Arc<ArcSwap<TimelineProject>>,
-    stop: Arc<AtomicBool>,
+    decoder_control: Arc<PcmDecoderControl>,
     prefill: Arc<AtomicU8>,
     join: Option<JoinHandle<()>>,
 }
@@ -4150,7 +4162,7 @@ impl AudioFeeder {
 
 impl Drop for AudioFeeder {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.decoder_control.cancel();
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -4225,8 +4237,8 @@ fn spawn_audio_feeder_inner(
 ) -> AudioFeeder {
     let project = Arc::new(ArcSwap::from(project));
     let worker_project = project.clone();
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_flag = Arc::clone(&stop);
+    let decoder_control = Arc::new(PcmDecoderControl::default());
+    let worker_control = Arc::clone(&decoder_control);
     let prefill = Arc::new(AtomicU8::new(0));
     let prefill_worker = Arc::clone(&prefill);
     let join = std::thread::Builder::new()
@@ -4239,7 +4251,7 @@ fn spawn_audio_feeder_inner(
                 sample_rate,
                 producer,
                 tools,
-                stop_flag,
+                worker_control,
                 master_meter,
                 spectrum_db,
                 graph_latency,
@@ -4250,7 +4262,7 @@ fn spawn_audio_feeder_inner(
         .expect("spawn photonic-video mixer thread");
     AudioFeeder {
         project,
-        stop,
+        decoder_control,
         prefill,
         join: Some(join),
     }
@@ -4263,7 +4275,7 @@ fn feeder_main(
     sample_rate: u32,
     mut producer: RingProducer,
     tools: Option<FfmpegTools>,
-    stop: Arc<AtomicBool>,
+    decoder_control: Arc<PcmDecoderControl>,
     master_meter: Arc<ArcSwapOption<LiveAudioMeters>>,
     spectrum_db: Arc<ArcSwapOption<Vec<f32>>>,
     graph_latency: Arc<std::sync::atomic::AtomicU32>,
@@ -4290,7 +4302,7 @@ fn feeder_main(
     // block, dropped when the clip stops sounding.
     let mut pcm: HashMap<ClipId, Box<dyn PcmSource>> = HashMap::new();
 
-    while !stop.load(Ordering::Relaxed) {
+    while !decoder_control.is_cancelled() {
         if output_end.is_some_and(|end| t >= end) {
             break;
         }
@@ -4354,8 +4366,8 @@ fn feeder_main(
             last_project = Some(project.clone());
         }
 
-        // Which clips sound at t? Audio tracks only in P3 — video-clip
-        // embedded audio arrives with the linked-clips story.
+        let block_end = t.saturating_add(block_ticks);
+        // Include audio clips whose in point falls inside this block.
         let active: Vec<(&photonic_core::timeline::Track, &Clip)> = seq
             .audio_tracks
             .iter()
@@ -4366,7 +4378,7 @@ fn feeder_main(
                     .iter()
                     .filter(|clip| {
                         clip.enabled
-                            && clip.start <= t
+                            && clip.start < block_end
                             && t < clip.end()
                             && matches!(clip.source, ClipSource::Asset { .. })
                     })
@@ -4394,15 +4406,16 @@ fn feeder_main(
                     .map(|a| (a.offset, a.stream))
                     .unwrap_or((Tick::ZERO, None));
                 let identity = matches!(clip.speed, SpeedMap::Constant(r) if r == Ratio::ONE);
+                let read_start = first_clip_sample(t, clip.start, sample_rate);
                 if identity {
                     let src_pos = crate::playback::pcm::source_seek_with_offset(
                         clip.source_in,
-                        t,
+                        read_start,
                         clip.start,
                         offset,
                     );
-                    if let Ok(source) =
-                        FfmpegPcmSource::spawn_stream(tools, path, src_pos, sample_rate, stream)
+                    if let Some(source) =
+                        decoder_control.spawn_stream(tools, path, src_pos, sample_rate, stream)
                     {
                         pcm.insert(clip.id, Box::new(source));
                     }
@@ -4416,13 +4429,9 @@ fn feeder_main(
                         / TICKS_PER_SECOND as f64)
                         .ceil() as usize
                         + 2;
-                    if let Ok(mut decoder) = FfmpegPcmSource::spawn_stream(
-                        tools,
-                        path,
-                        source_start,
-                        sample_rate,
-                        stream,
-                    ) {
+                    if let Some(mut decoder) =
+                        decoder_control.spawn_stream(tools, path, source_start, sample_rate, stream)
+                    {
                         let window = read_pcm_window(&mut decoder, frames);
                         pcm.insert(
                             clip.id,
@@ -4433,7 +4442,7 @@ fn feeder_main(
                                 clip.source_in,
                                 offset,
                                 clip.speed.clone(),
-                                t - clip.start,
+                                read_start - clip.start,
                             )),
                         );
                     }
@@ -4510,6 +4519,71 @@ fn feeder_main(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_audio_feeder_interrupts_a_stalled_pcm_decoder() {
+        use photonic_core::timeline::{MediaAsset, MediaProbe};
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = std::env::temp_dir().join(format!("photonic-pcm-stall-{}", AssetId::new()));
+        std::fs::create_dir(&directory).unwrap();
+        let program = directory.join("decoder.sh");
+        let ready = directory.join("decoder.sh.ready");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf started > \"$0.ready\"\nexec sleep 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = FfmpegTools {
+            ffmpeg: program,
+            ffprobe: PathBuf::from("ffprobe"),
+        };
+        let end = Tick::from_seconds(3);
+        let path = directory.join("audio.wav");
+        std::fs::write(&path, b"synthetic decoder input").unwrap();
+        let mut asset = MediaAsset::from_file(AssetKind::Audio, path);
+        asset.probe = Some(MediaProbe::basic(end, "wav", "pcm"));
+        let plan = crate::source_audition::plan_source_audition(&asset, (Tick::ZERO, end)).unwrap();
+
+        let mut elapsed = Vec::new();
+        for ratio in [Ratio::ONE, Ratio { num: 2, den: 1 }] {
+            let mut project = (*plan.project).clone();
+            let sequence = project.sequences.get_mut(&plan.sequence).unwrap();
+            sequence.audio_tracks[0].clips[0].speed = SpeedMap::Constant(ratio);
+            let (producer, _consumer, _) = audio_ring();
+            let feeder = spawn_source_audio_feeder(
+                Arc::new(project),
+                plan.sequence,
+                Tick::ZERO,
+                48_000,
+                producer,
+                Some(tools.clone()),
+                Arc::new(ArcSwapOption::empty()),
+                Arc::new(ArcSwapOption::empty()),
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                end,
+            );
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.is_file() {
+                assert!(Instant::now() < deadline, "PCM sidecar did not start");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(feeder.prefill_state(), 0);
+            let start = Instant::now();
+            drop(feeder);
+            elapsed.push(start.elapsed());
+            std::fs::remove_file(&ready).unwrap();
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(
+            elapsed
+                .iter()
+                .all(|time| *time < Duration::from_millis(700)),
+            "mixer shutdown waited for stalled decoder: {elapsed:?}"
+        );
+    }
 
     #[test]
     fn live_feeder_applies_mixer_edits_and_publishes_track_levels_without_device() {

@@ -11,9 +11,12 @@
 //! (`-ac 2` downmixes/duplicates) at the mixer's configured sample rate
 //! (`-ar`), so the mixer never resamples or remaps beyond `ChannelMap`.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use photonic_core::timeline::{SpeedMap, Tick, TICKS_PER_SECOND};
 
@@ -22,13 +25,58 @@ use crate::media::ffmpeg_locate::FfmpegTools;
 
 /// Interleaved-stereo f32 PCM decoded by a persistent ffmpeg process.
 pub struct FfmpegPcmSource {
-    child: Child,
+    child: Arc<Mutex<Child>>,
     stdout: ChildStdout,
     sample_rate: u32,
     /// Byte staging buffer reused across reads (no per-read allocation).
     buf: Vec<u8>,
     /// End-of-stream reached; subsequent reads return 0 frames.
     finished: bool,
+}
+
+/// Lets the mixer owner interrupt decoder reads before it joins the worker.
+#[derive(Default)]
+pub(crate) struct PcmDecoderControl {
+    cancelled: AtomicBool,
+    children: Mutex<Vec<Weak<Mutex<Child>>>>,
+}
+
+impl PcmDecoderControl {
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn spawn_stream(
+        &self,
+        tools: &FfmpegTools,
+        input: &Path,
+        start: Tick,
+        sample_rate: u32,
+        stream: Option<u32>,
+    ) -> Option<FfmpegPcmSource> {
+        if self.is_cancelled() {
+            return None;
+        }
+        let source =
+            FfmpegPcmSource::spawn_stream(tools, input, start, sample_rate, stream).ok()?;
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        // Recheck under the cancellation lock to cover a spawn in flight.
+        if self.is_cancelled() {
+            return None;
+        }
+        children.retain(|child| child.strong_count() > 0);
+        children.push(Arc::downgrade(&source.child));
+        Some(source)
+    }
+
+    pub(crate) fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
+        for child in children.iter().filter_map(Weak::upgrade) {
+            let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
+            let _ = child.kill();
+        }
+    }
 }
 
 /// A seekable, in-memory PCM source evaluated through a clip [`SpeedMap`].
@@ -162,10 +210,8 @@ impl FfmpegPcmSource {
         stream: Option<u32>,
     ) -> std::io::Result<FfmpegPcmSource> {
         let mut command = Command::new(&tools.ffmpeg);
-        for a in pcm_ffmpeg_argv(input, start, sample_rate, stream) {
-            command.arg(a);
-        }
         command
+            .args(pcm_ffmpeg_args(input, start, sample_rate, stream))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -174,7 +220,7 @@ impl FfmpegPcmSource {
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().expect("piped stdout");
         Ok(FfmpegPcmSource {
-            child,
+            child: Arc::new(Mutex::new(child)),
             stdout,
             sample_rate,
             buf: Vec::new(),
@@ -183,13 +229,25 @@ impl FfmpegPcmSource {
     }
 }
 
-/// Pure argv for the PCM sidecar (K-D3). Tested without spawning ffmpeg.
+/// Displayable arguments for the PCM sidecar (K-D3).
 pub fn pcm_ffmpeg_argv(
     input: &Path,
     start: Tick,
     sample_rate: u32,
     stream: Option<u32>,
 ) -> Vec<String> {
+    pcm_ffmpeg_args(input, start, sample_rate, stream)
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn pcm_ffmpeg_args(
+    input: &Path,
+    start: Tick,
+    sample_rate: u32,
+    stream: Option<u32>,
+) -> Vec<OsString> {
     // Input seeking alone may snap compressed audio to the next packet on
     // some FFmpeg builds (notably IMA ADPCM on Ubuntu), skipping a short sound
     // immediately after the requested mark. Seek at most one second early for
@@ -202,16 +260,16 @@ pub fn pcm_ffmpeg_argv(
         "error".into(),
         "-accurate_seek".into(),
         "-ss".into(),
-        format!("{:.6}", coarse.as_seconds_f64()),
+        format!("{:.6}", coarse.as_seconds_f64()).into(),
         "-i".into(),
-        input.display().to_string(),
+        input.as_os_str().to_owned(),
         "-ss".into(),
-        format!("{:.6}", residual.as_seconds_f64()),
+        format!("{:.6}", residual.as_seconds_f64()).into(),
     ];
     // K-D3: pick a specific demuxed audio stream when the clip asks for one.
     if let Some(n) = stream {
         args.push("-map".into());
-        args.push(format!("0:a:{n}"));
+        args.push(format!("0:a:{n}").into());
     }
     args.extend([
         "-vn".into(),
@@ -220,7 +278,7 @@ pub fn pcm_ffmpeg_argv(
         "-ac".into(),
         "2".into(),
         "-ar".into(),
-        sample_rate.to_string(),
+        sample_rate.to_string().into(),
         "-f".into(),
         "f32le".into(),
         "pipe:1".into(),
@@ -286,8 +344,9 @@ impl Drop for FfmpegPcmSource {
     fn drop(&mut self) {
         // Kill-on-drop, mirroring decode::sidecar: never leave an ffmpeg
         // writing into a dead pipe.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -330,6 +389,46 @@ mod tests {
         assert_eq!(seek2, Tick(200));
         let seek3 = source_seek_with_offset(Tick(0), Tick(200), Tick(100), Tick(0));
         assert_eq!(seek3, Tick(100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pcm_decoder_preserves_native_input_paths() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let Some(tools) = locate_for_test() else {
+            eprintln!("ffmpeg not found — skipping FfmpegPcmSource test");
+            return;
+        };
+        let directory =
+            std::env::temp_dir().join(format!("photonic-pcm-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let native = directory.join(OsStr::from_bytes(b"source_\xff.wav"));
+        let args = pcm_ffmpeg_args(&native, Tick::ZERO, 48_000, None);
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-i" && pair[1] == native.as_os_str()));
+
+        let audio = crate::captions::wav::write_pcm16_wav(48_000, 1, &[16_384; 4_096]);
+        let input = match std::fs::write(&native, &audio) {
+            Ok(()) => native,
+            // Filesystems such as APFS require valid Unicode filenames.
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => {
+                let path = directory.join("source é.wav");
+                std::fs::write(&path, &audio).unwrap();
+                path
+            }
+            Err(error) => panic!("could not write test audio: {error}"),
+        };
+        let mut source = FfmpegPcmSource::spawn(&tools, &input, Tick::ZERO, 48_000).unwrap();
+        let mut samples = [0.0; 128];
+        let frames = source.read(&mut samples, 64);
+        drop(source);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!(frames, 64);
+        assert!(samples.iter().all(|sample| *sample > 0.1));
     }
 
     #[test]

@@ -434,10 +434,15 @@ impl Mask {
     }
 
     fn morph(&mut self, px: u32, dilate: bool) {
-        // Growing/shrinking by more than the longest canvas dimension is a no-op
-        // beyond saturation, so cap iterations to avoid a pathological hang on a
-        // huge `px` (e.g. `u32::MAX`).
-        let max_useful = self.width.max(self.height);
+        let max_useful = if dilate {
+            // Four-neighbor growth can take separate horizontal and vertical
+            // steps to reach the opposite corner.
+            self.width
+                .saturating_sub(1)
+                .saturating_add(self.height.saturating_sub(1))
+        } else {
+            self.width.max(self.height)
+        };
         let px = px.min(max_useful);
         for _ in 0..px {
             let src = self.data.clone();
@@ -468,6 +473,10 @@ impl Mask {
                     self.data[i] = acc;
                 }
             }
+            // An unchanged pass is a fixed point, so further passes are no-ops.
+            if self.data == src {
+                break;
+            }
         }
     }
 
@@ -483,8 +492,8 @@ impl Mask {
     pub fn crop(&self, x: i64, y: i64, w: u32, h: u32) -> Mask {
         let x0 = x.clamp(0, self.width as i64);
         let y0 = y.clamp(0, self.height as i64);
-        let x1 = (x + w as i64).clamp(0, self.width as i64);
-        let y1 = (y + h as i64).clamp(0, self.height as i64);
+        let x1 = x.saturating_add(i64::from(w)).clamp(0, self.width as i64);
+        let y1 = y.saturating_add(i64::from(h)).clamp(0, self.height as i64);
         let cw = (x1 - x0).max(1) as u32;
         let ch = (y1 - y0).max(1) as u32;
         let mut out = Mask::empty(cw, ch);
@@ -846,5 +855,17 @@ mod tests {
         let mut m = Mask::full(6, 6);
         m.contract(u32::MAX);
         assert!(m.is_empty_selection());
+    }
+
+    #[test]
+    fn grow_reaches_the_opposite_corner_at_the_manhattan_radius() {
+        let mut mask = Mask::empty(4, 4);
+        mask.set(0, 0, 255);
+        let mut near = mask.clone();
+        near.grow(5);
+        assert_eq!(near.get(3, 2), 255);
+        assert_eq!(near.get(3, 3), 0);
+        mask.grow(6);
+        assert!(mask.data.iter().all(|&coverage| coverage == 255));
     }
 }

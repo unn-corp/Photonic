@@ -58,11 +58,10 @@ impl PlaybackClock {
         match &self.mode {
             ClockMode::Paused => self.origin,
             ClockMode::Soft { anchor } => {
-                let elapsed = anchor.elapsed();
-                // 1 µs granularity is far below a tick's resolution needs.
-                let ticks =
-                    (elapsed.as_micros() as i64).saturating_mul(TICKS_PER_SECOND / 1_000_000);
-                self.origin.saturating_add(Tick(ticks))
+                let elapsed_ns = anchor.elapsed().as_nanos() as i128;
+                let ticks = elapsed_ns * i128::from(TICKS_PER_SECOND) / 1_000_000_000;
+                let position = i128::from(self.origin.0) + ticks;
+                Tick(i64::try_from(position).unwrap_or(i64::MAX))
             }
             ClockMode::Audio {
                 master,
@@ -151,6 +150,34 @@ mod tests {
         let frozen = c.now();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert_eq!(c.now(), frozen, "paused clock is frozen");
+    }
+
+    #[test]
+    fn soft_clock_keeps_fractional_ticks_over_a_minute() {
+        use std::time::Duration;
+
+        // Truncating to 705 ticks per microsecond loses 36M ticks per minute.
+        // Windows cannot represent an Instant before boot, so skip when the
+        // machine has been up for less than a minute.
+        let Some(anchor) = Instant::now().checked_sub(Duration::from_secs(60)) else {
+            return;
+        };
+        let clock = PlaybackClock {
+            origin: Tick::from_seconds(10),
+            mode: ClockMode::Soft { anchor },
+        };
+        let reference = |elapsed: Duration| {
+            clock.origin
+                + Tick::from_seconds(elapsed.as_secs() as i64)
+                + Tick(i64::from(elapsed.subsec_nanos()) * TICKS_PER_SECOND / 1_000_000_000)
+        };
+        let earliest = reference(anchor.elapsed());
+        let observed = clock.now();
+        let latest = reference(anchor.elapsed());
+        assert!(
+            (earliest..=latest).contains(&observed),
+            "clock read {observed:?}, expected {earliest:?} through {latest:?}"
+        );
     }
 
     #[test]

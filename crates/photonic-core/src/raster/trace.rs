@@ -51,7 +51,8 @@ struct Edge {
 }
 
 /// Trace an RGBA sample grid into editable vector paths spanning `bounds`
-/// (`[x0, y0, x1, y1]`) in document coordinates.
+/// (`[x0, y0, x1, y1]`) in document coordinates. The grid uses the first
+/// `width * height` pixels.
 pub fn trace_bitmap(
     pixels: &[[u8; 4]],
     width: u32,
@@ -61,7 +62,6 @@ pub fn trace_bitmap(
 ) -> Vec<TracedShape> {
     if width == 0
         || height == 0
-        || pixels.len() < width as usize * height as usize
         || !bounds.iter().all(|v| v.is_finite())
         || bounds[2] <= bounds[0]
         || bounds[3] <= bounds[1]
@@ -69,12 +69,18 @@ pub fn trace_bitmap(
         return Vec::new();
     }
 
+    let Some(cells) = (width as usize).checked_mul(height as usize) else {
+        return Vec::new();
+    };
+    let Some(pixels) = pixels.get(..cells) else {
+        return Vec::new();
+    };
     let Some(palette) = build_palette(pixels, options) else {
         return Vec::new();
     };
-    let mut assignments = vec![usize::MAX; width as usize * height as usize];
+    let mut assignments = vec![usize::MAX; cells];
     let mut counts = vec![0usize; palette.len()];
-    for (i, &px) in pixels.iter().take(assignments.len()).enumerate() {
+    for (i, &px) in pixels.iter().enumerate() {
         if px[3] < options.alpha_threshold {
             continue;
         }
@@ -509,6 +515,19 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|shape| shape.sampled_cells == 16));
         assert!(out.iter().all(|shape| shape.path.bounding_box().is_some()));
+    }
+
+    #[test]
+    fn trace_palette_uses_only_the_declared_sample_grid() {
+        let pixels = [[240, 20, 10, 255], [10, 20, 240, 255]];
+        let options = TraceOptions {
+            colors: 1,
+            ..defaults()
+        };
+        let shapes = trace_bitmap(&pixels, 1, 1, [0.0, 0.0, 1.0, 1.0], options);
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].rgba, pixels[0]);
+        assert_eq!(shapes[0].sampled_cells, 1);
     }
 
     #[test]

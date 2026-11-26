@@ -89,6 +89,7 @@ pub struct HeadlessRenderer {
     supports_view_formats: bool,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    camera_submission_lock: std::sync::Mutex<()>,
     fill_pipeline: wgpu::RenderPipeline,
     /// One fill-pipeline variant per separable blend mode (matches the windowed
     /// renderer so headless export agrees with the on-canvas result).
@@ -218,6 +219,7 @@ impl HeadlessRenderer {
             supports_view_formats,
             camera_buffer,
             camera_bind_group,
+            camera_submission_lock: std::sync::Mutex::new(()),
             fill_pipeline,
             blend_pipelines,
             fill_pipeline_1spp,
@@ -285,7 +287,7 @@ impl HeadlessRenderer {
         let include_artboard_bg = opts.background == ExportBackground::Artboard;
         let mut view = CanvasView::new(w, h);
         if let Some((rx, ry, rw, rh)) = opts.region {
-            view.fit_to_rect(rx, ry, rw, rh);
+            view.fit_to_rect_exact(rx, ry, rw, rh);
         } else if opts.crop_to_content {
             // The crop bounds require geometry, but the final geometry must use
             // the resulting view scale. This preliminary pass is only for bounds.
@@ -294,7 +296,9 @@ impl HeadlessRenderer {
             if let Some((cx, cy, cw, ch)) =
                 content_bounds(&bounds_verts, include_artboard_bg, document)
             {
-                view.fit_to_rect(cx, cy, cw, ch);
+                // Export dialogs size the output from the document, so the
+                // artwork's aspect ratio can differ from the frame.
+                view.fit_to_rect_centered(cx, cy, cw, ch);
             } else {
                 view.fit_to_rect(0.0, 0.0, document.width, document.height);
             }
@@ -308,10 +312,6 @@ impl HeadlessRenderer {
             opts.overprint_preview,
             view.zoom,
         );
-
-        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
 
         let clear = match opts.background {
             ExportBackground::Artboard => BG,
@@ -592,7 +592,8 @@ impl HeadlessRenderer {
     /// (`Rgba8UnormSrgb`) texture and return it (submitted, ready to read or
     /// convert). Shared by the RGBA readback path (`render_rgba_with_opts`) and
     /// the §2.5 Tier B GPU-to-GPU working-texture path, so both render identical
-    /// pixels. The caller must have written the camera uniform for `view`.
+    /// pixels. The camera uniform for `view` is written and submitted together
+    /// under `camera_submission_lock`.
     ///
     /// The returned texture carries `COPY_SRC | TEXTURE_BINDING` so it can be
     /// either read back or sampled by the Tier B conversion pass.
@@ -716,7 +717,17 @@ impl HeadlessRenderer {
             drop(doc_tex);
         }
         drop(msaa_tex); // keep alive until submit
-        self.queue.submit([enc.finish()]);
+        let commands = enc.finish();
+        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
+        // A shared renderer can encode in parallel. Pair each camera update
+        // with the draw submission so another render cannot replace it first.
+        let _guard = self
+            .camera_submission_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
+        self.queue.submit([commands]);
         tex
     }
 
@@ -815,9 +826,6 @@ impl HeadlessRenderer {
         let mut view = CanvasView::new(w, h);
         view.fit_to_rect(0.0, 0.0, document.width, document.height);
         let (verts, idxs, segments, blur_jobs) = build_geometry(document, false, false, view.zoom);
-        let cam = CameraUniform::from_viewport(view.pan_x, view.pan_y, view.zoom, w, h);
-        self.queue
-            .write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&cam));
         let scene = self.render_scene_texture(
             &verts,
             &idxs,
@@ -2046,6 +2054,154 @@ mod blend_tests {
             force_fallback_adapter: false,
         }))?;
         Some(pollster::block_on(HeadlessRenderer::new()))
+    }
+
+    #[test]
+    fn explicit_raster_crop_fills_output_without_canvas_margins() {
+        let Some(renderer) = try_renderer() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        let mut doc = Document::new("Crop", 400.0, 125.0);
+        let layer = doc.layer_order[0];
+        let shape = PathNode::new(PathData::rect(12.0, 17.0, 257.0, 39.0));
+        doc.add_node(
+            SceneNode::new("Black rectangle", layer, SceneNodeKind::Path(shape)),
+            Some(layer),
+        );
+
+        let check_crop = |width: u32, opts: &ExportOptions| {
+            let (pixels, w, h) = renderer.render_rgba_with_opts(&doc, width, 39, opts);
+            assert_eq!((w, h), (width, 39));
+            assert_eq!(pixels.len(), (w * h * 4) as usize);
+            let outside = pixels
+                .chunks_exact(4)
+                .filter(|p| *p != [0, 0, 0, 255])
+                .count();
+            assert_eq!(
+                outside, 0,
+                "{outside} pixels fell outside the shape at {w}×{h}"
+            );
+        };
+        // Include widths on either side of the renderer's aligned row stride.
+        for width in [63, 64, 65, 137, 257] {
+            check_crop(
+                width,
+                &ExportOptions {
+                    background: ExportBackground::Transparent,
+                    region: Some((12.0, 17.0, f64::from(width), 39.0)),
+                    ..Default::default()
+                },
+            );
+        }
+        check_crop(
+            257,
+            &ExportOptions {
+                background: ExportBackground::Transparent,
+                crop_to_content: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn crop_to_content_centers_artwork_in_a_wider_output() {
+        let Some(renderer) = try_renderer() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        let mut doc = Document::new("Crop", 400.0, 125.0);
+        let layer = doc.layer_order[0];
+        let shape = PathNode::new(PathData::rect(50.0, 30.0, 100.0, 40.0));
+        doc.add_node(
+            SceneNode::new("Black rectangle", layer, SceneNodeKind::Path(shape)),
+            Some(layer),
+        );
+        let opts = ExportOptions {
+            background: ExportBackground::Transparent,
+            crop_to_content: true,
+            ..Default::default()
+        };
+        // 100×40 artwork in a 200×40 frame fills x = 50..150 at unit scale.
+        let (pixels, w, _) = renderer.render_rgba_with_opts(&doc, 200, 40, &opts);
+        let alpha = |x: u32| pixels[((20 * w + x) * 4 + 3) as usize];
+        for x in [5, 45, 155, 195] {
+            assert_eq!(alpha(x), 0, "column {x} lies beside the centered artwork");
+        }
+        for x in [52, 100, 147] {
+            assert_eq!(alpha(x), 255, "column {x} lies inside the centered artwork");
+        }
+    }
+
+    #[test]
+    fn shared_headless_renderer_keeps_each_concurrent_camera() {
+        let Some(renderer) = try_renderer() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 24;
+        let mut doc = Document::new("Camera concurrency", 100.0, 100.0);
+        let layer = doc.layer_order[0];
+        doc.add_node(
+            SceneNode::new(
+                "Offset shape",
+                layer,
+                SceneNodeKind::Path(PathNode::new(PathData::rect(20.0, 27.0, 31.0, 38.0))),
+            ),
+            Some(layer),
+        );
+        let cases: Vec<_> = (0..WORKERS)
+            .map(|i| {
+                let out = (43 + 4 * i as u32, 49 + 2 * i as u32);
+                let opts = ExportOptions {
+                    background: ExportBackground::Transparent,
+                    region: Some((i as f64 * 3.0, i as f64, 70.0, 80.0)),
+                    ..Default::default()
+                };
+                let expected = renderer.render_rgba_with_opts(&doc, out.0, out.1, &opts);
+                assert!(expected.0.chunks_exact(4).any(|p| p[3] > 0));
+                (out, opts, expected)
+            })
+            .collect();
+
+        let barrier = std::sync::Barrier::new(WORKERS);
+        let mismatches: usize = (0..ROUNDS)
+            .map(|_| {
+                std::thread::scope(|scope| {
+                    let jobs: Vec<_> = cases
+                        .iter()
+                        .map(|(size, opts, expected)| {
+                            let (renderer, doc, barrier) = (&renderer, &doc, &barrier);
+                            scope.spawn(move || {
+                                barrier.wait();
+                                let observed =
+                                    renderer.render_rgba_with_opts(doc, size.0, size.1, opts);
+                                usize::from(&observed != expected)
+                            })
+                        })
+                        .collect();
+                    jobs.into_iter()
+                        .map(|job| job.join().unwrap())
+                        .sum::<usize>()
+                })
+            })
+            .sum();
+        assert_eq!(
+            mismatches,
+            0,
+            "{mismatches} of {} renders used the wrong camera",
+            WORKERS * ROUNDS
+        );
     }
 
     /// Decode an IEEE-754 half (`Rgba16Float` storage) to `f32`. Inline to avoid

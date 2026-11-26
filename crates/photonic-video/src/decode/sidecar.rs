@@ -25,6 +25,19 @@ pub struct SidecarConfig {
     /// `-i` = fast keyframe-accurate seek; decode-forward discards to the target.
     pub seek: Tick,
     pub pix_fmt: PixFmt,
+    pub frame_sync: FrameSync,
+}
+
+/// How FFmpeg maps decoded frames onto the raw output stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameSync {
+    /// FFmpeg's default constant-rate output. Duplicates fill timestamp gaps,
+    /// so output ordinal `i` stays at `start_frame + i` source frames for the
+    /// arithmetic CFR timestamp model.
+    ConstantRate,
+    /// One output frame per decoded frame, so ordinal `i` matches the VFR
+    /// timestamp table entry `start_frame + i`.
+    Passthrough,
 }
 
 /// Lines of stderr kept for diagnostics (bounded ring).
@@ -42,7 +55,7 @@ impl Sidecar {
     /// Spawn ffmpeg and return the sidecar plus its stdout pipe.
     ///
     /// Args: `ffmpeg -hide_banner -nostdin -loglevel error -ss <seek> -i <file>
-    /// -f rawvideo -pix_fmt <fmt> pipe:1`. Input `-ss` seeks to the keyframe at
+    /// -map 0:v:0 -an [<passthrough sync>] -f rawvideo -pix_fmt <fmt> pipe:1`. Input `-ss` seeks to the keyframe at
     /// or before `seek`; the caller decode-forwards to the exact target.
     pub fn spawn(
         tools: &FfmpegTools,
@@ -76,13 +89,19 @@ impl Sidecar {
             .arg(&seek_secs)
             .arg("-i")
             .arg(&cfg.input)
-            .args([
-                "-an",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                cfg.pix_fmt.ffmpeg_name(),
-            ])
+            // Probe dimensions and frame indexes refer to this stream.
+            .args(["-map", "0:v:0", "-an"]);
+        if cfg.frame_sync == FrameSync::Passthrough {
+            // FrameReader assigns one table timestamp to each raw frame.
+            let sync_flag = if fps_mode_supported(&tools.ffmpeg) {
+                "-fps_mode"
+            } else {
+                "-vsync"
+            };
+            command.args([sync_flag, "passthrough", "-enc_time_base", "1:1000000"]);
+        }
+        command
+            .args(["-f", "rawvideo", "-pix_fmt", cfg.pix_fmt.ffmpeg_name()])
             .arg("pipe:1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -248,4 +267,61 @@ pub(crate) fn cuda_hwaccel_listed(ffmpeg: &std::path::Path) -> bool {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .insert(key, value);
     value
+}
+
+/// Whether this FFmpeg accepts `-fps_mode` (FFmpeg 5.1+), cached per
+/// executable. Older releases only understand `-vsync`, which FFmpeg 9 removed.
+/// An unreadable help listing assumes a current FFmpeg.
+fn fps_mode_supported(ffmpeg: &std::path::Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = ffmpeg.to_path_buf();
+    if let Some(value) = cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+        .copied()
+    {
+        return value;
+    }
+    let value = Command::new(ffmpeg)
+        .args(["-hide_banner", "-h", "long"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .is_none_or(|out| help_lists_fps_mode(&out.stdout));
+    cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(key, value);
+    value
+}
+
+fn help_lists_fps_mode(help: &[u8]) -> bool {
+    let help = String::from_utf8_lossy(help);
+    let mut lines = help.lines().map(str::trim_start);
+    if lines.clone().any(|line| line.starts_with("-fps_mode")) {
+        return true;
+    }
+    // A listing that documents `-vsync` but not `-fps_mode` predates 5.1.
+    !lines.any(|line| line.starts_with("-vsync"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::help_lists_fps_mode;
+
+    #[test]
+    fn fps_mode_detection_distinguishes_ffmpeg_generations() {
+        let modern = b"Advanced Video options:\n-fps_mode[:<stream_spec>]  set framerate mode\n";
+        let legacy = b"Advanced Video options:\n-vsync              video sync method\n";
+        assert!(help_lists_fps_mode(modern));
+        assert!(!help_lists_fps_mode(legacy));
+        assert!(help_lists_fps_mode(b"unrecognized listing"));
+    }
 }

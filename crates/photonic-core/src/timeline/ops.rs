@@ -98,6 +98,14 @@ fn clip(t: &Track, id: ClipId) -> Result<&Clip, EditError> {
         .ok_or(EditError::NoClip(id))
 }
 
+fn checked_clip_end(start: Tick, duration: Tick) -> Result<Tick, EditError> {
+    start
+        .0
+        .checked_add(duration.0)
+        .map(Tick)
+        .ok_or(EditError::Overlap)
+}
+
 /// True if `[start, end)` would overlap any clip on `t` other than `ignore`.
 fn overlaps_other(t: &Track, start: Tick, end: Tick, ignore: Option<ClipId>) -> bool {
     t.clips
@@ -594,10 +602,6 @@ pub fn offline_assets(
     out
 }
 
-fn file_name_of(p: &std::path::Path) -> Option<String> {
-    p.file_name().map(|n| n.to_string_lossy().into_owned())
-}
-
 /// Plan a batch relink of `offline` against the files in `candidates`.
 ///
 /// Rule order per asset — strongest identity first, which is the order
@@ -641,7 +645,7 @@ pub fn plan_relink(
         let super::media::AssetSource::File { path: old_path, .. } = &asset.source else {
             continue; // embedded vectors have no file to relink
         };
-        let want_name = file_name_of(old_path);
+        let want_name = old_path.file_name();
 
         // Collect the matches for each rule, then take the strongest non-empty.
         let by_hash: Vec<&RelinkCandidate> = match asset.content_hash.as_deref() {
@@ -651,20 +655,20 @@ pub fn plan_relink(
                 .collect(),
             None => Vec::new(),
         };
-        let by_exact: Vec<&RelinkCandidate> = match &want_name {
+        let by_exact: Vec<&RelinkCandidate> = match want_name {
             Some(name) => candidates
                 .iter()
-                .filter(|c| file_name_of(&c.path).as_deref() == Some(name.as_str()))
+                .filter(|c| c.path.file_name() == Some(name))
                 .collect(),
             None => Vec::new(),
         };
-        let by_ci: Vec<&RelinkCandidate> = match &want_name {
+        let by_ci: Vec<&RelinkCandidate> = match want_name {
             Some(name) => candidates
                 .iter()
                 .filter(|c| {
-                    file_name_of(&c.path)
-                        .map(|n| n.eq_ignore_ascii_case(name))
-                        .unwrap_or(false)
+                    c.path
+                        .file_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 })
                 .collect(),
             None => Vec::new(),
@@ -723,7 +727,8 @@ pub fn plan_relink(
 /// Turn accepted plan entries into commands — the caller wraps the whole `Vec`
 /// in ONE `Command::Batch` so a 200-clip relink is a single undo unit (DoD 4).
 ///
-/// Two data-integrity rules are enforced here rather than left to each caller:
+/// Apply entries only while the asset still points at the path in the preview.
+/// A previously verified match also requires the current asset hash to agree.
 ///
 /// * A [`RelinkHashCheck::Mismatch`] entry is **skipped** unless
 ///   `accept_mismatch`. Binding a clip to the wrong take is a failure the user
@@ -747,13 +752,22 @@ pub fn relink_plan_commands(
         if e.new_path == e.old_path {
             continue;
         }
+        let Some(asset) = p.media.assets.get(&e.asset) else {
+            continue;
+        };
+        if !matches!(
+            &asset.source,
+            super::media::AssetSource::File { path, .. } if path == &e.old_path
+        ) {
+            continue;
+        }
+        if e.hash == RelinkHashCheck::Match && asset.content_hash != e.new_hash {
+            continue;
+        }
         let Ok(relink) = relink_asset(p, e.asset, e.new_path.clone()) else {
             continue;
         };
         cmds.push(relink);
-        let Some(asset) = p.media.assets.get(&e.asset) else {
-            continue;
-        };
         match e.hash {
             RelinkHashCheck::Mismatch => {
                 if let Ok(meta) = set_asset_meta(p, e.asset, None, e.new_hash.clone()) {
@@ -1548,7 +1562,11 @@ pub fn move_clip_to_track(
     }
     let s = seq(p, id)?;
     let src = track(s, track_id)?;
+    if src.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(src, clip_id)?;
+    let new_end = checked_clip_end(new_start, c.duration)?;
 
     // Normalize: a `Some(same)` destination is really a same-track move.
     let dest_id = match new_track {
@@ -1558,17 +1576,20 @@ pub fn move_clip_to_track(
 
     match dest_id {
         None => {
-            if overlaps_other(src, new_start, new_start + c.duration, Some(clip_id)) {
+            if overlaps_other(src, new_start, new_end, Some(clip_id)) {
                 return Err(EditError::Overlap);
             }
         }
         Some(dest) => {
             let dst = track(s, dest)?;
+            if dst.locked {
+                return Err(EditError::TrackLocked);
+            }
             if dst.kind != src.kind {
                 return Err(EditError::NoTrack(dest));
             }
             // On the destination the clip is new — nothing to ignore.
-            if overlaps_other(dst, new_start, new_start + c.duration, None) {
+            if overlaps_other(dst, new_start, new_end, None) {
                 return Err(EditError::Overlap);
             }
         }
@@ -1594,10 +1615,17 @@ pub fn trim_clip(
     if new.duration.0 <= 0 {
         return Err(EditError::NonPositiveDuration);
     }
+    if new.start.0 < 0 || new.source_in.0 < 0 {
+        return Err(EditError::Overlap);
+    }
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
-    if overlaps_other(t, new.start, new.start + new.duration, Some(clip_id)) {
+    let new_end = checked_clip_end(new.start, new.duration)?;
+    if overlaps_other(t, new.start, new_end, Some(clip_id)) {
         return Err(EditError::Overlap);
     }
     Ok(TimelineCmd::TrimClip {
@@ -1653,14 +1681,8 @@ pub fn edit_clip_timing(
     // Ripple duration (end-edge) when the start is held fixed — the dialog's
     // "ripple" checkbox. Start-edge / position changes never ride this path.
     if ripple && new.start == old.start && new.duration != old.duration {
-        let mut cmds = ripple_trim(
-            p,
-            id,
-            track_id,
-            clip_id,
-            ClipEdge::End,
-            new.start + new.duration,
-        )?;
+        let new_end = checked_clip_end(new.start, new.duration)?;
+        let mut cmds = ripple_trim(p, id, track_id, clip_id, ClipEdge::End, new_end)?;
         if new.source_in != old.source_in {
             // Slip against the post-trim project is not available here (pure
             // planner). Emit SlipClip with the desired value — apply order is
@@ -1689,6 +1711,9 @@ pub fn split_clip(
 ) -> Result<TimelineCmd, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     if at <= c.start || at >= c.end() {
         return Err(EditError::InvalidSplit);
@@ -1710,8 +1735,14 @@ pub fn slip_clip(
     clip_id: ClipId,
     new_source_in: Tick,
 ) -> Result<TimelineCmd, EditError> {
+    if new_source_in.0 < 0 {
+        return Err(EditError::Overlap);
+    }
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     Ok(TimelineCmd::SlipClip {
         seq: id,
@@ -1826,6 +1857,33 @@ pub fn expand_sync_lock_ripple(
         .collect()
 }
 
+/// Reject a ripple whose shift would carry any moved clip past the tick
+/// ceiling. The riders are the clips at or after `point` on `edited_track`
+/// (except `edited_clip`) and on every sync-locked, unlocked sibling, matching
+/// the clips [`expand_sync_lock_ripple`] and the edited track's ripple move.
+/// A negative shift cannot go below zero, because riders start at or after
+/// the point it closes from.
+pub fn check_ripple_shift(
+    p: &TimelineProject,
+    id: SequenceId,
+    edited_track: TrackId,
+    edited_clip: ClipId,
+    point: Tick,
+    shift: Tick,
+) -> Result<(), EditError> {
+    let s = seq(p, id)?;
+    let rides = |t: &&Track| t.id == edited_track || (t.sync_lock && !t.locked);
+    let riders = s
+        .tracks()
+        .filter(rides)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.id != edited_clip && c.start >= point);
+    for c in riders {
+        checked_clip_end(c.start, c.duration).and_then(|end| checked_clip_end(end, shift))?;
+    }
+    Ok(())
+}
+
 /// Which edge of a clip a trim targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClipEdge {
@@ -1857,6 +1915,9 @@ pub fn ripple_trim(
 ) -> Result<Vec<TimelineCmd>, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     let old_start = c.start;
     let old_end = c.end();
@@ -1878,12 +1939,26 @@ pub fn ripple_trim(
             )
         }
         ClipEdge::Start => {
-            let delta = new_boundary - old_start;
-            let new_dur = c.duration - delta;
-            if new_dur.0 <= 0 {
+            let delta = new_boundary
+                .0
+                .checked_sub(old_start.0)
+                .map(Tick)
+                .ok_or(EditError::NonPositiveDuration)?;
+            let new_dur = c
+                .duration
+                .0
+                .checked_sub(delta.0)
+                .ok_or(EditError::NonPositiveDuration)?;
+            if new_dur <= 0 {
                 return Err(EditError::NonPositiveDuration);
             }
-            let new_source_in = c.source_in + c.speed.source_delta(delta);
+            let new_dur = Tick(new_dur);
+            let new_source_in = c
+                .source_in
+                .0
+                .checked_add(c.speed.source_delta(delta).0)
+                .map(Tick)
+                .ok_or(EditError::InvalidSplit)?;
             if new_source_in.0 < 0 {
                 // Cannot pull the in-point before the start of the source media.
                 return Err(EditError::InvalidSplit);
@@ -1899,6 +1974,12 @@ pub fn ripple_trim(
             )
         }
     };
+
+    // The trimmed clip and every clip that rides the ripple (here and on
+    // sync-locked tracks) must keep a representable end. A negative shift
+    // cannot go below zero: riders start at or after `old_end`.
+    checked_clip_end(trimmed.start, trimmed.duration)?;
+    check_ripple_shift(p, id, track_id, clip_id, old_end, shift)?;
 
     let mut changes = vec![(clip_id, ClipTiming::of(c), trimmed)];
     for other in &t.clips {
@@ -8279,6 +8360,39 @@ mod tests {
         assert_eq!(plan.unmatched, ids);
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn relink_matches_native_filenames_without_lossy_aliases() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        let (doc, ids) = relink_fixture(&[("/old/take-�.mp4", None)]);
+        let project = doc.timeline.as_ref().unwrap();
+        let unrelated = RelinkCandidate {
+            path: Path::new("/scanned/a").join(OsStr::from_bytes(b"take-\xff.mp4")),
+            content_hash: None,
+        };
+        for (target, matched_by) in [
+            ("/scanned/z/take-�.mp4", RelinkMatchKind::ExactName),
+            (
+                "/scanned/z/TAKE-�.MP4",
+                RelinkMatchKind::CaseInsensitiveName,
+            ),
+        ] {
+            let plan = plan_relink(
+                project,
+                &ids,
+                &[unrelated.clone(), cand(target, None)],
+                faked(&[]),
+            );
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(plan.entries[0].new_path, Path::new(target));
+            assert_eq!(plan.entries[0].matched_by, matched_by);
+            assert!(!plan.entries[0].ambiguous);
+        }
+    }
+
     /// An unverifiable hash must read `Unknown`, never `Mismatch` — a false
     /// mismatch would teach users to click through the one integrity guard.
     #[test]
@@ -8394,6 +8508,57 @@ mod tests {
                 .content_hash
                 .as_deref(),
             Some("xxh:aaa")
+        );
+    }
+
+    #[test]
+    fn a_stale_relink_preview_keeps_the_newer_asset_path() {
+        let (mut doc, ids) =
+            relink_fixture(&[("/old/a.mp4", Some("h:a")), ("/old/b.mp4", Some("h:b"))]);
+        let project = doc.timeline.as_ref().unwrap();
+        let candidates = [
+            cand("/scanned/a.mp4", Some("h:a")),
+            cand("/scanned/b.mp4", Some("h:b")),
+        ];
+        let disk = [("/scanned/a.mp4", "h:a"), ("/scanned/b.mp4", "h:b")];
+        let plan = plan_relink(project, &ids, &candidates, faked(&disk));
+        assert_eq!(plan.entries.len(), 2);
+
+        let newer_path = std::path::PathBuf::from("/chosen/a.mp4");
+        let newer = relink_asset(project, ids[0], newer_path.clone()).unwrap();
+        Command::Timeline(newer).apply(&mut doc);
+        let cmds = relink_plan_commands(doc.timeline.as_ref().unwrap(), &plan.entries, false);
+        Command::Batch(cmds.into_iter().map(Command::Timeline).collect()).apply(&mut doc);
+
+        let assets = &doc.timeline.as_ref().unwrap().media.assets;
+        assert!(
+            matches!(&assets[&ids[0]].source, AssetSource::File { path, .. } if path == &newer_path)
+        );
+        assert!(
+            matches!(&assets[&ids[1]].source, AssetSource::File { path, .. } if path == std::path::Path::new("/scanned/b.mp4"))
+        );
+    }
+
+    #[test]
+    fn a_verified_relink_requires_the_current_asset_identity() {
+        let (mut doc, ids) = relink_fixture(&[("/old/a.mp4", Some("h:original"))]);
+        let project = doc.timeline.as_ref().unwrap();
+        let candidate = cand("/scanned/a.mp4", Some("h:original"));
+        let plan = plan_relink(
+            project,
+            &ids,
+            &[candidate],
+            faked(&[("/scanned/a.mp4", "h:original")]),
+        );
+        assert_eq!(plan.entries[0].hash, RelinkHashCheck::Match);
+
+        let metadata =
+            set_asset_meta(project, ids[0], None, Some("h:updated".to_string())).unwrap();
+        Command::Timeline(metadata).apply(&mut doc);
+        let cmds = relink_plan_commands(doc.timeline.as_ref().unwrap(), &plan.entries, false);
+        assert!(
+            cmds.is_empty(),
+            "a match for the old hash cannot relink the updated asset"
         );
     }
 

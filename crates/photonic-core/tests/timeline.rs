@@ -261,6 +261,202 @@ fn sequence_and_track_ops_roundtrip() {
 }
 
 #[test]
+fn direct_timing_edits_respect_source_and_destination_track_locks() {
+    let mut f = fixture();
+    let seq = f
+        .doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap();
+    seq.track_mut(f.vtrack).unwrap().locked = true;
+    let mut destination = Track::new(TrackKind::Video, "Locked destination");
+    destination.locked = true;
+    let destination_id = destination.id;
+    seq.video_tracks.push(destination);
+
+    let p = f.project();
+    let timing = ClipTiming {
+        start: Tick::ZERO,
+        duration: Tick(500),
+        source_in: Tick::ZERO,
+    };
+    let edits = [
+        (
+            "move",
+            ops::move_clip(p, f.seq, f.vtrack, f.clip_b, Tick(2_000)),
+        ),
+        ("trim", ops::trim_clip(p, f.seq, f.vtrack, f.clip_a, timing)),
+        (
+            "split",
+            ops::split_clip(p, f.seq, f.vtrack, f.clip_a, Tick(500)),
+        ),
+        (
+            "slip",
+            ops::slip_clip(p, f.seq, f.vtrack, f.clip_a, Tick(500)),
+        ),
+    ];
+    let bypasses: Vec<_> = edits
+        .into_iter()
+        .filter_map(|(edit, result)| {
+            (!matches!(result, Err(ops::EditError::TrackLocked))).then_some(edit)
+        })
+        .collect();
+    assert!(
+        bypasses.is_empty(),
+        "edits bypassing the source track lock: {bypasses:?}"
+    );
+    assert!(
+        matches!(
+            ops::ripple_trim(p, f.seq, f.vtrack, f.clip_a, ClipEdge::End, Tick(500)),
+            Err(ops::EditError::TrackLocked)
+        ),
+        "ripple trims must respect the track lock"
+    );
+
+    let seq = f
+        .doc
+        .timeline
+        .as_mut()
+        .unwrap()
+        .sequences
+        .get_mut(&f.seq)
+        .unwrap();
+    seq.track_mut(f.vtrack).unwrap().locked = false;
+    assert!(matches!(
+        ops::move_clip_to_track(
+            f.project(),
+            f.seq,
+            f.vtrack,
+            f.clip_b,
+            Tick(2_000),
+            Some(destination_id)
+        ),
+        Err(ops::EditError::TrackLocked)
+    ));
+}
+
+#[test]
+fn trimming_and_slipping_reject_negative_positions() {
+    let f = fixture();
+    let timing = ClipTiming {
+        start: Tick::ZERO,
+        duration: Tick(500),
+        source_in: Tick::ZERO,
+    };
+    for invalid in [
+        ClipTiming {
+            start: Tick(-1),
+            ..timing
+        },
+        ClipTiming {
+            source_in: Tick(-1),
+            ..timing
+        },
+    ] {
+        assert!(ops::trim_clip(f.project(), f.seq, f.vtrack, f.clip_a, invalid).is_err());
+    }
+    assert!(ops::slip_clip(f.project(), f.seq, f.vtrack, f.clip_a, Tick(-1)).is_err());
+}
+
+#[test]
+fn moving_and_trimming_reject_unrepresentable_clip_ends() {
+    let f = fixture();
+    let near_end = Tick(i64::MAX - 10);
+    let timing = ClipTiming {
+        start: near_end,
+        duration: Tick(500),
+        source_in: Tick::ZERO,
+    };
+    let p = f.project();
+    let ripple = ClipTiming {
+        start: Tick(1_000),
+        duration: Tick(i64::MAX),
+        source_in: Tick::ZERO,
+    };
+    let probes = [
+        (
+            "trim",
+            std::panic::catch_unwind(|| ops::trim_clip(p, f.seq, f.vtrack, f.clip_a, timing))
+                .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "move",
+            std::panic::catch_unwind(|| ops::move_clip(p, f.seq, f.vtrack, f.clip_a, near_end))
+                .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "ripple duration",
+            std::panic::catch_unwind(|| {
+                ops::edit_clip_timing(p, f.seq, f.vtrack, f.clip_b, ripple, true)
+            })
+            .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "ripple shifting a later clip",
+            std::panic::catch_unwind(|| {
+                // A's new end fits, but B (1000..2000) would end past the ceiling.
+                let long = ClipTiming {
+                    start: Tick::ZERO,
+                    duration: Tick(i64::MAX - 500),
+                    source_in: Tick::ZERO,
+                };
+                ops::edit_clip_timing(p, f.seq, f.vtrack, f.clip_a, long, true)
+            })
+            .is_ok_and(|result| result.is_err()),
+        ),
+        (
+            "ripple in-point",
+            std::panic::catch_unwind(|| {
+                ops::ripple_trim(
+                    p,
+                    f.seq,
+                    f.vtrack,
+                    f.clip_b,
+                    ClipEdge::Start,
+                    Tick(i64::MIN),
+                )
+            })
+            .is_ok_and(|result| result.is_err()),
+        ),
+    ];
+    let failed: Vec<_> = probes
+        .into_iter()
+        .filter_map(|(edit, rejected)| (!rejected).then_some(edit))
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "overflow must return an edit error: {failed:?}"
+    );
+}
+
+#[test]
+fn undo_roundtrip_adding_first_active_sequence() {
+    let mut doc = Document::new("t", 100.0, 100.0);
+    doc.timeline = Some(TimelineProject::new());
+    let add = ops::add_sequence(Sequence::new("First", FrameRate::FPS_30, 1920, 1080));
+    assert_undo_roundtrip(&doc, &add);
+
+    let mut f = fixture();
+    f.doc.timeline.as_mut().unwrap().active_sequence = None;
+    assert_undo_roundtrip(&f.doc, &add);
+}
+
+#[test]
+fn undo_roundtrip_splitting_clip_with_outgoing_transition() {
+    let mut f = fixture();
+    let project = f.doc.timeline.as_mut().unwrap();
+    let sequence = project.sequences.get_mut(&f.seq).unwrap();
+    let clip = &mut sequence.track_mut(f.vtrack).unwrap().clips[1];
+    clip.transition_out = Some(Transition::new(TransitionKind::DipToBlack, Tick(100)));
+
+    let split = ops::split_clip(project, f.seq, f.vtrack, f.clip_b, Tick(1500)).unwrap();
+    assert_undo_roundtrip(&f.doc, &split);
+}
+
+#[test]
 fn effect_and_grade_ops_roundtrip() {
     let f = fixture();
     let p = f.project();

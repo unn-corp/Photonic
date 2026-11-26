@@ -413,6 +413,64 @@ fn run_export_group(
     let job = &jobs[indices[0]];
     let r = &resolutions[indices[0]];
 
+    // Finish offline audio preparation before spawning a renderer. An audio
+    // cancellation can then return without waiting for graphics initialization.
+    let mut deliveries = Vec::with_capacity(indices.len());
+    for &index in indices {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let job = &jobs[index];
+        let r = &resolutions[index];
+        let (audio, samples) = if r.preset.audio.is_some() {
+            let sample_rate = if project.settings.audio_sample_rate > 0 {
+                project.settings.audio_sample_rate
+            } else {
+                DEFAULT_EXPORT_SAMPLE_RATE
+            };
+            let pcm = offline_audio::render_export_audio_cancellable(
+                &project,
+                job.sequence,
+                r.start,
+                r.end,
+                tools,
+                r.preset.loudness_target.as_ref(),
+                cancel,
+            )?;
+            (
+                Some(AudioStreamSpec {
+                    sample_rate,
+                    channels: 2,
+                }),
+                Some(pcm),
+            )
+        } else {
+            (None, None)
+        };
+        deliveries.push((
+            ResolvedExport {
+                width: r.out_size.0,
+                height: r.out_size.1,
+                frame_rate: r.out_rate,
+                audio,
+                out_path: r.out_path.clone(),
+                colorimetry: Colorimetry::BT709_LIMITED,
+                prefer_hardware: job.options.prefer_hardware,
+                encoder_speed: job.options.encoder_speed.clone(),
+                raw_encoder_args: job.options.raw_encoder_args.clone(),
+                burn_in_timecode: job.options.burn_in_timecode,
+                two_pass: job.options.two_pass,
+            },
+            samples,
+        ));
+    }
+    if deliveries.len() != indices.len() || cancel.load(Ordering::Relaxed) {
+        for index in 0..indices.len() {
+            on_event(index, ExportEvent::Cancelled);
+        }
+        return Ok(());
+    }
+
     // Frozen shadow project with the export format forced active.
     let mut frozen = (*project).clone();
     if let Some(s) = frozen.sequences.get_mut(&job.sequence) {
@@ -452,60 +510,6 @@ fn run_export_group(
     };
     session.send(EngineCmd::SetPreviewQuality(quality));
 
-    // Each output keeps its own audio/loudness semantics. Audio mixing is
-    // still offline before frame production; this pipeline overlaps video only.
-    let mut deliveries = Vec::with_capacity(indices.len());
-    for &index in indices {
-        if cancel.load(Ordering::Relaxed) {
-            session.shutdown();
-            for index in 0..indices.len() {
-                on_event(index, ExportEvent::Cancelled);
-            }
-            return Ok(());
-        }
-        let job = &jobs[index];
-        let r = &resolutions[index];
-        let (audio, samples) = if r.preset.audio.is_some() {
-            let sample_rate = if project.settings.audio_sample_rate > 0 {
-                project.settings.audio_sample_rate
-            } else {
-                DEFAULT_EXPORT_SAMPLE_RATE
-            };
-            let pcm = offline_audio::render_export_audio(
-                &project,
-                job.sequence,
-                r.start,
-                r.end,
-                Some(tools),
-                r.preset.loudness_target.as_ref(),
-            )?;
-            (
-                Some(AudioStreamSpec {
-                    sample_rate,
-                    channels: 2,
-                }),
-                Some(pcm),
-            )
-        } else {
-            (None, None)
-        };
-        deliveries.push((
-            ResolvedExport {
-                width: r.out_size.0,
-                height: r.out_size.1,
-                frame_rate: r.out_rate,
-                audio,
-                out_path: r.out_path.clone(),
-                colorimetry: Colorimetry::BT709_LIMITED,
-                prefer_hardware: job.options.prefer_hardware,
-                encoder_speed: job.options.encoder_speed.clone(),
-                raw_encoder_args: job.options.raw_encoder_args.clone(),
-                burn_in_timecode: job.options.burn_in_timecode,
-                two_pass: job.options.two_pass,
-            },
-            samples,
-        ));
-    }
     let _sleep_guard = indices
         .iter()
         .any(|&index| jobs[index].options.inhibit_sleep)
@@ -721,6 +725,99 @@ mod tests {
             options: Default::default(),
         };
         (project, job)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_export_interrupts_stalled_audio_preparation() {
+        use photonic_core::timeline::{
+            AssetKind, Clip, ClipAudio, ClipSource, MediaAsset, Track, TrackKind,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(gpu) = GpuContext::request_blocking() else {
+            assert!(
+                std::env::var_os("PHOTONIC_REQUIRE_GPU").is_none(),
+                "GPU required"
+            );
+            return;
+        };
+        let directory = std::env::temp_dir().join(format!(
+            "photonic-export-audio-stall-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let program = directory.join("decoder.sh");
+        let ready = directory.join("decoder.sh.ready");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\nprintf started > \"$0.ready\"\nexec sleep 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tools = FfmpegTools {
+            ffmpeg: program,
+            ffprobe: PathBuf::from("ffprobe"),
+        };
+        let source = directory.join("audio.wav");
+        std::fs::write(&source, b"synthetic decoder input").unwrap();
+        let (mut project, mut job) = project_and_job();
+        assert!(job.preset.audio.is_some());
+        job.output = directory.join("export.mp4");
+        let asset = project
+            .media
+            .insert(MediaAsset::from_file(AssetKind::Audio, source));
+        let mut track = Track::new(TrackKind::Audio, "Audio");
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset },
+            Tick::ZERO,
+            Tick::from_seconds(1),
+        );
+        clip.audio = Some(ClipAudio::new());
+        track.clips.push(clip);
+        project
+            .sequences
+            .get_mut(&job.sequence)
+            .unwrap()
+            .audio_tracks
+            .push(track);
+
+        let cancel = AtomicBool::new(false);
+        let (elapsed, result, events) = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let mut events = Vec::new();
+                let result = run_export_job(
+                    gpu.clone(),
+                    Arc::new(project),
+                    &job,
+                    &tools,
+                    &cancel,
+                    |event| events.push(event),
+                );
+                (result, events)
+            });
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !ready.is_file() {
+                assert!(
+                    Instant::now() < deadline,
+                    "offline PCM sidecar did not start"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let started = Instant::now();
+            cancel.store(true, Ordering::Relaxed);
+            let (result, events) = worker.join().unwrap();
+            (started.elapsed(), result, events)
+        });
+        let published = job.output.exists();
+        std::fs::remove_dir_all(directory).unwrap();
+        result.unwrap();
+        assert_eq!(events, vec![ExportEvent::Cancelled]);
+        assert!(!published);
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "cancellation waited {elapsed:?} for audio preparation"
+        );
     }
 
     #[test]

@@ -112,8 +112,8 @@ pub fn scale(img: &RasterImage, factor: f32, filter: Resample) -> RasterImage {
 pub fn crop(img: &RasterImage, x: i64, y: i64, w: u32, h: u32) -> RasterImage {
     let x0 = x.clamp(0, img.width as i64);
     let y0 = y.clamp(0, img.height as i64);
-    let x1 = (x + w as i64).clamp(0, img.width as i64);
-    let y1 = (y + h as i64).clamp(0, img.height as i64);
+    let x1 = x.saturating_add(i64::from(w)).clamp(0, img.width as i64);
+    let y1 = y.saturating_add(i64::from(h)).clamp(0, img.height as i64);
     let cw = (x1 - x0).max(1) as u32;
     let ch = (y1 - y0).max(1) as u32;
     let mut out = RasterImage::new(cw, ch);
@@ -137,9 +137,9 @@ pub fn resize_canvas(
     let mut out = RasterImage::new(new_w.clamp(1, DIM_MAX), new_h.clamp(1, DIM_MAX));
     for y in 0..img.height {
         for x in 0..img.width {
-            let nx = x as i64 + offset_x;
-            let ny = y as i64 + offset_y;
-            if nx >= 0 && ny >= 0 && (nx as u32) < out.width && (ny as u32) < out.height {
+            let nx = offset_x.saturating_add(i64::from(x));
+            let ny = offset_y.saturating_add(i64::from(y));
+            if (0..i64::from(out.width)).contains(&nx) && (0..i64::from(out.height)).contains(&ny) {
                 out.set_pixel(nx as u32, ny as u32, img.pixel(x, y));
             }
         }
@@ -270,12 +270,44 @@ mod tests {
     }
 
     #[test]
+    fn image_and_mask_crops_clamp_far_positive_coordinates() {
+        let img = ramp(2, 2);
+        let mask = crate::raster::Mask::full(2, 2);
+        for (x, y, expected) in [(i64::MAX, 0, (1, 2)), (0, i64::MAX, (2, 1))] {
+            let cropped_image = crop(&img, x, y, 2, 2);
+            let cropped_mask = mask.crop(x, y, 2, 2);
+            assert_eq!((cropped_image.width, cropped_image.height), expected);
+            assert_eq!((cropped_mask.width, cropped_mask.height), expected);
+            assert!(cropped_image.pixels.iter().all(|&channel| channel == 0));
+            assert!(cropped_mask.is_empty_selection());
+        }
+    }
+
+    #[test]
     fn canvas_grows_with_transparent_border() {
         let img = RasterImage::filled(2, 2, [9, 9, 9, 255]);
         let c = resize_canvas(&img, 4, 4, 1, 1);
         assert_eq!((c.width, c.height), (4, 4));
         assert_eq!(c.pixel(0, 0), [0, 0, 0, 0]);
         assert_eq!(c.pixel(1, 1), [9, 9, 9, 255]);
+    }
+
+    #[test]
+    fn canvas_offsets_cannot_wrap_content_back_into_view() {
+        let img = ramp(2, 2);
+        for (x, y) in [
+            (1_i64 << 32, 0),
+            (0, 1_i64 << 32),
+            (i64::MAX, 0),
+            (0, i64::MAX),
+        ] {
+            let resized = resize_canvas(&img, 2, 2, x, y);
+            assert_eq!((resized.width, resized.height), (2, 2));
+            assert!(
+                resized.pixels.iter().all(|&channel| channel == 0),
+                "content at ({x}, {y}) is outside the canvas"
+            );
+        }
     }
 
     #[test]

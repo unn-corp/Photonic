@@ -20,12 +20,11 @@ use photonic_core::timeline::{
 
 use super::presets::LoudnessTarget;
 use super::render_loop::ExportError;
-use crate::audio::mixer::{ClipVoice, Mixer, PcmSource, TrackVoice};
+use crate::audio::mixer::{first_clip_sample, ClipVoice, Mixer, PcmSource, TrackVoice};
 use crate::audio::{BLOCK_FRAMES, CHANNELS};
 use crate::graph::analysis::{self, AnalysisCache, AnalysisResult};
 use crate::media::ffmpeg_locate::FfmpegTools;
-use crate::playback::pcm::{read_pcm_window, TimeWarpPcmSource};
-use crate::playback::FfmpegPcmSource;
+use crate::playback::pcm::{read_pcm_window, PcmDecoderControl, TimeWarpPcmSource};
 
 /// Default export mix rate when a sequence does not declare one (48 kHz).
 pub const DEFAULT_EXPORT_SAMPLE_RATE: u32 = 48_000;
@@ -60,6 +59,72 @@ pub fn render_export_audio_filtered(
     loudness: Option<&LoudnessTarget>,
     only_track: Option<photonic_core::timeline::TrackId>,
 ) -> Result<Vec<f32>, ExportError> {
+    mix_export_audio(
+        project,
+        sequence,
+        start,
+        end,
+        tools,
+        loudness,
+        only_track,
+        &PcmDecoderControl::default(),
+    )
+}
+
+/// Keep watching the export's cancel flag while the mixer may be in a pipe read.
+pub(super) fn render_export_audio_cancellable(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    start: Tick,
+    end: Tick,
+    tools: &FfmpegTools,
+    loudness: Option<&LoudnessTarget>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<f32>, ExportError> {
+    use crossbeam_channel::RecvTimeoutError;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let control = &PcmDecoderControl::default();
+    std::thread::scope(|scope| {
+        let (done, finished) = crossbeam_channel::bounded::<()>(0);
+        scope.spawn(move || {
+            while !cancel.load(Ordering::Relaxed) {
+                if !matches!(
+                    finished.recv_timeout(Duration::from_millis(10)),
+                    Err(RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+            }
+            control.cancel();
+        });
+        let result = mix_export_audio(
+            project,
+            sequence,
+            start,
+            end,
+            Some(tools),
+            loudness,
+            None,
+            control,
+        );
+        drop(done);
+        result
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mix_export_audio(
+    project: &TimelineProject,
+    sequence: SequenceId,
+    start: Tick,
+    end: Tick,
+    tools: Option<&FfmpegTools>,
+    loudness: Option<&LoudnessTarget>,
+    only_track: Option<photonic_core::timeline::TrackId>,
+    control: &PcmDecoderControl,
+) -> Result<Vec<f32>, ExportError> {
     if end <= start {
         return Ok(Vec::new());
     }
@@ -89,9 +154,10 @@ pub fn render_export_audio_filtered(
     let mut t = start;
     let mut frames_left = total_frames;
 
-    while frames_left > 0 {
+    while frames_left > 0 && !control.is_cancelled() {
         let frames_this = frames_left.min(BLOCK_FRAMES);
-        // Which clips sound at t? Audio tracks only (matches interactive feeder).
+        let block_end = t.saturating_add(block_ticks);
+        // Match the interactive feeder's half-open block coverage.
         let active: Vec<(&photonic_core::timeline::Track, &Clip)> = seq
             .audio_tracks
             .iter()
@@ -103,7 +169,7 @@ pub fn render_export_audio_filtered(
                     .iter()
                     .filter(|clip| {
                         clip.enabled
-                            && clip.start <= t
+                            && clip.start < block_end
                             && t < clip.end()
                             && matches!(clip.source, ClipSource::Asset { .. })
                     })
@@ -130,15 +196,16 @@ pub fn render_export_audio_filtered(
                     .map(|a| (a.offset, a.stream))
                     .unwrap_or((Tick::ZERO, None));
                 let identity = matches!(clip.speed, SpeedMap::Constant(r) if r == Ratio::ONE);
+                let read_start = first_clip_sample(t, clip.start, sample_rate);
                 if identity {
                     let src_pos = crate::playback::pcm::source_seek_with_offset(
                         clip.source_in,
-                        t,
+                        read_start,
                         clip.start,
                         offset,
                     );
-                    if let Ok(source) =
-                        FfmpegPcmSource::spawn_stream(tools, path, src_pos, sample_rate, stream)
+                    if let Some(source) =
+                        control.spawn_stream(tools, path, src_pos, sample_rate, stream)
                     {
                         pcm.insert(clip.id, Box::new(source));
                     }
@@ -152,13 +219,9 @@ pub fn render_export_audio_filtered(
                         / TICKS_PER_SECOND as f64)
                         .ceil() as usize
                         + 2;
-                    if let Ok(mut decoder) = FfmpegPcmSource::spawn_stream(
-                        tools,
-                        path,
-                        source_start,
-                        sample_rate,
-                        stream,
-                    ) {
+                    if let Some(mut decoder) =
+                        control.spawn_stream(tools, path, source_start, sample_rate, stream)
+                    {
                         let window = read_pcm_window(&mut decoder, frames);
                         pcm.insert(
                             clip.id,
@@ -169,7 +232,7 @@ pub fn render_export_audio_filtered(
                                 clip.source_in,
                                 offset,
                                 clip.speed.clone(),
-                                t - clip.start,
+                                read_start - clip.start,
                             )),
                         );
                     }
@@ -214,6 +277,9 @@ pub fn render_export_audio_filtered(
         t = t + block_ticks;
     }
 
+    if control.is_cancelled() {
+        return Ok(Vec::new());
+    }
     if let Some(target) = loudness {
         // Analyse (cached, E-2) → apply. Two statements, in that order, because
         // 31 §6.2 says the measurement is a job and the gain is what the render
@@ -303,6 +369,7 @@ pub fn write_stems_for_export(
         DEFAULT_EXPORT_SAMPLE_RATE
     };
     let mut written = Vec::new();
+    let mut used_paths = HashSet::new();
     for track in seq
         .audio_tracks
         .iter()
@@ -317,7 +384,15 @@ pub fn write_stems_for_export(
             loudness,
             Some(track.id),
         )?;
-        let path = stem_output_path(main_out, &track.name);
+        let base = stem_output_path(main_out, &track.name);
+        let mut path = base.clone();
+        let mut suffix = 2;
+        while !used_paths.insert(path.as_os_str().to_ascii_lowercase()) {
+            let mut name = base.file_stem().unwrap_or_default().to_owned();
+            name.push(format!("-{suffix}.wav"));
+            path.set_file_name(name);
+            suffix += 1;
+        }
         write_stem_wav(&path, &pcm, sample_rate)?;
         written.push(path);
     }
@@ -491,6 +566,98 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stem_exports_keep_tracks_with_colliding_names_separate() {
+        let (mut project, sid) = empty_audio_seq();
+        let seq = project.sequences.get_mut(&sid).unwrap();
+        seq.audio_tracks = ["Voice Over", "Voice/Over", "voice_over-2", "Music"]
+            .map(|name| Track::new(TrackKind::Audio, name))
+            .into();
+
+        let dir =
+            std::env::temp_dir().join(format!("photonic-stem-collisions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let main = dir.join("show.mp4");
+        let paths = write_stems_for_export(
+            &project,
+            sid,
+            Tick::ZERO,
+            Tick::from_seconds(1),
+            &main,
+            None,
+            None,
+        )
+        .unwrap();
+        let count = std::fs::read_dir(&dir).unwrap().count();
+        std::fs::remove_dir_all(dir).unwrap();
+
+        assert_eq!(paths.len(), 4);
+        assert_eq!(count, 4, "each track needs its own output file");
+        let names: HashSet<_> = paths
+            .iter()
+            .map(|path| path.file_name().unwrap().to_ascii_lowercase())
+            .collect();
+        assert_eq!(
+            names.len(),
+            4,
+            "names must also be distinct on case-insensitive volumes"
+        );
+        assert_eq!(paths[3], stem_output_path(&main, "Music"));
+    }
+
+    #[test]
+    fn offline_export_keeps_audio_clips_entirely_inside_one_block() {
+        let Some(tools) = crate::media::ffmpeg_locate::locate_for_test() else {
+            return;
+        };
+        let (mut project, sid) = empty_audio_seq();
+        let sound =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beep_flash.wav");
+        let asset = photonic_core::timeline::MediaAsset::from_file(
+            photonic_core::timeline::AssetKind::Audio,
+            sound,
+        );
+        let id = asset.id;
+        project.media.assets.insert(id, asset);
+
+        let step = TICKS_PER_SECOND / 48_000;
+        let end = Tick(BLOCK_FRAMES as i64 * step);
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: id },
+            Tick::ZERO,
+            Tick(128 * step),
+        );
+        clip.source_in = Tick::from_seconds(1);
+        let sequence = project.sequences.get_mut(&sid).unwrap();
+        sequence.audio_master.fx_chain.clear();
+        sequence.audio_tracks[0].clips.push(clip);
+        let aligned =
+            render_export_audio(&project, sid, Tick::ZERO, end, Some(&tools), None).unwrap();
+        assert!(
+            aligned.iter().any(|sample| sample.abs() > 0.01),
+            "the aligned clip must contain audio"
+        );
+
+        project.sequences.get_mut(&sid).unwrap().audio_tracks[0].clips[0].start = Tick(128 * step);
+        let unaligned =
+            render_export_audio(&project, sid, Tick::ZERO, end, Some(&tools), None).unwrap();
+        assert!(
+            unaligned.iter().any(|sample| sample.abs() > 0.01),
+            "a clip starting and ending inside one block must contain audio"
+        );
+        let clip_samples = 128 * CHANNELS;
+        assert!(unaligned[..clip_samples]
+            .iter()
+            .all(|&sample| sample == 0.0));
+        assert_eq!(
+            &unaligned[clip_samples..2 * clip_samples],
+            &aligned[..clip_samples]
+        );
+        assert!(unaligned[2 * clip_samples..]
+            .iter()
+            .all(|&sample| sample == 0.0));
     }
 
     #[test]

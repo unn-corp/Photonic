@@ -92,6 +92,28 @@ fn fractional_chunks_use_stable_frame_boundaries_and_half_open_ranges() {
     assert!(chunks_for_range(rate, (Tick(-1), first.end)).is_err());
     assert!(ChunkSpan::covering(FrameRate { num: 0, den: 1 }, Tick(0)).is_err());
 }
+
+#[test]
+fn preview_span_rejects_an_unrepresentable_end_tick() {
+    let rate = FrameRate::FPS_30;
+    let duration = ChunkSpan::covering(rate, Tick::ZERO).unwrap().end.0;
+    let last_end = Tick(i64::MAX / duration * duration);
+    assert_eq!(
+        ChunkSpan::covering(rate, last_end - Tick(1)).unwrap().end,
+        last_end
+    );
+    assert!(ChunkSpan::covering(rate, last_end).is_err());
+}
+
+#[test]
+fn preview_range_checks_that_its_final_chunk_is_representable() {
+    let rate = FrameRate::FPS_30;
+    let duration = ChunkSpan::covering(rate, Tick::ZERO).unwrap().end.0;
+    let last_end = Tick(i64::MAX / duration * duration);
+    assert!(chunks_for_range(rate, (Tick::ZERO, last_end)).is_ok());
+    assert!(chunks_for_range(rate, (Tick::ZERO, last_end + Tick(1))).is_err());
+}
+
 #[test]
 fn every_frame_order_and_render_context_participate_in_key() {
     let original = signature(SequenceId::new(), 0);
@@ -231,6 +253,102 @@ fn oversized_chunk_cannot_evict_good_content() {
     assert!(cache.lookup(&old).is_some());
     assert_eq!(cache.status().cache.evicted, 0);
 }
+
+#[test]
+fn rejected_publication_preserves_other_chunks_when_a_reader_pins_bytes() {
+    let root = Temp::new();
+    let budget = 10_000;
+    let cache = open_cache(&root, 8, budget);
+    let sequence = SequenceId::new();
+    let pinned = insert(&cache, signature(sequence, 0), &[1; 4_000]);
+    let reusable = signature(sequence, 30);
+    drop(insert(&cache, reusable.clone(), b"reusable media"));
+
+    let staged = cache.staging(signature(sequence, 60)).unwrap();
+    let payload = vec![2; (budget - pinned.bytes() + 1) as usize];
+    std::fs::write(&staged.path, payload).unwrap();
+    assert!(matches!(
+        cache.commit(staged, &AtomicBool::new(false)),
+        Err(PreviewError::BudgetExhausted)
+    ));
+    assert!(pinned.path().is_file());
+    assert_eq!(cache.status().cache.evicted, 0);
+    assert!(cache.lookup(&reusable).is_some());
+}
+
+#[test]
+fn failed_manifest_write_preserves_chunk_needed_for_eviction() {
+    let root = Temp::new();
+    let cache = open_cache(&root, 1, 1_000_000);
+    let sequence = SequenceId::new();
+    let original = signature(sequence, 0);
+    let replacement = signature(sequence, 30);
+    drop(insert(&cache, original.clone(), b"original"));
+
+    let staged = cache.staging(replacement.clone()).unwrap();
+    std::fs::write(&staged.path, b"replacement").unwrap();
+    std::fs::create_dir(staged.directory.join("manifest.json")).unwrap();
+    let staging_dir = staged.directory.clone();
+    assert!(cache.commit(staged, &AtomicBool::new(false)).is_err());
+    assert!(!staging_dir.exists());
+    assert_eq!(cache.status().cache.evicted, 0);
+    let retained = cache.lookup(&original).unwrap();
+    assert_eq!(std::fs::read(retained.path()).unwrap(), b"original");
+    drop(retained);
+
+    drop(insert(&cache, replacement.clone(), b"replacement"));
+    assert_eq!(cache.status().cache.evicted, 1);
+    assert!(cache.lookup(&original).is_none());
+    assert!(cache.lookup(&replacement).is_some());
+}
+
+#[test]
+fn preview_lookup_misses_preserve_job_status_for_the_same_content() {
+    let root = Temp::new();
+    let cache = open_cache(&root, 8, 1_000_000);
+    let sequence = SequenceId::new();
+    let active = signature(sequence, 0);
+    let edited = signature(sequence, 1);
+    assert_eq!(edited.span, active.span);
+    assert_ne!(edited.key, active.key);
+
+    for (state, frame, message) in [
+        (ChunkState::Queued, 0, None),
+        (ChunkState::Rendering, 12, None),
+        (ChunkState::Paused, 12, None),
+        (ChunkState::Failed, 0, Some("encoder stopped".into())),
+        (ChunkState::Cancelled, 0, None),
+    ] {
+        cache.set_status(&active, state, frame, message);
+        let before = cache.status().chunks;
+        assert!(cache.lookup(&active).is_none());
+        assert_eq!(cache.status().chunks, before);
+    }
+
+    assert!(cache.lookup(&edited).is_none());
+    assert_eq!(cache.status().chunks[0].state, ChunkState::NotRendered);
+}
+
+#[test]
+fn evicting_an_old_preview_variant_keeps_the_current_one_rendered() {
+    let root = Temp::new();
+    let cache = open_cache(&root, 2, 1_000_000);
+    let sequence = SequenceId::new();
+    let old = signature(sequence, 0);
+    let current = signature(sequence, 1);
+    let next = signature(sequence, 30);
+    assert_eq!(old.span, current.span);
+    drop(insert(&cache, old, b"old"));
+    drop(insert(&cache, current.clone(), b"current"));
+    drop(insert(&cache, next, b"next"));
+
+    let snapshot = cache.status();
+    assert_eq!(snapshot.cache.evicted, 1);
+    assert_eq!(snapshot.chunks[0].start, current.span.start);
+    assert_eq!(snapshot.chunks[0].state, ChunkState::Rendered);
+    assert!(cache.lookup(&current).is_some());
+}
+
 #[test]
 fn changed_media_is_never_served_and_corrupt_reopen_can_rebuild() {
     let root = Temp::new();

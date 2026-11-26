@@ -22,7 +22,7 @@ use photonic_core::timeline::{FrameRate, Tick};
 
 use super::reader::{FrameReader, PtsModel};
 use super::ring::SharedRing;
-use super::sidecar::{DecodeCancellation, Sidecar, SidecarConfig};
+use super::sidecar::{DecodeCancellation, FrameSync, Sidecar, SidecarConfig};
 use super::{DecodeError, DecodedFrame, PixFmt};
 use crate::media::ffmpeg_locate::FfmpegTools;
 use crate::media::keyframe_index::{KeyframeIndex, PtsIndex};
@@ -110,7 +110,15 @@ impl DecodeSource {
     /// Source frame ordinal of the keyframe at `kf_tick`, for the pts model.
     fn start_frame(&self, kf_tick: Tick) -> i64 {
         match &self.params.pts_kind {
-            PtsKind::Cfr(rate) => rate.frame_at(kf_tick),
+            // Probed keyframe times are rounded to microseconds, so 4/30 s
+            // arrives as 0.133333. FFmpeg's seek starts on the nearest frame,
+            // so a floor would label every following frame one too early.
+            // Known limit: a time base finer than 1 µs can put the rounded
+            // `-ss` just past the keyframe, which FFmpeg then skips.
+            PtsKind::Cfr(rate) => {
+                let half_frame = rate.ticks_per_frame().0.max(1) / 2;
+                rate.frame_at(Tick(kf_tick.0.saturating_add(half_frame)))
+            }
             PtsKind::Vfr(table) => table.ordinal_before(kf_tick),
         }
     }
@@ -142,6 +150,10 @@ impl DecodeSource {
             input: self.params.input.clone(),
             seek: kf_tick,
             pix_fmt: self.params.pix_fmt,
+            frame_sync: match self.params.pts_kind {
+                PtsKind::Cfr(_) => FrameSync::ConstantRate,
+                PtsKind::Vfr(_) => FrameSync::Passthrough,
+            },
         };
         let (sidecar, stdout) =
             Sidecar::spawn_with_decoder(&self.tools, &cfg, use_cuda, self.software_decoder)?;

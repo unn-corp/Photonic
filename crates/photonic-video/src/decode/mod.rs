@@ -27,7 +27,7 @@ use photonic_render::video::YuvPlanes;
 pub use reader::{FrameReader, PtsModel};
 pub use ring::{FrameRing, SharedRing};
 pub use scheduler::DecodeSource;
-pub use sidecar::{Sidecar, SidecarConfig};
+pub use sidecar::{FrameSync, Sidecar, SidecarConfig};
 pub use worker::DecodeWorker;
 
 /// Decode quality: the ring/cache and process are keyed by this so preview and

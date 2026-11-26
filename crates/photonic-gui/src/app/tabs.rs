@@ -112,6 +112,7 @@ impl PhotonicApp {
         self.area_trace_start = None;
         self.area_trace_source = None;
         let a = self.active_tab;
+        let previous_revision = history.revision();
         // Park the active document into its slot (its engine fields were scratch).
         std::mem::swap(doc, &mut self.tabs[a].document);
         std::mem::swap(history, &mut self.tabs[a].history);
@@ -126,6 +127,7 @@ impl PhotonicApp {
         // the scratch placeholder lands in the target's now-active slot.
         std::mem::swap(doc, &mut self.tabs[target].document);
         std::mem::swap(history, &mut self.tabs[target].history);
+        history.record_document_replacement(previous_revision);
         std::mem::swap(view, &mut self.tabs[target].view);
         self.current_file = self.tabs[target].current_file.take();
         self.selected_id = self.tabs[target].selected_id.take();
@@ -285,5 +287,62 @@ impl PhotonicApp {
                         });
                     });
             });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_tabs_invalidates_the_previous_document_revision() {
+        let mut app = PhotonicApp::default();
+        let mut first = Document::new("First", 100.0, 100.0);
+        let mut second = Document::new("Second", 100.0, 100.0);
+        let mut history = CommandHistory::default();
+        let mut second_history = CommandHistory::default();
+        let mut view = CanvasView::default();
+
+        for (doc, history) in [
+            (&mut first, &mut history),
+            (&mut second, &mut second_history),
+        ] {
+            let layer = doc.layer_order[0];
+            let node = SceneNode::new(
+                "Rectangle",
+                layer,
+                SceneNodeKind::Path(PathNode::new(PathData::rect(4.0, 4.0, 12.0, 12.0))),
+            );
+            history.execute(
+                Command::AddNode {
+                    node,
+                    layer_id: Some(layer),
+                },
+                doc,
+            );
+        }
+        let first_revision = history.revision();
+        assert_eq!(second_history.revision(), first_revision);
+
+        app.open_in_new_tab(
+            &mut first,
+            &mut history,
+            &mut view,
+            second,
+            second_history,
+            None,
+        );
+        assert_eq!(first.name, "Second");
+        let second_revision = history.revision();
+        assert!(second_revision > first_revision);
+        assert!(history.changes_since(first_revision).overflowed);
+
+        app.switch_tab(0, &mut first, &mut history, &mut view);
+        assert_eq!(first.name, "First");
+        assert!(history.revision() > second_revision);
+        assert!(history.changes_since(second_revision).overflowed);
+        assert_eq!(history.undo_depth(), 1);
+        history.undo(&mut first);
+        assert!(first.nodes.is_empty());
     }
 }

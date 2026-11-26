@@ -202,7 +202,7 @@ pub fn import_svg(svg_text: &str) -> Result<Document, ImportError> {
         return Err(ImportError::NotSvg);
     }
 
-    let (doc_width, doc_height) = parse_viewport(&root);
+    let (doc_width, doc_height, viewport_transform) = parse_viewport(&root);
     let mut doc = Document::new("Imported SVG", doc_width, doc_height);
     let layer_id = doc.active_layer_id.unwrap();
     let mut state = ImportState::default();
@@ -231,6 +231,10 @@ pub fn import_svg(svg_text: &str) -> Result<Document, ImportError> {
             &mut state,
             1,
         )? {
+            if viewport_transform != Transform::IDENTITY {
+                let node = doc.nodes.get_mut(&node_id).unwrap();
+                node.transform = viewport_transform.then(&node.transform);
+            }
             doc.layers
                 .get_mut(&layer_id)
                 .unwrap()
@@ -315,7 +319,7 @@ fn build_context(
     root: &roxmltree::Node,
     state: &mut ImportState,
 ) -> Result<SvgContext, ImportError> {
-    let (doc_width, doc_height) = parse_viewport(root);
+    let (doc_width, doc_height, _) = parse_viewport(root);
     let mut css_rules: HashMap<String, CssProps> = HashMap::new();
     let mut gradients: HashMap<String, ParsedGradient> = HashMap::new();
 
@@ -1472,7 +1476,8 @@ fn parse_transform_attr(s: &str) -> Transform {
             None => break,
         };
         let args_str = &remaining[..end_paren];
-        remaining = &remaining[end_paren + 1..];
+        remaining =
+            remaining[end_paren + 1..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
 
         let args: Vec<f64> = args_str
             .split(|c: char| c.is_whitespace() || c == ',')
@@ -1522,20 +1527,25 @@ fn parse_transform_attr(s: &str) -> Transform {
 
 // ─── Dimension / length parsing ───────────────────────────────────────────────
 
-fn parse_viewport(root: &roxmltree::Node) -> (f64, f64) {
+fn parse_viewport(root: &roxmltree::Node) -> (f64, f64, Transform) {
     if let Some(vb) = root.attribute("viewBox") {
         let nums: Vec<f64> = vb
             .split(|c: char| c.is_whitespace() || c == ',')
             .filter(|s| !s.is_empty())
             .filter_map(|s| s.parse().ok())
             .collect();
-        if nums.len() >= 4 && nums[2] > 0.0 && nums[3] > 0.0 {
-            return (nums[2], nums[3]);
+        if nums.len() >= 4
+            && nums[2] > 0.0
+            && nums[3] > 0.0
+            && nums[..4].iter().all(|value| value.is_finite())
+        {
+            // The artboard uses viewBox units with its origin at (0, 0).
+            return (nums[2], nums[3], Transform::translate(-nums[0], -nums[1]));
         }
     }
     let w = root.attribute("width").map(parse_length).unwrap_or(800.0);
     let h = root.attribute("height").map(parse_length).unwrap_or(600.0);
-    (w.max(1.0), h.max(1.0))
+    (w.max(1.0), h.max(1.0), Transform::IDENTITY)
 }
 
 /// Parse an SVG length value to logical pixels (96 dpi).
@@ -1636,6 +1646,47 @@ mod tests {
 
         let doc = import_svg(svg).expect("standard external SVG doctype should be accepted");
         assert_eq!(doc.nodes.len(), 1);
+    }
+
+    #[test]
+    fn comma_separates_svg_transform_functions() {
+        let document = import_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="1" y="2" width="4" height="6"
+        transform="translate(20,30) , scale(2,3),translate(1,-2)"/>
+</svg>"#,
+        )
+        .unwrap();
+        let shape = document.nodes.values().next().unwrap();
+        assert_eq!(
+            crate::export::node_world_bbox(shape, &document),
+            Some(kurbo::Rect::new(24.0, 30.0, 32.0, 48.0)),
+        );
+    }
+
+    #[test]
+    fn tight_svg_selection_reimports_into_its_viewport() {
+        let source = import_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 600">
+  <g id="selection" transform="translate(300 -200)">
+    <rect x="10" y="20" width="80" height="26" transform="scale(2)"/>
+  </g>
+</svg>"#,
+        )
+        .unwrap();
+        let selected = source
+            .nodes
+            .values()
+            .find(|n| n.name == "selection")
+            .unwrap();
+        let svg = crate::export::export_nodes_as_svg(&source, &[selected.id]);
+        let imported = import_svg(&svg).unwrap();
+        let root = imported.layers[&imported.active_layer_id.unwrap()].node_ids[0];
+        assert_eq!((imported.width, imported.height), (160.0, 52.0));
+        assert_eq!(
+            crate::export::node_world_bbox(&imported.nodes[&root], &imported),
+            Some(kurbo::Rect::new(0.0, 0.0, 160.0, 52.0)),
+        );
     }
 
     fn assert_limit(svg: &str, expected: ImportLimit) {

@@ -154,10 +154,13 @@ impl RasterImage {
         let ty = fy - y0;
         let x0 = x0 as i64;
         let y0 = y0 as i64;
+        // An out-of-range float can already have saturated to i64::MAX.
+        let x1 = x0.saturating_add(1);
+        let y1 = y0.saturating_add(1);
         let c00 = self.sample_clamped(x0, y0);
-        let c10 = self.sample_clamped(x0 + 1, y0);
-        let c01 = self.sample_clamped(x0, y0 + 1);
-        let c11 = self.sample_clamped(x0 + 1, y0 + 1);
+        let c10 = self.sample_clamped(x1, y0);
+        let c01 = self.sample_clamped(x0, y1);
+        let c11 = self.sample_clamped(x1, y1);
         let mut out = [0u8; 4];
         for c in 0..4 {
             let top = c00[c] as f32 * (1.0 - tx) + c10[c] as f32 * tx;
@@ -464,5 +467,22 @@ mod tests {
         img.set_pixel(1, 0, [100, 100, 100, 255]);
         let mid = img.sample_bilinear(0.5, 0.0);
         assert_eq!(mid[0], 50);
+    }
+
+    #[test]
+    fn bilinear_sampling_clamps_extreme_finite_coordinates() {
+        let mut image = RasterImage::filled(2, 2, [30, 40, 50, 255]);
+        image.set_pixel(1, 0, [10, 20, 30, 255]);
+        image.set_pixel(1, 1, [50, 60, 70, 255]);
+
+        assert_eq!(image.sample_bilinear(f32::MAX, f32::MAX), [50, 60, 70, 255]);
+        assert_eq!(
+            image.sample_bilinear(f32::MAX, -f32::MAX),
+            [10, 20, 30, 255]
+        );
+        assert_eq!(
+            image.sample_bilinear(-f32::MAX, f32::MAX),
+            [30, 40, 50, 255]
+        );
     }
 }

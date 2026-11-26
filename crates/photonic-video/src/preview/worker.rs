@@ -126,7 +126,6 @@ struct JobControl {
 struct QueuedChunk {
     id: PreviewJobId,
     request: PreviewChunkRequest,
-    cancel: Arc<AtomicBool>,
 }
 struct WorkerShared {
     cache: Arc<PreviewCache>,
@@ -193,41 +192,33 @@ impl PreviewWorker {
     pub fn submit(&self, request: PreviewChunkRequest) -> Result<PreviewJobId, PreviewError> {
         request.signature.validate()?;
         let shared = &self.inner.shared;
+        let mut jobs = shared.jobs.lock().unwrap_or_else(PoisonError::into_inner);
         if shared.stop.load(Ordering::Relaxed) {
             return Err(PreviewError::Stopped);
         }
-        let id = PreviewJobId(shared.next.fetch_add(1, Ordering::Relaxed));
-        let cancel = Arc::new(AtomicBool::new(false));
-        let mut jobs = shared.jobs.lock().unwrap_or_else(PoisonError::into_inner);
         if jobs.len() >= QUEUE_CAPACITY + 1 {
             return Err(PreviewError::QueueFull);
         }
-        jobs.insert(
-            id,
-            JobControl {
-                sequence: request.signature.context.sequence,
-                cancel: Arc::clone(&cancel),
-            },
-        );
-        // Worker cannot observe a request before its cancellation control exists.
+        let id = PreviewJobId(shared.next.fetch_add(1, Ordering::Relaxed));
         let signature = request.signature.clone();
-        shared
-            .cache
-            .set_status(&signature, ChunkState::Queued, 0, None);
-        match self.inner.sender.try_send(QueuedChunk {
-            id,
-            request,
-            cancel,
-        }) {
-            Ok(()) => Ok(id),
-            Err(crossbeam_channel::TrySendError::Full(_)) => {
-                jobs.remove(&id);
-                Err(PreviewError::QueueFull)
+        match self.inner.sender.try_send(QueuedChunk { id, request }) {
+            Ok(()) => {
+                // A received request looks up its cancellation flag under this
+                // lock before it can update the status.
+                jobs.insert(
+                    id,
+                    JobControl {
+                        sequence: signature.context.sequence,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                    },
+                );
+                shared
+                    .cache
+                    .set_status(&signature, ChunkState::Queued, 0, None);
+                Ok(id)
             }
-            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                jobs.remove(&id);
-                Err(PreviewError::Stopped)
-            }
+            Err(crossbeam_channel::TrySendError::Full(_)) => Err(PreviewError::QueueFull),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => Err(PreviewError::Stopped),
         }
     }
     pub fn cancel(&self, sequence: SequenceId) -> usize {
@@ -298,8 +289,15 @@ fn worker_loop(
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+        let cancel = shared
+            .jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&queued.id)
+            .map(|job| Arc::clone(&job.cancel));
+        let Some(cancel) = cancel else { continue };
         let signature = &queued.request.signature;
-        let result = render_chunk(&gpu, &tools, &shared, &queued);
+        let result = render_chunk(&gpu, &tools, &shared, &queued, &cancel);
         match result {
             Ok(()) => {}
             Err(PreviewError::Cancelled) => {
@@ -319,15 +317,13 @@ fn worker_loop(
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&queued.id);
     }
+    // Wait for any in-flight submission before observing the final inbox.
+    let mut jobs = shared.jobs.lock().unwrap_or_else(PoisonError::into_inner);
     for queued in receiver.try_iter() {
         shared
             .cache
             .set_status(&queued.request.signature, ChunkState::Cancelled, 0, None);
-        shared
-            .jobs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&queued.id);
+        jobs.remove(&queued.id);
     }
 }
 fn render_chunk(
@@ -335,11 +331,12 @@ fn render_chunk(
     tools: &FfmpegTools,
     shared: &WorkerShared,
     queued: &QueuedChunk,
+    cancel: &AtomicBool,
 ) -> Result<(), PreviewError> {
     let request = &queued.request;
     let signature = &request.signature;
     loop {
-        if queued.cancel.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
             return Err(PreviewError::Cancelled);
         }
         if shared.cache.lookup(signature).is_some() {
@@ -397,7 +394,7 @@ fn render_chunk(
                 }
             },
         );
-        if queued.cancel.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || shared.stop.load(Ordering::Relaxed) {
             return Err(PreviewError::Cancelled);
         }
         if permit.preempted.load(Ordering::Relaxed) {
@@ -612,6 +609,85 @@ fn verify_media(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_preview_submissions_leave_no_queued_status() {
+        use crate::graph::ir::ContentHash;
+        use crate::preview::{CacheConfig, ChunkSpan, PreviewContext, PreviewProfile};
+        use crate::session::ProxyMode;
+        use photonic_core::timeline::FrameRate;
+
+        let directory =
+            std::env::temp_dir().join(format!("photonic-preview-queue-{}", uuid::Uuid::new_v4()));
+        let cache =
+            Arc::new(PreviewCache::open(directory.clone(), CacheConfig::default()).unwrap());
+        let (sender, receiver) = crossbeam_channel::bounded(QUEUE_CAPACITY);
+        let worker = PreviewWorker {
+            inner: Arc::new(WorkerOwner {
+                shared: Arc::new(WorkerShared {
+                    cache,
+                    gate: PlaybackPriorityGate::default(),
+                    jobs: Mutex::new(HashMap::new()),
+                    stop: AtomicBool::new(false),
+                    next: AtomicU64::new(1),
+                }),
+                sender,
+                // The inbox is deliberately held idle to saturate admission.
+                join: Mutex::new(None),
+            }),
+        };
+        let context = PreviewContext {
+            sequence: SequenceId::new(),
+            format_index: 0,
+            width: 64,
+            height: 64,
+            frame_rate: FrameRate::FPS_30,
+            quality: PreviewQuality::Full,
+            proxy_mode: ProxyMode::ForceOriginal,
+            use_proxy: false,
+            source_signature: ContentHash(0),
+            profile: PreviewProfile::default(),
+        };
+        let submit = |index: usize| {
+            let start = context.frame_rate.frame_start(index as i64 * 30);
+            let span = ChunkSpan::covering(context.frame_rate, start).unwrap();
+            let signature = ChunkSignature::new(
+                context.clone(),
+                span,
+                vec![ContentHash(0); span.frame_count as usize],
+            )
+            .unwrap();
+            worker.submit(PreviewChunkRequest {
+                snapshot: Arc::new(RenderSnapshot {
+                    revision: 0,
+                    project: None,
+                    document: None,
+                }),
+                signature,
+                dependencies: Vec::new(),
+            })
+        };
+        for index in 0..QUEUE_CAPACITY {
+            submit(index).unwrap();
+        }
+        assert!(matches!(
+            submit(QUEUE_CAPACITY),
+            Err(PreviewError::QueueFull)
+        ));
+        let after_full = worker.status().chunks.len();
+        drop(receiver);
+        assert!(matches!(
+            submit(QUEUE_CAPACITY + 1),
+            Err(PreviewError::Stopped)
+        ));
+        let after_disconnect = worker.status().chunks.len();
+        assert_eq!(worker.pending(), QUEUE_CAPACITY);
+        drop(worker);
+        std::fs::remove_dir_all(directory).unwrap();
+
+        assert_eq!([after_full, after_disconnect], [QUEUE_CAPACITY; 2]);
+    }
+
     #[test]
     fn playback_preempts_active_render_and_releases_before_restart() {
         let gate = PlaybackPriorityGate::default();

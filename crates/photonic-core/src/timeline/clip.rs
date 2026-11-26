@@ -521,7 +521,10 @@ impl SpeedMap {
                 let lo = pair[0].at.0.max(0);
                 let hi = pair[1].at.0.min(duration.0);
                 if lo < hi && pair[0].ratio.num.signum() != pair[1].ratio.num.signum() {
-                    samples.push(zero_crossing(pair[0], pair[1]));
+                    // Asymmetric easing can put the extremal tick on either side.
+                    let crossing = zero_crossing(pair[0], pair[1]);
+                    samples.push((crossing.floor() as i64).clamp(lo, hi));
+                    samples.push((crossing.ceil() as i64).clamp(lo, hi));
                 }
             }
         }
@@ -536,7 +539,7 @@ impl SpeedMap {
     }
 }
 
-fn zero_crossing(a: SpeedKey, b: SpeedKey) -> i64 {
+fn zero_crossing(a: SpeedKey, b: SpeedKey) -> f64 {
     let mut lo = a.at.0 as f64;
     let mut hi = b.at.0 as f64;
     let target = 0.0;
@@ -544,7 +547,7 @@ fn zero_crossing(a: SpeedKey, b: SpeedKey) -> i64 {
         let mid = (lo + hi) * 0.5;
         let ratio = segment_ratio(a, b, mid);
         if (ratio - target).abs() < 1e-12 {
-            return mid.round() as i64;
+            return mid;
         }
         if ratio.signum() == a.ratio.as_f64().signum() {
             lo = mid;
@@ -552,7 +555,7 @@ fn zero_crossing(a: SpeedKey, b: SpeedKey) -> i64 {
             hi = mid;
         }
     }
-    ((lo + hi) * 0.5).round() as i64
+    (lo + hi) * 0.5
 }
 
 fn segment_ratio(a: SpeedKey, b: SpeedKey, at: f64) -> f64 {
@@ -575,7 +578,11 @@ fn segment_ratio(a: SpeedKey, b: SpeedKey, at: f64) -> f64 {
 /// `len * ratio`, exact (multiply-before-divide in i128, saturating back to i64).
 #[inline]
 fn scale_ticks(len: i64, r: Ratio) -> i64 {
-    ((len as i128 * r.num as i128) / r.den.max(1) as i128) as i64
+    clamp_tick_delta(i128::from(len) * i128::from(r.num) / i128::from(r.den.max(1)))
+}
+
+fn clamp_tick_delta(delta: i128) -> i64 {
+    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 /// Integrate a speed ramp over `[0, target]` (or `[target, 0]` when
@@ -641,13 +648,14 @@ fn integrate_hold(sorted: &[SpeedKey], target: i64) -> i64 {
         let b = seg_end.min(hi);
         if b > a {
             let r = sorted[i].ratio;
-            acc += (b - a) as i128 * r.num as i128 / r.den.max(1) as i128;
+            let len = i128::from(b) - i128::from(a);
+            acc += len * i128::from(r.num) / i128::from(r.den.max(1));
         }
     }
     if target < 0 {
         acc = -acc;
     }
-    acc as i64
+    clamp_tick_delta(acc)
 }
 
 /// `f64` integration for a ramp with at least one eased segment. The speed
@@ -673,7 +681,8 @@ fn integrate_eased_f64(sorted: &[SpeedKey], target: i64) -> f64 {
     let a = lo;
     let b = sorted[0].at.0.min(hi);
     if b > a {
-        acc += (b - a) as f64 * sorted[0].ratio.as_f64();
+        let len = i128::from(b) - i128::from(a);
+        acc += len as f64 * sorted[0].ratio.as_f64();
     }
 
     // Inter-key segments `[sorted[i].at, sorted[i+1].at)`.
@@ -1559,5 +1568,83 @@ mod tests {
             (high - 25.0).abs() < 1.0,
             "turnaround should be near 25 ticks: {high}"
         );
+    }
+
+    #[test]
+    fn speed_delta_saturates_beyond_the_tick_range() {
+        let mut wrong = Vec::new();
+        for multiplier in [2, -2] {
+            let ratio = Ratio::new(multiplier, 1);
+            let maps = [
+                ("constant", SpeedMap::Constant(ratio)),
+                (
+                    "hold",
+                    SpeedMap::Keyframed {
+                        keys: vec![SpeedKey::new(Tick::ZERO, ratio)],
+                    },
+                ),
+                (
+                    "eased",
+                    SpeedMap::Keyframed {
+                        keys: vec![
+                            SpeedKey::eased(Tick::ZERO, ratio, Interp::Linear),
+                            SpeedKey::new(Tick(50), ratio),
+                        ],
+                    },
+                ),
+            ];
+            for (mode, map) in maps {
+                assert_eq!(map.source_delta(Tick(3)), Tick(i64::from(multiplier) * 3));
+                for input in [i64::MIN, i64::MAX] {
+                    let value = i128::from(input) * i128::from(multiplier);
+                    let expected =
+                        Tick(value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64);
+                    let observed = std::panic::catch_unwind(|| map.source_delta(Tick(input)));
+                    if !observed.is_ok_and(|tick| tick == expected) {
+                        wrong.push((mode, multiplier, input));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "bad speed deltas at tick limits: {wrong:?}"
+        );
+    }
+
+    #[test]
+    fn speed_range_excludes_a_turnaround_after_the_requested_end() {
+        let map = SpeedMap::Keyframed {
+            keys: vec![
+                SpeedKey::eased(Tick::ZERO, Ratio::new(2, 1), Interp::Linear),
+                SpeedKey::new(Tick(100), Ratio::new(-1, 1)),
+            ],
+        };
+        let (lo, hi) = map.source_delta_range(Tick(20));
+        assert_eq!(lo, 0.0);
+        assert!(
+            (hi - 34.0).abs() < 1e-9,
+            "20-tick range included a later excursion up to {hi}"
+        );
+        assert!(map.source_delta_range(Tick(100)).1 > 66.0);
+    }
+
+    #[test]
+    fn speed_range_checks_both_ticks_beside_an_asymmetric_reversal() {
+        let ease = Interp::Bezier {
+            out_handle: [0.18, 0.90],
+            in_handle: [0.35, 0.62],
+        };
+        let map = SpeedMap::Keyframed {
+            keys: vec![
+                SpeedKey::eased(Tick::ZERO, Ratio::new(5, 3), ease),
+                SpeedKey::eased(Tick(11), Ratio::new(-14, 5), ease),
+                SpeedKey::new(Tick(22), Ratio::new(5, 4)),
+            ],
+        };
+        let expected = (0..=22)
+            .map(|tick| map.source_delta_f64(Tick(tick)))
+            .fold(f64::INFINITY, f64::min);
+        assert_eq!(map.source_delta_range(Tick(22)).0, expected);
     }
 }

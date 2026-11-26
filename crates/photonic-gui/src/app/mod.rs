@@ -2659,6 +2659,11 @@ impl PhotonicApp {
         history: &mut CommandHistory,
     ) -> bool {
         let mut doc_modified = false;
+        let trace_root_before = self
+            .area_trace_session
+            .as_ref()
+            .and_then(|s| s.preview_root);
+        let revision_before = history.revision();
 
         // ── Quit-from-welcome shortcut ────────────────────────────────────────
         // The quit prompt only runs in the editor (past the welcome early-return).
@@ -6948,6 +6953,17 @@ impl PhotonicApp {
                         ui.allocate_rect(ctx.screen_rect(), egui::Sense::click());
                     });
             }
+        }
+
+        let trace_root_after = self
+            .area_trace_session
+            .as_ref()
+            .and_then(|s| s.preview_root);
+        if trace_root_after != trace_root_before {
+            if history.revision() == revision_before {
+                history.record_preview_change();
+            }
+            ctx.request_repaint();
         }
 
         // ── Per-frame tab bookkeeping + autosave ─────────────────────────────

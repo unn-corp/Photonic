@@ -47,6 +47,18 @@ impl CommandHistory {
         self.revision
     }
 
+    /// Notify renderers of a transient document edit outside command execution.
+    pub fn record_preview_change(&mut self) {
+        self.record_revision_change(SmallVec::new());
+    }
+
+    /// Invalidate caches when a different document becomes live. Advance past
+    /// the outgoing revision even if the incoming history was parked earlier.
+    pub fn record_document_replacement(&mut self, previous_revision: u64) {
+        self.revision = self.revision.max(previous_revision).wrapping_add(1);
+        self.revision_ring.clear();
+    }
+
     /// Bump `revision` and record `affected` in the ring under the new
     /// revision number. Shared by every mutation site (`execute`'s two exit
     /// paths, `undo`, `redo`).

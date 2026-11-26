@@ -183,6 +183,54 @@ fn run_extract_root(root: &Path) -> String {
     String::from_utf8(out.stdout).expect("utf8 stdout")
 }
 
+#[cfg(unix)]
+#[test]
+fn native_workspace_and_output_paths_are_accepted() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let scratch =
+        std::env::temp_dir().join(format!("spec-extract-path-{}-{nonce}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let native_root = scratch.join(OsStr::from_bytes(b"workspace_\xff"));
+    // Filesystems such as APFS reject filenames that are not valid UTF-8.
+    // Native arguments still matter there for non-ASCII Unicode paths.
+    let (root, destination) = match std::fs::create_dir(&native_root) {
+        Ok(()) => (
+            native_root,
+            scratch.join(OsStr::from_bytes(b"index_\xfe.json")),
+        ),
+        Err(_) => (scratch.join("workspace_é"), scratch.join("index_é.json")),
+    };
+    let src = root.join("crates/mini/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub const N: u32 = 42;\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_spec-extract"))
+        .arg("--root")
+        .arg(&root)
+        .arg("--out")
+        .arg(&destination)
+        .output()
+        .unwrap();
+    let content = std::fs::read(&destination);
+    std::fs::remove_dir_all(scratch).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index: Value = serde_json::from_slice(&content.unwrap()).unwrap();
+    assert_eq!(
+        find(items(&index), "crates/mini/src/lib.rs", "N")["value"],
+        "42"
+    );
+}
+
 #[test]
 fn output_is_byte_identical_across_runs() {
     // (d) determinism: two independent runs over the SAME tree must produce
