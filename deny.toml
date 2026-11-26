@@ -53,6 +53,12 @@ allow = ["MPL-2.0"]
 crate = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
 
+# webpki-root-certs is the same Mozilla CA set in DER form, under the same
+# license. self_update's reqwest client pulls it in via rustls-platform-verifier.
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [bans]
 # Warn on multiple versions of the same crate (size/audit hygiene, not blocking).
 multiple-versions = "warn"
@@ -78,6 +84,12 @@ ignore = [
     # winit/self_update bump to quick-xml >=0.41.
     "RUSTSEC-2026-0194", # quick-xml — quadratic dup-attribute check (transitive)
     "RUSTSEC-2026-0195", # quick-xml — unbounded ns-declaration alloc (transitive)
+    # zbus helper crates folded back into zbus upstream; no vulnerability. They
+    # come transitively from rfd → ashpd → zbus 5 (Linux file dialogs). Revisit
+    # when ashpd moves to a zbus release that no longer uses them.
+    "RUSTSEC-2026-0370", # zvariant — unmaintained as a standalone crate
+    "RUSTSEC-2026-0371", # zbus_names — unmaintained as a standalone crate
+    "RUSTSEC-2026-0372", # zvariant_derive — unmaintained as a standalone crate
 ]
 
 [sources]

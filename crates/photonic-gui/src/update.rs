@@ -65,12 +65,15 @@ fn check() -> UpdateCheck {
         Ok(u) => u,
         Err(e) => return UpdateCheck::Error(e.to_string()),
     };
-    let release = match updater.get_latest_release() {
+    let releases = match updater.get_latest_release() {
         Ok(r) => r,
         Err(e) => return UpdateCheck::Error(e.to_string()),
     };
-    match self_update::version::bump_is_greater(CURRENT_VERSION, &release.version) {
-        Ok(true) => UpdateCheck::Available(release.version),
+    let Some(release) = releases.latest() else {
+        return UpdateCheck::UpToDate;
+    };
+    match self_update::version::bump_is_greater(CURRENT_VERSION, release.version()) {
+        Ok(true) => UpdateCheck::Available(release.version().to_owned()),
         Ok(false) => UpdateCheck::UpToDate,
         Err(e) => UpdateCheck::Error(e.to_string()),
     }
@@ -110,8 +113,9 @@ fn run() -> UpdateStatus {
         Err(e) => return UpdateStatus::Error(e.to_string()),
     };
     match updater.update() {
-        Ok(self_update::Status::UpToDate(v)) => UpdateStatus::UpToDate(v),
-        Ok(self_update::Status::Updated(v)) => UpdateStatus::Updated(v),
+        Ok(self_update::VersionStatus::Updated(v)) => UpdateStatus::Updated(v),
+        // `VersionStatus` is non-exhaustive; anything but `Updated` installed nothing.
+        Ok(status) => UpdateStatus::UpToDate(status.version().to_owned()),
         Err(e) => UpdateStatus::Error(e.to_string()),
     }
 }
