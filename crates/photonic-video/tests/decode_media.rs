@@ -472,6 +472,81 @@ fn decoder_reads_the_same_video_stream_as_the_frame_index() {
     );
 }
 
+#[test]
+fn constant_rate_decode_keeps_dropped_frame_gaps_on_the_frame_grid() {
+    let tools = tools_or_skip!();
+    let path = std::env::temp_dir().join(format!("photonic-cfr-gaps-{}.mp4", uuid::Uuid::new_v4()));
+    // A 30 fps source missing frames 10–12, with luma 16 + 7n identifying
+    // source frame n. Probing treats sources like this as constant rate, so
+    // the reader derives each timestamp from its output ordinal.
+    let output = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=size=64x48:rate=30:duration=1,format=yuv420p,geq=lum='16+N*7':cb=128:cr=128",
+            "-vf",
+            "select='not(between(n,10,12))'",
+            "-fps_mode",
+            "passthrough",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            // Keyframes land on source frames 0, 5, 13, 18, 23 and 28.
+            "-g",
+            "5",
+            "-sc_threshold",
+            "1000000000",
+            "-bf",
+            "0",
+            "-threads",
+            "1",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rate = FrameRate { num: 30, den: 1 };
+    let keyframes = KeyframeIndex::build(&tools, &path).unwrap();
+    let mut decoder = DecodeSource::new(
+        tools,
+        SourceParams {
+            input: path.clone(),
+            width: 64,
+            height: 48,
+            pix_fmt: PixFmt::Yuv420p,
+            pts_kind: PtsKind::Cfr(rate),
+            keyframes,
+        },
+        SharedRing::preview(),
+    );
+    // Slot 11 decodes across the gap from keyframe 5 and must repeat frame 9.
+    let decoded: Vec<_> = [(11, 9), (20, 20)]
+        .into_iter()
+        .map(|(slot, source)| (slot, source, decoder.seek(rate.frame_start(slot))))
+        .collect();
+    drop(decoder);
+    std::fs::remove_file(&path).unwrap();
+    for (slot, source, frame) in decoded {
+        let frame = frame.expect("constant-rate seek");
+        let luma = plane_y(&frame.planes);
+        let mean = luma.iter().map(|&v| f64::from(v)).sum::<f64>() / luma.len() as f64;
+        let expected = f64::from(16 + 7 * source);
+        assert!(
+            (mean - expected).abs() < 3.0,
+            "slot {slot} should show source frame {source} (luma {expected}), got {mean:.1}"
+        );
+    }
+}
+
 // ── 5. Alpha: yuva path, alpha ramps left→right (alpha_gradient.mov) ─────────
 
 #[test]

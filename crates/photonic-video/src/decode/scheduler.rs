@@ -22,7 +22,7 @@ use photonic_core::timeline::{FrameRate, Tick};
 
 use super::reader::{FrameReader, PtsModel};
 use super::ring::SharedRing;
-use super::sidecar::{DecodeCancellation, Sidecar, SidecarConfig};
+use super::sidecar::{DecodeCancellation, FrameSync, Sidecar, SidecarConfig};
 use super::{DecodeError, DecodedFrame, PixFmt};
 use crate::media::ffmpeg_locate::FfmpegTools;
 use crate::media::keyframe_index::{KeyframeIndex, PtsIndex};
@@ -142,6 +142,10 @@ impl DecodeSource {
             input: self.params.input.clone(),
             seek: kf_tick,
             pix_fmt: self.params.pix_fmt,
+            frame_sync: match self.params.pts_kind {
+                PtsKind::Cfr(_) => FrameSync::ConstantRate,
+                PtsKind::Vfr(_) => FrameSync::Passthrough,
+            },
         };
         let (sidecar, stdout) =
             Sidecar::spawn_with_decoder(&self.tools, &cfg, use_cuda, self.software_decoder)?;
