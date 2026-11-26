@@ -413,55 +413,12 @@ fn run_export_group(
     let job = &jobs[indices[0]];
     let r = &resolutions[indices[0]];
 
-    // Frozen shadow project with the export format forced active.
-    let mut frozen = (*project).clone();
-    if let Some(s) = frozen.sequences.get_mut(&job.sequence) {
-        s.active_format = r.format_index;
-    }
-
-    let engine = VideoEngine::new(gpu.clone());
-    let shadow_doc = Arc::new(Mutex::new(Document::new("export-shadow", 1.0, 1.0)));
-    let history = CommandHistory::new(1);
-    let expected_revision = snapshot.map_or(history.revision(), |snapshot| snapshot.revision);
-    let shadow_history = Arc::new(Mutex::new(history));
-    let session = engine.open_session(shadow_doc, shadow_history);
-    let expected_generation = session.publish_snapshot(RenderSnapshot {
-        revision: expected_revision,
-        project: Some(Arc::new(frozen)),
-        document: snapshot.and_then(|snapshot| snapshot.document.clone()),
-    });
-    let seq_id: SequenceId = job.sequence;
-    session.send(EngineCmd::SetActiveSequence(seq_id));
-    // K-F4: job options can request proxies / Draft resolution; default remains
-    // full quality + original media (02 §7 SS-3 determinism path).
-    let proxy = if job.options.use_proxies {
-        ProxyMode::ForceProxy
-    } else {
-        ProxyMode::ForceOriginal
-    };
-    session.send(EngineCmd::SetProxyMode(proxy));
-    let quality = if job.options.preview_resolution {
-        crate::session::PreviewQuality::Draft
-    } else {
-        crate::session::PreviewQuality::Full
-    };
-    let expected_size = if job.options.preview_resolution {
-        fit_long_edge(r.format_size.0, r.format_size.1, DRAFT_MAX_LONG_EDGE)
-    } else {
-        r.format_size
-    };
-    session.send(EngineCmd::SetPreviewQuality(quality));
-
-    // Each output keeps its own audio/loudness semantics. Audio mixing is
-    // still offline before frame production; this pipeline overlaps video only.
+    // Finish offline audio preparation before spawning a renderer. An audio
+    // cancellation can then return without waiting for graphics initialization.
     let mut deliveries = Vec::with_capacity(indices.len());
     for &index in indices {
         if cancel.load(Ordering::Relaxed) {
-            session.shutdown();
-            for index in 0..indices.len() {
-                on_event(index, ExportEvent::Cancelled);
-            }
-            return Ok(());
+            break;
         }
         let job = &jobs[index];
         let r = &resolutions[index];
@@ -507,6 +464,52 @@ fn run_export_group(
             samples,
         ));
     }
+    if deliveries.len() != indices.len() || cancel.load(Ordering::Relaxed) {
+        for index in 0..indices.len() {
+            on_event(index, ExportEvent::Cancelled);
+        }
+        return Ok(());
+    }
+
+    // Frozen shadow project with the export format forced active.
+    let mut frozen = (*project).clone();
+    if let Some(s) = frozen.sequences.get_mut(&job.sequence) {
+        s.active_format = r.format_index;
+    }
+
+    let engine = VideoEngine::new(gpu.clone());
+    let shadow_doc = Arc::new(Mutex::new(Document::new("export-shadow", 1.0, 1.0)));
+    let history = CommandHistory::new(1);
+    let expected_revision = snapshot.map_or(history.revision(), |snapshot| snapshot.revision);
+    let shadow_history = Arc::new(Mutex::new(history));
+    let session = engine.open_session(shadow_doc, shadow_history);
+    let expected_generation = session.publish_snapshot(RenderSnapshot {
+        revision: expected_revision,
+        project: Some(Arc::new(frozen)),
+        document: snapshot.and_then(|snapshot| snapshot.document.clone()),
+    });
+    let seq_id: SequenceId = job.sequence;
+    session.send(EngineCmd::SetActiveSequence(seq_id));
+    // K-F4: job options can request proxies / Draft resolution; default remains
+    // full quality + original media (02 §7 SS-3 determinism path).
+    let proxy = if job.options.use_proxies {
+        ProxyMode::ForceProxy
+    } else {
+        ProxyMode::ForceOriginal
+    };
+    session.send(EngineCmd::SetProxyMode(proxy));
+    let quality = if job.options.preview_resolution {
+        crate::session::PreviewQuality::Draft
+    } else {
+        crate::session::PreviewQuality::Full
+    };
+    let expected_size = if job.options.preview_resolution {
+        fit_long_edge(r.format_size.0, r.format_size.1, DRAFT_MAX_LONG_EDGE)
+    } else {
+        r.format_size
+    };
+    session.send(EngineCmd::SetPreviewQuality(quality));
+
     let _sleep_guard = indices
         .iter()
         .any(|&index| jobs[index].options.inhibit_sleep)
@@ -783,10 +786,14 @@ mod tests {
         let (elapsed, result, events) = std::thread::scope(|scope| {
             let worker = scope.spawn(|| {
                 let mut events = Vec::new();
-                let result =
-                    run_export_job(gpu, Arc::new(project), &job, &tools, &cancel, |event| {
-                        events.push(event)
-                    });
+                let result = run_export_job(
+                    gpu.clone(),
+                    Arc::new(project),
+                    &job,
+                    &tools,
+                    &cancel,
+                    |event| events.push(event),
+                );
                 (result, events)
             });
             let deadline = Instant::now() + Duration::from_secs(3);
