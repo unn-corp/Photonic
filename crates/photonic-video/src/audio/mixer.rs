@@ -1339,16 +1339,21 @@ fn render_clip_into(
     clip_scratch: &mut [f32],
     track_bus: &mut [f32],
 ) {
+    // Include sample starts before the out point, including a partial final
+    // sample interval. The rest of the block still runs through the track FX.
+    let frames = (clip.remaining.0.max(0) as u64)
+        .div_ceil(tick_per_sample.max(1) as u64)
+        .min(BLOCK_FRAMES as u64) as usize;
+    if frames == 0 {
+        return;
+    }
     let src_channels = clip.source.channels().max(1) as usize;
     debug_assert!(
         src_channels <= 2,
         "09 §4 channel policy: v1 PcmSources are mono/stereo only"
     );
-    let buf = &mut clip_scratch[..BLOCK_FRAMES * src_channels];
-    let got = clip.source.read(buf, BLOCK_FRAMES);
-    if got < BLOCK_FRAMES {
-        buf[got * src_channels..].fill(0.0);
-    }
+    let buf = &mut clip_scratch[..frames * src_channels];
+    let got = clip.source.read(buf, frames);
 
     // ClipAudioParams automation is clip-relative (01 §6) — evaluated at this
     // block's clip-relative start, not the sequence tick.
@@ -1358,7 +1363,7 @@ fn render_clip_into(
     let fade_in = clip.audio.fade_in.as_ref();
     let fade_out = clip.audio.fade_out.as_ref();
 
-    for f in 0..BLOCK_FRAMES {
+    for f in 0..got {
         let (sl, sr) = read_channel_mapped(buf, src_channels, f, channel_map);
         let dt = Tick(f as i64 * tick_per_sample);
         let elapsed = clip.elapsed.saturating_add(dt);
@@ -1899,6 +1904,44 @@ mod tests {
     }
 
     // ── 31 §8 step 4: segment-boundary tail plumbing ────────────────────
+
+    #[test]
+    fn source_audio_stops_at_the_clip_out_point_inside_a_block() {
+        let ticks_per_sample = TICKS_PER_SECOND / i64::from(SR);
+        let clip_audio = ClipAudio::new();
+        let track_audio = TrackAudio::new();
+        let master = master_bus_no_limiter();
+        for (remaining, audible_frames) in [
+            (100 * ticks_per_sample, 100),
+            (100 * ticks_per_sample + 1, 101),
+            (0, 0),
+        ] {
+            let mut source = StepSource {
+                channels: 2,
+                sample_rate: SR,
+                value: 0.5,
+            };
+            let mut tracks = [TrackVoice {
+                id: track_id(1),
+                audio: &track_audio,
+                clips: vec![ClipVoice {
+                    audio: &clip_audio,
+                    elapsed: Tick::ZERO,
+                    remaining: Tick(remaining),
+                    source: &mut source,
+                }],
+            }];
+            let mut output = [0.0; BLOCK_FRAMES * CHANNELS];
+            Mixer::new(SR).render_block(Tick::ZERO, &mut tracks, &master, &mut output);
+            let (audible, after_out) = output.split_at(audible_frames * CHANNELS);
+            assert!(audible.iter().all(|sample| *sample > 0.01));
+            assert_eq!(
+                after_out.iter().filter(|&&sample| sample != 0.0).count(),
+                0,
+                "audio leaked beyond the clip out point at {remaining} ticks"
+            );
+        }
+    }
 
     fn ending_clip_voice<'a>(audio: &'a ClipAudio, source: &'a mut dyn PcmSource) -> ClipVoice<'a> {
         let tick_per_sample = TICKS_PER_SECOND / SR as i64;
