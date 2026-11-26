@@ -1472,7 +1472,8 @@ fn parse_transform_attr(s: &str) -> Transform {
             None => break,
         };
         let args_str = &remaining[..end_paren];
-        remaining = &remaining[end_paren + 1..];
+        remaining =
+            remaining[end_paren + 1..].trim_start_matches(|c: char| c.is_whitespace() || c == ',');
 
         let args: Vec<f64> = args_str
             .split(|c: char| c.is_whitespace() || c == ',')
@@ -1636,6 +1637,22 @@ mod tests {
 
         let doc = import_svg(svg).expect("standard external SVG doctype should be accepted");
         assert_eq!(doc.nodes.len(), 1);
+    }
+
+    #[test]
+    fn comma_separates_svg_transform_functions() {
+        let document = import_svg(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <rect x="1" y="2" width="4" height="6"
+        transform="translate(20,30) , scale(2,3),translate(1,-2)"/>
+</svg>"#,
+        )
+        .unwrap();
+        let shape = document.nodes.values().next().unwrap();
+        assert_eq!(
+            crate::export::node_world_bbox(shape, &document),
+            Some(kurbo::Rect::new(24.0, 30.0, 32.0, 48.0)),
+        );
     }
 
     fn assert_limit(svg: &str, expected: ImportLimit) {
