@@ -292,7 +292,7 @@ impl MediaPoolUi {
         };
         self.relink_rx = None;
         self.relink_scanning = false;
-        let offline = photonic_core::timeline::ops::offline_assets(project, |p| p.exists());
+        let offline = photonic_core::timeline::ops::offline_assets(project, Path::is_file);
         let plan = photonic_core::timeline::ops::plan_relink(
             project,
             &offline,
@@ -709,7 +709,7 @@ pub fn asset_display_name(asset: &MediaAsset) -> String {
 /// online.
 pub fn asset_is_offline(asset: &MediaAsset) -> bool {
     match &asset.source {
-        AssetSource::File { path, .. } => !path.exists(),
+        AssetSource::File { path, .. } => !path.is_file(),
         AssetSource::EmbeddedVector { .. } => false,
     }
 }

@@ -1122,7 +1122,7 @@ fn to_clip_source(project: &TimelineProject, arg: ClipSourceArg) -> Result<ClipS
 fn check_asset_offline(project: &TimelineProject, asset_id: AssetId) -> Result<(), ToolResult> {
     if let Some(a) = project.media.assets.get(&asset_id) {
         if let photonic_core::timeline::AssetSource::File { path, .. } = &a.source {
-            if !path.exists() {
+            if !path.is_file() {
                 return Err(err_code(
                     "AssetOffline",
                     format!("asset {asset_id} file is unreachable: {}", path.display()),
@@ -3984,7 +3984,7 @@ pub async fn import_media(state: &AppState, args: ImportMediaArgs) -> ToolResult
                 "cannot infer media kind for {p:?} — unrecognized extension"
             ));
         };
-        if !path.exists() {
+        if !path.is_file() {
             return err_code("AssetOffline", format!("file not found: {p}"));
         }
         let hash = content_hash(&path);
@@ -4066,7 +4066,7 @@ pub async fn relink_media(state: &AppState, args: RelinkMediaArgs) -> ToolResult
             Ok(p) => p,
             Err(e) => return e,
         };
-    if !new_path.exists() {
+    if !new_path.is_file() {
         return err_code("AssetOffline", format!("file not found: {}", args.new_path));
     }
     let mut doc = state.document.lock().await;
@@ -4143,7 +4143,7 @@ pub async fn find_offline_media(state: &AppState, _args: FindOfflineMediaArgs) -
     let Some(project) = doc.timeline.as_ref() else {
         return ToolResult::text("No timeline project yet").with_data(json!({ "offline": [] }));
     };
-    let offline = ops::offline_assets(project, |p| p.exists());
+    let offline = ops::offline_assets(project, std::path::Path::is_file);
     let rows: Vec<Value> = offline
         .iter()
         .filter_map(|id| project.media.assets.get(id))
@@ -4221,7 +4221,7 @@ pub async fn relink_media_batch(state: &AppState, args: RelinkMediaBatchArgs) ->
             }
             ids.clone()
         }
-        _ => ops::offline_assets(project, |p| p.exists()),
+        _ => ops::offline_assets(project, std::path::Path::is_file),
     };
     let plan = ops::plan_relink(project, &targets, &candidates, hash_like);
 
@@ -5274,7 +5274,7 @@ pub async fn probe_media(state: &AppState, args: ProbeMediaArgs) -> ToolResult {
         Ok(p) => p,
         Err(e) => return e,
     };
-    if !path.exists() {
+    if !path.is_file() {
         return err_code(
             "AssetOffline",
             format!("file not found: {}", path.display()),
@@ -5837,7 +5837,7 @@ pub async fn transcode_media(state: &AppState, args: TranscodeMediaArgs) -> Tool
         Ok(p) => p,
         Err(e) => return e,
     };
-    if !input.exists() {
+    if !input.is_file() {
         return err_code(
             "AssetOffline",
             format!("file not found: {}", input.display()),
@@ -8413,7 +8413,7 @@ pub async fn get_waveform(state: &AppState, args: GetWaveformArgs) -> ToolResult
             _ => return ToolResult::error("asset is not file-backed"),
         }
     };
-    if !path.exists() {
+    if !path.is_file() {
         return err_code(
             "AssetOffline",
             format!("file not found: {}", path.display()),
@@ -11809,6 +11809,45 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&old);
         let _ = std::fs::remove_dir_all(&new);
+    }
+
+    #[tokio::test]
+    async fn a_directory_cannot_stand_in_for_a_media_file() {
+        let state = test_state();
+        let old = scratch_dir("replaced");
+        let new = scratch_dir("moved");
+        let path = old.join("clip.mp4");
+        std::fs::write(&path, b"original media bytes").unwrap();
+        let ids = import_from(&state, &old, &["clip.mp4"]).await;
+        std::fs::rename(&path, new.join("clip.mp4")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let offline = call(&state, "find_offline_media", json!({})).await;
+        let preview = call(
+            &state,
+            "relink_media_batch",
+            json!({ "search_dir": new.to_string_lossy(), "dry_run": true }),
+        )
+        .await;
+        let invalid_target = call(
+            &state,
+            "relink_media",
+            json!({ "asset_id": ids[0], "new_path": path.to_string_lossy() }),
+        )
+        .await;
+        let invalid_import = call(
+            &state,
+            "import_media",
+            json!({ "paths": [path.to_string_lossy()] }),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&old);
+        let _ = std::fs::remove_dir_all(&new);
+
+        assert_eq!(data(&offline)["offline"][0]["asset_id"], ids[0]);
+        assert_eq!(data(&preview)["relinked"][0]["asset_id"], ids[0]);
+        assert_eq!(data(&invalid_target)["error_code"], json!("AssetOffline"));
+        assert_eq!(data(&invalid_import)["error_code"], json!("AssetOffline"));
     }
 
     /// A same-named file holding *different* bytes is the wrong-take trap. It
