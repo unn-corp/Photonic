@@ -196,8 +196,17 @@ fn native_workspace_and_output_paths_are_accepted() {
         .as_nanos();
     let scratch =
         std::env::temp_dir().join(format!("spec-extract-path-{}-{nonce}", std::process::id()));
-    let root = scratch.join(OsStr::from_bytes(b"workspace_\xff"));
-    let destination = scratch.join(OsStr::from_bytes(b"index_\xfe.json"));
+    std::fs::create_dir_all(&scratch).unwrap();
+    let native_root = scratch.join(OsStr::from_bytes(b"workspace_\xff"));
+    // Filesystems such as APFS reject filenames that are not valid UTF-8.
+    // Native arguments still matter there for non-ASCII Unicode paths.
+    let (root, destination) = match std::fs::create_dir(&native_root) {
+        Ok(()) => (
+            native_root,
+            scratch.join(OsStr::from_bytes(b"index_\xfe.json")),
+        ),
+        Err(_) => (scratch.join("workspace_é"), scratch.join("index_é.json")),
+    };
     let src = root.join("crates/mini/src");
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("lib.rs"), "pub const N: u32 = 42;\n").unwrap();
