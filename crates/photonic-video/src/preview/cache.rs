@@ -498,6 +498,26 @@ impl PreviewCache {
             retire_entry(&mut inner, staging.signature.key);
             collect_retired(&mut inner);
         }
+        if inner.bytes.saturating_add(external).saturating_add(size) > self.config.max_bytes {
+            // A reader can pin enough bytes that even evicting every unleased
+            // entry would fail admission. Preserve those entries in that case.
+            let reclaimable = inner
+                .entries
+                .values()
+                .filter(|entry| Arc::strong_count(&entry.chunk) == 1)
+                .map(|entry| entry.chunk.bytes)
+                .fold(0, u64::saturating_add);
+            if inner
+                .bytes
+                .saturating_sub(reclaimable)
+                .saturating_add(external)
+                .saturating_add(size)
+                > self.config.max_bytes
+            {
+                inner.rejected = inner.rejected.saturating_add(1);
+                return Err(PreviewError::BudgetExhausted);
+            }
+        }
         enforce_budget(&mut inner, self.config, size);
         if inner.bytes.saturating_add(external).saturating_add(size) > self.config.max_bytes
             || inner.entries.len() >= self.config.max_entries
