@@ -602,10 +602,6 @@ pub fn offline_assets(
     out
 }
 
-fn file_name_of(p: &std::path::Path) -> Option<String> {
-    p.file_name().map(|n| n.to_string_lossy().into_owned())
-}
-
 /// Plan a batch relink of `offline` against the files in `candidates`.
 ///
 /// Rule order per asset — strongest identity first, which is the order
@@ -649,7 +645,7 @@ pub fn plan_relink(
         let super::media::AssetSource::File { path: old_path, .. } = &asset.source else {
             continue; // embedded vectors have no file to relink
         };
-        let want_name = file_name_of(old_path);
+        let want_name = old_path.file_name();
 
         // Collect the matches for each rule, then take the strongest non-empty.
         let by_hash: Vec<&RelinkCandidate> = match asset.content_hash.as_deref() {
@@ -659,20 +655,20 @@ pub fn plan_relink(
                 .collect(),
             None => Vec::new(),
         };
-        let by_exact: Vec<&RelinkCandidate> = match &want_name {
+        let by_exact: Vec<&RelinkCandidate> = match want_name {
             Some(name) => candidates
                 .iter()
-                .filter(|c| file_name_of(&c.path).as_deref() == Some(name.as_str()))
+                .filter(|c| c.path.file_name() == Some(name))
                 .collect(),
             None => Vec::new(),
         };
-        let by_ci: Vec<&RelinkCandidate> = match &want_name {
+        let by_ci: Vec<&RelinkCandidate> = match want_name {
             Some(name) => candidates
                 .iter()
                 .filter(|c| {
-                    file_name_of(&c.path)
-                        .map(|n| n.eq_ignore_ascii_case(name))
-                        .unwrap_or(false)
+                    c.path
+                        .file_name()
+                        .is_some_and(|n| n.eq_ignore_ascii_case(name))
                 })
                 .collect(),
             None => Vec::new(),
@@ -8309,6 +8305,39 @@ mod tests {
         let plan = plan_relink(p, &ids, &[cand("/new/other.mov", None)], faked(&[]));
         assert!(plan.entries.is_empty());
         assert_eq!(plan.unmatched, ids);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn relink_matches_native_filenames_without_lossy_aliases() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::Path;
+
+        let (doc, ids) = relink_fixture(&[("/old/take-�.mp4", None)]);
+        let project = doc.timeline.as_ref().unwrap();
+        let unrelated = RelinkCandidate {
+            path: Path::new("/scanned/a").join(OsStr::from_bytes(b"take-\xff.mp4")),
+            content_hash: None,
+        };
+        for (target, matched_by) in [
+            ("/scanned/z/take-�.mp4", RelinkMatchKind::ExactName),
+            (
+                "/scanned/z/TAKE-�.MP4",
+                RelinkMatchKind::CaseInsensitiveName,
+            ),
+        ] {
+            let plan = plan_relink(
+                project,
+                &ids,
+                &[unrelated.clone(), cand(target, None)],
+                faked(&[]),
+            );
+            assert_eq!(plan.entries.len(), 1);
+            assert_eq!(plan.entries[0].new_path, Path::new(target));
+            assert_eq!(plan.entries[0].matched_by, matched_by);
+            assert!(!plan.entries[0].ambiguous);
+        }
     }
 
     /// An unverifiable hash must read `Unknown`, never `Mismatch` — a false
