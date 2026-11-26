@@ -731,7 +731,8 @@ pub fn plan_relink(
 /// Turn accepted plan entries into commands — the caller wraps the whole `Vec`
 /// in ONE `Command::Batch` so a 200-clip relink is a single undo unit (DoD 4).
 ///
-/// Two data-integrity rules are enforced here rather than left to each caller:
+/// Apply entries only while the asset still points at the path in the preview.
+/// A newer relink supersedes the earlier preview for that asset.
 ///
 /// * A [`RelinkHashCheck::Mismatch`] entry is **skipped** unless
 ///   `accept_mismatch`. Binding a clip to the wrong take is a failure the user
@@ -755,13 +756,19 @@ pub fn relink_plan_commands(
         if e.new_path == e.old_path {
             continue;
         }
+        let Some(asset) = p.media.assets.get(&e.asset) else {
+            continue;
+        };
+        if !matches!(
+            &asset.source,
+            super::media::AssetSource::File { path, .. } if path == &e.old_path
+        ) {
+            continue;
+        }
         let Ok(relink) = relink_asset(p, e.asset, e.new_path.clone()) else {
             continue;
         };
         cmds.push(relink);
-        let Some(asset) = p.media.assets.get(&e.asset) else {
-            continue;
-        };
         match e.hash {
             RelinkHashCheck::Mismatch => {
                 if let Ok(meta) = set_asset_meta(p, e.asset, None, e.new_hash.clone()) {
@@ -8419,6 +8426,34 @@ mod tests {
                 .content_hash
                 .as_deref(),
             Some("xxh:aaa")
+        );
+    }
+
+    #[test]
+    fn a_stale_relink_preview_keeps_the_newer_asset_path() {
+        let (mut doc, ids) =
+            relink_fixture(&[("/old/a.mp4", Some("h:a")), ("/old/b.mp4", Some("h:b"))]);
+        let project = doc.timeline.as_ref().unwrap();
+        let candidates = [
+            cand("/scanned/a.mp4", Some("h:a")),
+            cand("/scanned/b.mp4", Some("h:b")),
+        ];
+        let disk = [("/scanned/a.mp4", "h:a"), ("/scanned/b.mp4", "h:b")];
+        let plan = plan_relink(project, &ids, &candidates, faked(&disk));
+        assert_eq!(plan.entries.len(), 2);
+
+        let newer_path = std::path::PathBuf::from("/chosen/a.mp4");
+        let newer = relink_asset(project, ids[0], newer_path.clone()).unwrap();
+        Command::Timeline(newer).apply(&mut doc);
+        let cmds = relink_plan_commands(doc.timeline.as_ref().unwrap(), &plan.entries, false);
+        Command::Batch(cmds.into_iter().map(Command::Timeline).collect()).apply(&mut doc);
+
+        let assets = &doc.timeline.as_ref().unwrap().media.assets;
+        assert!(
+            matches!(&assets[&ids[0]].source, AssetSource::File { path, .. } if path == &newer_path)
+        );
+        assert!(
+            matches!(&assets[&ids[1]].source, AssetSource::File { path, .. } if path == std::path::Path::new("/scanned/b.mp4"))
         );
     }
 
