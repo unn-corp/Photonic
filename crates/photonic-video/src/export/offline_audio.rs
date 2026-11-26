@@ -20,7 +20,7 @@ use photonic_core::timeline::{
 
 use super::presets::LoudnessTarget;
 use super::render_loop::ExportError;
-use crate::audio::mixer::{ClipVoice, Mixer, PcmSource, TrackVoice};
+use crate::audio::mixer::{first_clip_sample, ClipVoice, Mixer, PcmSource, TrackVoice};
 use crate::audio::{BLOCK_FRAMES, CHANNELS};
 use crate::graph::analysis::{self, AnalysisCache, AnalysisResult};
 use crate::media::ffmpeg_locate::FfmpegTools;
@@ -91,7 +91,8 @@ pub fn render_export_audio_filtered(
 
     while frames_left > 0 {
         let frames_this = frames_left.min(BLOCK_FRAMES);
-        // Which clips sound at t? Audio tracks only (matches interactive feeder).
+        let block_end = t.saturating_add(block_ticks);
+        // Match the interactive feeder's half-open block coverage.
         let active: Vec<(&photonic_core::timeline::Track, &Clip)> = seq
             .audio_tracks
             .iter()
@@ -103,7 +104,7 @@ pub fn render_export_audio_filtered(
                     .iter()
                     .filter(|clip| {
                         clip.enabled
-                            && clip.start <= t
+                            && clip.start < block_end
                             && t < clip.end()
                             && matches!(clip.source, ClipSource::Asset { .. })
                     })
@@ -130,10 +131,11 @@ pub fn render_export_audio_filtered(
                     .map(|a| (a.offset, a.stream))
                     .unwrap_or((Tick::ZERO, None));
                 let identity = matches!(clip.speed, SpeedMap::Constant(r) if r == Ratio::ONE);
+                let read_start = first_clip_sample(t, clip.start, sample_rate);
                 if identity {
                     let src_pos = crate::playback::pcm::source_seek_with_offset(
                         clip.source_in,
-                        t,
+                        read_start,
                         clip.start,
                         offset,
                     );
@@ -169,7 +171,7 @@ pub fn render_export_audio_filtered(
                                 clip.source_in,
                                 offset,
                                 clip.speed.clone(),
-                                t - clip.start,
+                                read_start - clip.start,
                             )),
                         );
                     }
@@ -539,6 +541,59 @@ mod tests {
             "names must also be distinct on case-insensitive volumes"
         );
         assert_eq!(paths[3], stem_output_path(&main, "Music"));
+    }
+
+    #[test]
+    fn offline_export_keeps_audio_clips_entirely_inside_one_block() {
+        let Some(tools) = crate::media::ffmpeg_locate::locate_for_test() else {
+            return;
+        };
+        let (mut project, sid) = empty_audio_seq();
+        let sound =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/beep_flash.wav");
+        let asset = photonic_core::timeline::MediaAsset::from_file(
+            photonic_core::timeline::AssetKind::Audio,
+            sound,
+        );
+        let id = asset.id;
+        project.media.assets.insert(id, asset);
+
+        let step = TICKS_PER_SECOND / 48_000;
+        let end = Tick(BLOCK_FRAMES as i64 * step);
+        let mut clip = Clip::new(
+            ClipSource::Asset { asset: id },
+            Tick::ZERO,
+            Tick(128 * step),
+        );
+        clip.source_in = Tick::from_seconds(1);
+        let sequence = project.sequences.get_mut(&sid).unwrap();
+        sequence.audio_master.fx_chain.clear();
+        sequence.audio_tracks[0].clips.push(clip);
+        let aligned =
+            render_export_audio(&project, sid, Tick::ZERO, end, Some(&tools), None).unwrap();
+        assert!(
+            aligned.iter().any(|sample| sample.abs() > 0.01),
+            "the aligned clip must contain audio"
+        );
+
+        project.sequences.get_mut(&sid).unwrap().audio_tracks[0].clips[0].start = Tick(128 * step);
+        let unaligned =
+            render_export_audio(&project, sid, Tick::ZERO, end, Some(&tools), None).unwrap();
+        assert!(
+            unaligned.iter().any(|sample| sample.abs() > 0.01),
+            "a clip starting and ending inside one block must contain audio"
+        );
+        let clip_samples = 128 * CHANNELS;
+        assert!(unaligned[..clip_samples]
+            .iter()
+            .all(|&sample| sample == 0.0));
+        assert_eq!(
+            &unaligned[clip_samples..2 * clip_samples],
+            &aligned[..clip_samples]
+        );
+        assert!(unaligned[2 * clip_samples..]
+            .iter()
+            .all(|&sample| sample == 0.0));
     }
 
     #[test]

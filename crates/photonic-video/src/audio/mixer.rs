@@ -47,12 +47,9 @@ pub trait PcmSource: Send {
     fn read(&mut self, out: &mut [f32], frames: usize) -> usize;
 }
 
-/// One playing clip, as of this block's start. The elapsed/remaining ticks are
-/// **clip-relative** (01 §6): `elapsed` since the clip's timeline-in-point,
-/// `remaining` until its timeline-out-point. The playback controller computes
-/// these each block — traversing the timeline to find "what's covering tick
-/// t" is its job, not the mixer's (this crate's `audio/` owns only the signal
-/// path, per this module family's doc).
+/// One clip overlapping a mixer block. At the block start, `elapsed` is the
+/// signed time since the clip's in point, and `remaining` is the time until
+/// its out point. The caller supplies PCM starting at the first in-range sample.
 pub struct ClipVoice<'a> {
     pub audio: &'a ClipAudio,
     pub elapsed: Tick,
@@ -1329,6 +1326,19 @@ impl Mixer {
     }
 }
 
+fn frame_at_clip_boundary(offset: i64, tick_per_sample: i64) -> usize {
+    (offset.max(0) as u64)
+        .div_ceil(tick_per_sample.max(1) as u64)
+        .min(BLOCK_FRAMES as u64) as usize
+}
+
+/// Align a decoder's initial seek to the first sample the mixer will consume.
+pub(crate) fn first_clip_sample(block_start: Tick, clip_start: Tick, sample_rate: u32) -> Tick {
+    let tick_per_sample = TICKS_PER_SECOND / i64::from(sample_rate.max(1));
+    let frame = frame_at_clip_boundary(clip_start.saturating_sub(block_start).0, tick_per_sample);
+    block_start.saturating_add(Tick(frame as i64 * tick_per_sample))
+}
+
 /// Render one clip's contribution for the block into `track_bus` (accumulate,
 /// not overwrite — multiple clips can sum onto the same track bus, e.g. a
 /// crossfade). `clip_scratch` is reused raw-PCM scratch, resized as needed by
@@ -1339,11 +1349,9 @@ fn render_clip_into(
     clip_scratch: &mut [f32],
     track_bus: &mut [f32],
 ) {
-    // Include sample starts before the out point, including a partial final
-    // sample interval. The rest of the block still runs through the track FX.
-    let frames = (clip.remaining.0.max(0) as u64)
-        .div_ceil(tick_per_sample.max(1) as u64)
-        .min(BLOCK_FRAMES as u64) as usize;
+    let first = frame_at_clip_boundary(clip.elapsed.0.saturating_neg(), tick_per_sample);
+    let end = frame_at_clip_boundary(clip.remaining.0, tick_per_sample);
+    let frames = end.saturating_sub(first);
     if frames == 0 {
         return;
     }
@@ -1355,9 +1363,10 @@ fn render_clip_into(
     let buf = &mut clip_scratch[..frames * src_channels];
     let got = clip.source.read(buf, frames);
 
-    // ClipAudioParams automation is clip-relative (01 §6) — evaluated at this
-    // block's clip-relative start, not the sequence tick.
-    let params = eval_clip_audio_params(&clip.audio.params, clip.elapsed);
+    let first_elapsed = clip
+        .elapsed
+        .saturating_add(Tick(first as i64 * tick_per_sample));
+    let params = eval_clip_audio_params(&clip.audio.params, first_elapsed);
     let base_gain = db_to_linear(params.gain_db);
     let channel_map = clip.audio.channel_map;
     let fade_in = clip.audio.fade_in.as_ref();
@@ -1365,12 +1374,13 @@ fn render_clip_into(
 
     for f in 0..got {
         let (sl, sr) = read_channel_mapped(buf, src_channels, f, channel_map);
-        let dt = Tick(f as i64 * tick_per_sample);
+        let output_frame = first + f;
+        let dt = Tick(output_frame as i64 * tick_per_sample);
         let elapsed = clip.elapsed.saturating_add(dt);
         let remaining = clip.remaining.saturating_sub(dt);
         let g = base_gain * fade_in_gain(fade_in, elapsed) * fade_out_gain(fade_out, remaining);
-        track_bus[f * CHANNELS] += sl * g as f32;
-        track_bus[f * CHANNELS + 1] += sr * g as f32;
+        track_bus[output_frame * CHANNELS] += sl * g as f32;
+        track_bus[output_frame * CHANNELS + 1] += sr * g as f32;
     }
 }
 

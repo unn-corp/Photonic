@@ -40,7 +40,7 @@ use photonic_render::color::{Colorimetry, Matrix, Range};
 use photonic_render::video::YuvConverter;
 use photonic_render::{ExportBackground, ExportOptions, HeadlessRenderer};
 
-use crate::audio::mixer::PcmSource;
+use crate::audio::mixer::{first_clip_sample, PcmSource};
 use crate::audio::{
     audio_ring, AudioEngine, ClipVoice, Mixer, RingProducer, TrackVoice, XrunCounters,
     BLOCK_FRAMES, CHANNELS,
@@ -4366,8 +4366,8 @@ fn feeder_main(
             last_project = Some(project.clone());
         }
 
-        // Which clips sound at t? Audio tracks only in P3 — video-clip
-        // embedded audio arrives with the linked-clips story.
+        let block_end = t.saturating_add(block_ticks);
+        // Include audio clips whose in point falls inside this block.
         let active: Vec<(&photonic_core::timeline::Track, &Clip)> = seq
             .audio_tracks
             .iter()
@@ -4378,7 +4378,7 @@ fn feeder_main(
                     .iter()
                     .filter(|clip| {
                         clip.enabled
-                            && clip.start <= t
+                            && clip.start < block_end
                             && t < clip.end()
                             && matches!(clip.source, ClipSource::Asset { .. })
                     })
@@ -4406,10 +4406,11 @@ fn feeder_main(
                     .map(|a| (a.offset, a.stream))
                     .unwrap_or((Tick::ZERO, None));
                 let identity = matches!(clip.speed, SpeedMap::Constant(r) if r == Ratio::ONE);
+                let read_start = first_clip_sample(t, clip.start, sample_rate);
                 if identity {
                     let src_pos = crate::playback::pcm::source_seek_with_offset(
                         clip.source_in,
-                        t,
+                        read_start,
                         clip.start,
                         offset,
                     );
@@ -4445,7 +4446,7 @@ fn feeder_main(
                                 clip.source_in,
                                 offset,
                                 clip.speed.clone(),
-                                t - clip.start,
+                                read_start - clip.start,
                             )),
                         );
                     }
