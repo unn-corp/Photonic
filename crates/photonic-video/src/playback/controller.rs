@@ -164,10 +164,8 @@ impl PlaybackController {
     /// from the current frame, and force evaluation of exactly that tick.
     pub fn step(&mut self, frames: i32) {
         self.clock.pause();
-        let cur = self.rate.frame_at(self.clock.now());
-        let last = self.rate.frame_at(Tick(i64::MAX));
-        let target = cur.saturating_add(i64::from(frames)).clamp(0, last);
-        self.clock.set(self.rate.frame_start(target));
+        let target = self.rate.step_from(self.clock.now(), i64::from(frames));
+        self.clock.set(target);
         self.presenter.force_next();
     }
 

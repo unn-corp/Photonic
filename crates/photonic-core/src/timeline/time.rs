@@ -134,6 +134,14 @@ impl FrameRate {
         Tick(frame * self.ticks_per_frame().0)
     }
 
+    /// Start of the frame `frames` away from the one containing `from`,
+    /// clamped between frame 0 and the last frame whose start is representable.
+    pub fn step_from(&self, from: Tick, frames: i64) -> Tick {
+        let last = self.frame_at(Tick(i64::MAX));
+        let target = self.frame_at(from).saturating_add(frames).clamp(0, last);
+        self.frame_start(target)
+    }
+
     /// True when [`ticks_per_frame`](Self::ticks_per_frame) divides exactly (no
     /// rounding). All the SPEC's supported rates are exact; only exotic rates
     /// (e.g. 23.9-something custom) are not, and the UI surfaces that.
@@ -291,6 +299,23 @@ impl Timecode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stepping_clamps_to_the_first_and_last_representable_frames() {
+        let rate = FrameRate { num: 30, den: 1 };
+        let last = rate.frame_start(rate.frame_at(Tick(i64::MAX)));
+        assert_eq!(rate.step_from(Tick(i64::MAX), 5), last);
+        assert_eq!(rate.step_from(Tick(i64::MAX), i64::MAX), last);
+        assert_eq!(
+            rate.step_from(last, -1),
+            Tick(last.0 - rate.ticks_per_frame().0)
+        );
+        assert_eq!(rate.step_from(rate.frame_start(2), -5), Tick::ZERO);
+        assert_eq!(
+            rate.step_from(rate.frame_start(2) + Tick(7), 1),
+            rate.frame_start(3)
+        );
+    }
 
     #[test]
     fn ticks_per_frame_is_exact_for_supported_rates() {

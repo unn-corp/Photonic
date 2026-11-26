@@ -4790,8 +4790,7 @@ pub async fn step(state: &AppState, args: StepArgs) -> ToolResult {
         // the forced re-present of the same frame satisfies the wait at once).
         Some(seq) => match sequence_render_info(state, seq).await {
             Ok((fr, _, _)) => {
-                let target_frame = (fr.frame_at(before) + args.frames as i64).max(0);
-                let expected = fr.frame_start(target_frame);
+                let expected = fr.step_from(before, i64::from(args.frames));
                 settle_transport(
                     bridge,
                     prev,
