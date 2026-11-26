@@ -261,6 +261,18 @@ fn sequence_and_track_ops_roundtrip() {
 }
 
 #[test]
+fn undo_roundtrip_adding_first_active_sequence() {
+    let mut doc = Document::new("t", 100.0, 100.0);
+    doc.timeline = Some(TimelineProject::new());
+    let add = ops::add_sequence(Sequence::new("First", FrameRate::FPS_30, 1920, 1080));
+    assert_undo_roundtrip(&doc, &add);
+
+    let mut f = fixture();
+    f.doc.timeline.as_mut().unwrap().active_sequence = None;
+    assert_undo_roundtrip(&f.doc, &add);
+}
+
+#[test]
 fn effect_and_grade_ops_roundtrip() {
     let f = fixture();
     let p = f.project();

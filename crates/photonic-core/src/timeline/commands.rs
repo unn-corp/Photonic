@@ -1963,8 +1963,14 @@ impl TimelineCmd {
             } => {
                 p.sequences.remove(&sequence.id);
                 p.sequence_order.retain(|s| *s != sequence.id);
-                if *was_active {
-                    p.active_sequence = p.sequence_order.first().copied();
+                if p.active_sequence == Some(sequence.id) {
+                    // Undoing AddSequence restores the empty selection that
+                    // caused the added sequence to become active.
+                    p.active_sequence = if *was_active {
+                        p.sequence_order.first().copied()
+                    } else {
+                        None
+                    };
                 }
             }
             TimelineCmd::RenameSequence { seq, new, .. } => {
