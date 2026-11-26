@@ -43,9 +43,24 @@ static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 ///
 /// The complete payload is written and synced to a uniquely named sibling before
 /// the sibling replaces the destination. A failed write or replacement leaves an
-/// existing destination untouched and removes the staging file.
+/// existing destination untouched and removes the staging file. Existing regular
+/// files keep their Unix read, write, and execute permission bits.
 pub fn write_atomic_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_atomic_file_with_replacer(path, bytes, None, replace_destination)
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() => Some(metadata.permissions().mode() & 0o777),
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(not(unix))]
+    let mode = None;
+
+    write_atomic_file_with_replacer(path, bytes, mode, replace_destination)
 }
 
 /// Write bytes atomically while applying a Unix permission mode to the staged
@@ -463,6 +478,23 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert!(staging_files(&dir).is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_unix_permission_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("preserve-mode");
+        let path = dir.join("project.photon");
+        write_atomic_file_with_mode(&path, b"old project", 0o500).unwrap();
+
+        write_atomic_file(&path, b"updated project").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let bytes = fs::read(&path).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(mode, 0o500);
+        assert_eq!(bytes, b"updated project");
     }
 
     #[test]
