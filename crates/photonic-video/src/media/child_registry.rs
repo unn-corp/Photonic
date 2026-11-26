@@ -24,6 +24,7 @@
 //! Windows uses a kill-on-close Job Object; macOS relies on tier 1 only.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,10 @@ pub struct ChildRecord {
 /// start time is at or slightly before `started_unix`. Anything meaningfully
 /// newer is a reused pid.
 const START_TIME_SLACK_SECS: u64 = 5;
+
+// Handles for this process can share a registry file, so creation and
+// read-modify-write updates must hold the same lock.
+static REGISTRY_UPDATE: Mutex<()> = Mutex::new(());
 
 /// True when a live pid whose recorded spawn time was `recorded_started_unix`
 /// and whose currently-observed process start time is `observed_started_unix`
@@ -99,6 +104,9 @@ impl ChildRegistry {
     pub fn open(cache_dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
         let path = registry_path(cache_dir, std::process::id());
+        let _update = REGISTRY_UPDATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if !path.exists() {
             super::atomic_write::write_atomic(&path, b"[]")?;
         }
@@ -119,6 +127,9 @@ impl ChildRegistry {
 
     /// Append a child record (atomic rewrite).
     pub fn record(&self, rec: ChildRecord) -> std::io::Result<()> {
+        let _update = REGISTRY_UPDATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut records = self.read();
         records.push(rec);
         self.write(&records)
@@ -126,6 +137,9 @@ impl ChildRegistry {
 
     /// Drop a child record by pid (atomic rewrite). No error if absent.
     pub fn forget(&self, pid: u32) -> std::io::Result<()> {
+        let _update = REGISTRY_UPDATE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let mut records = self.read();
         records.retain(|r| r.pid != pid);
         self.write(&records)
@@ -331,5 +345,43 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].pid, 22);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_registry_handles_keep_other_workers_records() {
+        const WORKERS: u32 = 8;
+        const RECORDS: u32 = 12;
+        let dir = std::env::temp_dir().join(format!("photonic-childreg-{}", uuid::Uuid::new_v4()));
+        let start = std::sync::Barrier::new(WORKERS as usize);
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let dir = &dir;
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    let registry = ChildRegistry::open(dir).unwrap();
+                    let first = worker * RECORDS + 1;
+                    for pid in first..first + RECORDS {
+                        registry.record(record_for(pid, "decode")).unwrap();
+                    }
+                    for pid in (first..first + RECORDS).step_by(2) {
+                        registry.forget(pid).unwrap();
+                    }
+                });
+            }
+        });
+        let mut actual: Vec<_> = ChildRegistry::open(&dir)
+            .unwrap()
+            .read()
+            .into_iter()
+            .map(|record| record.pid)
+            .collect();
+        actual.sort_unstable();
+        let expected: Vec<_> = (2..=WORKERS * RECORDS).step_by(2).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            actual, expected,
+            "only the explicitly forgotten records may disappear"
+        );
     }
 }
