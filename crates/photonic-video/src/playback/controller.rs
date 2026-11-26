@@ -165,7 +165,8 @@ impl PlaybackController {
     pub fn step(&mut self, frames: i32) {
         self.clock.pause();
         let cur = self.rate.frame_at(self.clock.now());
-        let target = (cur + frames as i64).max(0);
+        let last = self.rate.frame_at(Tick(i64::MAX));
+        let target = cur.saturating_add(i64::from(frames)).clamp(0, last);
         self.clock.set(self.rate.frame_start(target));
         self.presenter.force_next();
     }
@@ -198,6 +199,20 @@ mod tests {
 
     fn tpf() -> i64 {
         RATE.ticks_per_frame().0
+    }
+
+    #[test]
+    fn stepping_caps_at_the_last_representable_frame_boundary() {
+        let mut controller = PlaybackController::new(RATE);
+        let last_index = RATE.frame_at(Tick(i64::MAX));
+        let last = RATE.frame_start(last_index);
+        controller.seek(RATE.frame_start(last_index - 1));
+        controller.step(2);
+        assert_eq!(controller.tick(), PresentDecision::Present(last));
+        controller.step(1);
+        assert_eq!(controller.playhead(), last);
+        controller.step(-1);
+        assert_eq!(controller.playhead(), RATE.frame_start(last_index - 1));
     }
 
     /// The story's soft-clock playback test: simulate 2s of clock samples (4
