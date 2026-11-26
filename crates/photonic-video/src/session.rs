@@ -837,10 +837,22 @@ impl EngineSession {
         let generation = self
             .next_snapshot_generation
             .fetch_add(1, Ordering::Relaxed);
-        self.snapshot_input.store(Some(Arc::new(PublishedSnapshot {
+        let published = Arc::new(PublishedSnapshot {
             generation,
             value: snapshot,
-        })));
+        });
+        // A publisher can be interrupted between reserving its generation and
+        // installing the snapshot. Keep a newer publication if it won the race.
+        self.snapshot_input.rcu(|current| {
+            if current
+                .as_ref()
+                .is_none_or(|value| value.generation < generation)
+            {
+                Some(Arc::clone(&published))
+            } else {
+                current.clone()
+            }
+        });
         let _ = self.mailbox.wake_tx.try_send(());
         generation
     }

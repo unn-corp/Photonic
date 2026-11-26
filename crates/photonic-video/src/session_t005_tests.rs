@@ -144,6 +144,44 @@ fn t005_snapshots_reuse_arcs_and_vector_updates_change_source_namespace() {
 }
 
 #[test]
+fn concurrent_snapshot_publication_keeps_generations_monotonic() {
+    const PUBLISHERS: usize = 8;
+    const PUBLICATIONS: u64 = 8_192;
+
+    let session = test_session();
+    let start = std::sync::Barrier::new(PUBLISHERS);
+    let regressions: u64 = std::thread::scope(|scope| {
+        let publishers: Vec<_> = (0..PUBLISHERS)
+            .map(|_| {
+                scope.spawn(|| {
+                    start.wait();
+                    (0..PUBLICATIONS)
+                        .filter(|&revision| {
+                            let generation = session.publish_snapshot(RenderSnapshot {
+                                revision,
+                                project: None,
+                                document: None,
+                            });
+                            session.snapshot_input.load().as_ref().unwrap().generation < generation
+                        })
+                        .count() as u64
+                })
+            })
+            .collect();
+        publishers
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .sum()
+    });
+    let total = PUBLISHERS as u64 * PUBLICATIONS;
+    assert_eq!(regressions, 0, "{regressions}/{total} reads went backward");
+    assert_eq!(
+        session.snapshot_input.load().as_ref().unwrap().generation,
+        total
+    );
+}
+
+#[test]
 fn t005_worker_permits_survive_request_invalidation() {
     let active = Arc::new(AtomicU64::new(0));
     let a = WorkPermit::acquire(&active, 2).unwrap();
