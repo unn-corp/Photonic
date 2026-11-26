@@ -92,6 +92,28 @@ fn fractional_chunks_use_stable_frame_boundaries_and_half_open_ranges() {
     assert!(chunks_for_range(rate, (Tick(-1), first.end)).is_err());
     assert!(ChunkSpan::covering(FrameRate { num: 0, den: 1 }, Tick(0)).is_err());
 }
+
+#[test]
+fn preview_span_rejects_an_unrepresentable_end_tick() {
+    let rate = FrameRate::FPS_30;
+    let duration = ChunkSpan::covering(rate, Tick::ZERO).unwrap().end.0;
+    let last_end = Tick(i64::MAX / duration * duration);
+    assert_eq!(
+        ChunkSpan::covering(rate, last_end - Tick(1)).unwrap().end,
+        last_end
+    );
+    assert!(ChunkSpan::covering(rate, last_end).is_err());
+}
+
+#[test]
+fn preview_range_checks_that_its_final_chunk_is_representable() {
+    let rate = FrameRate::FPS_30;
+    let duration = ChunkSpan::covering(rate, Tick::ZERO).unwrap().end.0;
+    let last_end = Tick(i64::MAX / duration * duration);
+    assert!(chunks_for_range(rate, (Tick::ZERO, last_end)).is_ok());
+    assert!(chunks_for_range(rate, (Tick::ZERO, last_end + Tick(1))).is_err());
+}
+
 #[test]
 fn every_frame_order_and_render_context_participate_in_key() {
     let original = signature(SequenceId::new(), 0);

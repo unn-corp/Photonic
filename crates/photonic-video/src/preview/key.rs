@@ -105,8 +105,15 @@ impl ChunkSpan {
         let end_frame = first_frame
             .checked_add(frame_count as i64)
             .ok_or_else(|| PreviewError::Invalid("preview range overflow".into()))?;
-        let start = rate.frame_start(first_frame);
-        let end = rate.frame_start(end_frame);
+        let ticks_per_frame = rate.ticks_per_frame().0;
+        let to_tick = |frame: i64| {
+            frame
+                .checked_mul(ticks_per_frame)
+                .map(Tick)
+                .ok_or_else(|| PreviewError::Invalid("preview range overflow".into()))
+        };
+        let start = to_tick(first_frame)?;
+        let end = to_tick(end_frame)?;
         if end <= start {
             return Err(PreviewError::Invalid("preview frame range is empty".into()));
         }
@@ -159,16 +166,19 @@ impl Iterator for ChunkSpans {
     }
 }
 pub fn chunks_for_range(rate: FrameRate, range: (Tick, Tick)) -> Result<ChunkSpans, PreviewError> {
-    if range.0 .0 < 0 || range.1 <= range.0 {
+    let (start, end) = range;
+    if start.0 < 0 || end <= start {
         return Err(PreviewError::Invalid(
             "preview range must be nonempty and nonnegative".into(),
         ));
     }
-    let first = ChunkSpan::covering(rate, range.0)?;
+    let first = ChunkSpan::covering(rate, start)?;
+    // Validate the last aligned chunk before returning the lazy iterator.
+    ChunkSpan::covering(rate, end - Tick(1))?;
     Ok(ChunkSpans {
         rate,
         next_frame: first.first_frame,
-        end: range.1,
+        end,
         frames: first.frame_count,
     })
 }
