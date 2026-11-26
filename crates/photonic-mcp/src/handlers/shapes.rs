@@ -6,6 +6,9 @@ use crate::handlers::shared::{
     paths::{apply_pucker_bloat, apply_roughen, apply_round_corners, apply_twirl, apply_zig_zag},
     styling::apply_style,
 };
+use crate::procedural_work::{
+    check_flare_work, check_polar_grid_work, check_rectangular_grid_work, check_spiral_work,
+};
 use crate::protocol::*;
 use crate::server::AppState;
 use kurbo;
@@ -35,14 +38,22 @@ pub async fn create_shape(state: &AppState, args: CreateShapeArgs) -> ToolResult
             let cx = args.x + args.width / 2.0;
             let cy = args.y + args.height / 2.0;
             let r = args.width.min(args.height) / 2.0;
-            PathData::regular_polygon(cx, cy, r, args.sides.unwrap_or(6))
+            let sides = args.sides.unwrap_or(6);
+            if sides < 3 {
+                return ToolResult::error("Polygon sides must be at least 3");
+            }
+            PathData::regular_polygon(cx, cy, r, sides)
         }
         ShapeType::Star => {
             let cx = args.x + args.width / 2.0;
             let cy = args.y + args.height / 2.0;
             let outer = args.width.min(args.height) / 2.0;
             let inner = outer * args.inner_radius.unwrap_or(0.4);
-            PathData::star(cx, cy, outer, inner, args.sides.unwrap_or(5))
+            let sides = args.sides.unwrap_or(5);
+            if sides < 3 {
+                return ToolResult::error("Star sides must be at least 3");
+            }
+            PathData::star(cx, cy, outer, inner, sides)
         }
         ShapeType::Line => {
             PathData::line(args.x, args.y, args.x + args.width, args.y + args.height)
@@ -198,6 +209,14 @@ pub async fn create_flare(state: &AppState, args: CreateFlareArgs) -> ToolResult
     let ring_count = args.ring_count.unwrap_or(3);
     let ray_opacity = args.ray_opacity.unwrap_or(0.3);
 
+    if let Err(error) = check_flare_work(ray_count, ring_count) {
+        return ToolResult::error(error);
+    }
+    let generated_nodes = 2usize
+        .checked_add(ray_count)
+        .and_then(|count| count.checked_add(ring_count))
+        .expect("validated flare work count");
+
     let halo_color = args.halo_color.as_deref().unwrap_or("#fffbe6");
     let halo_c = Color::from_hex(halo_color).unwrap_or(Color::new(1.0, 0.98, 0.9, 0.6));
 
@@ -209,7 +228,7 @@ pub async fn create_flare(state: &AppState, args: CreateFlareArgs) -> ToolResult
     let actual_layer = layer_id
         .or(doc.active_layer_id)
         .unwrap_or(uuid::Uuid::nil());
-    let mut child_ids = Vec::new();
+    let mut child_ids = Vec::with_capacity(generated_nodes - 1);
 
     // 1. Create halo circle (semi-transparent filled ellipse).
     {
@@ -333,8 +352,8 @@ pub async fn create_spiral(state: &AppState, args: CreateSpiralArgs) -> ToolResu
     if args.outer_radius <= 0.0 {
         return ToolResult::error("outer_radius must be greater than 0");
     }
-    if args.turns <= 0.0 {
-        return ToolResult::error("turns must be greater than 0");
+    if let Err(error) = check_spiral_work(args.turns, args.segments_per_turn) {
+        return ToolResult::error(error);
     }
 
     let path_data = PathData::spiral(
@@ -375,6 +394,9 @@ pub async fn create_polar_grid(state: &AppState, args: CreatePolarGridArgs) -> T
     let inner_r = args.inner_radius.unwrap_or(0.0).max(0.0);
     let rings = args.rings.unwrap_or(4).max(1);
     let sectors = args.sectors.unwrap_or(8).max(1);
+    if let Err(error) = check_polar_grid_work(Some(rings), Some(sectors)) {
+        return ToolResult::error(error);
+    }
 
     let path_data =
         PathData::polar_grid(args.x, args.y, args.outer_radius, inner_r, rings, sectors);
@@ -409,6 +431,9 @@ pub async fn create_grid(state: &AppState, args: CreateGridArgs) -> ToolResult {
     }
     let cols = args.cols.unwrap_or(4).max(1);
     let rows = args.rows.unwrap_or(4).max(1);
+    if let Err(error) = check_rectangular_grid_work(Some(cols), Some(rows)) {
+        return ToolResult::error(error);
+    }
 
     let path_data = PathData::grid(args.x, args.y, args.width, args.height, cols, rows);
 
