@@ -294,7 +294,7 @@ fn fps_mode_supported(ffmpeg: &std::path::Path) -> bool {
         .output()
         .ok()
         .filter(|out| out.status.success())
-        .map_or(true, |out| help_lists_fps_mode(&out.stdout));
+        .is_none_or(|out| help_lists_fps_mode(&out.stdout));
     cache
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
