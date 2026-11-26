@@ -521,7 +521,7 @@ impl SpeedMap {
                 let lo = pair[0].at.0.max(0);
                 let hi = pair[1].at.0.min(duration.0);
                 if lo < hi && pair[0].ratio.num.signum() != pair[1].ratio.num.signum() {
-                    samples.push(zero_crossing(pair[0], pair[1]));
+                    samples.push(zero_crossing(pair[0], pair[1]).clamp(lo, hi));
                 }
             }
         }
@@ -1559,5 +1559,22 @@ mod tests {
             (high - 25.0).abs() < 1.0,
             "turnaround should be near 25 ticks: {high}"
         );
+    }
+
+    #[test]
+    fn speed_range_excludes_a_turnaround_after_the_requested_end() {
+        let map = SpeedMap::Keyframed {
+            keys: vec![
+                SpeedKey::eased(Tick::ZERO, Ratio::new(2, 1), Interp::Linear),
+                SpeedKey::new(Tick(100), Ratio::new(-1, 1)),
+            ],
+        };
+        let (lo, hi) = map.source_delta_range(Tick(20));
+        assert_eq!(lo, 0.0);
+        assert!(
+            (hi - 34.0).abs() < 1e-9,
+            "20-tick range included a later excursion up to {hi}"
+        );
+        assert!(map.source_delta_range(Tick(100)).1 > 66.0);
     }
 }
