@@ -1857,6 +1857,33 @@ pub fn expand_sync_lock_ripple(
         .collect()
 }
 
+/// Reject a ripple whose shift would carry any moved clip past the tick
+/// ceiling. The riders are the clips at or after `point` on `edited_track`
+/// (except `edited_clip`) and on every sync-locked, unlocked sibling, matching
+/// the clips [`expand_sync_lock_ripple`] and the edited track's ripple move.
+/// A negative shift cannot go below zero, because riders start at or after
+/// the point it closes from.
+pub fn check_ripple_shift(
+    p: &TimelineProject,
+    id: SequenceId,
+    edited_track: TrackId,
+    edited_clip: ClipId,
+    point: Tick,
+    shift: Tick,
+) -> Result<(), EditError> {
+    let s = seq(p, id)?;
+    let rides = |t: &&Track| t.id == edited_track || (t.sync_lock && !t.locked);
+    let riders = s
+        .tracks()
+        .filter(rides)
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| c.id != edited_clip && c.start >= point);
+    for c in riders {
+        checked_clip_end(c.start, c.duration).and_then(|end| checked_clip_end(end, shift))?;
+    }
+    Ok(())
+}
+
 /// Which edge of a clip a trim targets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ClipEdge {
@@ -1952,17 +1979,7 @@ pub fn ripple_trim(
     // sync-locked tracks) must keep a representable end. A negative shift
     // cannot go below zero: riders start at or after `old_end`.
     checked_clip_end(trimmed.start, trimmed.duration)?;
-    let rides = |t: &Track| t.id != track_id && t.sync_lock && !t.locked;
-    let riders = t
-        .clips
-        .iter()
-        .filter(|other| other.id != clip_id)
-        .chain(s.tracks().filter(|t| rides(t)).flat_map(|t| t.clips.iter()))
-        .filter(|other| other.start >= old_end);
-    for other in riders {
-        checked_clip_end(other.start, other.duration)
-            .and_then(|end| checked_clip_end(end, shift))?;
-    }
+    check_ripple_shift(p, id, track_id, clip_id, old_end, shift)?;
 
     let mut changes = vec![(clip_id, ClipTiming::of(c), trimmed)];
     for other in &t.clips {

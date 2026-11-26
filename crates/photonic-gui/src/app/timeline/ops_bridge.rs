@@ -781,20 +781,28 @@ pub fn ripple_trim(
     };
     // Prefer the core end-edge path when the timeline start is unchanged (the
     // common Shift+edge drag). Core already fans out to sync-locked tracks.
+    // A refusal there is final: falling through would redo the same ripple
+    // without the core's lock and tick-range checks.
     if new.start == c.start {
-        let new_boundary = new.start + new.duration;
+        let Some(new_boundary) = new.start.0.checked_add(new.duration.0).map(Tick) else {
+            return;
+        };
         if let Ok(cmds) = ops::ripple_trim(p, seq, track, clip, ops::ClipEdge::End, new_boundary) {
             commit_group(history, doc, cmds);
-            return;
         }
+        return;
     }
     let Ok(trim_cmd) = ops::trim_clip(p, seq, track, clip, new) else {
         return;
     };
     // Delta by which the clip's end moved: downstream clips shift by the same.
+    // `trim_clip` has already checked that the new end is representable.
     let old_end = c.end();
     let new_end = new.start + new.duration;
     let delta = new_end - old_end;
+    if ops::check_ripple_shift(p, seq, track, clip, old_end, delta).is_err() {
+        return;
+    }
     let mut changes = Vec::new();
     if delta.0 != 0 {
         for other in &t.clips {
@@ -2290,6 +2298,36 @@ mod sync_lock_tests {
             .clips
             .iter()
             .any(|c| c.id == clip)
+    }
+
+    #[test]
+    fn ripple_trim_refuses_shifts_past_the_tick_ceiling() {
+        let (mut doc, mut history, seq, a, b, _) = doc_with_three_tracks();
+        let a1 = insert(&mut doc, &mut history, seq, a, Tick(0), Tick(100));
+        // A sync-locked clip that cannot move 200 ticks later.
+        let near_end = Tick(i64::MAX - 100);
+        let b1 = insert(&mut doc, &mut history, seq, b, near_end, Tick(50));
+        let duration_of_a1 = |doc: &Document| {
+            doc.timeline.as_ref().unwrap().sequences[&seq]
+                .track(a)
+                .unwrap()
+                .clips
+                .iter()
+                .find(|c| c.id == a1)
+                .unwrap()
+                .duration
+        };
+        // End-edge (the core path) and start-edge (the local fallback) drags.
+        for start in [Tick(0), Tick(50)] {
+            let new_timing = ClipTiming {
+                start,
+                duration: Tick(300) - start,
+                source_in: start,
+            };
+            ripple_trim(&mut doc, &mut history, seq, a, a1, new_timing);
+            assert_eq!(duration_of_a1(&doc), Tick(100), "start {start:?}");
+            assert_eq!(start_of(&doc, seq, b, b1), near_end, "start {start:?}");
+        }
     }
 
     #[test]
