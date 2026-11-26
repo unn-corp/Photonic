@@ -92,6 +92,32 @@ fn revision_bumps_on_undo_and_redo() {
     );
 }
 
+#[test]
+fn restoring_checkpoint_invalidates_the_previous_document_revision() {
+    let mut doc = make_doc();
+    let mut history = CommandHistory::new(20);
+    let checkpoint = history.create_checkpoint("Empty canvas".into(), &doc);
+    let node = make_node(&doc);
+    let layer = node.layer_id;
+    history.execute(
+        Command::AddNode {
+            node,
+            layer_id: Some(layer),
+        },
+        &mut doc,
+    );
+    let before = history.revision();
+
+    assert!(history.restore_checkpoint(uuid::Uuid::new_v4()).is_none());
+    assert_eq!(history.revision(), before);
+    let restored = history.restore_checkpoint(checkpoint).unwrap();
+    assert!(restored.nodes.is_empty());
+    assert_eq!(history.undo_depth(), 0);
+    let changes = history.changes_since(before);
+    assert!(changes.revision > before);
+    assert!(changes.overflowed);
+}
+
 // ─── Command::affected_nodes() ──────────────────────────────────────────────
 
 /// 03 §2.1: "add `fn affected_nodes(&self) -> SmallVec<[NodeId; 4]>` to

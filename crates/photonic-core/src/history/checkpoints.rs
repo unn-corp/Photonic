@@ -114,6 +114,7 @@ impl CommandHistory {
             .clone();
         // The checkpoint snapshot becomes the new baseline — start history fresh.
         self.init_empty_tree();
+        self.record_document_replacement(self.revision);
         Some(snapshot)
     }
 
