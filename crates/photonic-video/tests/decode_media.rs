@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use photonic_core::timeline::{FrameRate, TICKS_PER_SECOND};
+use photonic_core::timeline::{FrameRate, Tick, TICKS_PER_SECOND};
 use photonic_video::decode::scheduler::{PtsKind, SourceParams};
 use photonic_video::decode::{DecodeSource, DecodedPlanes, PixFmt, SharedRing};
 use photonic_video::media::ffmpeg_locate::{locate_for_test, FfmpegTools};
@@ -278,6 +278,84 @@ fn decode_vfr_is_pts_true_via_table() {
         "VFR decode assigns pts from the ground-truth table (pts-true), not a constant rate"
     );
     assert!(frame.pts >= target);
+}
+
+#[test]
+fn seek_uses_the_container_start_as_its_origin() {
+    let tools = tools_or_skip!();
+    let dir = std::env::temp_dir().join(format!("photonic-offset-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("offset.mp4");
+    let output = std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=48x32:rate=24",
+            "-frames:v",
+            "24",
+            "-c:v",
+            "mpeg4",
+            "-g",
+            "6",
+            "-bf",
+            "0",
+            "-threads",
+            "1",
+            "-output_ts_offset",
+            "5",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Old cache entries hold the absolute container timestamp.
+    std::fs::write(
+        dir.join("offset.keyframes.json"),
+        serde_json::to_vec(&KeyframeIndex {
+            keyframes: vec![Tick::from_seconds(5)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("offset.pts.json"),
+        serde_json::to_vec(&PtsIndex {
+            pts: vec![Tick::from_seconds(5)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let index = Arc::new(PtsIndex::load_or_build(&tools, &path, &dir, "offset").unwrap());
+    let keyframes = KeyframeIndex::load_or_build(&tools, &path, &dir, "offset").unwrap();
+    let first_keyframe = keyframes.keyframes[0];
+    let decoded = {
+        let params = SourceParams {
+            input: path.clone(),
+            width: 48,
+            height: 32,
+            pix_fmt: PixFmt::Yuv420p,
+            pts_kind: PtsKind::Vfr(Arc::clone(&index)),
+            keyframes,
+        };
+        let mut source = DecodeSource::new(tools, params, SharedRing::preview());
+        source.seek(Tick::ZERO)
+    };
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(
+        decoded.expect("seek from the start of the file").pts,
+        Tick::ZERO
+    );
+    assert_eq!(first_keyframe, Tick::ZERO);
+    assert_eq!(index.pts[0], Tick::ZERO);
+    assert_eq!(index.pts.len(), 24);
 }
 
 // ── 5. Alpha: yuva path, alpha ramps left→right (alpha_gradient.mov) ─────────

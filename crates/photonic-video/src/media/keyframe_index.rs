@@ -41,6 +41,9 @@ pub enum IndexError {
 /// spec's `<project>.photon.cache/` form (01 §9).
 pub const CACHE_DIR_SUFFIX: &str = ".cache";
 
+// Version 2 stores positions relative to the container start time.
+const FRAME_INDEX_CACHE_VERSION: u32 = 2;
+
 /// The sidecar cache dir for `project_path`: append `.cache` to the project
 /// file path (01 §9). For `/proj/movie.photon` this is
 /// `/proj/movie.photon.cache/`. The directory is not created here — callers
@@ -53,7 +56,9 @@ pub fn cache_dir_for_project(project_path: &Path) -> PathBuf {
 
 /// Path of the keyframe-index cache file for `content_hash` inside `cache_dir`.
 pub fn keyframe_cache_path(cache_dir: &Path, content_hash: &str) -> PathBuf {
-    cache_dir.join(format!("{content_hash}.keyframes.json"))
+    cache_dir.join(format!(
+        "{content_hash}.v{FRAME_INDEX_CACHE_VERSION}.keyframes.json"
+    ))
 }
 
 /// True when a keyframe index for this hash already exists (24 L4 ready).
@@ -63,7 +68,9 @@ pub fn keyframe_index_ready(cache_dir: &Path, content_hash: &str) -> bool {
 
 /// Path of the pts-index cache file for `content_hash` inside `cache_dir`.
 fn pts_cache_path(cache_dir: &Path, content_hash: &str) -> PathBuf {
-    cache_dir.join(format!("{content_hash}.pts.json"))
+    cache_dir.join(format!(
+        "{content_hash}.v{FRAME_INDEX_CACHE_VERSION}.pts.json"
+    ))
 }
 
 // ── Keyframe index ──────────────────────────────────────────────────────────
@@ -194,6 +201,13 @@ impl PtsIndex {
 struct FramesDoc {
     #[serde(default)]
     frames: Vec<FrameEntry>,
+    #[serde(default)]
+    format: FormatTiming,
+}
+
+#[derive(Default, Deserialize)]
+struct FormatTiming {
+    start_time: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -222,7 +236,7 @@ fn probe_frame_ticks(
         "v:0",
         "-show_frames",
         "-show_entries",
-        "frame=best_effort_timestamp_time,pts_time",
+        "frame=best_effort_timestamp_time,pts_time:format=start_time",
         "-print_format",
         "json",
     ])
@@ -237,6 +251,15 @@ fn probe_frame_ticks(
     }
 
     let doc: FramesDoc = serde_json::from_slice(&output.stdout).map_err(IndexError::Json)?;
+    // FFmpeg's input seek is relative to the container start. The probed
+    // frame timestamps still include that origin.
+    let start = doc
+        .format
+        .start_time
+        .as_deref()
+        .and_then(parse_secs)
+        .filter(|seconds| seconds.is_finite())
+        .unwrap_or(0.0);
     let mut ticks: Vec<Tick> = doc
         .frames
         .iter()
@@ -246,7 +269,7 @@ fn probe_frame_ticks(
                 .or(f.pts_time.as_deref())
                 .and_then(parse_secs)
         })
-        .map(secs_to_tick)
+        .map(|secs| secs_to_tick(secs - start))
         .collect();
     // ffprobe emits frames in decode order; keyframe/pts indices are keyed by
     // presentation time, so sort ascending.
