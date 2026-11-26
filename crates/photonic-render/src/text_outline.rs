@@ -564,18 +564,28 @@ mod tests {
         );
     }
 
-    /// Pick a real, non-generic font face installed in the system DB so the
+    /// Pick an installed, non-generic face that covers the sample so the
     /// resolution test is portable (no hardcoded family). Prefers a plain
     /// regular (weight 400, normal style) face for unambiguous resolution,
     /// falling back to the first concrete face otherwise. Returns `None` on a
     /// font-less environment.
-    fn pick_installed_face(fs: &FontSystem) -> Option<(String, u16, FontStyle)> {
+    fn pick_installed_face(fs: &FontSystem, sample: &str) -> Option<(String, u16, FontStyle)> {
         let mut fallback: Option<(String, u16, FontStyle)> = None;
         for face in fs.db().faces() {
             let Some((family, _)) = face.families.first() else {
                 continue;
             };
             if is_generic_family(family) {
+                continue;
+            }
+            let covers_sample = fs
+                .db()
+                .with_face_data(face.id, |data, index| {
+                    ttf_parser::Face::parse(data, index)
+                        .is_ok_and(|font| sample.chars().all(|ch| font.glyph_index(ch).is_some()))
+                })
+                .unwrap_or(false);
+            if !covers_sample {
                 continue;
             }
             let style = match face.style {
@@ -600,13 +610,14 @@ mod tests {
     /// CI image where no concrete family exists.)
     #[test]
     fn export_resolves_exact_requested_family_and_weight() {
+        let sample = "Ag";
         let mut fs = FontSystem::new();
-        let Some((family, weight, style)) = pick_installed_face(&fs) else {
-            eprintln!("no installed fonts — skipping font-resolution check");
+        let Some((family, weight, style)) = pick_installed_face(&fs, sample) else {
+            eprintln!("no installed font covers the font-resolution sample");
             return;
         };
 
-        let mut node = TextNode::new("Ag");
+        let mut node = TextNode::new(sample);
         node.font_family = family.clone();
         node.font_weight = weight;
         node.font_style = style;
