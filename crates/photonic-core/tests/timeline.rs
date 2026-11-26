@@ -273,6 +273,18 @@ fn undo_roundtrip_adding_first_active_sequence() {
 }
 
 #[test]
+fn undo_roundtrip_splitting_clip_with_outgoing_transition() {
+    let mut f = fixture();
+    let project = f.doc.timeline.as_mut().unwrap();
+    let sequence = project.sequences.get_mut(&f.seq).unwrap();
+    let clip = &mut sequence.track_mut(f.vtrack).unwrap().clips[1];
+    clip.transition_out = Some(Transition::new(TransitionKind::DipToBlack, Tick(100)));
+
+    let split = ops::split_clip(project, f.seq, f.vtrack, f.clip_b, Tick(1500)).unwrap();
+    assert_undo_roundtrip(&f.doc, &split);
+}
+
+#[test]
 fn effect_and_grade_ops_roundtrip() {
     let f = fixture();
     let p = f.project();

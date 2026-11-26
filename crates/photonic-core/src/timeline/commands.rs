@@ -2170,6 +2170,7 @@ impl TimelineCmd {
                             }
                             sort_markers(&mut l.markers);
                             l.duration = right_clip.end() - l.start;
+                            l.transition_out = right_clip.transition_out;
                             clear_stabilization_analysis(l);
                         }
                     }
