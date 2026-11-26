@@ -308,6 +308,13 @@ fn direct_timing_edits_respect_source_and_destination_track_locks() {
         bypasses.is_empty(),
         "edits bypassing the source track lock: {bypasses:?}"
     );
+    assert!(
+        matches!(
+            ops::ripple_trim(p, f.seq, f.vtrack, f.clip_a, ClipEdge::End, Tick(500)),
+            Err(ops::EditError::TrackLocked)
+        ),
+        "ripple trims must respect the track lock"
+    );
 
     let seq = f
         .doc

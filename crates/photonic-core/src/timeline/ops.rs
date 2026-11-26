@@ -1888,6 +1888,9 @@ pub fn ripple_trim(
 ) -> Result<Vec<TimelineCmd>, EditError> {
     let s = seq(p, id)?;
     let t = track(s, track_id)?;
+    if t.locked {
+        return Err(EditError::TrackLocked);
+    }
     let c = clip(t, clip_id)?;
     let old_start = c.start;
     let old_end = c.end();
